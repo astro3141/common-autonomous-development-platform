@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+
+# Byte-identical duplicate of "Authority order.md" under a filename that reads like
+# STATUS_workflow_harness.md. Kept locally, excluded here so it cannot be mistaken
+# for the workflow-harness status document.
+STATUS_workflow_harness 복사본.md

@@ -1,0 +1,17 @@
+{
+  "name": "@platform/core",
+  "version": "0.0.1",
+  "description": "Common Autonomous Development Platform — deterministic Core contract primitives",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,165 @@
+/**
+ * State machine inputs (TD §19, §20).
+ *
+ * Every precondition Batch 8 evaluates arrives as an already-observed, typed fact. There is no
+ * `Record<string, unknown>` bag and no adapter handle: the state machine cannot reach a backend
+ * even by accident, and a model's self-report has nowhere to enter — note that no fact below
+ * carries a `declared_status` (I-TD3).
+ */
+
+import type { AttemptState, BatchState, TaskState } from "../store/domain-types.ts";
+
+export type { AttemptState, BatchState, TaskState };
+
+/** TD §24 codes this batch can attach to a HELD/FAILED row. Not a new taxonomy — a subset. */
+export const TRANSITION_REASON_CODES = [
+  "RUNTIME_FAILED",
+  "CAPABILITY_BOUNDARY_CHANGED",
+  "VERIFICATION_FAILED",
+  "VERIFICATION_INFRA",
+  "AUDIT_HUMAN_REQUIRED",
+  /**
+   * TD §16.2 (M1-13) — **one** unusable Auditor structured-result observation: no structured
+   * output, the wrong protocol, a malformed envelope, or `reviewed.*` that does not bind. It is
+   * retryable, and for the same candidate it permits exactly one `auditor-turn-2`.
+   */
+  "AUDIT_INVALID",
+  /**
+   * TD §16.2 (M1-13) — the *second* unusable observation for the same candidate. The retry is
+   * spent, so this is terminal for that audit cycle: no third turn, no settlement, no record.
+   * Deliberately distinct from `AUDIT_INVALID`, which is the retryable observation itself.
+   */
+  "AUDIT_UNUSABLE",
+  /**
+   * TD §16.3 (M1-13) — a *valid* Auditor verdict exists, but the audit gate's settlement could
+   * not be authoritatively established. Never re-read as `FIX_REQUIRED`: the Auditor said what it
+   * said, and what failed is the Platform's ability to prove the gate settled.
+   */
+  "AUDIT_GATE_UNAVAILABLE",
+  "REWORK_LIMIT",
+  "CONTRACT_DRIFT",
+  /**
+   * TD §19.3a (M1-7) — the pre-Attempt selection basis no longer matches the authoritative
+   * TaskDefinition or canonical head. Distinct from `CONTRACT_DRIFT`, which is §11's post-Attempt
+   * concept and is driven by `contract_drift_policy` at stage boundaries.
+   */
+  "SELECTION_STALE",
+  /**
+   * TD §11.3/§11.4/§24 (M1-11) — the boundary could not determine *whether* drift exists, because
+   * an authoritative current value could not be read. Deliberately distinct from `CONTRACT_DRIFT`,
+   * which means a difference was actually observed: "I proved it changed" and "I could not tell"
+   * are different facts, and neither may be recorded as the other.
+   */
+  "DRIFT_CHECK_UNAVAILABLE",
+  "CONTRACT_BUILD_ERROR",
+  "REPOSITORY_CONFLICT",
+  "HUMAN_MERGE_MISMATCH",
+  "RECOVERY_CONFLICT",
+  "EXTERNAL_CLOSED",
+  "MERGE_REJECTED",
+  "POLICY_BACKEND_INCOMPATIBLE",
+] as const;
+
+export type TransitionReasonCode = (typeof TRANSITION_REASON_CODES)[number];
+
+/** `BLOCKED_BY_DECISION:<decision_id>` (TD §19.1) — the one parameterized reason. */
+export const BLOCKED_BY_DECISION = "BLOCKED_BY_DECISION";
+
+export const blockedByDecision = (decisionId: string): string =>
+  `${BLOCKED_BY_DECISION}:${decisionId}`;
+
+/** True for a fixed §24 code or the parameterized blocking form. Nothing else is a reason. */
+/** TD §19.3a (M1-7) — the pre-Attempt staleness hold reason. */
+export const SELECTION_STALE = "SELECTION_STALE";
+
+export function isReasonCode(value: string): boolean {
+  if ((TRANSITION_REASON_CODES as readonly string[]).includes(value)) return true;
+  if (!value.startsWith(`${BLOCKED_BY_DECISION}:`)) return false;
+  return value.slice(BLOCKED_BY_DECISION.length + 1).length > 0;
+}
+
+// --- attempt facts ------------------------------------------------------------------
+
+/**
+ * Authoritative facts a caller has already observed. Booleans are claims about the *world*, so a
+ * `false` is rejected by the guard rather than reinterpreted.
+ */
+export type AttemptFact =
+  /** §19.3 READY→IMPLEMENTING: workspace exists and the enforcement receipt matched the grant. */
+  | { readonly kind: "EXECUTION_STARTED"; readonly workspace_created: boolean; readonly receipt_valid: boolean }
+  /** §19.3 IMPLEMENTING→VERIFYING — repository facts only; no model report is consulted. */
+  | {
+      readonly kind: "CANDIDATE_OBSERVED";
+      readonly candidate_commit: string;
+      readonly lineage_valid: boolean;
+      readonly tracked_clean: boolean;
+    }
+  /**
+   * §19.3 IMPLEMENTING — the repository says there is no usable candidate: no commit, a commit that
+   * is not a child of `base_head`, or a workspace that is not tracked-clean. Carries no detail
+   * because the guard is not re-evaluated here; the caller already asked the RepositoryAdapter.
+   */
+  | { readonly kind: "CANDIDATE_REJECTED" }
+  /** §19.3 VERIFYING→AUDITING: every required check produced accepted, bound evidence. */
+  | { readonly kind: "VERIFICATION_PASSED" }
+  /**
+   * §19.3/§16.1 (M1-10) — the Auditor's own session exists and its first turn was accepted. The
+   * attempt only enters `AUDITING` on this fact, so there is never an audit in progress whose turn
+   * the Platform cannot name.
+   */
+  | { readonly kind: "AUDIT_STARTED"; readonly session_ready: boolean; readonly receipt_valid: boolean }
+  | { readonly kind: "VERIFICATION_FAILED"; readonly infrastructure: boolean }
+  /** §16.2 verdict. §16.3's gate commit is the caller's precondition, not a model utterance. */
+  | {
+      readonly kind: "AUDIT_DECIDED";
+      readonly verdict: "AUDIT_PASS" | "FIX_REQUIRED" | "HUMAN_REQUIRED";
+      readonly drift_clear: boolean;
+    }
+  /** §19.3 REWORKING→IMPLEMENTING. */
+  | { readonly kind: "REWORK_STARTED"; readonly snapshot_valid: boolean }
+  /** §19.4 — a human APPROVE. Explicitly not a merge. */
+  | { readonly kind: "MANUAL_MERGE_APPROVED" }
+  | { readonly kind: "MANUAL_MERGE_REJECTED" }
+  /** §19.3 MVP 2 automatic merge start; the Gate preconditions are the caller's observation. */
+  | { readonly kind: "AUTOMATIC_MERGE_STARTED"; readonly gate_preconditions_met: boolean }
+  /** §19.4 — canonical observation, the only thing that may produce MERGED. */
+  | { readonly kind: "MERGE_OBSERVED"; readonly canonical_contains_candidate: boolean }
+  /** §19.4 — canonical moved in a way the approval does not explain. */
+  | { readonly kind: "MERGE_MISMATCH_OBSERVED" }
+  /** §11.1 INVALIDATE_AT_BOUNDARY, or an explicit human decision. */
+  | { readonly kind: "CONTRACT_DRIFT_INVALIDATED" }
+  /** Any §24 hold that leaves the attempt where it is and parks the task. */
+  | { readonly kind: "EXECUTION_HELD"; readonly reason_code: TransitionReasonCode }
+  /** Unrecoverable: the attempt terminates and the task fails with it (§19.2 I4). */
+  | { readonly kind: "ATTEMPT_FAILED"; readonly reason_code: TransitionReasonCode };
+
+/** What one attempt fact resolves to. The commit function writes exactly this. */
+export interface AttemptOutcome {
+  readonly attempt_state: AttemptState;
+  readonly candidate_commit?: string;
+  readonly rework_count?: number;
+  readonly attempt_reason_code?: string;
+  /** Present when the same transaction must also decide the TaskState (§19.2 I4). */
+  readonly task_state?: TaskState;
+  readonly task_reason_code?: string;
+  /** The transition needs a human decision to be opened alongside it (§11.1, §19.4). */
+  readonly needs_human_decision?: boolean;
+}
+
+// --- batch facts --------------------------------------------------------------------
+
+export type BatchFact =
+  /**
+   * §20.1 — whether any task could safely be started next. Derived by the Coordinator from the
+   * dependency graph and repository conflicts; Batch 8 never computes it.
+   */
+  | { readonly kind: "EVALUATE_WAITING"; readonly safe_independent_runnable_exists: boolean }
+  | { readonly kind: "RESUME"; readonly safe_independent_runnable_exists: boolean }
+  | { readonly kind: "EVALUATE_COMPLETION" }
+  /** Spec §52 circuit breaker — observed outside, never detected here. */
+  | { readonly kind: "CIRCUIT_BREAKER"; readonly also_pause_run: boolean };
+
+export interface BatchOutcome {
+  readonly batch_state: BatchState;
+  readonly pause_run: boolean;
+}
