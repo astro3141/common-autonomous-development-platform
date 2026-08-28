@@ -70,5 +70,14 @@ execution:
     max_concurrent_sessions: 1
 
 filtering:
+  # Milestone membership IS the prepared production graph's scope. Without it this
+  # engine is board-wide: max_to_start: 0 means unlimited, and milestone filtering
+  # applies only when this list is non-empty. Scope must not depend on the incidental
+  # lifecycle state of unrelated agent-labelled issues.
+  #
+  #   milestone membership -> which issues are in the prepared graph
+  #   agent:* label        -> execution routing/admission INSIDE that graph
+  milestones:
+    - "MVP1 Live Pilot — Production Integration"
   fetch_limit: 100
   max_to_start: 0
