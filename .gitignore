@@ -5,3 +5,14 @@ node_modules/
 # STATUS_workflow_harness.md. Kept locally, excluded here so it cannot be mistaken
 # for the workflow-harness status document.
 STATUS_workflow_harness 복사본.md
+
+# Issue-Orchestrator runtime state (generated; never tracked)
+.issue-orchestrator/ai-gate-state.json
+.issue-orchestrator/state/
+.issue-orchestrator/attempts/
+.issue-orchestrator/locks/
+.issue-orchestrator/repo.lock
+
+# Provider hook material installed per machine by `issue-orchestrator setup-hooks`
+.claude/
+.codex/
