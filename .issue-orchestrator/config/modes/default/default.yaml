@@ -1,0 +1,83 @@
+# Issue-Orchestrator repository configuration for this repository.
+#
+# Tracked deliberately: agent worktrees are seeded from a git ref, so prompts and
+# configuration must be reachable from that ref. Untracked local configuration and
+# absolute external prompt paths are not a supported production onboarding shape.
+#
+# Named default.yaml deliberately: `setup-hooks` resolves only DEFAULT_CONFIG_NAME
+# and ignores --config/--mode, so a differently-named file cannot be onboarded
+# through the documented path. Measured on both upstream 7c967f65 and R25 ad4ecf9f.
+
+repo:
+  name: astro3141/common-autonomous-development-platform
+
+default_agent:
+  provider: claude-code
+  model: opus
+
+agents:
+  agent:backend:
+    prompt: .issue-orchestrator/prompts/backend.md
+    provider: claude-code
+    ai_system: claude-code
+    model: opus
+    timeout_minutes: 90
+    reviewer: agent:reviewer
+    provider_args:
+      effort: xhigh
+      permission_mode: bypassPermissions
+  agent:reviewer:
+    prompt: .issue-orchestrator/prompts/reviewer.md
+    provider: codex
+    ai_system: codex
+    model: gpt-5.6-sol
+    timeout_minutes: 45
+    provider_args:
+      approval_mode: full-auto
+      sandbox: workspace-write
+      reasoning_effort: xhigh
+
+review:
+  enabled: true
+  default: agent:reviewer
+
+worktrees:
+  base: ${ADP_IO_WORKTREE_BASE}
+  base_branch_override: main
+  seed_ref: origin/main
+  setup:
+    # --no-package-lock deliberately: this repository tracks no lockfile, and a
+    # generated one would leave the worktree dirty and block completion.
+    - npm install --no-package-lock
+
+validation:
+  quick:
+    cmd: "npm run typecheck"
+    timeout_seconds: 600
+  publish:
+    cmd: "npm test && npm run typecheck"
+    timeout_seconds: 1800
+
+security:
+  workspace_trust:
+    # Absolute path to the checkout a human approved for agent execution.
+    # Supplied per machine rather than committed: config loading fails closed
+    # when the variable is unset, which is the intended behaviour.
+    approved_repository_root: ${ADP_IO_APPROVED_ROOT}
+
+execution:
+  concurrency:
+    max_concurrent_sessions: 1
+
+filtering:
+  # Milestone membership IS the prepared production graph's scope. Without it this
+  # engine is board-wide: max_to_start: 0 means unlimited, and milestone filtering
+  # applies only when this list is non-empty. Scope must not depend on the incidental
+  # lifecycle state of unrelated agent-labelled issues.
+  #
+  #   milestone membership -> which issues are in the prepared graph
+  #   agent:* label        -> execution routing/admission INSIDE that graph
+  milestones:
+    - "MVP1 Live Pilot — Production Integration"
+  fetch_limit: 100
+  max_to_start: 0
