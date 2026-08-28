@@ -77,7 +77,17 @@ filtering:
   #
   #   milestone membership -> which issues are in the prepared graph
   #   agent:* label        -> execution routing/admission INSIDE that graph
+  # `--issue N` does NOT bypass this list. Measured on R25 ad4ecf9f against this repo:
+  # `start --issue 37 --dry-run` reported "No matching issues found." while #37 carried
+  # agent:backend but no milestone; the identical command with the list cleared reported
+  # "Total issues: 4 / Available to process: 2". A prepared graph must therefore be given
+  # a milestone here, not admitted by CLI selection.
   milestones:
     - "MVP1 Live Pilot — Production Integration"
+    # Document/information-governance lane (#35 ADP-DOC-100 and its children). Separate
+    # from the production-integration graph by design, and separate for a second reason:
+    # clearing the filter instead would readmit the disposable measurement fixtures
+    # #10 / #12 / #15, which the same dry-run shows returning to the queue.
+    - "ADP Governance — Information Placement"
   fetch_limit: 100
   max_to_start: 0
