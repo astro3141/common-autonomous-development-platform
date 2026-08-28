@@ -1,8 +1,10 @@
 # Common Autonomous Development Platform — Technical Design v1.4 (design-track canonical)
 
-> **Authority 관계 (ADP #6 AMENDMENT-1):** 이 문서는 **TD 개선축(design track)의 working canonical**이다.
-> repository authority는 여전히 main의 TD v1.1이며, 이 문서는 안정화 후 applicability를 따져 별도
-> sync로 반영된다 — 그 시점부터 exact commit SHA로 참조한다(#1 AMENDMENT-1).
+> **Authority provenance ([원장], ADP #6 AMENDMENT-1 계보):** v1.2~v1.4는 **TD 개선축(design track)의
+> working canonical**로 개발되었다. **PR #18 머지 전까지 repository authority는 main의 TD v1.1이었고**,
+> **이 파일이 main에 올라간 시점부터 이 문서가 Spec v0.3 아래의 repository TD authority다.** 이후의
+> 개선축 산출물은 다시 별도 sync를 거치며, 참조는 exact commit SHA로 한다(#1 AMENDMENT-1).
+> authority 서열 자체는 불변: Spec v0.3 > 이 TD > Backend Capability Contract > STATUS 문서들.
 >
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
@@ -5576,6 +5578,10 @@ D18 (v1.4) practitioner hardening — I-TD12 executable predicate + PROSPECTIVE 
     §5.11 partial-result, §5.12 handoffs/interventions·cost provenance·attempt-aggregate,
     §1.1 DesignEvidenceGrade 네임스페이스 분리, applicability map의 main-sync gate 격상,
     문서 계층 경계 guidance. SPEC_FIT=PASS, MAIN_SYNC=CONDITIONAL_GO 조건 A 충족(설계측)
+D19 (v1.4 rev.2) main-sync 준비 완료 — §31a Gate-B rev.2(소스 재대조 정정: I-TD9
+    PROSPECTIVE/MEASURED, I-TD10 근거 교체, I-TD11 근거 보강, I-TD12 close/호출부 정정),
+    §31 gate row RESOLVED, authority provenance 문구를 승격 후에도 참이 되게 교체.
+    조건 B 충족 → MAIN_SYNC=GO. D18은 조건 A 시점의 기록으로 소급 수정하지 않는다([원장] 규율)
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
@@ -6475,7 +6481,7 @@ STATUS/HANDOFF가 이긴다. (형식은 IO fork Atlas #309의 hotspot 규율 준
 | Medium | `receipt_supported=false` 경로의 live 거부 | 고신뢰 operation의 V10 거부가 deterministic으로만 증명됨 | FACT(테스트) / live 미증명 | RA-4 READY 후 첫 spawn |
 | Medium | audit_decide live round-trip DEFERRED | `[D]`-only. 실패 방향이 fail-closed(`WORKFLOW_AUDIT_UNAVAILABLE`)라 안전측 오류만 존재 | FACT (harness STATUS §5.2) | 첫 live Auditor commit (§16.3) |
 | Medium | EXPLAINABLE recovery 분류 미생산 | MVP 0 recovery는 무결성 분류만. 외부 authority 관측이 붙기 전까지 catch-up 부재 | FACT (STATUS mvp0 §7) | MVP 4 reconciliation 착수 |
-| High | I-TD8~**I-TD12** applicability map 미작성 — **main-sync gate (v1.4 격상)** | 신설 invariant의 MUST가 sealed 구현에 자동 소급되는 것으로 오독될 위험. sync 시 invariant별로 `ALREADY_CONFORMANT / PROSPECTIVE_REQUIREMENT / PILOT_BOUND_VALIDATION / IMPLEMENTATION_DELTA_REQUIRED / NOT_APPLICABLE_TO_SEALED_SCOPE` 분류를 durable하게 남긴다 — `new design requirement ≠ old implementation retroactively invalid`. I-TD12는 이미 PROSPECTIVE 선언됨(§2) | FACT (v1.2–v1.4) | **main-sync 선행 조건** — read-only 평가, gap 발견 시 통상 절차 |
+| ~~High~~ | ~~I-TD8~I-TD12 applicability map 미작성 — main-sync gate~~ | **RESOLVED (v1.4 rev.2)** — §31a에 5개 invariant 분류 완료(소급 무효화 0건, sealed 코드 변경 요구 0건). gate 조건 B 충족 | 원장 | — |
 | Low | TD monolith 분리 — 운영성 계약(§5.11/§5.12)의 별도 Ops/readout 문서화 | 문서 계층 경계(§1.1 [설명]) 유지 비용 — main TD를 더 키우지 않기 위함 | FACT (v1.4, practitioner review 권고) | main-sync 시 분리 여부 결정 |
 | High | **C-03** — strong Spec/TD → bounded work graph **one-shot Plan Compilation seam** (pre-TaskSource compiler) | Spec/TD-only 프로젝트를 ADP가 직접 받으려면 필요. Supervisor 즉석 계획·TaskSource 내부 inference로 넣으면 read boundary/semantics confinement 침범 — 별도 compiler + 승인 + idempotent publish 형상만 허용. **ARCHITECTURE REOPENING 필요 — 채택 아님** | CANDIDATE (material assessment; "one-shot 충분성"은 hypothesis, MEASURED 아님) | (a) 수동 graph 작성 비용/오류 실측, (b) compiler input/output·provenance·approval·idempotency·graph validity 계약 합의, (c) 수동 대비 bounded one-shot 실험 유의미 — 셋 충족 시 reopening 절차 |
 | Medium | **C-12** — exact-approved deterministic finalization + expected-old-head **CAS publication**의 composed transaction | 구성 원리(exact binding, frozen proposal, fresh revalidation, CAS, write-ahead)는 각각 보유하나 native composed path 부재. **ARCHITECTURE REOPENING 필요 — 채택 아님.** #5(DELTA-3)와 원리는 같고 대상이 다름 — C-12=Task candidate publication chain, #5=플랫폼 자기 배포 승격. 중복 생성 금지 | CANDIDATE (IO Foundation #20 단일 사례; upstream native 존재는 INFERRED 부정 — C-13) | Foundation 외 두 번째 use case 출현, 또는 ADP 자기 deployment promotion에서 Human-authorized deterministic transform이 실제 필요 + exact input/output/failure/reconciliation 계약 합의 |
@@ -6484,24 +6490,34 @@ STATUS/HANDOFF가 이긴다. (형식은 IO fork Atlas #309의 hotspot 규율 준
 
 ---
 
-## 31a. I-TD8~I-TD12 Applicability Map (main-sync gate 산출물, v1.4)
+## 31a. I-TD8~I-TD12 Applicability Map (main-sync gate 산출물, v1.4 — rev.2)
 
 [원장] §31의 main-sync gate 조건 B 이행. 목적은 conformance 채점이 아니라 **`new design requirement
 ≠ old implementation retroactively invalid`**를 durable하게 고정해, 구현자가 `FORMAL COMPLETE`와 새
 MUST 사이를 임의 해석하지 않게 하는 것이다. MVP 0/1 FORMAL seal은 이 map으로 변경되지 않는다.
 
-근거: main `20264c4` (TD blob `e738921`) 기준 read-only 확인. DesignEvidenceGrade 병기(§1.1).
+근거: main `20264c4` (TD blob `e738921`) 기준 read-only 확인 — 파일/메서드/호출부 직접 열람.
+DesignEvidenceGrade 병기(§1.1). **rev.2**: 소스 재대조로 rev.1을 정정했다 — I-TD9 분류·등급 조정,
+I-TD10 근거 교체, I-TD11 근거 보강, I-TD12의 존재하지 않는 `discard` 및 durable-before-close 주장
+철회(원장은 §31a 말미).
 
 | Invariant | 분류 | 근거 (read-only) | 구현자에게 주는 의미 |
 |---|---|---|---|
-| **I-TD8** ownerless 상태 금지 | `PROSPECTIVE_REQUIREMENT` | MEASURED — sealed core에 `next_owner` 필드/도출 없음(0건). HELD reason·PendingDecision category·`BLOCKED_BY_DECISION` 등 **원천 데이터는 존재**(activate-task / dependency-admission / complete-auditing / receipt) | sealed 코드 수정 불요. next-owner는 **도출(derivation)** 로 신설하며 첫 소비자는 §5.11/§5.12. 신규 HELD/terminal reason 추가 시 도출 가능성이 binding |
-| **I-TD9** mutation-reach 선언 | `IMPLEMENTATION_DELTA_REQUIRED` (비행위적) | INFERRED — RepositoryAdapter operation에 READ_ONLY/WORKSPACE_SCOPED/CANONICAL 선언 부재. 동작 결함 증거는 없음 | 선언 추가는 계약/문서 층 작업이며 기존 동작 변경이 아니다. 신규 operation은 선언 없이 추가 불가 |
-| **I-TD10** 관측 ≠ actuation | `ALREADY_CONFORMANT` | MEASURED — Coordinator 단일 admission, `WorkflowObservation`은 transition fact가 아님이 계약·테스트로 고정(STATUS mvp0 §6) | 변경 없음. MVP 3 scheduler 설계 시 사전 구속으로 작동 |
-| **I-TD11** presentation ≠ routing | `ALREADY_CONFORMANT` | MEASURED — envelope 기반 전진, model text 비권위; CORR1 정정이 우회 활성화 경로를 봉인 | 변경 없음. 라이브 runner가 Coordinator를 우회하면 그것이 finding(HANDOFF §11) |
-| **I-TD12** capture-before-teardown | `PROSPECTIVE_REQUIREMENT` (일부 `NOT_APPLICABLE_TO_SEALED_SCOPE`) | MEASURED — sealed scope의 파기 사이트는 `RuntimeResultChannel.discard`(armed turn 일치 시 slot 제거) 하나뿐이며, `collect`가 결과를 durable로 옮긴 뒤에만 슬롯이 닫힌다 → **authoritative record가 참조 중인 아티팩트를 파기하는 경로 없음**. worktree 제거·verification sandbox 정리는 **아직 존재하지 않음**(라이브 composition 영역) | sealed teardown path 소급 적용 없음(§2 선언과 일치). teardown-DENY predicate는 라이브 composition에서 신설되는 파기 경로부터 binding |
+| **I-TD8** ownerless 상태 금지 | `PROSPECTIVE_REQUIREMENT` | **MEASURED** — sealed core에 표준 `next_owner` 필드/canonical derivation 없음(검색 0건). HELD reason · PendingDecision · outbox 등 **원천 fact는 존재**하나 v1.4가 요구하는 explicit derivation은 미존재 | sealed 코드 수정 불요. next-owner는 **도출(derivation)** 로 신설하며 첫 소비자는 §5.11/§5.12. 신규 HELD/terminal reason 추가 시 "도출 가능성"이 binding |
+| **I-TD9** mutation-reach 선언 | `PROSPECTIVE_REQUIREMENT` | **MEASURED** — `adapters/interfaces/repository-adapter.ts` interface 전수 확인: `snapshot_canonical / create_feature_workspace / inspect_candidate / get_diff / verify_tracked_clean / verify_expected_files / verify_lineage / verify_canonical_head / prepare_merge / commit_merge` 10개 operation에 reach 분류 metadata 없음(`READ_ONLY|WORKSPACE_SCOPED|mutation_reach` 0건) | 계약 선언 추가이며 기존 동작 변경이 아님 — 그래서 DELTA가 아니라 PROSPECTIVE다. 신규 operation은 선언 없이 추가 불가 |
+| **I-TD10** 관측 ≠ actuation (scope-bound admission 포함) | `ALREADY_CONFORMANT` | **MEASURED** — 주 근거: ProductionCoordinator가 durable state에 따라 단일 use-case를 dispatch하고 lifecycle rule을 중복 구현하지 않으며, 외부 operation이 attempt/op identity + repository scope binding 위에서만 움직임. 보조: `WorkflowObservation`이 transition fact가 아님(STATUS mvp0 §6) | 변경 없음. MVP 3 scheduler 설계 시 사전 구속으로 작동 |
+| **I-TD11** presentation ≠ routing | `ALREADY_CONFORMANT` | **MEASURED** — envelope 기반 전진, model text 비권위(CORR1 봉인) **+ durable state/PendingDecision ≠ Report Outbox transport**: report 전송 실패가 완료된 lifecycle fact를 롤백하지 않음(MVP1 STATUS; HANDOFF §20) | 변경 없음. 라이브 runner가 Coordinator를 우회하면 그것이 finding(HANDOFF §11) |
+| **I-TD12** capture-before-teardown | `PROSPECTIVE_REQUIREMENT` | **MEASURED** — sealed scope의 ephemeral 파기 primitive는 `RuntimeResultChannel.close(session_ref, turn)`(armed turn 일치 시 `rmSync`). 공개 메서드는 `arm / submit / collect / close`이며 `discard`는 존재하지 않는다. `collect`는 결과 객체를 읽어 반환할 뿐 durable store에 쓰지 않고 `close`는 독립 메서드이므로 **채널 자체로는 durable-capture-before-close가 증명되지 않는다**. 추가 사실: core/adapters에 `collect`/`close` **production 호출부가 아직 없음** — 순서 보장은 향후 호출부에서 성립시켜야 함. worktree/verification sandbox teardown path는 sealed scope에 미존재 | sealed teardown path 소급 적용 없음(§2 PROSPECTIVE 선언과 일치). teardown-DENY predicate는 **라이브 composition에서 신설되는 파기 경로 + 그 호출부의 순서 보장**부터 binding. `PILOT_BOUND_VALIDATION`으로 낮추지 않음 — 요구는 지금 존재하고 pilot은 증명 장소일 뿐 |
 
-**Gate 판정:** 조건 B 충족 — 5개 invariant 모두 분류 완료, 소급 무효화 0건, sealed 코드 변경
-요구 0건(I-TD9는 비행위적 선언 추가). 잔여는 통상 절차의 leaf가 되며 main-sync를 막지 않는다.
+**Gate 판정 (rev.2):** 조건 B 충족 — 5개 invariant 분류 완료, 소급 무효화 0건, sealed 코드 변경
+요구 0건. I-TD9·I-TD12 근거는 직접 열람으로 MEASURED. 잔여는 통상 절차의 leaf가 되며 main-sync를
+막지 않는다.
+
+**[원장] rev.1 오류와 정정.** rev.1은 I-TD12 근거를 `rmSync` 주변만 grep해 메서드명(`discard`)과
+호출 순서(durable-before-close)를 추정해 적었고, I-TD9를 "코드 변경 0건"이라면서 동시에
+`IMPLEMENTATION_DELTA_REQUIRED`로 분류하는 taxonomy 모순을 담았다. §1.1의 `MEASURED`는 "해당 경로를
+열어 확인"이며 grep 히트 확인이 아니다. 이는 v1.2가 §13.1 매핑을 추측으로 적었다가 실측에 반증된 것과
+동일한 실패 유형이다. rev.1 본문은 원장 규율에 따라 소급 삭제하지 않고 이 기록으로 정정한다.
 
 ---
 
