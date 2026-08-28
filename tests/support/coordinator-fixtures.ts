@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 
 import type { RuntimeProfile, RuntimeSessionHandle, RuntimeTurnHandle } from "../../adapters/interfaces/handles.ts";
 import type { RuntimeTurnResult } from "../../adapters/interfaces/runtime-adapter.ts";
-import { issueSupervisorGrant } from "../../core/execution/supervisor-grant.ts";
+import { issueSupervisorGrant } from "../../core/admission/supervisor-grant.ts";
 import {
   ProductionCoordinator,
   type CoordinatorIdentities,

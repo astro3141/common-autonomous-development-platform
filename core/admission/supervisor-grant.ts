@@ -19,14 +19,19 @@
  *
  *   **It enforces nothing.** Enforcement is the Runtime's and is checked against the spawn receipt
  *   (§12.6) by `supervisor-session.ts`, which loads this grant and never re-derives it.
+ *
+ * It lives in admission because §13.4 places it in run admission — after the run is opened and
+ * before any Supervisor external effect — and because admission is where the ownership contract
+ * puts issuance and persistence. It is the one grant write admission may make; the attempt-scoped
+ * ACTOR/AUDITOR pair still reaches the store only through the state machine (§12.7).
  */
 
 import { issueCapabilityGrant } from "../capability/broker.ts";
 import { validateManifestSet, type ManifestSetInput } from "../capability/manifest-set.ts";
 import type { CapabilityGrantV1Body, TaskContractCapabilityView } from "../capability/types.ts";
 import type { CompiledProfileV1Body } from "../profile/types.ts";
+import { StoreError } from "../store/errors.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
-import { ExecutionStartError } from "./start-implementation.ts";
 
 /** TD §12.5 — the CoreExecutionRole, and the only one anchored to a run rather than an attempt. */
 const SUPERVISOR_ROLE = "SUPERVISOR";
@@ -63,8 +68,8 @@ export interface SupervisorGrantResult {
  *
  * Safe to call again: a run that already holds its grant gets the same logical grant back, and a
  * run whose material inputs have moved since gets a closed failure rather than a second grant.
- * Every failure here is raised before the row is written, and every one of them is a failure the
- * store or the capability module already defines.
+ * Every failure is a failure the store or the capability module already defines, and none of them
+ * leaves a row behind — the write is the last thing that happens, inside one transaction.
  */
 export function issueSupervisorGrant(
   store: PlatformStore,
@@ -94,7 +99,10 @@ export function issueSupervisorGrant(
     // Same material inputs ⇒ same envelope ⇒ same hash. A different hash means an input moved
     // under a run that is already authorized, and no second grant may paper over that.
     if (existing.grant_hash !== grant.grant_hash) {
-      throw new ExecutionStartError(
+      // The same identity re-derived to different content: §18.1a's own conflict, raised here
+      // because reuse never reaches `put()`.
+      throw new StoreError(
+        "ARTIFACT_CONFLICT",
         `run ${command.run_id} already holds SUPERVISOR grant ${existing.grant_id}, which the current inputs do not reproduce`,
       );
     }
@@ -102,7 +110,10 @@ export function issueSupervisorGrant(
     // corrupt record never becomes authority.
     const stored = store.grants.get(existing.grant_id);
     if (stored === undefined) {
-      throw new ExecutionStartError(`SUPERVISOR grant ${existing.grant_id} did not load`);
+      throw new StoreError(
+        "DOMAIN_ROW_MISSING",
+        `SUPERVISOR grant ${existing.grant_id} is indexed for run ${command.run_id} but did not load`,
+      );
     }
     return {
       grant_id: existing.grant_id,
@@ -113,7 +124,10 @@ export function issueSupervisorGrant(
   }
 
   store.withTransaction(() => {
-    // A second SUPERVISOR row for the same run is refused by §18.1a's partial unique index.
+    // A second SUPERVISOR row for the same run is refused by §18.1a's partial unique index, and a
+    // `grant_id` another run already holds is refused by the store's anchor check — `run_id` is not
+    // in the envelope, so without it an identical grant would be swallowed as an idempotent no-op
+    // and this run would hold no grant at all. Either way the transaction leaves nothing behind.
     store.grants.put(grant, { kind: "RUN", run_id: command.run_id });
   });
   return {

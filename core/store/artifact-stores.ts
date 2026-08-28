@@ -128,6 +128,14 @@ export type GrantScope =
   | { readonly kind: "RUN"; readonly run_id: string }
   | { readonly kind: "ATTEMPT"; readonly attempt_key: string };
 
+/** A stored grant row as `put`/`get` read it: its content, and the scope it is anchored to. */
+interface GrantRowContent {
+  readonly grant_hash: string;
+  readonly run_id: string | null;
+  readonly attempt_key: string | null;
+  readonly envelope_json: string;
+}
+
 export class CapabilityGrantStore {
   readonly #database: DatabaseSync;
   readonly #now: () => string;
@@ -151,9 +159,24 @@ export class CapabilityGrantStore {
       );
     }
 
+    const runId = scope.kind === "RUN" ? scope.run_id : null;
+    const attemptKey = scope.kind === "ATTEMPT" ? scope.attempt_key : null;
+
     const json = envelopeText(grant.envelope);
     const existing = this.#row(grantId);
     if (existing !== undefined) {
+      // §18.1a — a grant identity is anchored exactly once. The anchor is not part of the envelope,
+      // so two runs (or two attempts) can compute byte-identical grants: without this check the
+      // second write would pass as an idempotent no-op, leaving that scope with no grant row while
+      // its caller was told the grant was stored.
+      if (existing.run_id !== runId || existing.attempt_key !== attemptKey) {
+        const anchor =
+          existing.run_id === null ? `attempt ${existing.attempt_key}` : `run ${existing.run_id}`;
+        throw new StoreError(
+          "DOMAIN_ROW_INVALID",
+          `capability grant ${grantId} is already anchored to ${anchor}; it may not be re-anchored`,
+        );
+      }
       assertSameContent("capability grant", grantId, existing.envelope_json, json);
       return grantId;
     }
@@ -164,15 +187,7 @@ export class CapabilityGrantStore {
            (grant_id, grant_hash, role, run_id, attempt_key, envelope_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(
-        grantId,
-        grant.grant_hash,
-        role,
-        scope.kind === "RUN" ? scope.run_id : null,
-        scope.kind === "ATTEMPT" ? scope.attempt_key : null,
-        json,
-        this.#now(),
-      );
+      .run(grantId, grant.grant_hash, role, runId, attemptKey, json, this.#now());
     return grantId;
   }
 
@@ -235,10 +250,12 @@ export class CapabilityGrantStore {
     return countRows(this.#database, "capability_grant");
   }
 
-  #row(grantId: string): { grant_hash: string; envelope_json: string } | undefined {
+  #row(grantId: string): GrantRowContent | undefined {
     return this.#database
-      .prepare("SELECT grant_hash, envelope_json FROM capability_grant WHERE grant_id = ?")
-      .get(grantId) as { grant_hash: string; envelope_json: string } | undefined;
+      .prepare(
+        "SELECT grant_hash, run_id, attempt_key, envelope_json FROM capability_grant WHERE grant_id = ?",
+      )
+      .get(grantId) as GrantRowContent | undefined;
   }
 }
 

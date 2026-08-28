@@ -85,9 +85,13 @@ test("M1B4-AC5 / §2: the Decision Validator still imports no adapter and no sto
 
 test("M1B4-AC4 / AC32 / AC37: the front half touches no Runtime, Workflow or Verification adapter", () => {
   // MVP1-B5 added activation to this module: it builds the Task Contract and both Grants, which
-  // is exactly its job (§12.7). What must stay absent is every *external* adapter.
+  // is exactly its job (§12.7). IG-1 added the run-scoped SUPERVISOR grant, which §13.4 settles as
+  // a run-admission step. What must stay absent is every *external* adapter.
   const ACTIVATION = "core/admission/activate-task.ts";
-  const frontHalf = sourcesIn(ADMISSION).filter((file) => relative(ROOT, file) !== ACTIVATION);
+  const GRANT_ISSUANCE = "core/admission/supervisor-grant.ts";
+  const frontHalf = sourcesIn(ADMISSION).filter(
+    (file) => ![ACTIVATION, GRANT_ISSUANCE].includes(relative(ROOT, file)),
+  );
 
   scan(sourcesIn(ADMISSION), "a forbidden adapter", [
     /RuntimeAdapter|WorkflowAdapter|VerificationAdapter|ReportAdapter/,
@@ -100,6 +104,13 @@ test("M1B4-AC4 / AC32 / AC37: the front half touches no Runtime, Workflow or Ver
     /RuntimeTurnResult|structured_output|spawn_session|send_turn|get_turn_result/,
     /audit_decide|acquire_workflow_controller|run_verification|deliver\(/,
     /buildTaskContract|CapabilityGrant|issueGrant|contract_snapshot/,
+  ]);
+
+  // The IG-1 exemption is exactly one grant: the run-scoped SUPERVISOR one. It builds no Task
+  // Contract and touches no contract snapshot, so activation stays the only module that does.
+  scan([join(ROOT, GRANT_ISSUANCE)], "work that is not the run-scoped grant", [
+    /buildTaskContract|issueGrant|contract_snapshot/,
+    /"ACTOR"|"AUDITOR"|actor_grant|auditor_grant|attempt_key/,
   ]);
 
   // Only the RepositoryAdapter interface may be named, and only as an interface.
@@ -179,10 +190,27 @@ test("M1B4-AC20 / §20: no observation is mapped onto a lifecycle state", () => 
 test("M1B4-AC36: only the state machine writes lifecycle rows", () => {
   // Activation reads `attempts.nextOrdinal`/`attempts.current`, but every *write* still goes
   // through `commitContractActivation` — the state machine remains the only writer.
-  scan(sourcesIn(ADMISSION), "a direct lifecycle write", [
-    /tasks\.write|attempts\.create|attempts\.write|contracts\.put|grants\.put/,
+  const GRANT_ISSUANCE = "core/admission/supervisor-grant.ts";
+  const lifecycleWrites = /tasks\.write|attempts\.create|attempts\.write|contracts\.put/;
+  const others = sourcesIn(ADMISSION).filter((file) => relative(ROOT, file) !== GRANT_ISSUANCE);
+
+  scan(others, "a direct lifecycle write", [
+    new RegExp(`${lifecycleWrites.source}|grants\\.put`),
     /INSERT INTO|UPDATE |outbox\.enqueue|idempotency\./,
   ]);
+
+  // IG-1 (§13.4) settles one grant write in admission — and only that. The run-scoped SUPERVISOR
+  // grant is not a lifecycle row: no state, no attempt, no idempotency, no outbox.
+  scan([join(ROOT, GRANT_ISSUANCE)], "a direct lifecycle write", [
+    lifecycleWrites,
+    /INSERT INTO|UPDATE |outbox\.enqueue|idempotency\./,
+  ]);
+  const issuance = stripComments(readFileSync(join(ROOT, GRANT_ISSUANCE), "utf8"));
+  assert.deepEqual(
+    [...issuance.matchAll(/grants\.put\([^,]+,\s*\{\s*kind:\s*"(\w+)"/g)].map((match) => match[1]),
+    ["RUN"],
+    "the one admission grant write is run-scoped",
+  );
 });
 
 // --- the Coordinator and the schema -----------------------------------------------------------

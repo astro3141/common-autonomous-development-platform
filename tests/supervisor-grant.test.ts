@@ -21,11 +21,10 @@ import type {
   EnforcementAssurance,
 } from "../core/capability/types.ts";
 import { CAPABILITY_NAMES } from "../core/schemas/capability-vocabulary.ts";
-import { issueSupervisorGrant } from "../core/execution/supervisor-grant.ts";
+import { issueSupervisorGrant } from "../core/admission/supervisor-grant.ts";
 import { requestSupervisorProposal } from "../core/execution/supervisor-session.ts";
-import { ExecutionStartError } from "../core/execution/start-implementation.ts";
 import type { RuntimeProfile } from "../adapters/interfaces/handles.ts";
-import { StoreError } from "../core/store/errors.ts";
+import { StoreError, type StoreErrorCode } from "../core/store/errors.ts";
 import type { PlatformStore } from "../core/store/platform-store.ts";
 import { manifestSetInput } from "./support/admission-fixtures.ts";
 import { compiled } from "./support/decision-fixtures.ts";
@@ -41,6 +40,15 @@ const BATCH_ID = `${"batch:"}${RUN_ID}:1`;
 const PROJECT = "alpha";
 const GRANT_ID = "01JQ8ZK5T7RC9V2W4X6Y8Z0E02";
 const OTHER_GRANT_ID = "01JQ8ZK5T7RC9V2W4X6Y8Z0E03";
+
+/** A second run in the same store, opened exactly like the first (§18.1a scopes them apart). */
+const SECOND_RUN_ID = "run:01JQ8ZK5T7RC9V2W4X6Y8Z0E04";
+const SECOND_BATCH_ID = `${"batch:"}${SECOND_RUN_ID}:1`;
+
+const storeError =
+  (code: StoreErrorCode) =>
+  (error: unknown): boolean =>
+    error instanceof StoreError && error.code === code;
 
 /**
  * A manifest set whose `shell.execute` deny direction differs from its allow direction, so the
@@ -159,7 +167,7 @@ test("IG-1: a moved material input fails closed rather than issuing a second gra
           grant_id: GRANT_ID,
           manifests: manifests("UNENFORCEABLE_CAPABILITY_BOUNDARY"),
         }),
-      ExecutionStartError,
+      storeError("ARTIFACT_CONFLICT"),
     );
     assert.equal(store.grants.count(), 1, "the run still holds exactly one grant");
     assert.equal(supervisorRow(store)?.grant_id, GRANT_ID);
@@ -177,9 +185,56 @@ test("IG-1: a missing run is refused before anything is derived or written", () 
           grant_id: GRANT_ID,
           manifests: manifests(),
         }),
-      (error: unknown) => error instanceof StoreError && error.code === "DOMAIN_ROW_MISSING",
+      storeError("DOMAIN_ROW_MISSING"),
     );
     assert.equal(store.grants.count(), 0);
+  });
+});
+
+test("IG-1: a grant identity another run already holds is refused, not silently reused", () => {
+  withRun((store) => {
+    bootstrapRun(store, {
+      run_id: SECOND_RUN_ID,
+      batch_id: SECOND_BATCH_ID,
+      project_id: PROJECT,
+      compiled_profile: compiled(),
+    });
+    issueSupervisorGrant(store, { run_id: RUN_ID, grant_id: GRANT_ID, manifests: manifests() });
+
+    // `run_id` is not part of the grant envelope, so a second run reusing one caller-allocated
+    // ULID over the same profile and manifests derives byte-identical content. That must not read
+    // as "already stored, nothing to do": the second run would then hold no grant at all.
+    assert.throws(
+      () =>
+        issueSupervisorGrant(store, {
+          run_id: SECOND_RUN_ID,
+          grant_id: GRANT_ID,
+          manifests: manifests(),
+        }),
+      storeError("DOMAIN_ROW_INVALID"),
+    );
+
+    assert.equal(store.grants.count(), 1, "no row was written for the second run");
+    assert.deepEqual(store.grants.forRun(SECOND_RUN_ID), []);
+    assert.equal(store.grants.meta(GRANT_ID)?.run_id, RUN_ID, "the first run keeps its grant");
+
+    // And the second run cannot reach the Runtime on the strength of the first run's grant.
+    const runtime = new RecordingRuntime();
+    assert.throws(
+      () =>
+        requestSupervisorProposal(
+          { store, runtime, manifests: manifests(), preflight: readyPreflight },
+          {
+            run_id: SECOND_RUN_ID,
+            batch_id: SECOND_BATCH_ID,
+            decision_context: {} as never,
+            runtime_profile: "supervisor" as unknown as RuntimeProfile,
+          },
+        ),
+      /no run-scoped SUPERVISOR grant/,
+    );
+    assert.equal(runtime.spawnCalls.length, 0);
+    assert.equal(runtime.sessionCount, 0);
   });
 });
 
@@ -304,9 +359,9 @@ test("IG-1: grant issuance stays in Core, and deployment derives nothing", () =>
 
   // The Broker, its barrel, and the only two use-cases that may reach it (§12.7, §13.4).
   assert.deepEqual(issuers.sort(), [
+    "core/admission/supervisor-grant.ts",
     "core/capability/broker.ts",
     "core/capability/index.ts",
     "core/contract/builder.ts",
-    "core/execution/supervisor-grant.ts",
   ]);
 });

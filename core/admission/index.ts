@@ -30,3 +30,9 @@ export {
   type ProposalSubmissionResult,
   type SubmitProposalCommand,
 } from "./submit-proposal.ts";
+/** TD §13.4 — the run-scoped SUPERVISOR grant, issued before the run's first Supervisor spawn. */
+export {
+  issueSupervisorGrant,
+  type SupervisorGrantCommand,
+  type SupervisorGrantResult,
+} from "./supervisor-grant.ts";
