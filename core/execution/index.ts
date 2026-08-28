@@ -72,6 +72,12 @@ export {
   supervisorTurnOp,
   SUPERVISOR_SESSION_METADATA_KEY,
 } from "./supervisor-operations.ts";
+/** TD §13.4 — the run-scoped SUPERVISOR grant, issued before the run's first Supervisor spawn. */
+export {
+  issueSupervisorGrant,
+  type SupervisorGrantCommand,
+  type SupervisorGrantResult,
+} from "./supervisor-grant.ts";
 export {
   nextSupervisorTurn,
   requestSupervisorProposal,

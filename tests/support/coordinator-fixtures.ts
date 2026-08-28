@@ -14,8 +14,7 @@ import assert from "node:assert/strict";
 
 import type { RuntimeProfile, RuntimeSessionHandle, RuntimeTurnHandle } from "../../adapters/interfaces/handles.ts";
 import type { RuntimeTurnResult } from "../../adapters/interfaces/runtime-adapter.ts";
-import { issueCapabilityGrant } from "../../core/capability/broker.ts";
-import { validateManifestSet } from "../../core/capability/manifest-set.ts";
+import { issueSupervisorGrant } from "../../core/execution/supervisor-grant.ts";
 import {
   ProductionCoordinator,
   type CoordinatorIdentities,
@@ -87,18 +86,13 @@ export interface CoordinatorWorld extends ProductionCoordinatorDependencies {
  */
 export function coordinatorWorld(world: DomainWorld): CoordinatorWorld {
   const manifests = receiptFreeManifests();
-  const validated = validateManifestSet(manifests);
 
-  // §13.4 — the run-scoped SUPERVISOR grant is issued before the first Supervisor session exists.
-  const grant = issueCapabilityGrant({
+  // §13.4 — the run-scoped SUPERVISOR grant is issued before the first Supervisor session exists,
+  // through the Core use-case that owns it. The fixture supplies only the caller-owned ULID.
+  issueSupervisorGrant(world.store, {
+    run_id: RUN_ID,
     grant_id: SUPERVISOR_GRANT,
-    role: "SUPERVISOR",
-    effective_policy: world.profile.body.effective.policy,
-    runtime_manifest: validated.runtime,
-    task_contract_capability_view: { repository_scope: { allowed_paths: [], forbidden_paths: [] } },
-  });
-  world.store.withTransaction(() => {
-    world.store.grants.put(grant, { kind: "RUN", run_id: RUN_ID });
+    manifests,
   });
 
   discover(world);
