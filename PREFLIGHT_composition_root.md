@@ -15,6 +15,10 @@
 > Operational handoff: `HANDOFF_common_platform_mvp1_live_pilot.md`
 >
 > Survey date: 2026-08-27. No code was modified; read-only inspection only.
+>
+> IG-1 factual sync: 2026-08-28, after PR #33 merged at
+> `676e6a627d5bb82f7a1e80357345f78c0a4c4f5b`. Only IG-1 current-state facts were rechecked;
+> the rest of the survey retains its 2026-08-27 scope.
 
 ---
 
@@ -29,8 +33,8 @@ Is building the production composition root ordinary dependency wiring,
 or does it require a decision that Spec/TD has not made?
 ```
 
-Verdict is in §5. Short version: **ordinary dependency wiring**, plus six implementation gaps —
-one of which is not where the status document implies it is.
+Verdict is in §5. Short version: **ordinary dependency wiring**. The survey originally found six
+implementation gaps; IG-1 is now implemented, leaving five.
 
 ---
 
@@ -79,7 +83,7 @@ fixture would silently skip them. It must call `bootstrapRun` and `materializeDi
 | `report` | `ReportAdapter` | `FakeReportAdapter` | production transport | — | **MISSING** |
 | `manifests` | `ManifestSetInput` | `receiptFreeManifests()` | TD §12.3 values | validator only | **MISSING** |
 | `identities` | `CoordinatorIdentities` | counters | real ULID/clock | — | **MISSING** (root may own) |
-| — | run-scoped SUPERVISOR grant | issued inline by the fixture | **a Core use-case** | — | **MISSING** (IG-1) |
+| — | run-scoped SUPERVISOR grant | calls the Core use-case | `issueSupervisorGrant` | `core/admission/supervisor-grant.ts` | **READY** (root invocation pending) |
 | ingress | Proposal transport | direct function call | MCP tool server | `submitProposal` (Core side only) | **MISSING** |
 
 `LocalVerificationAdapter` requires `runtime`, `workflow` and a backend seam
@@ -111,6 +115,7 @@ exists* ≠ *a publicly importable production export exists*.
 | RA-4 preflight | `backendRuntimePreflight`, `inspectBackendRuntime` | `adapters/backend-runtime-preflight/index.ts` |
 | RuntimeResultChannel | `RuntimeResultChannel`, `withCollectedResult` | `adapters/runtime-result-channel/index.ts` |
 | Manifest validator | `validateManifestSet` | `core/capability/manifest-set.ts:27` |
+| SUPERVISOR grant issuance | `issueSupervisorGrant` | `core/admission/supervisor-grant.ts` |
 
 Direct module imports compose all of these without a barrel, so the absence of a barrel is not an
 architecture gap. Two configuration facts worth recording: `DocumentProfileSource` parses **JSON**
@@ -137,46 +142,30 @@ architecture gap. Two configuration facts worth recording: `DocumentProfileSourc
 
 ---
 
-## 4. IG-1 — no production path issues the run-scoped SUPERVISOR grant
+## 4. IG-1 — Core issuance use-case implemented; root invocation remains wiring
 
-This is the one finding that is not a simple omission.
-
-```text
-required:  requestSupervisorProposal → requireSupervisorGrant(store, run_id)
-           → store.grants.forRun(run_id).find(role === "SUPERVISOR")
-           → absent ⇒ throw ExecutionStartError("run <id> has no run-scoped SUPERVISOR grant")
-           core/execution/supervisor-session.ts:262-276
-
-issuers:   bootstrapRun            → writes run / batch / compiled profile. No grant.
-           activateSelectedTask    → buildTaskContract issues ACTOR + AUDITOR at ATTEMPT scope
-           transition-commit.ts:382-383 → grants.put(..., {kind:"ATTEMPT"}) — the only two calls
-           production grants.put({kind:"RUN"}) callers = 0
-
-only issuer in the tree: tests/support/coordinator-fixtures.ts:93-102
-```
-
-The comment at `core/execution/supervisor-session.ts:262` reads *"The run-scoped SUPERVISOR grant
-activation already issued"*. **That is false.** Activation issues no SUPERVISOR grant, and
-activation happens *after* the Supervisor turn — the ordering it implies cannot occur.
-
-Without this step the first tick throws inside `#requestProposalIfNeeded` and the run never opens.
-
-**The composition root cannot supply it.** CapabilityGrant derivation is not the root's to own, and
-TD §13.4 places issuance in Core: *"Core가 run-scoped grant를 발급한다."*
-
-The behavior is nevertheless fully determined:
+PR #33 closed the implementation gap at merge commit
+`676e6a627d5bb82f7a1e80357345f78c0a4c4f5b`:
 
 ```text
-§12.4  SUPERVISOR requested map = all 12 capabilities false  (core/capability/derive.ts:39 implements this)
-§13.4  issued after run init, before the first Supervisor spawn
-§13.4  persisted in the existing capability_grant row (run_id non-null, attempt_key null, partial unique per run)
-§13.4  "새 grant schema는 없다" — no new grant schema
-§12.7  task_contract_capability_view is a required input that v1 derivation does not read
-       (core/capability/broker.ts:26-40)
+owner:      core/admission/supervisor-grant.ts
+export:     core/admission/index.ts
+use-case:   issueSupervisorGrant(store, { run_id, grant_id, manifests })
+scope:      role=SUPERVISOR, run_id non-null, attempt_key null
+ordering:   requires an existing run; Supervisor spawn still requires the durable grant
 ```
 
-So this is an **IMPLEMENTATION GAP, not a CONTRACT GAP** — no decision is missing, only code. Its
-location matters more than its size: it belongs in Core, not in the root.
+The use-case delegates requested/enforcement/hash derivation to the existing Capability Broker,
+persists exactly one run-scoped grant, reuses the same logical grant on conforming re-entry, and
+fails closed when material inputs or the grant's scope anchor conflict. The fixture now calls this
+production-importable use-case instead of deriving and persisting a grant inline.
+
+The production composition root is still absent, so no production caller yet performs the settled
+`bootstrapRun → issueSupervisorGrant → first Supervisor spawn` ordering. That remaining call site is
+ordinary composition wiring; it does not reopen IG-1 or transfer grant derivation into deployment.
+
+**IG-1 status: IMPLEMENTED.** No contract gap, schema, table, role, capability, lifecycle state, or
+new authority was introduced.
 
 ---
 
@@ -196,12 +185,12 @@ identity, trust semantics, proposal submission authority, capability semantics, 
 audit authority, PendingDecision resolution, retry/recovery semantics, or Core↔Backend contract is
 required. Every blocked point is behavior TD already determined, missing only code.
 
-One qualification, stated rather than buried: **IG-1 requires adding code to sealed Core.** It
-changes no semantics — no new schema, table, vocabulary or state, and `derive.ts:39` already
-implements the rule — but it is not something the composition root may do on its behalf.
+One qualification, stated rather than buried: **IG-1 added code to sealed Core and is now merged.**
+It changed no semantics — no new schema, table, vocabulary or state — and the composition root must
+call the use-case rather than do its work on Core's behalf.
 
 ```text
-IG-1  run-scoped SUPERVISOR grant issuance use-case       Core,    §12.4 / §13.4
+IG-1  run-scoped SUPERVISOR grant issuance use-case       IMPLEMENTED at 676e6a6
 IG-2  OpenClawRuntimeAdapter                              adapter, §13.1 / §30.2
 IG-3  DurableJobsWorkflowAdapter + WorkflowToolTransport   adapter, §14.1
 IG-4  production ReportAdapter                             adapter, §21.1
@@ -209,8 +198,8 @@ IG-5  Platform MCP/API Proposal ingress transport          adapter, §5.1
 IG-6  BackendManifestSet production values                 config,  §12.3
 ```
 
-Live pilot remains blocked by these six plus the already-recorded
-`RA-4 live BLOCKED(C2,C3,C4,C5)`.
+Live pilot remains blocked by the five remaining implementation gaps, production composition-root
+wiring, and the already-recorded `RA-4 live BLOCKED(C2,C3,C4,C5)`.
 
 ---
 
@@ -238,7 +227,7 @@ plumbing.
 ```text
 compileProfile(...)
   → bootstrapRun(store, { run_id, batch_id, project_id, compiled_profile })
-  → [IG-1, in Core] issue run-scoped SUPERVISOR grant
+  → issueSupervisorGrant(store, { run_id, grant_id, manifests })
   → materializeDiscoveryPass(store, taskSource, { run_id, batch_id, context })
 ```
 
@@ -272,11 +261,8 @@ that is a finding, not a workaround.
 ```text
 new:     deployment/{config,compose,open-run,main}.ts
          deployment/manifests/*.json                      (§12.3 transcription)
-         core/admission/issue-supervisor-grant.ts          ← IG-1
          tests/deployment-composition.test.ts
 edit:    tsconfig.json                                     (include deployment)
-         core/admission/index.ts                           (barrel, one line)
-         core/execution/supervisor-session.ts:262          (correct the false comment)
 ```
 
 Acceptance:
@@ -284,12 +270,10 @@ Acceptance:
 ```text
 zero imports from tests/support/* or testdoubles/* in production code (source guard)
 compose() fills all eleven dependency slots and typechecks
-IG-1 satisfies §12.4 (all 12 false) and run-scoped persistence
-  — exactly one role=SUPERVISOR row per run, attempt_key null
-  — re-issue on the same run fails closed on the partial unique
+root calls the merged IG-1 use-case after run initialization and before the first Supervisor spawn
 no transition / validation / derivation / eligibility logic anywhere in deployment/ (source guard)
 no durable tick cursor, scheduler table, work queue, or new durable state
-1034 tests + typecheck still PASS; schema stays v6/17 (no migration)
+current tests + typecheck still PASS; schema stays v6/17 (no migration)
 ```
 
 **Stage 2 — the missing adapters (IG-2 … IG-5)**, as a separate batch, under
