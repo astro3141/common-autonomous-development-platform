@@ -118,6 +118,10 @@ npm test        # 1034 deterministic tests
 npm run typecheck
 ```
 
+Those two commands are the repository's entire check surface: `npm test` runs the deterministic
+suite under `node --test`, and `npm run typecheck` runs `tsc --noEmit`. Both must pass before a
+change is proposed — a change that fails either one is not ready to be reviewed.
+
 There is no `start` script, because there is no production composition root yet. See
 `PREFLIGHT_composition_root.md` for what building one requires.
 
