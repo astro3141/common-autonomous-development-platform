@@ -131,9 +131,9 @@ export function supervisorSession(
 /**
  * §13.4 — the spawn that precedes request `n`, under its own operation identity.
  *
- * The grant is the run-scoped SUPERVISOR one activation already issued; it is loaded and checked,
- * never re-derived. A spawn whose acceptance cannot be established fails closed rather than
- * producing a second Supervisor session.
+ * The grant is the run-scoped SUPERVISOR one `issueSupervisorGrant` issued when the run opened; it
+ * is loaded and checked, never re-derived. A spawn whose acceptance cannot be established fails
+ * closed rather than producing a second Supervisor session.
  */
 function spawnSupervisor(
   authorities: SupervisorAuthorities,
@@ -259,7 +259,7 @@ function supervisorInstruction(command: SupervisorRequestCommand): string {
   ].join("\n");
 }
 
-/** The run-scoped SUPERVISOR grant activation already issued. Loaded and checked, never derived. */
+/** The run-scoped SUPERVISOR grant the run was opened with. Loaded and checked, never derived. */
 function requireSupervisorGrant(
   store: PlatformStore,
   run_id: string,
