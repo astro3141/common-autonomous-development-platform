@@ -118,6 +118,10 @@ npm test        # 1034 deterministic tests
 npm run typecheck
 ```
 
+This repository is validated by exactly those two commands: `npm test` runs the deterministic test
+suite, and `npm run typecheck` checks the types. A change is proposed only after both pass — a
+proposal made while either one fails is not a proposal.
+
 There is no `start` script, because there is no production composition root yet. See
 `PREFLIGHT_composition_root.md` for what building one requires.
 
