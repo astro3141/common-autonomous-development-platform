@@ -19,6 +19,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import type { DecisionAuthorities } from "../core/admission/fact-assembly.ts";
 import { resolveHumanGateAndAdmit, submitProposal } from "../core/admission/submit-proposal.ts";
+import { monitorOnce } from "../core/coordinator/monitor.ts";
+import { recoverRun } from "../core/coordinator/production-recovery.ts";
+import { commitBatchResumeFromPause } from "../core/statemachine/transition-commit.ts";
 import { materializeDiscoveryPass } from "../core/discovery/materialize.ts";
 import type { PlatformStore } from "../core/store/platform-store.ts";
 import type { ProductionCoordinatorDependencies } from "../core/coordinator/production-coordinator.ts";
@@ -88,6 +91,23 @@ async function handle(
     const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(path);
     if (runMatch !== null) {
       return json(response, 200, runProjection(store, decodeURIComponent(runMatch[1] ?? "")));
+    }
+    // §22.5 — read-only anomaly observation. No transition, no retry, no actuation.
+    const monitorMatch = /^\/v1\/runs\/([^/]+)\/monitor$/.exec(path);
+    if (monitorMatch !== null) {
+      const anomalies = monitorOnce(deps, {
+        run_id: decodeURIComponent(monitorMatch[1] ?? ""),
+        now: isoNow(),
+        trigger_config: {
+          stale_after_ms: readNumber(url.searchParams.get("stale_after_ms"), 30 * 60_000),
+          intent_unresolved_after_ms: readNumber(
+            url.searchParams.get("intent_unresolved_after_ms"),
+            10 * 60_000,
+          ),
+          config_ref: "ingress-defaults-v1",
+        },
+      });
+      return json(response, 200, { anomalies });
     }
     return fail(response, 404, "unknown path");
   }
@@ -160,6 +180,31 @@ async function handle(
     return json(response, 200, { result: applied.result, admitted: applied.admitted });
   }
 
+  // §22.2 — one full reconciliation pass over a run, applied through the sealed guards.
+  const recoverMatch = /^\/v1\/runs\/([^/]+)\/recover$/.exec(path);
+  if (recoverMatch !== null) {
+    const report = recoverRun(deps, { run_id: decodeURIComponent(recoverMatch[1] ?? "") });
+    return json(response, 200, report);
+  }
+
+  // Spec §52 — the explicit human exit from PAUSED_SAFELY: reconcile first, resume only on
+  // CONSISTENT, and never touch the fail-closed task/attempt states.
+  const resumeMatch = /^\/v1\/runs\/([^/]+)\/resume$/.exec(path);
+  if (resumeMatch !== null) {
+    const run_id = decodeURIComponent(resumeMatch[1] ?? "");
+    const report = recoverRun(deps, { run_id });
+    if (report.classification === "UNEXPLAINED") {
+      return json(response, 409, { error: "the run does not reconcile", report });
+    }
+    const resumed: string[] = [];
+    for (const batch of store.batches.forRun(run_id)) {
+      if (batch.status !== "PAUSED_SAFELY") continue;
+      commitBatchResumeFromPause(store, { batch_id: batch.batch_id });
+      resumed.push(batch.batch_id);
+    }
+    return json(response, 200, { resumed, report });
+  }
+
   if (path === "/v1/discovery") {
     const { run_id, batch_id } = body as { run_id?: unknown; batch_id?: unknown };
     if (typeof run_id !== "string" || typeof batch_id !== "string") {
@@ -228,4 +273,9 @@ function json(response: ServerResponse, status: number, body: unknown): void {
 
 function fail(response: ServerResponse, status: number, message: string): void {
   json(response, status, { error: message });
+}
+
+function readNumber(value: string | null, fallback: number): number {
+  const parsed = value === null ? Number.NaN : Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }

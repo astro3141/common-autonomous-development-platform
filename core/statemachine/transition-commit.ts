@@ -680,6 +680,34 @@ export interface BatchCommand {
   readonly within?: (transition: TransitionRecord, outcome: BatchOutcome) => void;
 }
 
+/**
+ * MVP 4 (TD §20/§22.2) — the explicit, human-initiated exit from PAUSED_SAFELY.
+ *
+ * Spec §52 forbids automatic recovery; the caller must be an operator surface, and the caller must
+ * have re-run the §22.2 reconciliation and obtained CONSISTENT before asking. This function trusts
+ * neither: it re-checks the states and refuses anything but the exact PAUSED_SAFELY → RUNNING
+ * step. It never touches tasks or attempts — whatever fail-closed states they hold, they keep.
+ */
+export function commitBatchResumeFromPause(
+  store: PlatformStore,
+  command: { readonly batch_id: string },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const batch = store.batches.require(command.batch_id);
+    if (batch.status !== "PAUSED_SAFELY") {
+      throw illegal(`resume-from-pause requires PAUSED_SAFELY, not ${batch.status}`);
+    }
+    const transition = appendTransition(store, {
+      primary_entity_key: batch.batch_id,
+      batch: { from: "PAUSED_SAFELY", to: "RUNNING" },
+    });
+    const updated = store.batches.setStatus(batch.batch_id, "RUNNING");
+    const run = store.runs.require(batch.run_id);
+    if (run.status === "PAUSED_SAFELY") store.runs.setStatus(batch.run_id, "RUNNING");
+    return { transition, batch: updated };
+  });
+}
+
 export function commitBatchFact(store: PlatformStore, command: BatchCommand): TransitionResult {
   return store.withTransaction(() => {
     const batch = store.batches.require(command.batch_id);

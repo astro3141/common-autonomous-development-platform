@@ -85,6 +85,21 @@ export class IdempotencyStore {
    * under a *different* qualifier of the same `op:<entity>:<operation>:` family, which is the
    * fail-closed check for an identity whose qualifier can move (TD §19.3).
    */
+  /** Every unresolved INTENT row, oldest first. A monitoring read model, never an authority. */
+  unresolvedIntents(): readonly IdempotencyRecord[] {
+    const rows = this.#database
+      .prepare(
+        "SELECT op_key, state, result_json, ts FROM idempotency WHERE state = 'INTENT' ORDER BY ts ASC",
+      )
+      .all() as { op_key: string; state: "INTENT"; result_json: string | null; ts: string }[];
+    return rows.map((row) => ({
+      opKey: row.op_key,
+      state: row.state,
+      result: row.result_json === null ? undefined : (JSON.parse(row.result_json) as never),
+      ts: row.ts,
+    }));
+  }
+
   keysWithPrefix(prefix: string): readonly string[] {
     const rows = this.#database
       .prepare("SELECT op_key FROM idempotency WHERE op_key LIKE ? ESCAPE '\\' ORDER BY op_key ASC")

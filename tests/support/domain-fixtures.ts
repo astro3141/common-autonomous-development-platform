@@ -74,9 +74,12 @@ export interface DomainWorld {
 }
 
 /** A store with a persisted Compiled Profile, one run and one batch. */
-export function world(policyOverrides: Record<string, unknown> = {}): DomainWorld {
+export function world(
+  policyOverrides: Record<string, unknown> = {},
+  options: { readonly now?: () => string } = {},
+): DomainWorld {
   const temp = tempStore();
-  const store = temp.open();
+  const store = temp.open(options.now === undefined ? {} : { now: options.now });
   const inputs = { project: projectProfile(), policy: executionPolicy(policyOverrides) };
   const profile = compiled(policyOverrides);
 
@@ -110,8 +113,9 @@ export function world(policyOverrides: Record<string, unknown> = {}): DomainWorl
 export const withWorld = <T>(
   run: (world: DomainWorld) => T,
   policyOverrides: Record<string, unknown> = {},
+  options: { readonly now?: () => string } = {},
 ): T => {
-  const created = world(policyOverrides);
+  const created = world(policyOverrides, options);
   try {
     return run(created);
   } finally {
