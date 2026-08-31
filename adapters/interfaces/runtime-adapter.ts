@@ -53,7 +53,39 @@ export interface ModelDeclaredOutcome {
 }
 
 /**
- * TD §13.2 — schema `platform/runtime-turn-result` v1.
+ * TD §13.2a (v1.5, PROSPECTIVE) — the measurement observation a v2 turn result carries.
+ *
+ * Everything is availability-honest: a backend that does not report provider/model/usage/cost
+ * yields `UNKNOWN`, and nothing is inferred from profile names, elapsed time or price tables.
+ * This is a measurement/evidence source only — never Task success, Verification PASS, retry or
+ * transition authority.
+ */
+export interface RuntimeExecutionObservationV1 {
+  readonly op_key: string;
+  readonly role: string;
+  readonly runtime_profile: string;
+  readonly actual: {
+    readonly provider:
+      | { readonly availability: "REPORTED"; readonly value: string }
+      | { readonly availability: "UNKNOWN" };
+    readonly model:
+      | { readonly availability: "REPORTED"; readonly value: string }
+      | { readonly availability: "UNKNOWN" };
+  };
+  readonly timing: { readonly started_at: string; readonly completed_at: string };
+  readonly usage:
+    | {
+        readonly kind: "REPORTED";
+        readonly quantities: Readonly<Record<string, { readonly value: number; readonly unit: string }>>;
+      }
+    | { readonly kind: "UNKNOWN" };
+  readonly cost:
+    | { readonly kind: "REPORTED"; readonly value: string; readonly currency: string }
+    | { readonly kind: "UNKNOWN" };
+}
+
+/**
+ * TD §13.2 — schema `platform/runtime-turn-result` v1 (v2 adds `execution_observation`).
  *
  * `model_declared_outcome` is always non-authoritative; `structured_output` is absent when the
  * adapter could not collect a structured result, in which case `result_channel` is `TURN_TEXT`.
@@ -71,6 +103,8 @@ export interface RuntimeTurnResult {
   readonly model_declared_outcome?: ModelDeclaredOutcome;
   /** Backend references admissible under I-TD7; stored only as adapter metadata (TD §6.1). */
   readonly backend_native_refs?: CanonicalObject;
+  /** TD §13.2a — present when the adapter speaks v2. Measurement source, never authority. */
+  readonly execution_observation?: RuntimeExecutionObservationV1;
 }
 
 /**

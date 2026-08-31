@@ -203,6 +203,11 @@ export interface ProjectProfileV1Body {
   /** TD §7.1a (M1-6) — the declaration authority for repository mutation scope. */
   readonly repository_scopes: Readonly<Record<string, RepositoryScopeV1>>;
   readonly hooks: Readonly<Record<string, AdapterConfigured>>;
+  /**
+   * TD §7.1d (v2, PROSPECTIVE) — the Supervisor's role binding. Present exactly when the document
+   * is `platform/project-profile` schema_version 2; a v1 body never carries it.
+   */
+  readonly supervisor_profile?: string;
 }
 
 export const PROJECT_PROFILE_TOP_LEVEL: readonly (keyof ProjectProfileV1Body)[] = [
@@ -217,6 +222,12 @@ export const PROJECT_PROFILE_TOP_LEVEL: readonly (keyof ProjectProfileV1Body)[] 
   "verification_profiles",
   "repository_scopes",
   "hooks",
+];
+
+/** TD §7.1d — the v2 body is the v1 body plus exactly one required field. */
+export const PROJECT_PROFILE_TOP_LEVEL_V2: readonly string[] = [
+  ...PROJECT_PROFILE_TOP_LEVEL,
+  "supervisor_profile",
 ];
 
 // --- Execution Policy v1 (TD §7.1b) ------------------------------------------------

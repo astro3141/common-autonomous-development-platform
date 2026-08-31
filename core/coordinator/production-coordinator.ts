@@ -485,11 +485,20 @@ export class ProductionCoordinator {
     const policy = store.batchView.compiledProfileFor(batch_id).effective.policy.batch_policy;
     if (view.active_task_count >= policy.concurrency) return undefined;
 
+    // §13.5 / §7.1d — a v2 Compiled Profile freezes the Supervisor's binding; only a v1 profile
+    // may fall back to the deployment's configured value, and a production unattended composition
+    // is expected to be v2 (the fallback exists for v1 worlds, not as a second authority).
+    const project = store.batchView.compiledProfileFor(batch_id).effective.project;
+    const boundProfile =
+      project.supervisor_profile === undefined
+        ? undefined
+        : project.roles[project.supervisor_profile]?.runtime_profile;
+    const configured = this.#deps.identities.supervisorRuntimeProfile;
     const outcome = requestSupervisorProposal(this.#deps, {
       run_id,
       batch_id,
       decision_context: this.#decisionContext(batch_id),
-      runtime_profile: this.#deps.identities.supervisorRuntimeProfile,
+      runtime_profile: (boundProfile ?? configured) as typeof configured,
     });
     switch (outcome.kind) {
       case "REQUESTED":

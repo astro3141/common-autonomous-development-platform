@@ -135,6 +135,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP 2 — the Gate's recovery decides between "effect exists" and "effect provably absent"
     // by reading canonical (§21). Observation before actuation, exactly as everywhere else.
     "core/execution/automatic-merge.ts",
+    // v1.5 §5.11 — the diagnostic packet may carry a *fresh* canonical observation with explicit
+    // provenance. A read presented as a read, never a merge and never authority.
+    "core/operability/diagnostics.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge
@@ -222,6 +225,10 @@ test("M1B3-AC33: no production Repository Gate module was added", () => {
     "discovery",
     "execution",
     "humandecision",
+    // v1.5 §5.11–§5.14 — read-only derivations (diagnostics, measurement, findings, routing).
+    // None of them is a Gate: the Repository Gate lives in `execution/automatic-merge.ts` and is
+    // held to its own guards (B14).
+    "operability",
     "profile",
     "schemas",
     "statemachine",

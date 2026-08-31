@@ -21,6 +21,14 @@ import type { DecisionAuthorities } from "../core/admission/fact-assembly.ts";
 import { resolveHumanGateAndAdmit, submitProposal } from "../core/admission/submit-proposal.ts";
 import { monitorOnce } from "../core/coordinator/monitor.ts";
 import { recoverRun } from "../core/coordinator/production-recovery.ts";
+import {
+  buildRoutingRecommendations,
+  diagnosticPacket,
+  listFindings,
+  measurementPacket,
+  recordFinding,
+  type ImprovementFindingV1Body,
+} from "../core/operability/index.ts";
 import { commitBatchResumeFromPause } from "../core/statemachine/transition-commit.ts";
 import { materializeDiscoveryPass } from "../core/discovery/materialize.ts";
 import type { PlatformStore } from "../core/store/platform-store.ts";
@@ -109,12 +117,76 @@ async function handle(
       });
       return json(response, 200, { anomalies });
     }
+    // §5.11 — the diagnostic packet: per-field provenance, partial-tolerant, zero authority.
+    const diagnosticMatch = /^\/v1\/diagnostics\/(.+)$/.exec(path);
+    if (diagnosticMatch !== null) {
+      return json(
+        response,
+        200,
+        diagnosticPacket(
+          { store, repository: deps.repository },
+          decodeURIComponent(diagnosticMatch[1] ?? ""),
+        ),
+      );
+    }
+    // §5.12 — the attempt-level measurement aggregate. UNKNOWN is an answer, never estimated.
+    const measurementMatch = /^\/v1\/measurements\/(.+)$/.exec(path);
+    if (measurementMatch !== null) {
+      return json(
+        response,
+        200,
+        measurementPacket(store, decodeURIComponent(measurementMatch[1] ?? "")),
+      );
+    }
+    // §5.13 — recorded findings, re-read and hash-verified from the blob chain.
+    if (path === "/v1/findings") {
+      return json(response, 200, {
+        findings: listFindings(store).map((finding) => ({
+          finding_id: finding.body.finding_id,
+          finding_hash: finding.finding_hash,
+          subject_ref: finding.body.subject_ref,
+          classification: finding.body.classification,
+          summary: finding.body.summary,
+          supersedes_finding_ref: finding.body.supersedes_finding_ref,
+        })),
+      });
+    }
+    // §5.14 — read-only routing recommendations. Evidence for a person, never a policy input.
+    const routingMatch = /^\/v1\/runs\/([^/]+)\/routing-recommendations$/.exec(path);
+    if (routingMatch !== null) {
+      return json(response, 200, {
+        recommendations: buildRoutingRecommendations(store, {
+          run_id: decodeURIComponent(routingMatch[1] ?? ""),
+          generated_at: isoNow(),
+        }),
+      });
+    }
     return fail(response, 404, "unknown path");
   }
 
   if (request.method !== "POST") return fail(response, 405, "method not allowed");
   const body = await readJson(request);
 
+  // §5.13 — record a Finding. Evidence must resolve or the record is refused; recording changes
+  // no lifecycle state, and re-execution goes through the ordinary admission path only.
+  if (path === "/v1/findings") {
+    const input = body as Partial<ImprovementFindingV1Body> & { classifier_ref?: string };
+    const recorded = recordFinding(store, {
+      finding_id: input.finding_id ?? ulid(),
+      subject_ref: input.subject_ref ?? "",
+      classification: input.classification as ImprovementFindingV1Body["classification"],
+      summary: input.summary ?? "",
+      evidence_refs: input.evidence_refs ?? [],
+      observation_refs: input.observation_refs ?? [],
+      discovered_at: input.discovered_at ?? isoNow(),
+      classifier: (input.classifier ?? "HUMAN") as ImprovementFindingV1Body["classifier"],
+      classifier_ref: input.classifier_ref ?? "ingress",
+      escaped_from: input.escaped_from ?? null,
+      supersedes_finding_ref: input.supersedes_finding_ref ?? null,
+    });
+    return json(response, 200, recorded);
+  }
+  
   if (path === "/v1/proposals") {
     const { run_id, batch_id, proposal } = body as {
       run_id?: unknown;

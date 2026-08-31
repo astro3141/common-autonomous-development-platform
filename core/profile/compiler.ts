@@ -54,8 +54,10 @@ export function compileProfile(input: CompileInput): CompileResult {
   const policy = validateExecutionPolicy(input.executionPolicy);
   const overrides = validateApprovedOverrides(input.approvedOverrides);
 
+  // TD §7.1d/§7.7a — a v2 Project Profile compiles to a v2 Compiled Profile; merge rules stay v1.
+  const profileVersion = project.supervisor_profile === undefined ? 1 : 2;
   const projectHash = hashEnvelope(
-    makeEnvelope(PROJECT_PROFILE_SCHEMA, 1, project as unknown as CanonicalObject),
+    makeEnvelope(PROJECT_PROFILE_SCHEMA, profileVersion, project as unknown as CanonicalObject),
   );
   const policyHash = hashEnvelope(
     makeEnvelope(EXECUTION_POLICY_SCHEMA, 1, policy as unknown as CanonicalObject),
@@ -73,7 +75,7 @@ export function compileProfile(input: CompileInput): CompileResult {
     project_profile: { id: project.id, version: project.version, hash: projectHash },
     execution_policy: { id: policy.id, version: policy.version, hash: policyHash },
     approved_overrides: { hash: overridesHash },
-    compiled_version: COMPILED_VERSION,
+    compiled_version: profileVersion === 2 ? 2 : COMPILED_VERSION,
     merge_rules_version: MERGE_RULES_VERSION,
     effective: { project, policy: effectivePolicy },
   };
@@ -81,7 +83,7 @@ export function compileProfile(input: CompileInput): CompileResult {
   // compiled_hash is the hash of this envelope; it is deliberately not a member of the body.
   const envelope = makeEnvelope(
     COMPILED_PROFILE_SCHEMA,
-    1,
+    profileVersion === 2 ? 2 : 1,
     body as unknown as CanonicalObject,
   );
   return { envelope, compiled_hash: hashEnvelope(envelope), body };

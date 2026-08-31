@@ -30,6 +30,8 @@ export const PILOT_CHECK = "unit";
 export const pilotProjectProfile = (): Record<string, unknown> => ({
   id: "pilot",
   version: 1,
+  // TD §7.1d — a production unattended composition binds its Supervisor explicitly (v2).
+  supervisor_profile: "supervisor",
   repository: { adapter: "local-git", config: {} },
   task_sources: [
     {

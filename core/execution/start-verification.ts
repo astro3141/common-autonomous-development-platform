@@ -40,11 +40,11 @@ import { commitAttemptFact } from "../statemachine/transition-commit.ts";
 import type { TaskAttemptRow } from "../store/domain-types.ts";
 import { StoreError } from "../store/errors.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
+import { actorTurnMetadataKey } from "./actor-operations.ts";
 import {
   ExecutionStartError,
   REPOSITORY_ADAPTER,
   RUNTIME_ADAPTER,
-  TURN_METADATA_KEY,
   WORKSPACE_METADATA_KEY,
 } from "./start-implementation.ts";
 
@@ -118,13 +118,38 @@ export function startVerification(
   const contract = requireContract(store, attempt);
 
   // --- step 1–2 — the Runtime's only contribution: the turn is over --------------------
-  const turn_handle = requireMetadata(store, attempt_key, RUNTIME_ADAPTER, TURN_METADATA_KEY);
+  // The *current* turn, not the first one: after a rework the attempt's live turn is
+  // `actor-turn:<rework_count + 1>` (M1-15), and consulting an earlier, already-terminal turn
+  // would advance the lifecycle while the real work is still running (§19.3 — the trigger is
+  // this turn's terminal observation).
+  const turn_handle = requireMetadata(
+    store,
+    attempt_key,
+    RUNTIME_ADAPTER,
+    actorTurnMetadataKey(attempt.rework_count + 1),
+  );
   const result = authorities.runtime.get_turn_result(turn_handle as unknown as RuntimeTurnHandle);
   if (result.backend_status !== "COMPLETED") {
     // §7 — the other terminal states belong to the existing failure/recovery rules, and §22.3's
     // catch-up is a recovery pass, not this transition. Nothing is written either way.
     return { kind: "TURN_NOT_COMPLETED", backend_status: result.backend_status };
   }
+  // §5.12 (durable source minimum) — the completed turn's redacted envelope is preserved as a
+  // durable measurement source when the transition that consumes it commits. Structured bodies,
+  // backend-native refs and anything I-TD7 restricts are deliberately not part of the projection.
+  const turn_ordinal = attempt.rework_count + 1;
+  const redacted_turn: CanonicalValue = {
+    backend_status: result.backend_status,
+    termination_reason: result.termination_reason,
+    started_at: result.started_at,
+    completed_at: result.completed_at,
+    ...((result as { execution_observation?: CanonicalObject }).execution_observation === undefined
+      ? {}
+      : {
+          execution_observation: (result as { execution_observation?: CanonicalObject })
+            .execution_observation as CanonicalObject,
+        }),
+  } as unknown as CanonicalValue;
 
   // --- steps 3–5 — the repository decides what exists ----------------------------------
   const workspace = requireWorkspace(store, attempt_key);
@@ -160,6 +185,7 @@ export function startVerification(
       attempt_key,
       op_key,
       candidate,
+      turn_projection: { key: `actor_turn_result:${turn_ordinal}`, value: redacted_turn },
       run_value: requireStoredRun(stored, record?.result, op_key),
       already_stored: stored !== undefined,
     });
@@ -193,6 +219,7 @@ export function startVerification(
     candidate,
     run_value: started.run_handle as unknown as CanonicalValue,
     already_stored: false,
+    turn_projection: { key: `actor_turn_result:${turn_ordinal}`, value: redacted_turn },
   });
 }
 
@@ -206,6 +233,7 @@ function commitVerifying(
     readonly candidate: string;
     readonly run_value: CanonicalValue;
     readonly already_stored: boolean;
+    readonly turn_projection?: { readonly key: string; readonly value: CanonicalValue };
   },
 ): StartVerificationOutcome {
   const result = commitAttemptFact(store, {
@@ -229,6 +257,18 @@ function commitVerifying(
       }
       if (store.idempotency.get(input.op_key)?.state !== "DONE") {
         store.idempotency.markDone(input.op_key, input.run_value);
+      }
+      if (
+        input.turn_projection !== undefined &&
+        store.adapterMetadata.get(input.attempt_key, RUNTIME_ADAPTER, input.turn_projection.key) ===
+          undefined
+      ) {
+        store.adapterMetadata.put({
+          entity_key: input.attempt_key,
+          adapter_id: RUNTIME_ADAPTER,
+          key: input.turn_projection.key,
+          value: input.turn_projection.value,
+        });
       }
     },
   });

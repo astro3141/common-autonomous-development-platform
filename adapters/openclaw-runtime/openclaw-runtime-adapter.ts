@@ -165,6 +165,18 @@ export class OpenClawRuntimeAdapter implements RuntimeAdapter {
         identity_authority: "BACKEND",
         result_channel: "TURN_TEXT",
       },
+      // §13.2a v2 — an honest observation: the measured backend reports no provider/model/usage,
+      // so every one of those is UNKNOWN rather than inferred (no alias promotion, no back-derived
+      // cost). Timing is the adapter's own observation, as RA-2a records.
+      execution_observation: {
+        op_key: turn.request_id,
+        role: "UNKNOWN",
+        runtime_profile: turn.agent_id,
+        actual: { provider: { availability: "UNKNOWN" }, model: { availability: "UNKNOWN" } },
+        timing: { started_at: status.started_at, completed_at: status.completed_at },
+        usage: { kind: "UNKNOWN" },
+        cost: { kind: "UNKNOWN" },
+      },
     };
     const collected = this.#channel.collect(sessionRefKey(ref), turn.request_id);
     return withCollectedResult(base, collected);

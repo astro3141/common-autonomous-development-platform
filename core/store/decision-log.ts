@@ -45,6 +45,16 @@ export class DecisionLog {
   }
 
   /** Appends one entry and returns it, including the assigned monotonic `seq`. */
+  /** Entries of one kind about one ref, oldest first. A derivation read, never an authority. */
+  byKindAndRef(kind: string, refKey: string): DecisionLogEntry[] {
+    const rows = this.#database
+      .prepare(
+        "SELECT seq, ts, kind, ref_key, payload_json FROM decision_log WHERE kind = ? AND ref_key = ? ORDER BY seq ASC",
+      )
+      .all(kind, refKey) as unknown as DecisionLogRow[];
+    return rows.map(toEntry);
+  }
+
   /** How many entries of one kind exist. A read model for pacing, never an authority. */
   countByKind(kind: string): number {
     const row = this.#database
