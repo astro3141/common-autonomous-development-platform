@@ -106,6 +106,12 @@ export interface AdmissionCommand {
    * decision, and the transition ref is written back into its resolution.
    */
   readonly resolved_decision_id?: string;
+  /**
+   * MVP 3 (Spec §47/§68) — present for a `START_SUBFLOW` admission: the child is linked to this
+   * parent, and an ACTIVE parent is suspended in the same transaction. A parent that is already
+   * HELD keeps its own blocker — suspension never erases a held reason.
+   */
+  readonly subflow_parent_task_key?: string;
 }
 
 /**
@@ -193,7 +199,60 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       store.pendingDecisions.recordAppliedTransition(command.resolved_decision_id, transition.seq);
     }
 
-    return { transition, task: updated, batch: currentBatch };
+    if (command.subflow_parent_task_key !== undefined) {
+      linkSubflowParent(store, task.task_key, command.subflow_parent_task_key);
+    }
+
+    return { transition, task: store.tasks.require(task.task_key), batch: currentBatch };
+  });
+}
+
+/**
+ * MVP 3 — links an admitted subflow child to its parent and suspends an ACTIVE parent
+ * (Spec §47: Parent Task → SUSPENDED). Runs inside the admission transaction: a subflow whose
+ * parent cannot be linked is not admitted at all.
+ */
+function linkSubflowParent(store: PlatformStore, childKey: string, parentKey: string): void {
+  if (childKey === parentKey) throw illegal(`${childKey} cannot be its own subflow parent`);
+  const child = store.tasks.require(childKey);
+  const parent = store.tasks.require(parentKey);
+  if (parent.batch_id !== child.batch_id) {
+    throw illegal(`subflow parent ${parentKey} is not in ${child.batch_id}`);
+  }
+  if (
+    parent.platform_state !== "ACTIVE" &&
+    parent.platform_state !== "HELD" &&
+    parent.platform_state !== "SUSPENDED"
+  ) {
+    throw illegal(`subflow parent ${parentKey} is ${parent.platform_state}; nothing to suspend`);
+  }
+
+  store.tasks.write(childKey, { platform_state: child.platform_state, parent_task_key: parentKey });
+  if (parent.platform_state === "ACTIVE") {
+    appendTransition(store, {
+      primary_entity_key: parentKey,
+      task: { from: "ACTIVE", to: "SUSPENDED" },
+    });
+    store.tasks.write(parentKey, { platform_state: "SUSPENDED" });
+  }
+}
+
+/**
+ * MVP 3 — `SUSPENDED → ACTIVE`. Explicitly by a validated `RESUME_PARENT` Proposal, or by the
+ * Coordinator when every subflow child has COMPLETED (Spec §47: Child PASS → Parent RESUME).
+ * The parent's Attempt was never touched by the suspension, so nothing else changes.
+ */
+export function commitParentResume(store: PlatformStore, parentTaskKey: string): TransitionResult {
+  return store.withTransaction(() => {
+    const parent = store.tasks.require(parentTaskKey);
+    if (parent.platform_state !== "SUSPENDED") {
+      throw illegal(`resume requires SUSPENDED, not ${parent.platform_state}`);
+    }
+    const transition = appendTransition(store, {
+      primary_entity_key: parentTaskKey,
+      task: { from: "SUSPENDED", to: "ACTIVE" },
+    });
+    return { transition, task: store.tasks.write(parentTaskKey, { platform_state: "ACTIVE" }) };
   });
 }
 

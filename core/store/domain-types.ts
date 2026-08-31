@@ -34,6 +34,8 @@ export type TaskState =
   | "SELECTED"
   | "ACTIVE"
   | "HELD"
+  /** TD §19.1 / §27 — MVP 3 extension state, held only by a subflow parent. */
+  | "SUSPENDED"
   | "DEFERRED"
   | "COMPLETED"
   | "FAILED";
@@ -42,6 +44,7 @@ export const TASK_STATES: readonly TaskState[] = [
   "SELECTED",
   "ACTIVE",
   "HELD",
+  "SUSPENDED",
   "DEFERRED",
   "COMPLETED",
   "FAILED",
@@ -179,6 +182,8 @@ export interface TaskRow {
   readonly external_snapshot: ExternalTaskSnapshotV1;
   /** Monotonic admission marker: once set it is never cleared (TD §18.1a). */
   readonly admitted_at: string | null;
+  /** MVP 3 (TD §27) — the parent this task is a subflow child of, or null. */
+  readonly parent_task_key: string | null;
   readonly state_reason: StateReason | null;
   readonly created_at: string;
   readonly updated_at: string;

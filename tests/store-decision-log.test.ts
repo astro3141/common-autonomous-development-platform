@@ -101,7 +101,7 @@ test("B2-AC6: the domain API exposes no mutation or deletion path", () => {
   const methods = Object.getOwnPropertyNames(DecisionLog.prototype).filter(
     (name) => name !== "constructor",
   );
-  assert.deepEqual(methods.sort(), ["append", "count", "read"]);
+  assert.deepEqual(methods.sort(), ["append", "count", "countByKind", "read"]);
 
   const source = readFileSync(join(ROOT, "core/store/decision-log.ts"), "utf8");
   assert.equal(/UPDATE\s+decision_log|DELETE\s+FROM\s+decision_log/i.test(source), false);

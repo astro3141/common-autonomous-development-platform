@@ -19,11 +19,11 @@ const stripComments = (source: string): string =>
   source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 
 test("B7-29: the schema is still v5 / 17 tables and no workflow table was added", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 7);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 7);
   } finally {
     store.close();
   }

@@ -53,7 +53,8 @@ import {
 } from "../execution/supervisor-session.ts";
 import { mergeDecisionCause } from "../humandecision/merge-decision.ts";
 import type { ProfileSource } from "../profile/types.ts";
-import { commitBatchFact } from "../statemachine/transition-commit.ts";
+import { commitBatchFact, commitParentResume } from "../statemachine/transition-commit.ts";
+import { DECISION_VALIDATION_LOG_KIND } from "../decision/decision-log.ts";
 import type { TaskAttemptRow, TaskRow } from "../store/domain-types.ts";
 import { isTerminalTask } from "../store/domain-types.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
@@ -108,6 +109,9 @@ export type TickStep =
   | "AUTO_MERGE_STARTED"
   | "AUTO_MERGE_COMPLETED"
   | "MERGE_OBSERVED"
+  | "PARENT_RESUMED"
+  | "BATCH_WAITING"
+  | "BATCH_RESUMED"
   | "BATCH_COMPLETED"
   | "RUN_COMPLETED"
   | "REPORT_DELIVERED"
@@ -144,6 +148,11 @@ export class ProductionCoordinator {
 
       const requested = this.#requestProposalIfNeeded(run_id, batch.batch_id);
       if (requested !== undefined) return requested;
+
+      // §20.1 — with nothing to advance and nothing to ask, the batch may be WAITING on people,
+      // or a WAITING batch may have become runnable again. The guard owns the condition.
+      const waited = this.#settleWaiting(batch.batch_id);
+      if (waited !== undefined) return waited;
     }
 
     // Transport last. It is not lifecycle work and never gates any of the above.
@@ -177,6 +186,18 @@ export class ProductionCoordinator {
     // A task blocked on a person stays blocked — unless the one decision MVP 1 knows how to apply
     // has been answered. Every other category is a safe held endpoint (M1-15).
     if (task.platform_state === "HELD") return this.#applyResolvedMerge(task);
+
+    // MVP 3 (Spec §47) — a suspended parent advances nothing itself; it resumes when every
+    // subflow child COMPLETED. A child that failed or deferred leaves the parent suspended for an
+    // explicit RESUME_PARENT or human decision — never a guessed resume.
+    if (task.platform_state === "SUSPENDED") {
+      const children = store.tasks.childrenOf(task.task_key);
+      const allComplete =
+        children.length > 0 && children.every((child) => child.platform_state === "COMPLETED");
+      if (!allComplete) return undefined;
+      commitParentResume(store, task.task_key);
+      return "PARENT_RESUMED";
+    }
 
     const attempt = store.attempts.current(task.task_key);
     // §26 step 7 — a selected task with no Attempt is waiting to be activated. This has to come
@@ -404,6 +425,39 @@ export class ProductionCoordinator {
     return store.runs.require(run_id).status === "COMPLETED" ? "RUN_COMPLETED" : "BATCH_COMPLETED";
   }
 
+  /**
+   * §20.1 — WAITING and its resumption, judged by the guard from durable counts. The Coordinator
+   * supplies only `safe_independent_runnable_exists`: whether admission is open and an undecided
+   * candidate exists (Spec §48's Hold-and-Continue judgement, kept deliberately simple).
+   */
+  #settleWaiting(batch_id: string): TickStep | undefined {
+    const store = this.#deps.store;
+    const batch = store.batches.require(batch_id);
+    const safe =
+      !batch.admission_closed &&
+      store.tasks.inBatch(batch_id).some((task) => task.platform_state === "DISCOVERED");
+
+    try {
+      if (batch.status === "RUNNING") {
+        commitBatchFact(store, {
+          batch_id,
+          fact: { kind: "EVALUATE_WAITING", safe_independent_runnable_exists: safe },
+        });
+        return "BATCH_WAITING";
+      }
+      if (batch.status === "WAITING") {
+        commitBatchFact(store, {
+          batch_id,
+          fact: { kind: "RESUME", safe_independent_runnable_exists: safe },
+        });
+        return "BATCH_RESUMED";
+      }
+    } catch {
+      // The §20.1 condition does not hold in this direction. An ordinary answer, not a failure.
+    }
+    return undefined;
+  }
+
   // --- supervisor --------------------------------------------------------------------------------
 
   /**
@@ -413,15 +467,23 @@ export class ProductionCoordinator {
    */
   #requestProposalIfNeeded(run_id: string, batch_id: string): TickStep | undefined {
     const store = this.#deps.store;
+    const batch = store.batches.require(batch_id);
+    if (batch.status !== "RUNNING" || batch.admission_closed) return undefined;
     const undecided = store.tasks
       .inBatch(batch_id)
       .some((task) => task.platform_state === "DISCOVERED");
     if (!undecided) return undefined;
 
-    // §13.4 — one request, then wait. A completed turn with no Proposal advances nothing, and a
-    // deliberate re-request is a caller action, not something a tick does over and over. The
-    // durable operation rows are the whole test: there is no `WAITING_FOR_PROPOSAL` state.
-    if (supervisorTurnsIssued(store, batch_id) > 0) return "SUPERVISOR_AWAITING_PROPOSAL";
+    // MVP 3 pacing — a next turn is requested only when the previous one has been answered (a
+    // Proposal was validated, whatever its verdict) and a concurrency slot is actually free, so a
+    // turn is never spent on work V11 would refuse. Both inputs are durable: the turn operations
+    // and the `decision_validation` journal. There is still no `WAITING_FOR_PROPOSAL` state.
+    const turns = supervisorTurnsIssued(store, batch_id);
+    const answered = store.decisions.countByKind(DECISION_VALIDATION_LOG_KIND);
+    if (turns > answered) return "SUPERVISOR_AWAITING_PROPOSAL";
+    const view = store.batchView.project(batch_id);
+    const policy = store.batchView.compiledProfileFor(batch_id).effective.policy.batch_policy;
+    if (view.active_task_count >= policy.concurrency) return undefined;
 
     const outcome = requestSupervisorProposal(this.#deps, {
       run_id,

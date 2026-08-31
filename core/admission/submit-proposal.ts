@@ -24,7 +24,12 @@ import type { DecisionValidationResult, ProposalV1 } from "../decision/types.ts"
 import { validateAndRecordDecision } from "../decision/decision-log.ts";
 import { buildHumanGateDecision } from "../humandecision/gate-request.ts";
 import { resolvedHumanGateAuthorization } from "../humandecision/gate-authorization.ts";
-import { commitAdmission, commitPendingDecision } from "../statemachine/transition-commit.ts";
+import {
+  commitAdmission,
+  commitParentResume,
+  commitPendingDecision,
+  commitTaskDeferral,
+} from "../statemachine/transition-commit.ts";
 import type { TaskDependency } from "../tasksource/types.ts";
 import { AdmissionError } from "./errors.ts";
 import { evaluateHardDependencies } from "./dependency-admission.ts";
@@ -188,10 +193,52 @@ function act(
     return { ...base, pending_decision_id: opened.decision_id };
   }
 
-  // ACCEPTED. The one transition this batch performs is task admission; START_SUBFLOW and every
-  // control decision are reported as accepted without a lifecycle change (MVP 3 / later batches).
-  if (proposal === null || proposal.variant !== "TASK_SELECTION") return base;
-  if (proposal.decision !== "START_TASK" || assembled.task_key === null) return base;
+  // ACCEPTED. Selection decisions admit; MVP 3 also applies DEFER_TASK and RESUME_PARENT.
+  // HOLD_TASK and CLOSE_BATCH-adjacent control remain reported-without-lifecycle: the TD defines
+  // no held-reason vocabulary for a Supervisor-initiated hold, and inventing one is not this
+  // module's authority.
+  if (proposal === null) return base;
+
+  if (proposal.decision === "DEFER_TASK" && assembled.task_key !== null) {
+    // TD §19.3 — DEFERRED is entered only before selection, from a validated DEFER_TASK.
+    const deferred = commitTaskDeferral(authorities.store, assembled.task_key);
+    return { ...base, transition_seq: deferred.transition.seq };
+  }
+
+  if (proposal.decision === "RESUME_PARENT" && assembled.task_key !== null) {
+    // MVP 3 (Spec §47/§68) — an explicit, validated resume of a suspended subflow parent.
+    const resumed = commitParentResume(authorities.store, assembled.task_key);
+    return { ...base, transition_seq: resumed.transition.seq };
+  }
+
+  if (proposal.variant !== "TASK_SELECTION") return base;
+  if (assembled.task_key === null) return base;
+
+  // MVP 3 — a subflow child is admitted exactly like a task, plus the parent linkage. The parent
+  // is the batch's unique in-flight admitted task; when that is not unique the Platform refuses to
+  // guess (Spec §47 names one parent) — nothing is admitted and the refusal is observable.
+  let subflow_parent: string | undefined;
+  if (proposal.decision === "START_SUBFLOW") {
+    const candidates = authorities.store.tasks
+      .inBatch(assembled.batch.batch_id)
+      .filter(
+        (task) =>
+          task.task_key !== assembled.task_key &&
+          task.admitted_at !== null &&
+          (task.platform_state === "ACTIVE" || task.platform_state === "HELD"),
+      );
+    if (candidates.length !== 1) {
+      authorities.store.decisions.append({
+        kind: "subflow_parent_unresolved",
+        refKey: assembled.task_key,
+        payload: { candidates: candidates.map((task) => task.task_key) } as never,
+      });
+      return base;
+    }
+    subflow_parent = candidates[0]?.task_key;
+  } else if (proposal.decision !== "START_TASK") {
+    return base;
+  }
 
   // TD §8.4a — computed as late as possible, from this invocation's own fresh observations, and
   // recomputed on the resolved-gate path too: a human approval does not carry a dependency fact.
@@ -223,6 +270,7 @@ function act(
     },
     admitted_at: command.observed_at,
     ...(resolvedDecisionId === undefined ? {} : { resolved_decision_id: resolvedDecisionId }),
+    ...(subflow_parent === undefined ? {} : { subflow_parent_task_key: subflow_parent }),
   });
 
   return { ...base, admitted: true, transition_seq: admitted.transition.seq };

@@ -14,6 +14,13 @@ export interface Migration {
   readonly name: string;
   /** One or more statements applied inside a single transaction. */
   readonly statements: string;
+  /**
+   * A table-rewrite migration over a table other tables reference must run with foreign-key
+   * enforcement off (SQLite cannot alter a CHECK in place). The runner turns enforcement back on
+   * and verifies with `PRAGMA foreign_key_check` afterwards — a rewrite that broke a reference is
+   * a failed migration, never a silently weaker database.
+   */
+  readonly disable_foreign_keys?: boolean;
 }
 
 const MIGRATION_V1 = `
@@ -294,6 +301,56 @@ DROP TABLE pending_human_decision;
 ALTER TABLE pending_human_decision_v6 RENAME TO pending_human_decision;
 `;
 
+/**
+ * Migration v7 — MVP 3 (TD §19.1/§27): the `SUSPENDED` parent state and the child's
+ * `parent_task_key`. SQLite cannot extend a CHECK, so the task table is rewritten — the same
+ * pattern migration v6 used for the decision category, with the foreign-key handling the runner
+ * provides for a referenced table. Table count stays 17: no new table, one new nullable column.
+ */
+const MIGRATION_V7 = `
+CREATE TABLE task_v7 (
+  task_key               TEXT PRIMARY KEY,
+  batch_id               TEXT NOT NULL REFERENCES batch(batch_id),
+  project_id             TEXT NOT NULL,
+  external_task_ref      TEXT NOT NULL,
+  platform_state         TEXT NOT NULL CHECK (platform_state IN
+                           ('DISCOVERED', 'SELECTED', 'ACTIVE', 'HELD', 'SUSPENDED',
+                            'DEFERRED', 'COMPLETED', 'FAILED')),
+  classification         TEXT,
+  pipeline_id            TEXT,
+  actor_profile          TEXT,
+  verification_profile   TEXT,
+  external_snapshot_json TEXT NOT NULL,
+  admitted_at            TEXT,
+  state_reason_code      TEXT,
+  state_reason_log_seq   INTEGER REFERENCES decision_log(seq),
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  repository_scope_id    TEXT,
+  selection_binding_json TEXT,
+  parent_task_key        TEXT REFERENCES task_v7(task_key),
+  UNIQUE (project_id, external_task_ref),
+  CHECK (platform_state NOT IN ('HELD', 'FAILED')
+         OR (state_reason_code IS NOT NULL AND state_reason_log_seq IS NOT NULL))
+) STRICT;
+
+INSERT INTO task_v7
+  (task_key, batch_id, project_id, external_task_ref, platform_state,
+   classification, pipeline_id, actor_profile, verification_profile,
+   external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+   created_at, updated_at, repository_scope_id, selection_binding_json, parent_task_key)
+SELECT
+  task_key, batch_id, project_id, external_task_ref, platform_state,
+  classification, pipeline_id, actor_profile, verification_profile,
+  external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+  created_at, updated_at, repository_scope_id, selection_binding_json, NULL
+FROM task;
+
+DROP TABLE task;
+
+ALTER TABLE task_v7 RENAME TO task;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "foundation", statements: MIGRATION_V1 },
   { version: 2, name: "domain", statements: MIGRATION_V2 },
@@ -301,6 +358,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 4, name: "selection-scope", statements: MIGRATION_V4 },
   { version: 5, name: "selection-binding", statements: MIGRATION_V5 },
   { version: 6, name: "audit-decision-category", statements: MIGRATION_V6 },
+  { version: 7, name: "subflow-parent", statements: MIGRATION_V7, disable_foreign_keys: true },
 ];
 
 const BOOTSTRAP = `
@@ -348,15 +406,26 @@ export function migrate(
 }
 
 function applyOne(database: DatabaseSync, migration: Migration): void {
+  const withoutForeignKeys = migration.disable_foreign_keys === true;
+  // PRAGMA foreign_keys cannot change inside a transaction, so the toggle brackets it.
+  if (withoutForeignKeys) database.exec("PRAGMA foreign_keys = OFF");
   database.exec("BEGIN IMMEDIATE");
   try {
     database.exec(migration.statements);
+    if (withoutForeignKeys) {
+      // The check runs before COMMIT: a rewrite that broke a reference rolls back whole.
+      const broken = database.prepare("PRAGMA foreign_key_check").all();
+      if (broken.length > 0) {
+        throw new Error(`${broken.length} broken foreign-key references after rewrite`);
+      }
+    }
     database
       .prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
       .run(migration.version, migration.name, new Date().toISOString());
     database.exec("COMMIT");
   } catch (error) {
     rollbackQuietly(database);
+    if (withoutForeignKeys) database.exec("PRAGMA foreign_keys = ON");
     throw new StoreError(
       "MIGRATION_FAILED",
       `migration ${migration.version} (${migration.name}) was rolled back and not recorded: ${
@@ -364,6 +433,7 @@ function applyOne(database: DatabaseSync, migration: Migration): void {
       }`,
     );
   }
+  if (withoutForeignKeys) database.exec("PRAGMA foreign_keys = ON");
 }
 
 function rollbackQuietly(database: DatabaseSync): void {

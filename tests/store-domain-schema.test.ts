@@ -57,7 +57,7 @@ test("B8-AC4 / B8-AC5 / B8-AC6 / B8-AC7: the four state vocabularies are exact",
   );
   assert.deepEqual(
     [...TASK_STATES],
-    ["DISCOVERED", "SELECTED", "ACTIVE", "HELD", "DEFERRED", "COMPLETED", "FAILED"],
+    ["DISCOVERED", "SELECTED", "ACTIVE", "HELD", "SUSPENDED", "DEFERRED", "COMPLETED", "FAILED"],
   );
   assert.deepEqual(
     [...ATTEMPT_STATES],
@@ -76,10 +76,11 @@ test("B8-AC4 / B8-AC5 / B8-AC6 / B8-AC7: the four state vocabularies are exact",
     ],
   );
 
-  // HELD is deliberately not terminal; SUSPENDED does not exist at all.
+  // HELD is deliberately not terminal; SUSPENDED (MVP 3) is not terminal either — a suspended
+  // parent resumes when its subflow children complete (Spec §47).
   assert.deepEqual([...TERMINAL_TASK_STATES], ["COMPLETED", "FAILED", "DEFERRED"]);
   assert.deepEqual([...TERMINAL_ATTEMPT_STATES], ["MERGED", "INVALIDATED", "FAILED"]);
-  assert.equal((TASK_STATES as readonly string[]).includes("SUSPENDED"), false);
+  assert.equal((TERMINAL_TASK_STATES as readonly string[]).includes("SUSPENDED"), false);
 });
 
 // --- exact columns ------------------------------------------------------------------------
@@ -124,10 +125,11 @@ test("B8-AC7 / B8-AC8: the domain columns are exactly TD §18.1a", () => {
     "state_reason_log_seq",
     "created_at",
     "updated_at",
-    // Appended by migrations v4/v5, so they land at the end: §18.1a's listing is the logical
-    // schema, and `ALTER TABLE ADD COLUMN` never rewrites the physical order of what came before.
+    // Appended by migrations v4/v5 and the v7 rewrite, so they land at the end: §18.1a's listing
+    // is the logical schema, and column order is not part of it.
     "repository_scope_id",
     "selection_binding_json",
+    "parent_task_key",
   ]);
   assert.deepEqual(columns("task_attempt"), [
     "attempt_key",

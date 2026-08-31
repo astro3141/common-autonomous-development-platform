@@ -251,7 +251,7 @@ test("C9 / C10: v5 rows survive the v6 rebuild, and the table count is unchanged
     old.close();
 
     const upgraded = temp.open();
-    assert.equal(upgraded.schemaVersion, 6);
+    assert.equal(upgraded.schemaVersion, 7);
     upgraded.close();
 
     const database = openDatabase(temp.path);

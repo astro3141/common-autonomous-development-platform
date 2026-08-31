@@ -59,8 +59,8 @@ test("B5-M1 / B5-M4 ~ B5-M8: a fresh database reaches v6 with the two nullable c
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6, "B5-M4");
-    assert.equal(MIGRATIONS.length, 6);
+    assert.equal(store.schemaVersion, 7, "B5-M4");
+    assert.equal(MIGRATIONS.length, 7);
   } finally {
     store.close();
   }
@@ -78,7 +78,7 @@ test("B5-M1 / B5-M4 ~ B5-M8: a fresh database reaches v6 with the two nullable c
     }
     assert.deepEqual(
       MIGRATIONS.slice(3).map((migration) => migration.name),
-      ["selection-scope", "selection-binding", "audit-decision-category"],
+      ["selection-scope", "selection-binding", "audit-decision-category", "subflow-parent"],
     );
     // M1-13 — v6 rebuilds one table to widen a CHECK vocabulary; the table set is unchanged.
     const v6 = MIGRATIONS[5] as Migration;
@@ -115,7 +115,7 @@ test("B5-M2 / B5-M3: v3 upgrades through v4/v5 to v6, and reopening applies noth
 
   // v3 → v4 → v5.
   const upgraded = temp.open();
-  assert.equal(upgraded.schemaVersion, 6);
+  assert.equal(upgraded.schemaVersion, 7);
   upgraded.close();
 
   // v4 → v5 alone.
@@ -124,14 +124,14 @@ test("B5-M2 / B5-M3: v3 upgrades through v4/v5 to v6, and reopening applies noth
   assert.equal(atFour.schemaVersion, 4);
   atFour.close();
   const toLatest = temp4.open();
-  assert.equal(toLatest.schemaVersion, 6, "B5-M2");
+  assert.equal(toLatest.schemaVersion, 7, "B5-M2");
   toLatest.close();
 
   try {
     // B5-M3 — reopening a migrated database is a no-op and never duplicates a column.
     for (const path of [temp, temp4]) {
       const reopened = path.open();
-      assert.equal(reopened.schemaVersion, 6);
+      assert.equal(reopened.schemaVersion, 7);
       reopened.close();
       const task = columns(path.path, "task");
       assert.equal(task.filter((name) => name === "repository_scope_id").length, 1);
@@ -275,7 +275,7 @@ test("B5-M4: PlatformStore reports the migrated version on a real file", () => {
   const temp = tempStore();
   const store = PlatformStore.open(temp.path);
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 7);
   } finally {
     store.close();
     temp.dispose();

@@ -693,11 +693,11 @@ test("B12-61 / B12-64 ~ B12-66: the Platform merges nothing and reaches no backe
 });
 
 test("B12-63: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 7);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 7);
   } finally {
     store.close();
   }

@@ -45,6 +45,14 @@ export class DecisionLog {
   }
 
   /** Appends one entry and returns it, including the assigned monotonic `seq`. */
+  /** How many entries of one kind exist. A read model for pacing, never an authority. */
+  countByKind(kind: string): number {
+    const row = this.#database
+      .prepare("SELECT count(*) AS n FROM decision_log WHERE kind = ?")
+      .get(kind) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
   append(entry: DecisionLogAppend): DecisionLogEntry {
     const payloadJson = canonicalize(entry.payload);
     if (entry.ts !== undefined && entry.ts.length === 0) {

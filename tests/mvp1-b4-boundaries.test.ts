@@ -234,6 +234,7 @@ test("M1B4-AC41 ~ AC44: the schema and the B1/B2/B3 surfaces are untouched", () 
       { version: 4, name: "selection-scope" },
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
+      { version: 7, name: "subflow-parent" },
     ],
   );
   assert.deepEqual(

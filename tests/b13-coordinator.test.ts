@@ -376,11 +376,11 @@ test("B13-4 / B13-33 / B13-34 / B13-35: the Coordinator dispatches and never mer
 });
 
 test("B13-39: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 7);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 7);
   } finally {
     store.close();
   }
