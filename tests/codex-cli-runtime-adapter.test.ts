@@ -1,0 +1,322 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import type {
+  CapabilityGrant,
+  RuntimeProfile,
+  RuntimeSessionHandle,
+} from "../adapters/interfaces/handles.ts";
+import {
+  CODEX_CLI_INSPECTED_SOURCE_COMMIT,
+  CODEX_CLI_INSPECTED_VERSION,
+  CodexCliBackendCapabilityGap,
+  CodexCliRuntimeAdapter,
+  CodexCliRuntimeOperationConflict,
+  codexCliPilotManifests,
+  type CodexCliCommandObservation,
+  type CodexCliInvocation,
+  type CodexCliProcessRunner,
+  type CodexCliRuntimeAdapterConfig,
+} from "../adapters/codex-cli-runtime/index.ts";
+import { validateManifestSet } from "../core/capability/manifest-set.ts";
+import type { CanonicalObject } from "../core/schemas/canonical-json.ts";
+
+const NOW = "2026-09-01T00:00:00.000Z";
+
+class ScriptedRunner implements CodexCliProcessRunner {
+  readonly invocations: CodexCliInvocation[] = [];
+  readonly turns: CodexCliCommandObservation[] = [];
+  version = CODEX_CLI_INSPECTED_VERSION;
+  loggedIn = true;
+
+  run(invocation: CodexCliInvocation): CodexCliCommandObservation {
+    this.invocations.push(invocation);
+    if (invocation.args.length === 1 && invocation.args[0] === "--version") {
+      return observation({ stdout: `${this.version}\n` });
+    }
+    if (invocation.args[0] === "login") {
+      return this.loggedIn
+        ? observation({ stdout: "Logged in using ChatGPT\n" })
+        : observation({ exit_code: 1, stderr: "Not logged in\n" });
+    }
+    const next = this.turns.shift();
+    if (next === undefined) throw new Error("no scripted Codex turn");
+    return next;
+  }
+}
+
+function observation(
+  overrides: Partial<CodexCliCommandObservation> = {},
+): CodexCliCommandObservation {
+  return {
+    started_at: NOW,
+    completed_at: NOW,
+    exit_code: 0,
+    signal: null,
+    stdout: "",
+    stderr: "",
+    timed_out: false,
+    error_code: null,
+    ...overrides,
+  };
+}
+
+function completedTurn(thread_id: string, response: CanonicalObject): CodexCliCommandObservation {
+  return observation({
+    stdout: [
+      { type: "thread.started", thread_id },
+      { type: "turn.started" },
+      {
+        type: "item.completed",
+        item: { id: "item-1", type: "agent_message", text: JSON.stringify(response) },
+      },
+      {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 11,
+          cached_input_tokens: 2,
+          cache_write_input_tokens: 0,
+          output_tokens: 3,
+          reasoning_output_tokens: 1,
+        },
+      },
+    ]
+      .map((event) => JSON.stringify(event))
+      .join("\n"),
+  });
+}
+
+function failedTurn(thread_id: string, message: string): CodexCliCommandObservation {
+  return observation({
+    exit_code: 1,
+    stdout: [
+      { type: "thread.started", thread_id },
+      { type: "turn.started" },
+      { type: "turn.failed", error: { message } },
+    ]
+      .map((event) => JSON.stringify(event))
+      .join("\n"),
+  });
+}
+
+function config(root: string): CodexCliRuntimeAdapterConfig {
+  return {
+    adapter_instance_id: "codex-cli-test",
+    cli_executable: "/opt/homebrew/bin/codex",
+    expected_cli_version: CODEX_CLI_INSPECTED_VERSION,
+    state_root: join(root, "state"),
+    default_cwd: root,
+    turn_timeout_seconds: 30,
+    profiles: {
+      "supervisor-agent": { provider: "openai", model: "gpt-5.6-sol", sandbox: "read-only" },
+      "actor-agent": { provider: "openai", model: "gpt-5.6-sol", sandbox: "workspace-write" },
+      "auditor-agent": { provider: "openai", model: "gpt-5.6-sol", sandbox: "read-only" },
+    },
+  };
+}
+
+function spawnActor(adapter: CodexCliRuntimeAdapter): RuntimeSessionHandle {
+  return adapter.spawn_session(
+    { op_key: "op:actor:spawn" },
+    "ACTOR",
+    "actor-agent" as unknown as RuntimeProfile,
+    "/workspace",
+    { task_ref: "TASK-1" },
+    {} as CapabilityGrant,
+  ).session_handle;
+}
+
+test("Codex CLI adapter advertises only inspected/configured capability and preflights auth", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    assert.deepEqual(adapter.preflight(), { status: "READY" });
+    const advertised = adapter.capabilityAdvertisement();
+    assert.equal(advertised.cli_version, CODEX_CLI_INSPECTED_VERSION);
+    assert.equal(advertised.inspected_source_commit, CODEX_CLI_INSPECTED_SOURCE_COMMIT);
+    assert.equal(advertised.model_catalog, null);
+    assert.equal(advertised.execution.explicit_thread_resume, true);
+    assert.equal(advertised.execution.create_only_session, false);
+    assert.equal(advertised.execution.active_turn_cancellation, false);
+
+    runner.loggedIn = false;
+    assert.equal(adapter.preflight().status, "BLOCKED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("spawn uses a bounded real initialization turn and send uses explicit thread resume", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    runner.turns.push(
+      completedTurn("thread-actor", { ready: true }),
+      completedTurn("thread-actor", {
+        declared_status: "DONE",
+        summary: "implemented",
+        refs: ["src/feature.txt"],
+      }),
+    );
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    const session = spawnActor(adapter);
+    const turn = adapter.send_turn({ op_key: "op:actor:turn:1" }, session, "implement");
+    const result = adapter.get_turn_result(turn);
+
+    const execInvocations = runner.invocations.filter((entry) => entry.args[0] === "exec");
+    assert.equal(execInvocations.length, 2);
+    assert.equal(execInvocations[0]?.args.includes("resume"), false);
+    const resumeAt = execInvocations[1]?.args.indexOf("resume") ?? -1;
+    assert.notEqual(resumeAt, -1);
+    assert.equal(execInvocations[1]?.args[resumeAt + 1], "thread-actor");
+    assert.equal(execInvocations[1]?.args.includes("--ignore-user-config"), true);
+    assert.equal(execInvocations[1]?.args.includes("--ignore-rules"), true);
+    assert.equal(execInvocations[1]?.args.includes("--json"), true);
+    assert.equal(execInvocations[1]?.args.includes("--output-schema"), true);
+    assert.equal(execInvocations[1]?.args.includes("workspace-write"), true);
+
+    assert.equal(result.backend_status, "COMPLETED");
+    assert.equal(result.structured_output?.protocol, "codex-cli-actor-turn-result-v1");
+    assert.equal(result.model_declared_outcome?.declared_status, "DONE");
+    assert.deepEqual(result.execution_observation?.actual.provider, { availability: "UNKNOWN" });
+    assert.deepEqual(result.execution_observation?.actual.model, { availability: "UNKNOWN" });
+    assert.equal(result.execution_observation?.usage.kind, "REPORTED");
+    if (result.execution_observation?.usage.kind === "REPORTED") {
+      assert.equal(result.execution_observation.usage.quantities["input"]?.value, 11);
+      assert.equal(result.execution_observation.usage.quantities["input"]?.unit, "token");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("same-process operation identity is idempotent and conflicting material fails", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    runner.turns.push(
+      completedTurn("thread-idempotent", { ready: true }),
+      completedTurn("thread-idempotent", {
+        declared_status: "DONE",
+        summary: "done",
+        refs: [],
+      }),
+    );
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    const session = spawnActor(adapter);
+    assert.equal(spawnActor(adapter), session);
+    const first = adapter.send_turn({ op_key: "op:turn:same" }, session, "one");
+    const second = adapter.send_turn({ op_key: "op:turn:same" }, session, "one");
+    assert.equal(second, first);
+    assert.throws(
+      () => adapter.send_turn({ op_key: "op:turn:same" }, session, "different"),
+      CodexCliRuntimeOperationConflict,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backend turn failure is terminal evidence, while unsupported control capabilities fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    runner.turns.push(
+      completedTurn("thread-failed", { ready: true }),
+      failedTurn("thread-failed", "model rejected"),
+    );
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    const session = spawnActor(adapter);
+    const turn = adapter.send_turn({ op_key: "op:actor:failed" }, session, "implement");
+    const result = adapter.get_turn_result(turn);
+    assert.equal(result.backend_status, "RUNTIME_ERROR");
+    assert.match(result.termination_reason, /model rejected/);
+    assert.equal(result.execution_observation?.failure_attribution?.reporter, "BACKEND");
+    assert.throws(() => adapter.cancel_session(session), /BACKEND_CAPABILITY_GAP/);
+    assert.throws(() => adapter.acquire_workflow_controller(), /BACKEND_CAPABILITY_GAP/);
+    adapter.close_session(session);
+    assert.equal(
+      (adapter.get_session_status(session) as unknown as { state: string }).state,
+      "CLOSED",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uninspected versions, providers and model profiles fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    assert.throws(
+      () =>
+        new CodexCliRuntimeAdapter(
+          { ...config(root), expected_cli_version: "codex-cli 9.9.9" },
+          new ScriptedRunner(),
+        ),
+      /BACKEND_CAPABILITY_GAP/,
+    );
+    const invalid = config(root) as unknown as {
+      profiles: Record<string, { provider: string; model: string; sandbox: string }>;
+    };
+    invalid.profiles["actor-agent"] = {
+      provider: "grok",
+      model: "grok-code",
+      sandbox: "workspace-write",
+    };
+    assert.throws(
+      () => new CodexCliRuntimeAdapter(invalid as unknown as CodexCliRuntimeAdapterConfig, new ScriptedRunner()),
+      /BACKEND_CAPABILITY_GAP/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manifest records the exact matrix and unsupported restart/reacquisition honestly", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const manifests = validateManifestSet(
+      codexCliPilotManifests({ backend_instance_id: "backend-test" }, config(root)),
+    );
+    const features = manifests.runtime.body.features as Record<string, unknown>;
+    assert.equal(features["active_turn_cancellation"], false);
+    assert.equal(features["spawn_op_reacquisition_after_adapter_restart"], false);
+    assert.equal(features["turn_op_reacquisition_after_adapter_restart"], false);
+    assert.equal(features["in_flight_turn_reacquisition"], false);
+    assert.equal(features["explicit_thread_resume_across_cli_processes"], true);
+    assert.equal(features["resolved_model_identity"], "UNAVAILABLE_IN_JSONL");
+    assert.equal(manifests.runtime.body.receipt_supported, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a projected thread handle can resume after a CLI process exit, but turn result reacquisition cannot", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const firstRunner = new ScriptedRunner();
+    firstRunner.turns.push(completedTurn("thread-persisted", { ready: true }));
+    const first = new CodexCliRuntimeAdapter(config(root), firstRunner);
+    const session = spawnActor(first);
+
+    const secondRunner = new ScriptedRunner();
+    secondRunner.turns.push(
+      completedTurn("thread-persisted", {
+        declared_status: "DONE",
+        summary: "resumed",
+        refs: [],
+      }),
+    );
+    const second = new CodexCliRuntimeAdapter(config(root), secondRunner);
+    const turn = second.send_turn({ op_key: "op:after:adapter:restart" }, session, "continue");
+    assert.equal(second.get_turn_result(turn).backend_status, "COMPLETED");
+    const third = new CodexCliRuntimeAdapter(config(root), new ScriptedRunner());
+    assert.throws(() => third.get_turn_result(turn), /result reacquisition.*unsupported/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
