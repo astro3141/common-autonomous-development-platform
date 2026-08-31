@@ -103,7 +103,9 @@ async function handle(
     // §22.5 — read-only anomaly observation. No transition, no retry, no actuation.
     const monitorMatch = /^\/v1\/runs\/([^/]+)\/monitor$/.exec(path);
     if (monitorMatch !== null) {
-      const anomalies = monitorOnce(deps, {
+      const monitored = monitorOnce(
+        { store: deps.store, runtime: deps.runtime, repository: deps.repository, verification: deps.verification },
+        {
         run_id: decodeURIComponent(monitorMatch[1] ?? ""),
         now: isoNow(),
         trigger_config: {
@@ -112,10 +114,11 @@ async function handle(
             url.searchParams.get("intent_unresolved_after_ms"),
             10 * 60_000,
           ),
-          config_ref: "ingress-defaults-v1",
+            config_ref: "ingress-defaults-v1",
+          },
         },
-      });
-      return json(response, 200, { anomalies });
+      );
+      return json(response, 200, monitored);
     }
     // §5.11 — the diagnostic packet: per-field provenance, partial-tolerant, zero authority.
     const diagnosticMatch = /^\/v1\/diagnostics\/(.+)$/.exec(path);

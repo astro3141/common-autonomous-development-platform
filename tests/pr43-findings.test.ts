@@ -19,7 +19,8 @@ import type { ManifestSetInput } from "../core/capability/manifest-set.ts";
 import { compose, type Composition } from "../deployment/compose.ts";
 import { openRun } from "../deployment/open-run.ts";
 import { AUDITOR_VERDICT_PROTOCOL } from "./support/execution-fixtures.ts";
-import { BATCH_ID, RUN_ID, TASK_KEY, withWorld } from "./support/domain-fixtures.ts";
+import { STATE_TRANSITION_KIND } from "../core/statemachine/transition-commit.ts";
+import { BATCH_ID, discover, RUN_ID, TASK_KEY, withWorld } from "./support/domain-fixtures.ts";
 import {
   auditorVerdict,
   auditorTurnResult,
@@ -29,9 +30,11 @@ import {
 import {
   actorProduced,
   coordinatorWorld,
+  mergeAnswer,
   submitSupervisorProposal,
   type CoordinatorWorld,
 } from "./support/coordinator-fixtures.ts";
+import { buildRoutingRecommendations } from "../core/operability/routing.ts";
 import { pilotWorld, ScriptedGateway } from "./support/deployment-fixtures.ts";
 import { createRequire } from "node:module";
 
@@ -255,7 +258,9 @@ test("F12: a terminal prior turn never produces EXTERNAL_COMPLETION_UNPROJECTED 
       trigger_config: { stale_after_ms: 1e12, intent_unresolved_after_ms: 1e12, config_ref: "t" },
     });
     assert.equal(
-      negatives.some((anomaly) => anomaly.anomaly_kind === "EXTERNAL_COMPLETION_UNPROJECTED"),
+      negatives.anomalies.some(
+        (anomaly) => anomaly.anomaly_kind === "EXTERNAL_COMPLETION_UNPROJECTED",
+      ),
       false,
       "negative control: the stale prior turn is history, not an anomaly",
     );
@@ -268,7 +273,9 @@ test("F12: a terminal prior turn never produces EXTERNAL_COMPLETION_UNPROJECTED 
       trigger_config: { stale_after_ms: 1e12, intent_unresolved_after_ms: 1e12, config_ref: "t" },
     });
     assert.equal(
-      positives.some((anomaly) => anomaly.anomaly_kind === "EXTERNAL_COMPLETION_UNPROJECTED"),
+      positives.anomalies.some(
+        (anomaly) => anomaly.anomaly_kind === "EXTERNAL_COMPLETION_UNPROJECTED",
+      ),
       true,
       "positive control: the current ordinal's completion is observed",
     );
@@ -913,5 +920,373 @@ test("F4: external CLOSED under an open decision goes STALE and parks the task (
         .some((row) => row.op_key.includes(`report-stale:${open[0]!.body.decision_id}`)),
       true,
     );
+  }, SINGLE);
+});
+
+// --- F10: "safe independent runnable" is a judgement, not a row count ----------------------------
+
+/** Drives the single fixture task to an open merge approval, then into §20.1 WAITING. */
+function driveToApprovalWaiting(world: Parameters<Parameters<typeof withWorld>[0]>[0]): CoordinatorWorld {
+  const w = coordinatorWorld(world);
+  assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+  submitSupervisorProposal(w, world);
+  assert.equal(w.tick(), "ACTIVATED");
+  assert.equal(w.tick(), "IMPLEMENTATION_STARTED");
+  actorProduced(w, CANDIDATE, 1);
+  assert.equal(w.tick(), "VERIFICATION_STARTED");
+  const attempt = w.store.attempts.current(TASK_KEY)!;
+  const hash = w.store.contracts.hashOf(attempt.contract_snapshot_id) as string;
+  w.verification.completeWith([
+    evidenceItem({ check_id: REQUIRED_CHECK, target_commit: CANDIDATE, task_contract_hash: hash }),
+  ]);
+  assert.equal(w.tick(), "AUDIT_STARTED");
+  const review = {
+    candidate_commit: CANDIDATE,
+    task_contract_hash: hash,
+    evidence_ids: w.store.verificationEvidence
+      .forAttempt(attempt.attempt_key)
+      .filter((row) => row.target_commit === CANDIDATE)
+      .map((row) => row.evidence_id),
+  };
+  const handle = w.store.adapterMetadata
+    .forEntity(attempt.attempt_key)
+    .find((row) => row.key.startsWith("auditor_turn-1:") && row.key.endsWith(CANDIDATE));
+  w.runtime.turnResults.set(
+    JSON.stringify(handle?.value),
+    auditorTurnResult({ body: auditorVerdict(review), protocol: AUDITOR_VERDICT_PROTOCOL }),
+  );
+  w.verification.settlement = { kind: "SETTLED" };
+  assert.equal(w.tick(), "AUDIT_COMPLETED");
+  assert.equal(w.tick(), "MERGE_APPROVAL_OPENED");
+  assert.equal(w.tick(), "BATCH_WAITING");
+  assert.equal(w.store.batches.require(BATCH_ID).status, "WAITING");
+  return w;
+}
+
+const TWO_TASKS = { batch_policy: { max_tasks: 2, max_rework: 2, concurrency: 1 } };
+
+test("F10: a DISCOVERED row with a blocked HARD dependency never resumes a WAITING batch", () => {
+  withWorld((world) => {
+    const w = driveToApprovalWaiting(world);
+
+    // A second candidate appears mid-WAITING — but its HARD dependency is externally open.
+    discover(world, "task-b");
+    w.tasks.dependencies = [
+      { task_ref: "task-b", depends_on_ref: "task-dep", kind: "HARD" },
+    ];
+    w.tasks.externalStates["task-dep"] = "READY";
+
+    // The pre-fix judgement was "a DISCOVERED row exists" — which would resume here.
+    assert.notEqual(w.tick(), "BATCH_RESUMED");
+    assert.equal(w.store.batches.require(BATCH_ID).status, "WAITING");
+
+    // Falsification (fail-closed): the dependency is CLOSED but the TaskSource cannot answer —
+    // an unanswerable authority never clears a dependency (§8.4a).
+    w.tasks.externalStates["task-dep"] = "CLOSED";
+    w.tasks.stateFailure = new Error("task source unreachable");
+    assert.notEqual(w.tick(), "BATCH_RESUMED");
+    assert.equal(w.store.batches.require(BATCH_ID).status, "WAITING");
+
+    // The authority answers and the dependency is genuinely satisfied → the batch resumes.
+    w.tasks.stateFailure = undefined;
+    assert.equal(w.tick(), "BATCH_RESUMED");
+    assert.equal(w.store.batches.require(BATCH_ID).status, "RUNNING");
+  }, TWO_TASKS);
+});
+
+// --- F13: §22.5 signal vocabulary, keyed thresholds and coverage honesty -------------------------
+
+test("F13: staleness thresholds resolve pipeline:state → state → default, with provenance", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    assert.equal(w.tick(), "IMPLEMENTATION_STARTED");
+    const pipeline = w.store.tasks.require(TASK_KEY).pipeline_id as string;
+    const later = new Date(Date.now() + 1000).toISOString();
+
+    // Most specific key wins: the pipeline:state override fires despite lax broader levels.
+    const specific = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: later,
+      trigger_config: {
+        stale_after_ms: 1e12,
+        stale_after_ms_by_state: { IMPLEMENTING: 1e12 },
+        stale_after_ms_by_pipeline_state: { [`${pipeline}:IMPLEMENTING`]: 0 },
+        intent_unresolved_after_ms: 1e12,
+        config_ref: "t",
+      },
+    });
+    const stale = specific.anomalies.find((a) => a.anomaly_kind === "DURABLE_PROGRESS_STALE");
+    assert.notEqual(stale, undefined);
+    assert.equal(stale?.threshold_ref, `t#by_pipeline_state[${pipeline}:IMPLEMENTING]`);
+
+    // The state key shields against a pre-fix flat default: default 0 alone must NOT fire here.
+    const shielded = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: later,
+      trigger_config: {
+        stale_after_ms: 0,
+        stale_after_ms_by_state: { IMPLEMENTING: 1e12 },
+        intent_unresolved_after_ms: 1e12,
+        config_ref: "t",
+      },
+    });
+    assert.equal(
+      shielded.anomalies.some((a) => a.anomaly_kind === "DURABLE_PROGRESS_STALE"),
+      false,
+      "a per-state threshold overrides the default",
+    );
+
+    // No override at all → the default fires and says so.
+    const fallback = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: later,
+      trigger_config: { stale_after_ms: 0, intent_unresolved_after_ms: 1e12, config_ref: "t" },
+    });
+    const viaDefault = fallback.anomalies.find((a) => a.anomaly_kind === "DURABLE_PROGRESS_STALE");
+    assert.equal(viaDefault?.threshold_ref, "t#default");
+  }, SINGLE, { now: () => new Date().toISOString() });
+});
+
+test("F13: an unanswerable repository degrades coverage — it never kills the packet and never claims divergence", () => {
+  withWorld((world) => {
+    const w = driveToApprovalWaiting(world);
+    const report = monitorOnce(
+      {
+        store: w.store,
+        runtime: w.runtime,
+        repository: {
+          snapshot_canonical() {
+            throw new Error("repository unavailable");
+          },
+        } as never,
+      },
+      {
+        run_id: RUN_ID,
+        now: "2026-08-31T00:00:00Z",
+        trigger_config: { stale_after_ms: 1e12, intent_unresolved_after_ms: 1e12, config_ref: "t" },
+      },
+    );
+    assert.equal(report.authority_coverage.repository, "UNAVAILABLE");
+    assert.equal(report.authority_coverage.store, "AVAILABLE");
+    assert.equal(
+      report.anomalies.some((a) => a.anomaly_kind === "TERMINAL_DIVERGENCE"),
+      false,
+      "absence of an answer is never a confident claim (§22.5)",
+    );
+  }, TWO_TASKS);
+});
+
+test("F13: a candidate already in canonical history while the Platform still awaits approval is TERMINAL_DIVERGENCE", () => {
+  withWorld((world) => {
+    const w = driveToApprovalWaiting(world);
+
+    // Negative control: canonical does not contain the candidate → no divergence.
+    w.repository.head = "0000000000000000000000000000000000000000";
+    w.repository.lineageValid = false;
+    const clean = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: "2026-08-31T00:00:00Z",
+      trigger_config: { stale_after_ms: 1e12, intent_unresolved_after_ms: 1e12, config_ref: "t" },
+    });
+    assert.equal(clean.anomalies.some((a) => a.anomaly_kind === "TERMINAL_DIVERGENCE"), false);
+
+    // The candidate reached canonical outside the Platform → observed, and only observed.
+    w.repository.head = CANDIDATE;
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    const before = w.store.decisions.count();
+    const diverged = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: "2026-08-31T00:00:00Z",
+      trigger_config: { stale_after_ms: 1e12, intent_unresolved_after_ms: 1e12, config_ref: "t" },
+    });
+    const anomaly = diverged.anomalies.find((a) => a.anomaly_kind === "TERMINAL_DIVERGENCE");
+    assert.equal(anomaly?.subject_ref, attempt.attempt_key);
+    assert.equal(diverged.authority_coverage.repository, "AVAILABLE");
+    // Observation is not authority: the attempt did not move and nothing was journalled.
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "READY_TO_MERGE");
+    assert.equal(w.store.decisions.count(), before);
+  }, TWO_TASKS);
+});
+
+test("F13: the same subject re-held for the same reason within the window is RECOVERY_OR_HOLD_REPEATED", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    assert.equal(w.tick(), "IMPLEMENTATION_STARTED");
+
+    for (const decision of ["d1", "d2", "d3"]) {
+      w.store.decisions.append({
+        kind: STATE_TRANSITION_KIND,
+        refKey: TASK_KEY,
+        payload: {
+          primary_entity_key: TASK_KEY,
+          task: { to: "HELD" },
+          reason_code: `BLOCKED_BY_DECISION:${decision}`,
+        } as never,
+      });
+    }
+
+    const report = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: new Date(Date.now() + 1000).toISOString(),
+      trigger_config: {
+        stale_after_ms: 1e12,
+        intent_unresolved_after_ms: 1e12,
+        repeat_window_ms: 86_400_000,
+        repeat_count: 3,
+        config_ref: "t",
+      },
+    });
+    const repeated = report.anomalies.find((a) => a.anomaly_kind === "RECOVERY_OR_HOLD_REPEATED");
+    assert.notEqual(repeated, undefined, "three normalised BLOCKED_BY_DECISION holds in-window");
+    assert.equal(repeated?.threshold_ref, "t#repeat[3@86400000ms]");
+    assert.equal(
+      repeated?.signal_refs.some((ref) => ref.includes("HELD(BLOCKED_BY_DECISION) ×3")),
+      true,
+      "distinct decision ids normalise to one reason — the §22.5 repetition, not three novelties",
+    );
+
+    // Falsification: below the configured count, no claim.
+    const under = monitorOnce(w, {
+      run_id: RUN_ID,
+      now: new Date(Date.now() + 1000).toISOString(),
+      trigger_config: {
+        stale_after_ms: 1e12,
+        intent_unresolved_after_ms: 1e12,
+        repeat_window_ms: 86_400_000,
+        repeat_count: 4,
+        config_ref: "t",
+      },
+    });
+    assert.equal(
+      under.anomalies.some((a) => a.anomaly_kind === "RECOVERY_OR_HOLD_REPEATED"),
+      false,
+    );
+  }, SINGLE, { now: () => new Date().toISOString() });
+});
+
+// --- F15: the execution observation's role chain is Core-stamped, never adapter-claimed ----------
+
+test("F15: schema v2 passes through and the frozen role chain overrides every adapter claim", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    assert.equal(w.tick(), "IMPLEMENTATION_STARTED");
+
+    // The adapter reports a v2 observation whose chain fields all lie (I-TD3: model/adapter
+    // output is never authoritative for identity).
+    w.repository.candidate = CANDIDATE;
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    const stored = w.store.adapterMetadata
+      .forEntity(attempt.attempt_key)
+      .find((row) => row.key.startsWith("actor_turn:"));
+    w.runtime.turnResults.set(JSON.stringify(stored?.value), {
+      session_handle: {} as never,
+      turn_handle: stored?.value as never,
+      backend_status: "COMPLETED",
+      termination_reason: "end_turn",
+      started_at: "t1",
+      completed_at: "t2",
+      provenance: { runtime_backend: "fake", identity_authority: "BACKEND", result_channel: "TURN_TEXT" },
+      schema_version: 2,
+      execution_observation: {
+        schema_version: 2,
+        subject: { kind: "UNKNOWN" },
+        role: "SUPERVISOR",
+        role_profile_id: "model-invented",
+        runtime_profile: "model-invented",
+        requested_binding_ref: "req-1",
+        actual: { provider: "p", model: "m", binding_ref: "bind-1" },
+        failure_attribution: null,
+      },
+    } as never);
+    assert.equal(w.tick(), "VERIFICATION_STARTED");
+
+    const projection = w.store.adapterMetadata
+      .forEntity(attempt.attempt_key)
+      .find((row) => row.key === "actor_turn_result:1");
+    assert.notEqual(projection, undefined, "the redacted turn is a durable measurement source (§5.12)");
+    const turn = projection?.value as {
+      schema_version: number;
+      execution_observation: {
+        subject: { attempt_key?: string };
+        role: string;
+        role_profile_id: string;
+        runtime_profile: string;
+        requested_binding_ref: string;
+        actual: { binding_ref: string };
+      };
+    };
+    assert.equal(turn.schema_version, 2, "the v2 schema version survives the projection");
+
+    // Core stamped the frozen chain (§13.2a/§13.5): durable selection + batch-bound profile.
+    const observation = turn.execution_observation;
+    assert.equal(observation.subject.attempt_key, attempt.attempt_key);
+    assert.equal(observation.role, "ACTOR");
+    const task = w.store.tasks.require(TASK_KEY);
+    assert.equal(observation.role_profile_id, task.actor_profile);
+    const compiled = w.store.batchView.compiledProfileFor(BATCH_ID);
+    assert.equal(
+      observation.runtime_profile,
+      compiled.effective.project.roles[task.actor_profile as string]?.runtime_profile,
+      "the runtime profile resolves through the frozen Compiled Profile, never the adapter claim",
+    );
+
+    // Adapter-observed facts that are genuinely the backend's to report pass through untouched.
+    assert.equal(observation.requested_binding_ref, "req-1");
+    assert.equal(observation.actual.binding_ref, "bind-1");
+  }, SINGLE);
+});
+
+// --- F16: routing recommendations are §5.14 evaluation units with required refs ------------------
+
+test("F16: a recommendation names its full §5.14 unit and per-category measurement refs", () => {
+  withWorld((world) => {
+    const w = driveToApprovalWaiting(world);
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    mergeAnswer(w, w.store.pendingDecisions.openFor(TASK_KEY)[0]!.body.decision_id, "APPROVE");
+    assert.equal(w.tick(), "MERGE_APPROVAL_APPLIED");
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "APPROVED_FOR_MANUAL_MERGE");
+    // The human merges manually; the Platform confirms the repository fact.
+    w.repository.head = CANDIDATE;
+    w.until(() => w.store.attempts.forTask(TASK_KEY).some((row) => row.state === "MERGED"));
+
+    const rows = buildRoutingRecommendations(w.store, {
+      run_id: RUN_ID,
+      generated_at: "2026-08-31T00:00:00Z",
+    });
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+
+    // The §5.14 unit axes are all present — never one global leaderboard row.
+    assert.equal(row.role, "ACTOR");
+    assert.equal(row.task_or_corpus_class, w.store.tasks.require(TASK_KEY).classification);
+    const task = w.store.tasks.require(TASK_KEY);
+    const compiled = w.store.batchView.compiledProfileFor(BATCH_ID);
+    assert.equal(
+      row.candidate_runtime_profile,
+      compiled.effective.project.roles[task.actor_profile as string]?.runtime_profile,
+    );
+    assert.equal(
+      row.assurance_context.includes(REQUIRED_CHECK),
+      true,
+      "the assurance axis is derived from the frozen verification policy, not a constant",
+    );
+    assert.notEqual(row.input_completeness, undefined);
+
+    // §5.14 required refs: every category traces to attempt-level measurement sources.
+    assert.deepEqual(row.quality_refs, [`measurement:${attempt.attempt_key}`]);
+    assert.deepEqual(row.failure_refs, [], "no failure attribution exists for a merged attempt");
+    assert.equal(row.sample_size, 1);
+    assert.deepEqual(row.completed_rate, { kind: "REPORTED", value: 1 });
+    // Honest UNKNOWN, not an estimate (finding 16's companion invariant).
+    assert.deepEqual(row.cost_refs, [], "no cost source series exists, so no cost ref is invented");
   }, SINGLE);
 });

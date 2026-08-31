@@ -31,6 +31,7 @@ import type { VerificationAdapter } from "../../adapters/interfaces/verification
 import type { ManifestSetInput } from "../capability/manifest-set.ts";
 import type { ContractSourceReader } from "../contract/types.ts";
 import { activateSelectedTask } from "../admission/activate-task.ts";
+import { evaluateHardDependencies } from "../admission/dependency-admission.ts";
 import {
   completeAutomaticMerge,
   startAutomaticMerge,
@@ -433,9 +434,7 @@ export class ProductionCoordinator {
   #settleWaiting(batch_id: string): TickStep | undefined {
     const store = this.#deps.store;
     const batch = store.batches.require(batch_id);
-    const safe =
-      !batch.admission_closed &&
-      store.tasks.inBatch(batch_id).some((task) => task.platform_state === "DISCOVERED");
+    const safe = this.#safeIndependentRunnable(batch_id);
 
     try {
       if (batch.status === "RUNNING") {
@@ -456,6 +455,48 @@ export class ProductionCoordinator {
       // The §20.1 condition does not hold in this direction. An ordinary answer, not a failure.
     }
     return undefined;
+  }
+
+  /**
+   * Spec §48 / TD §20.1 — whether any task could *safely* start next (finding 10). "Safe" is a
+   * judgement over every required authority, not the existence of a DISCOVERED row:
+   *
+   *   policy       admission open, a max_tasks slot and a concurrency slot actually free
+   *   repository   no active writable candidate holds the single writable slot
+   *   TaskSource   the candidate's fresh direct HARD dependencies are all satisfied (§8.4a)
+   *
+   * A TaskSource query failure makes that candidate unsafe (never clear-by-assumption), and a
+   * batch with no candidate passing all four authorities reports none.
+   */
+  #safeIndependentRunnable(batch_id: string): boolean {
+    const store = this.#deps.store;
+    const batch = store.batches.require(batch_id);
+    if (batch.admission_closed) return false;
+
+    const view = store.batchView.project(batch_id);
+    const policy = store.batchView.compiledProfileFor(batch_id).effective.policy.batch_policy;
+    if (view.admitted_task_count >= policy.max_tasks) return false;
+    if (view.active_task_count >= policy.concurrency) return false;
+    // Conservative: a next task's pipeline may need the writable slot, and one is already held.
+    if (view.active_writable_candidate_count >= 1) return false;
+
+    const run = store.runs.require(batch.run_id);
+    for (const task of store.tasks.inBatch(batch_id)) {
+      if (task.platform_state !== "DISCOVERED") continue;
+      try {
+        const dependencies = this.#deps.taskSource.get_dependencies(task.external_task_ref);
+        const { hard_dependencies_clear } = evaluateHardDependencies({
+          store,
+          taskSource: this.#deps.taskSource,
+          project_id: run.project_id,
+          dependencies,
+        });
+        if (hard_dependencies_clear) return true;
+      } catch {
+        // An unanswerable TaskSource never clears a dependency (§8.4a: never fail-open).
+      }
+    }
+    return false;
   }
 
   // --- supervisor --------------------------------------------------------------------------------

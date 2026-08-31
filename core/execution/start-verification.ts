@@ -154,16 +154,32 @@ export function startVerification(
   // durable measurement source when the transition that consumes it commits. Structured bodies,
   // backend-native refs and anything I-TD7 restricts are deliberately not part of the projection.
   const turn_ordinal = attempt.rework_count + 1;
+  // §13.2a / §13.5 — role, role_profile_id, subject and the resolved runtime_profile are supplied
+  // by Core from the *frozen* authority chain, never by the adapter and never inferred from
+  // provider output: the selection is durable on the task row and the chain is resolved from the
+  // batch-bound Compiled Profile. Adapter-observed fields (provider/model/binding/usage/cost/
+  // timing/attribution) pass through untouched.
+  const adapter_observation = (result as { execution_observation?: CanonicalObject })
+    .execution_observation;
+  const frozen_chain = {
+    subject: { attempt_key },
+    role: "ACTOR",
+    role_profile_id: task.actor_profile ?? "",
+    runtime_profile: resolveFrozenActorRuntimeProfile(store, attempt, task.actor_profile),
+  };
   const redacted_turn: CanonicalValue = {
     backend_status: result.backend_status,
     termination_reason: result.termination_reason,
     started_at: result.started_at,
     completed_at: result.completed_at,
-    ...((result as { execution_observation?: CanonicalObject }).execution_observation === undefined
+    schema_version: (result as { schema_version?: number }).schema_version ?? 1,
+    ...(adapter_observation === undefined
       ? {}
       : {
-          execution_observation: (result as { execution_observation?: CanonicalObject })
-            .execution_observation as CanonicalObject,
+          execution_observation: {
+            ...(adapter_observation as Record<string, unknown>),
+            ...frozen_chain,
+          } as unknown as CanonicalObject,
         }),
   } as unknown as CanonicalValue;
 
@@ -395,4 +411,24 @@ function requireStoredRun(
     throw new StoreError("DOMAIN_ROW_INVALID", `${op_key} completed without a run reference`);
   }
   return value;
+}
+
+/**
+ * §13.5 — the frozen Actor runtime-profile chain: `task.actor_profile` (validated selection) →
+ * batch-bound Compiled Profile `roles[...].runtime_profile`. Never the current registry, never a
+ * default; an unresolvable chain is honestly empty rather than guessed.
+ */
+function resolveFrozenActorRuntimeProfile(
+  store: PlatformStore,
+  attempt: TaskAttemptRow,
+  actor_profile: string | null,
+): string {
+  if (actor_profile === null) return "";
+  try {
+    const task = store.tasks.require(attempt.task_key);
+    const compiled = store.batchView.compiledProfileFor(task.batch_id);
+    return compiled.effective.project.roles[actor_profile]?.runtime_profile ?? "";
+  } catch {
+    return "";
+  }
 }

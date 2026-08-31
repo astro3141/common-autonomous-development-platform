@@ -141,6 +141,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP 4 §22.2/§22.3 — the recovery pass queries the repository as one of the authoritative
     // owners (canonical reachability under merge-pending states). Observation, never mutation.
     "core/coordinator/production-recovery.ts",
+    // MVP 4 §22.5 — TERMINAL_DIVERGENCE compares canonical lineage against the Platform's
+    // projection. A lineage read for an anomaly *observation*; the monitor mutates nothing.
+    "core/coordinator/monitor.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge
@@ -167,6 +170,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     "core/execution/human-merge.ts",
     // MVP 2 — the Repository Gate's own preconditions are lineage/cleanliness *facts* (§14.4).
     "core/execution/automatic-merge.ts",
+    // MVP 4 §22.5 — TERMINAL_DIVERGENCE reads canonical lineage as an observation. The monitor
+    // owns no transition and no mutation; it may not even recommend one.
+    "core/coordinator/monitor.ts",
   ];
   scan(
     core.filter((file) => !CANDIDATE_OBSERVERS.includes(relative(ROOT, file))),

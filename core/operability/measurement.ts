@@ -54,9 +54,10 @@ export interface MeasurementPacketV1 {
     readonly pipeline_id: string;
     readonly verification_profile: string;
   }>;
-  /** Actual provider/model identity — REPORTED only from a stored §13.2a observation. */
+  /** Actual provider/model/binding identity — REPORTED only from a stored §13.2a observation. */
   readonly actual_provider: Availability<string>;
   readonly actual_model: Availability<string>;
+  readonly actual_binding_ref: Availability<string>;
   readonly stage_durations_ms: Availability<Readonly<Record<string, number>>>;
   readonly rework_count: number;
   readonly audit_rounds: number;
@@ -102,6 +103,7 @@ export function measurementPacket(store: PlatformStore, attempt_key: string): Me
           },
     actual_provider: storedObservationField(store, attempt_key, "provider"),
     actual_model: storedObservationField(store, attempt_key, "model"),
+    actual_binding_ref: storedObservationField(store, attempt_key, "binding_ref"),
     stage_durations_ms: stageDurations(store, attempt_key),
     rework_count: attempt.rework_count,
     audit_rounds: audits.length,
@@ -122,7 +124,7 @@ export function measurementPacket(store: PlatformStore, attempt_key: string): Me
 function storedObservationField(
   store: PlatformStore,
   attempt_key: string,
-  field: "provider" | "model",
+  field: "provider" | "model" | "binding_ref",
 ): Availability<string> {
   const rows = store.adapterMetadata
     .forEntity(attempt_key)

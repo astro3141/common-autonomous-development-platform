@@ -216,11 +216,12 @@ test("B16-7: monitor_once reports staleness and unresolved INTENT — and acts o
       log: w.store.decisions.count(),
     };
 
-    const anomalies = monitorOnce(w, {
+    const { anomalies, authority_coverage } = monitorOnce(w, {
       run_id: RUN_ID,
       now: new Date(Date.now() + 1000).toISOString(),
       trigger_config: TRIGGERS,
     });
+    assert.equal(authority_coverage.store, "AVAILABLE");
 
     const kinds = anomalies.map((anomaly) => anomaly.anomaly_kind);
     assert.equal(kinds.includes("DURABLE_PROGRESS_STALE"), true, "the implementing attempt is stale at threshold 0");
@@ -245,7 +246,7 @@ test("B16-8: an unprojected external completion is observed, not projected, by t
     // The turn is terminal at the backend, but no tick has projected it yet.
     actorProduced(w, CANDIDATE, 1);
 
-    const anomalies = monitorOnce(w, {
+    const { anomalies } = monitorOnce(w, {
       run_id: RUN_ID,
       now: new Date(Date.now() + 1000).toISOString(),
       trigger_config: TRIGGERS,

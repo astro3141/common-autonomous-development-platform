@@ -154,6 +154,7 @@ export class OpenClawRuntimeAdapter implements RuntimeAdapter {
     }
 
     const base: RuntimeTurnResult = {
+      schema_version: 2,
       session_handle: { agent_id: turn.agent_id, session_id: turn.session_id } as unknown as RuntimeSessionHandle,
       turn_handle,
       backend_status: status.backend_status,
@@ -165,17 +166,35 @@ export class OpenClawRuntimeAdapter implements RuntimeAdapter {
         identity_authority: "BACKEND",
         result_channel: "TURN_TEXT",
       },
-      // §13.2a v2 — an honest observation: the measured backend reports no provider/model/usage,
-      // so every one of those is UNKNOWN rather than inferred (no alias promotion, no back-derived
-      // cost). Timing is the adapter's own observation, as RA-2a records.
+      // §13.2a v2 — an honest observation: the measured backend reports no provider/model/usage/
+      // binding, so every one of those is UNKNOWN rather than inferred (no alias promotion, no
+      // back-derived cost). Subject/role/role_profile_id are Core-supplied at persist time
+      // (§13.5); the adapter only asserts what it authoritatively knows. A failed turn carries a
+      // §24.1 attribution in the backend's own voice.
       execution_observation: {
         op_key: turn.request_id,
+        subject: { kind: "UNKNOWN" },
         role: "UNKNOWN",
+        role_profile_id: "",
         runtime_profile: turn.agent_id,
-        actual: { provider: { availability: "UNKNOWN" }, model: { availability: "UNKNOWN" } },
+        actual: {
+          provider: { availability: "UNKNOWN" },
+          model: { availability: "UNKNOWN" },
+          binding_ref: { availability: "UNKNOWN" },
+        },
         timing: { started_at: status.started_at, completed_at: status.completed_at },
         usage: { kind: "UNKNOWN" },
         cost: { kind: "UNKNOWN" },
+        failure_attribution:
+          status.backend_status === "COMPLETED"
+            ? null
+            : {
+                domain: "RUNTIME_INFRASTRUCTURE",
+                detail_code: status.backend_status,
+                source_ref: `runtime:${turn.request_id}`,
+                reporter: "BACKEND",
+                retryable: { kind: "UNKNOWN" },
+              },
       },
     };
     const collected = this.#channel.collect(sessionRefKey(ref), turn.request_id);
