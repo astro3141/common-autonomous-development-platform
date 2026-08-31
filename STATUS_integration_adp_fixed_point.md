@@ -12,16 +12,16 @@
 > Where this file disagrees with those, they win. This branch was **not merged to canonical
 > `main`**; the human decides that. Baseline: main `9ccbe61a388842d663b0c41bd7801186e6471225`.
 >
-> Last updated: 2026-08-31.
+> Last updated: 2026-09-01.
 
 ---
 
 ## 0. Verdict
 
 ```text
-tests       1127 / 1127 PASS      (baseline 1045; +82, no test deleted to pass)
+tests       1140 / 1140 PASS      (baseline 1045; +95, no test deleted to pass)
 typecheck   PASS
-schema      v7 / 17 tables        (v7 = subflow-parent: SUSPENDED + task.parent_task_key)
+schema      v8 / 17 tables        (v7 = subflow-parent; v8 = subflow-succeeded: additive SUCCEEDED)
 
 production composition root       PRESENT   (deployment/, runnable entrypoint)
 production vertical E2E           RUNNABLE  (3 E2Es over the production composition)
@@ -109,18 +109,15 @@ VERIFYING commit.
 
 ## 3. Contract gaps / interpretations (not silently decided)
 
-- **CONTRACT_AMBIGUITY — subflow parent binding (PR #43 finding 9; not decided).**
-  `TaskSelectionProposalV1` has no parent field and the TD defers START_SUBFLOW lifecycle
-  application without fixing the parent linkage. An earlier revision applied a "unique in-flight
-  admitted task" reading; the independent review correctly classified that as implementation-decided
-  contract semantics, and it has been reverted. Current behavior: a START_SUBFLOW Proposal is
-  **validated but not applied** — nothing is admitted, no parent is chosen, and the refusal is a
-  durable journal observation (`contract_ambiguity_observed`, naming Spec §47 and the proposal
-  schema). The sealed mechanisms the resolution will need — explicit-parent admission linkage
-  (`subflow_parent_task_key`: child link + ACTIVE parent suspension in one transaction) and
-  `commitParentResume` (explicit RESUME_PARENT, child-completion resume) — remain implemented and
-  are proven directly at the state machine (B15-3/B15-6). Governance must fix an explicit parent
-  reference (likely a ProposalV2 field) before START_SUBFLOW can apply.
+- **RESOLVED — subflow parent binding (PR #43 finding 9 → TD v1.5 PR #44 amendment, D22).**
+  The CONTRACT_AMBIGUITY this branch had separated is now closed *by governance*: TD §9.2f fixes
+  the explicit-parent `SubflowSelectionProposalV1` (variant E), §10.1a the Contract v2 relation
+  freeze, §18.1f the durable relation/suspension provenance, and §19.5 the atomic admission,
+  frozen-pipeline terminal-success (`SUCCEEDED`) and deterministic normal `RESUME_PARENT`. This
+  branch implements that contract exactly: a legacy parentless START_SUBFLOW is
+  `PROPOSAL_SCHEMA_INVALID` (never a deferred acceptance), cardinality inference stays forbidden,
+  and the resume predicate — not a Supervisor Proposal — owns `SUSPENDED→ACTIVE`
+  (B15-3/B15-4/B15-6, td19-5-subflow-contract).
 - **EXPLICITLY_DEFERRED — non-MERGE_GATE pipelines.** `RESUME_PARENT`/review-only pipeline steps
   remain declared-but-not-executable (M0-30 unchanged): a subflow child completes through an
   ordinary MERGE_GATE pipeline.
@@ -179,6 +176,35 @@ Evidence strengthening beyond the findings: B16-2 now corrupts a real durable ar
 tamper of `envelope_json` → circuit breaker), and ALIVE-4 proves total backend loss across a
 restart: honest waiting while no authority answers, §22.3 R-1 catch-up through the sealed judge,
 and the armed result-channel slot forcing `HELD(RECOVERY_CONFLICT)` with **zero** duplicate turns.
+
+## 5b. TD v1.5 PR #44 contract-gap amendment (D22) — implemented
+
+Canonical `main` merged PR #44 (`94b9b74`), closing three PR #43 contract gaps with
+PROSPECTIVE_REQUIREMENTs. This branch implements all three against the merged TD:
+
+- **§17.4 resolution ≠ application.** Exact category × origin × chosen-option mapping for
+  `AUDIT_DECISION` / `REATTEMPT_DECISION` / `CONTRACT_DECISION` / `RECOVERY_DECISION`, with fresh
+  owner reads and revalidation before any transition; `RESOLVED(null)` + safe-held on refusal;
+  one judged application per resolution (`op:decision:<id>:apply`, I-TD2), never background
+  retry; owner-unavailable spends nothing (§22.5 distinction). `REATTEMPT_REQUIRED:<id>` re-entry
+  runs as §9.2e RESELECTION into a fresh Contract + Attempt n+1. New §24 reasons:
+  `REATTEMPT_REQUESTED`, `REATTEMPT_REQUIRED:<id>`, `ABANDONED_BY_DECISION:<id>`.
+  (tests/td17-4-resolution-application.test.ts)
+- **§9.2f/§10.1a/§19.5.1 explicit subflow parent binding.** Variant E with the four-field parent
+  intent; 7 new reject reasons; P1–P5 in V11 with projected atomic slot exchange; commit-time
+  full revalidation inside the admission transaction; parent `SUSPENDED` rows carry
+  `SUBFLOW_CHILD:<child>` + transition ref (§18.1f); Contract v2 freezes the committed relation
+  (13-field body, schema v2) and never selects a parent. (tests/td19-5-subflow-contract.test.ts)
+- **§19.5.2/§19.5.3 completion ≠ merge.** Migration v8 adds the additive terminal `SUCCEEDED`;
+  a RESUME_PARENT-terminal pipeline's settled AUDIT_PASS commits `AUDITING→SUCCEEDED` +
+  `COMPLETED` with zero repository operations; `resumeEligibility` derives the deterministic
+  normal resume from §18.1f + Contract v2 alone (restart catch-up proven); `RESUME_PARENT`
+  Proposals are demoted to re-observation requests with a durable `resume_predicate_not_met`
+  refusal. (B15-3/B15-6)
+
+Guard fixed points were updated to the new stronger truths (v8 migration list, five Proposal
+variants, 19 reject reasons, `SUCCEEDED` vocabulary) — never deleted. All 27 F-numbered PR #43
+regressions remain passing unchanged.
 
 ## 5a. The candidate
 
