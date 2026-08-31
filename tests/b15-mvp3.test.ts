@@ -6,9 +6,10 @@
  *   - a batch runs more than one task, and the Coordinator paces Supervisor turns by durable
  *     facts (answered proposals + a free concurrency slot), never by an in-memory cursor;
  *   - §20.1 WAITING is entered and left through the guard, from real counts;
- *   - a validated START_SUBFLOW admits the child, links it to the unique in-flight parent and
- *     suspends an ACTIVE parent; the parent resumes when every child completes (Spec §47);
- *   - an ambiguous parent is refused — nothing is admitted and nothing suspended;
+ *   - START_SUBFLOW is validated-but-not-applied: the Proposal names no parent and no contract
+ *     rule derives one (CONTRACT_AMBIGUITY, durable observation); the sealed explicit-parent
+ *     linkage — suspension on admission, resume on child completion (Spec §47) — is proven
+ *     directly at the state machine;
  *   - DEFER_TASK and RESUME_PARENT are applied lifecycle decisions now.
  */
 
@@ -25,10 +26,14 @@ import type {
 } from "../adapters/interfaces/repository-adapter.ts";
 import { submitProposal } from "../core/admission/submit-proposal.ts";
 import { AUDITOR_VERDICT_PROTOCOL } from "./support/execution-fixtures.ts";
+import { commitAdmission } from "../core/statemachine/transition-commit.ts";
 import {
   BATCH_ID,
+  BINDING,
   PROJECT,
   RUN_ID,
+  SCOPE_ID,
+  SELECTION,
   discover,
   withWorld,
   type DomainWorld,
@@ -308,7 +313,7 @@ test("B15-2: §20.1 WAITING is entered on a blocking decision and left when it r
   }, { batch_policy: { max_tasks: 1, max_rework: 2, concurrency: 1 } });
 });
 
-test("B15-3: START_SUBFLOW admits the child, suspends the unique ACTIVE parent, and completion resumes it", () => {
+test("B15-3: START_SUBFLOW is validated-but-not-applied; the sealed explicit-parent linkage suspends and resumes", () => {
   withWorld((world) => {
     const repository = new ChainRepository(HEAD);
     const w = coordinatorWorld(world, { repository });
@@ -336,11 +341,28 @@ test("B15-3: START_SUBFLOW admits the child, suspends the unique ACTIVE parent, 
     assert.equal(w.tick(), "VERIFICATION_STARTED");
     assert.equal(w.store.attempts.current(A_KEY)?.state, "VERIFYING");
 
-    // The Supervisor starts a subflow for B. The unique in-flight parent is A.
+    // PR #43 finding 9 — even with a unique in-flight candidate, the Platform must not derive a
+    // parent from a Proposal that names none: that reading was implementation-decided contract
+    // semantics (CONTRACT_AMBIGUITY, Spec §47). The Proposal validates; nothing is applied.
     repository.candidate = null;
-    const admitted = submit(w, world, { ref: B_REF, decision: "START_SUBFLOW", classification: "SPLIT_NEEDED" });
-    assert.deepEqual(admitted.result, { kind: "ACCEPTED" });
-    assert.equal(admitted.admitted, true);
+    const refused = submit(w, world, { ref: B_REF, decision: "START_SUBFLOW", classification: "SPLIT_NEEDED" });
+    assert.deepEqual(refused.result, { kind: "ACCEPTED" }, "validation itself accepts");
+    assert.equal(refused.admitted, false, "but no parent rule exists to apply");
+    assert.equal(w.store.tasks.require(B_KEY).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(A_KEY).platform_state, "ACTIVE", "the parent is untouched");
+    assert.equal(w.store.decisions.countByKind("contract_ambiguity_observed"), 1);
+
+    // The sealed mechanism, driven with the explicit parent reference a governance-fixed contract
+    // (e.g. a ProposalV2 parent field) would supply: linkage and suspension in one transaction.
+    commitAdmission(w.store, {
+      task_key: B_KEY,
+      selection: SELECTION,
+      repository_scope_id: SCOPE_ID,
+      selection_binding: BINDING,
+      admitted_at: "t-admit",
+      hard_dependencies_clear: true,
+      subflow_parent_task_key: A_KEY,
+    });
     assert.equal(w.store.tasks.require(B_KEY).platform_state, "SELECTED");
     assert.equal(w.store.tasks.require(B_KEY).parent_task_key, A_KEY, "the child is linked");
     assert.equal(w.store.tasks.require(A_KEY).platform_state, "SUSPENDED", "the parent parked");
@@ -364,22 +386,26 @@ test("B15-3: START_SUBFLOW admits the child, suspends the unique ACTIVE parent, 
   });
 });
 
-test("B15-4: an ambiguous parent refuses the subflow — nothing admitted, nothing suspended", () => {
+test("B15-4: START_SUBFLOW records the CONTRACT_AMBIGUITY durably — nothing admitted, nothing suspended", () => {
   withWorld((world) => {
     const w = coordinatorWorld(world);
-    // Two in-flight admitted tasks by construction: admit A and hold it, then admit B... the
-    // simplest deterministic construction is two DISCOVERED rows and no in-flight task at all —
-    // zero candidates is just as ambiguous as two, and proves the same refusal.
     discover(world, B_REF);
     const outcome = submit(w, world, { ref: B_REF, decision: "START_SUBFLOW" });
     assert.deepEqual(outcome.result, { kind: "ACCEPTED" }, "validation itself accepts");
     assert.equal(outcome.admitted, false, "but nothing was admitted");
     assert.equal(w.store.tasks.require(B_KEY).platform_state, "DISCOVERED");
-    assert.equal(
-      w.store.decisions.countByKind("subflow_parent_unresolved"),
-      1,
-      "the refusal is a durable observation",
-    );
+    assert.equal(w.store.decisions.countByKind("contract_ambiguity_observed"), 1);
+    const entry = w.store.decisions
+      .read()
+      .find((row) => row.kind === "contract_ambiguity_observed");
+    const payload = entry?.payload as {
+      classification?: string;
+      subject?: string;
+      contract_refs?: string[];
+    };
+    assert.equal(payload.classification, "CONTRACT_AMBIGUITY");
+    assert.equal(payload.subject, "subflow_parent_binding");
+    assert.equal(payload.contract_refs?.includes("spec:§47"), true, "the observation names its contract");
   }, { ...TWO_TASK_AUTO, allow_auto_subflow: true, classification_policy: { IMPLEMENTABLE: "AUTO_SUBFLOW" } });
 });
 
@@ -419,11 +445,17 @@ test("B15-6: RESUME_PARENT is applied — an explicit, validated resume of a sus
     });
     assert.equal(w.tick(), "VERIFICATION_STARTED");
     repository.candidate = null;
-    assert.equal(
-      submit(w, world, { ref: B_REF, decision: "START_SUBFLOW", classification: "SPLIT_NEEDED" })
-        .admitted,
-      true,
-    );
+    // Finding 9 — the suspension precondition comes from the sealed explicit-parent linkage, not
+    // from a Proposal-derived parent (that derivation is a recorded CONTRACT_AMBIGUITY).
+    commitAdmission(w.store, {
+      task_key: B_KEY,
+      selection: SELECTION,
+      repository_scope_id: SCOPE_ID,
+      selection_binding: BINDING,
+      admitted_at: "t-admit",
+      hard_dependencies_clear: true,
+      subflow_parent_task_key: A_KEY,
+    });
     assert.equal(w.store.tasks.require(A_KEY).platform_state, "SUSPENDED");
 
     // The Supervisor decides the parent should resume now — child or no child.

@@ -220,31 +220,28 @@ function act(
   if (proposal.variant !== "TASK_SELECTION") return base;
   if (assembled.task_key === null) return base;
 
-  // MVP 3 — a subflow child is admitted exactly like a task, plus the parent linkage. The parent
-  // is the batch's unique in-flight admitted task; when that is not unique the Platform refuses to
-  // guess (Spec §47 names one parent) — nothing is admitted and the refusal is observable.
-  let subflow_parent: string | undefined;
+  // CONTRACT_AMBIGUITY (Spec §47; PR #43 finding 9) — a validated START_SUBFLOW names no parent:
+  // `TaskSelectionProposalV1` carries no parent reference and no contract rule determines one.
+  // Any selection rule here — including "the batch's unique in-flight admitted task" — would be
+  // implementation-decided contract semantics, which this module has no authority to invent. The
+  // Proposal is therefore validated-but-not-applied: nothing is admitted, no parent is chosen,
+  // and the refusal is a durable observation for governance to resolve. The sealed linkage and
+  // resume mechanisms (`subflow_parent_task_key` on admission, `commitParentResume`) stay proven
+  // and unreachable from here until the contract fixes an explicit parent reference.
   if (proposal.decision === "START_SUBFLOW") {
-    const candidates = authorities.store.tasks
-      .inBatch(assembled.batch.batch_id)
-      .filter(
-        (task) =>
-          task.task_key !== assembled.task_key &&
-          task.admitted_at !== null &&
-          (task.platform_state === "ACTIVE" || task.platform_state === "HELD"),
-      );
-    if (candidates.length !== 1) {
-      authorities.store.decisions.append({
-        kind: "subflow_parent_unresolved",
-        refKey: assembled.task_key,
-        payload: { candidates: candidates.map((task) => task.task_key) } as never,
-      });
-      return base;
-    }
-    subflow_parent = candidates[0]?.task_key;
-  } else if (proposal.decision !== "START_TASK") {
+    authorities.store.decisions.append({
+      kind: "contract_ambiguity_observed",
+      refKey: assembled.task_key,
+      payload: {
+        classification: "CONTRACT_AMBIGUITY",
+        subject: "subflow_parent_binding",
+        contract_refs: ["spec:§47", "platform/task-selection-proposal@v1"],
+        question: "which task is the subflow parent; the proposal vocabulary names none",
+      } as never,
+    });
     return base;
   }
+  if (proposal.decision !== "START_TASK") return base;
 
   // TD §8.4a — computed as late as possible, from this invocation's own fresh observations, and
   // recomputed on the resolved-gate path too: a human approval does not carry a dependency fact.
@@ -276,7 +273,6 @@ function act(
     },
     admitted_at: command.observed_at,
     ...(resolvedDecisionId === undefined ? {} : { resolved_decision_id: resolvedDecisionId }),
-    ...(subflow_parent === undefined ? {} : { subflow_parent_task_key: subflow_parent }),
   });
 
   return { ...base, admitted: true, transition_seq: admitted.transition.seq };

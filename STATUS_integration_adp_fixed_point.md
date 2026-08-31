@@ -108,13 +108,18 @@ VERIFYING commit.
 
 ## 3. Contract gaps / interpretations (not silently decided)
 
-- **CONTRACT_AMBIGUITY — subflow parent binding.** `TaskSelectionProposalV1` has no parent field
-  and the TD defers START_SUBFLOW lifecycle application without fixing the parent linkage. The
-  implementation uses the only deterministic reading available (Spec §47 + V11): the parent is the
-  batch's **unique** in-flight admitted task; when that is not unique, nothing is admitted and the
-  refusal is a durable observation (`subflow_parent_unresolved`). Governance may later fix an
-  explicit parent reference (likely a ProposalV2 field); the current behavior invents no authority
-  and fails closed on ambiguity.
+- **CONTRACT_AMBIGUITY — subflow parent binding (PR #43 finding 9; not decided).**
+  `TaskSelectionProposalV1` has no parent field and the TD defers START_SUBFLOW lifecycle
+  application without fixing the parent linkage. An earlier revision applied a "unique in-flight
+  admitted task" reading; the independent review correctly classified that as implementation-decided
+  contract semantics, and it has been reverted. Current behavior: a START_SUBFLOW Proposal is
+  **validated but not applied** — nothing is admitted, no parent is chosen, and the refusal is a
+  durable journal observation (`contract_ambiguity_observed`, naming Spec §47 and the proposal
+  schema). The sealed mechanisms the resolution will need — explicit-parent admission linkage
+  (`subflow_parent_task_key`: child link + ACTIVE parent suspension in one transaction) and
+  `commitParentResume` (explicit RESUME_PARENT, child-completion resume) — remain implemented and
+  are proven directly at the state machine (B15-3/B15-6). Governance must fix an explicit parent
+  reference (likely a ProposalV2 field) before START_SUBFLOW can apply.
 - **EXPLICITLY_DEFERRED — non-MERGE_GATE pipelines.** `RESUME_PARENT`/review-only pipeline steps
   remain declared-but-not-executable (M0-30 unchanged): a subflow child completes through an
   ordinary MERGE_GATE pipeline.
