@@ -27,6 +27,17 @@
 > completeness, (f) material fail-closed boundary의 bounded falsification validation만 추가한다. 전부
 > **PROSPECTIVE_REQUIREMENT**이며 Spec 변경, architecture reopening, 새 store/state machine은 없다.
 >
+> **v1.5 PR #43 contract-gap amendment (comments `5479029297` / `5479598382`, Design Evidence이지
+> authority가 아님):** 구현·운영 검토에서 측정된 세 failure를 Spec의 기존 lifecycle primitive로만 닫는다.
+> (a) `PendingDecision RESOLVED` fact와 category별 lifecycle application을 분리하고 fresh authority/state
+> revalidation 뒤에만 deterministic transition 또는 current-world Proposal re-entry를 허용한다(§17.4),
+> (b) `START_SUBFLOW` parent는 cardinality로 추론하지 않고 explicit authoritative intent에서 검증·동결하며
+> child admission과 parent suspension을 atomic하게 기록한다(§9.2f/§10.1a/§19.5), (c) completion은 frozen
+> pipeline의 terminal-success predicate이며 `MERGED → COMPLETED`는 `MERGE_GATE`의 한 concrete case로만
+> 남기고 foundation child success는 canonical merge 없이 deterministic `RESUME_PARENT` eligibility를 만든다
+> (§19.2/§19.5). 전부 **PROSPECTIVE_REQUIREMENT**다. Spec 변경, architecture reopening, 새 workflow/
+> decision state machine, 새 table, IO mechanism 이전은 없고 MVP 0/1 FORMAL seal은 불변이다.
+>
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
 > (2) §1.1에 TRANSFER_KIND 이전 규율(#1 AMENDMENT-1), (3) §5.11 Diagnostic Projection + §5.12
@@ -1783,12 +1794,13 @@ DEFER_TASK  START_SUBFLOW   RESUME_PARENT  CLOSE_BATCH
 unknown DecisionType은 V1 schema invalid다. B4 `human_gate_policy.required_decisions`가 같은 vocabulary를
 재사용한다(§7.1b).
 
-**네 structural variant.** decision별 개별 schema를 만들지도, 모든 decision에 의미 없는 field를 강제하는
-단일 flat schema를 쓰지도 않는다. 각 variant wrapper와 `expected` wrapper는 **exact field set**이며 unknown
-field는 reject다.
+**네 MVP 0/1 structural variant + 한 MVP 3 subflow variant.** decision별 개별 schema를 만들지도, 모든
+decision에 의미 없는 field를 강제하는 단일 flat schema를 쓰지도 않는다. 각 variant wrapper와 `expected`
+wrapper는 **exact field set**이며 unknown field는 reject다. 기존 네 variant의 MVP 0/1 seal은 불변이다.
+`START_SUBFLOW`를 실제 적용하는 prospective MVP 3 path만 ordinary task selection과 분리된 E를 요구한다.
 
 ```yaml
-# A. TaskSelectionProposalV1  — START_TASK | START_SUBFLOW
+# A. TaskSelectionProposalV1  — START_TASK
 proposal_id, decision, task_ref, classification,
 pipeline_id, actor_profile, verification_profile, repository_scope_id, expected, reason_refs
 expected: { task_version, task_definition_hash, base_head, compiled_profile_hash }
@@ -1804,6 +1816,15 @@ expected: { task_version, task_definition_hash, compiled_profile_hash }
 # D. BatchControlProposalV1 — CLOSE_BATCH
 proposal_id, decision, expected, reason_refs
 expected: { compiled_profile_hash }
+
+# E. SubflowSelectionProposalV1 — START_SUBFLOW (MVP 3, prospective)
+proposal_id, decision, task_ref, classification,
+pipeline_id, actor_profile, verification_profile, repository_scope_id,
+parent, expected, reason_refs
+parent: {
+  task_key, attempt_key, task_contract_hash, attempt_state
+}
+expected: { task_version, task_definition_hash, base_head, compiled_profile_hash }
 ```
 
 - **B**는 §19.3대로 동일 Attempt/snapshot/session의 rework 경로이므로 pipeline/actor_profile/
@@ -1813,6 +1834,13 @@ expected: { compiled_profile_hash }
 - **C**는 repository expected HEAD를 요구하지 않는다 — 이 셋의 repository/state legality는 §19.3
   transition guard가 소유한다.
 - **D**에 `task_ref`/classification/pipeline/profile/task hash/base_head를 fake placeholder로 넣지 않는다.
+- **E의 `parent`는 Supervisor가 관측한 explicit relationship intent다.** `task_key`는 Platform durable parent
+  identity이고, 나머지 세 field는 그 parent의 current Attempt/Contract/continuation point에 대한 stale guard다.
+  `parent = batch의 unique in-flight task`나 `parent = 유일 ACTIVE task` 같은 cardinality inference는
+  금지다. **Uniqueness is not relationship authority.** TaskSource 또는 durable Platform record가 이미 exact
+  parent relation을 authority로 가진 경우, Proposal producer가 그 relation에서 E를 deterministic하게 구성할
+  수는 있다. 이때도 normalized E는 네 parent field를 모두 가지며 `reason_refs`가 relation provenance를
+  지목한다. UI label, issue topology, subscriber visibility, 주변 task 수는 parent authority가 아니다.
 
 **공통 field 규칙.** `proposal_id`는 valid ULID. `reason_refs`는 `string[]`이며 empty 허용, 각 item
 non-empty, **입력 순서 보존, 중복 허용** — semantic set이 아니므로 sorting/dedup/normalization을 추가하지
@@ -1856,6 +1884,7 @@ TaskLookupView   { status: FOUND, task } | { status: NOT_FOUND }
 RepositoryValidationView { canonical_head }     # RepositoryAdapter fact의 projection
 BackendManifestSet                              # B5 validated
 DecisionValidationBatchView                     # §V11
+SubflowParentValidationView | null               # §9.2f; E에서만 non-null
 ```
 
 TaskSource unavailable/malformed/IO failure는 **`NOT_FOUND`로 가장하지 않는다** — 그런 operational failure
@@ -1866,26 +1895,34 @@ authoritative input이 아니다.
 V1  Proposal structural/domain validation (variant exact shape, unknown field reject)
       → POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID)
       task lookup·membership·repository·capability·batch·state legality를 V1에 섞지 않는다.
+      prospective MVP 3에서 parent 없는 legacy-shaped START_SUBFLOW는 E가 아니므로
+      POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID). validated-but-unapplied acceptance로 parent를 나중에
+      고르는 경로도 금지한다.
 
-V2  task 존재 — task-bearing variant(A/B/C)에만 적용, CLOSE_BATCH는 N/A
+V2  task 존재 — task-bearing variant(A/B/C/E)에만 적용, CLOSE_BATCH는 N/A
       TaskLookupView.status == NOT_FOUND → POLICY_REJECTED(TASK_NOT_FOUND)
+      E는 SubflowParentValidationView도 FOUND여야 한다
+      → 아니면 POLICY_REJECTED(SUBFLOW_PARENT_NOT_FOUND)
 
 V3  expected freshness (M0-25). task-bearing variant는 아래 순서로 비교한다:
       1) expected.task_version         == TaskDefinition.version          → 불일치: TASK_DRIFT
       2) expected.task_definition_hash == TaskDefinition.definition_hash  → 불일치: TASK_DRIFT
       3) expected.compiled_profile_hash == 현재 Compiled Profile hash      → 불일치: PROFILE_DRIFT
       CLOSE_BATCH는 3)만 비교한다.
+      E는 이어서 parent.task_key/attempt_key/task_contract_hash/attempt_state를
+      fresh SubflowParentValidationView와 exact 비교한다
+      → 하나라도 불일치: SUBFLOW_PARENT_STALE
       이로써 Spec §18의 "Task version 일치"를 직접 만족한다. version은 §8.1a대로 definition hash에
       포함되지 않으므로(M0-20 유지) body 동일·version 변경도 여기서 잡힌다.
 
-V4  classification — TaskSelectionProposalV1에만 적용
+V4  classification — selection variant(A/E)에만 적용
       proposal.classification ∈ effective.project.classifications
       → 아니면 POLICY_REJECTED(CLASSIFICATION_UNKNOWN)
       control Proposal에 fake classification을 요구하지 않는다.
 
 V5  decision authorization (§9.2a) — policy/disposition만 판단. current state legality는 §19.3 소유.
 
-V6  profile reference — TaskSelectionProposalV1에만 적용
+V6  profile reference — selection variant(A/E)에만 적용
       pipeline_id          ∈ effective.project.pipelines
       actor_profile        ∈ effective.project.roles
       verification_profile ∈ effective.project.verification_profiles
@@ -1894,10 +1931,12 @@ V6  profile reference — TaskSelectionProposalV1에만 적용
       네 번째 reference도 기존 reason code를 재사용한다 — 새 V-step도 새
       DecisionRejectReason도 만들지 않으며 V4/V5의 classification/disposition
       semantics는 변경되지 않는다.
+      E의 selected pipeline은 frozen definition의 terminal step이 RESUME_PARENT여야 한다
+      → 아니면 POLICY_REJECTED(SUBFLOW_PIPELINE_INVALID)
 
 V7  Human Gate (§9.2b) → HUMAN_GATE_REQUIRED (거부도, 실행 승인도 아님)
 
-V8  repository expected state — variant A/B에만 적용, C/D는 N/A
+V8  repository expected state — variant A/B/E에만 적용, C/D는 N/A
       expected.base_head == RepositoryValidationView.canonical_head
       → 불일치: POLICY_REJECTED(REPOSITORY_STATE_MISMATCH)
 
@@ -1918,6 +1957,9 @@ PROPOSAL_SCHEMA_INVALID   TASK_NOT_FOUND            TASK_DRIFT
 PROFILE_DRIFT             CLASSIFICATION_UNKNOWN    DECISION_NOT_ALLOWED
 PROFILE_REFERENCE_UNKNOWN REPOSITORY_STATE_MISMATCH CAPABILITY_DERIVATION_FAILED
 BATCH_MAX_TASKS_REACHED   CONCURRENCY_LIMIT_REACHED WRITABLE_CONCURRENCY_CONFLICT
+SUBFLOW_PARENT_NOT_FOUND  SUBFLOW_PARENT_STALE       SUBFLOW_PARENT_INELIGIBLE
+SUBFLOW_PARENT_BATCH_MISMATCH SUBFLOW_RELATION_CONFLICT SUBFLOW_CYCLE_DETECTED
+SUBFLOW_PIPELINE_INVALID
 ```
 
 V10 실패는 이 enum이 아니라 `BACKEND_INCOMPATIBLE` result kind다.
@@ -1951,6 +1993,9 @@ V5는 **Execution Policy와 effective classification disposition이 이 Proposal
 - **`PROPOSE_MERGE`는 `auto_merge=false`에서도 V5에서 거부되지 않는다.** `auto_merge`는 automatic canonical
   side effect의 authority이지 merge proposal 자체의 권한이 아니며, MVP 1 §19.4 Human Merge 경로가 살아
   있어야 한다.
+- **`RESUME_PARENT`의 V5 PASS는 resume authority가 아니다.** prospective MVP 3에서 normal resume는
+  §19.5.3 predicate가 직접 소유한다. Proposal은 exceptional re-observation/recovery request일 뿐이며,
+  predicate 또는 exact recovery/operator authorization 없이 `SUSPENDED→ACTIVE`를 만들지 못한다.
 
 ### 9.2b V7 — Human Gate (M0-26)
 
@@ -1958,7 +2003,7 @@ V5는 **Execution Policy와 effective classification disposition이 이 Proposal
 
 ```text
 Rule A  proposal.decision ∈ effective.policy.human_gate_policy.required_decisions
-Rule B  TaskSelectionProposal이고 effective classification disposition == HOLD_HUMAN
+Rule B  selection variant(A/E)이고 effective classification disposition == HOLD_HUMAN
 ```
 
 - V1–V6 실패가 있으면 그것이 먼저 반환된다 — human gate는 invalid proposal을 승인하는 escape hatch가 아니다.
@@ -1975,7 +2020,7 @@ Rule B  TaskSelectionProposal이고 effective classification disposition == HOLD
 Contract도, `TaskContractCapabilityView`도 필요 없다).
 
 ```text
-TaskSelectionProposal            → ACTOR, AUDITOR 두 role에 대해 derivation
+selection variant(A/E)           → ACTOR, AUDITOR 두 role에 대해 derivation
 PROPOSE_MERGE + auto_merge=true  → ACTOR requested/enforcement 계산
 그 외                             → N/A
 ```
@@ -2043,9 +2088,10 @@ exact 세 field이며 구체 Store query는 Batch 8/Coordinator의 projection이
   active_writable_candidate_count >= 1                 → WRITABLE_CONCURRENCY_CONFLICT
 ```
 
-**두 mode (M1-7).** 같은 `START_TASK`가 신규 admission일 수도 있고, 이미 admitted된 task의
-**explicit reselection**(§19.3, `HELD(SELECTION_STALE)` 해소)일 수도 있다. 후자는 새 admission이 아니므로
-rule 1을 다시 소비하지 않는다:
+**두 mode (M1-7 + §17.4).** 같은 `START_TASK`가 신규 admission일 수도 있고, 이미 admitted된 task의
+**explicit reselection**(§19.3 `HELD(SELECTION_STALE)` 또는 §17.4
+`HELD(REATTEMPT_REQUIRED:<decision_id>)` 해소)일 수도 있다. 후자는 새 admission이 아니므로 rule 1을 다시
+소비하지 않는다:
 
 ```text
 SelectionAdmissionKind = INITIAL_ADMISSION | RESELECTION
@@ -2056,10 +2102,10 @@ RESELECTION         rule 1 = N/A  — 이 task는 이미 admitted slot을 소비
 ```
 
 `SelectionAdmissionKind`는 **Proposal field가 아니다.** Model이 공급하지 않고, Coordinator가 durable task
-state(`platform_state == HELD` + `state_reason_code == SELECTION_STALE` + `admitted_at != null` + Attempt
-부재)에서 결정해 typed caller context로 넘긴다. generic operating-mode framework가 아니라 이 한 판정을
-위한 두 값짜리 enum이다. **새 DecisionRejectReason은 추가되지 않는다** — RESELECTION에서도 rule 2/3의
-기존 reason code를 그대로 쓴다.
+state(`platform_state == HELD` + reason이 `SELECTION_STALE` 또는 `REATTEMPT_REQUIRED:<decision_id>` +
+`admitted_at != null` + current non-terminal Attempt 부재)에서 결정해 typed caller context로 넘긴다.
+generic operating-mode framework가 아니라 이 한 판정을 위한 두 값짜리 enum이다. **새
+DecisionRejectReason은 추가되지 않는다** — RESELECTION에서도 rule 2/3의 기존 reason code를 그대로 쓴다.
 
 `batch.admission_closed`는 **새 task admission**의 차단이지 이미 admitted된 task의 안전한 진행 차단이
 아니므로, RESELECTION은 `admission_closed == true`라는 이유만으로 거부되지 않는다 — `max_tasks` 도달로
@@ -2070,10 +2116,65 @@ pipeline의 ACTOR 유무는 B4 `PipelineStep` vocabulary(§7.1a)를 그대로 �
 field를 만들지 않는다 — ACTOR가 없는 review-only pipeline은 rule 3의 writable slot을 요구하지 않는다.
 `REQUEST_REWORK`의 `max_rework` 검사는 V11이 아니라 §19.3 state guard다.
 
+**START_SUBFLOW projected admission (prospective MVP 3).** E는 parent `ACTIVE→SUSPENDED`와 child
+`DISCOVERED→SELECTED`가 한 transaction에서 일어날 것을 전제로 V11을 계산한다. 따라서 parent가 소비하던
+`active_task_count` slot 하나와 child가 소비할 slot 하나는 atomic하게 교환되며 concurrency를 둘로 부풀리지
+않는다. 그러나 parent에 이미 존재하는 writable candidate/workspace conflict는 suspension으로 사라지지 않는다.
+rule 3은 그 fact를 그대로 세며, conflict가 있으면 `WRITABLE_CONCURRENCY_CONFLICT`다. `admitted_task_count`는
+child 하나만 증가한다. 이 projected 계산과 같은 식을 §19.5 admission transaction 안에서 current rows로
+다시 평가한다.
+
 **lifecycle legality 경계.** "현재 AttemptState에서 REQUEST_REWORK 가능한가", "현재 READY_TO_MERGE인가",
 "parent가 실제 suspended인가", "batch가 close 가능한가" 같은 판단의 fail-closed authority는 §19.3/§20의
 state-machine precondition이다. V5는 policy authorization, V11은 admission/concurrency policy만 담당하며
 state machine과 중복되는 guard table을 B7에 만들지 않는다.
+
+### 9.2f START_SUBFLOW parent authority / binding (v1.5 PR #43 amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] `START_SUBFLOW`의 relationship authority는 E의 explicit parent intent와
+Platform의 fresh validation이 함께 만든다. **주변 cardinality, unique in-flight task, 유일 ACTIVE task는
+relation authority가 아니다.** parent를 Task Contract 생성 단계나 Coordinator tick에서 새로 선택·추론하지
+않는다.
+
+Caller가 owner에서 구성하는 read-model은 exact shape다:
+
+```text
+SubflowParentValidationView =
+  | { status: NOT_FOUND }
+  | { status: FOUND,
+      task_key, batch_id, platform_state,
+      current_attempt_key, current_attempt_state, current_task_contract_hash,
+      ancestor_task_keys, current_suspension_child_task_key,
+      has_open_blocker, has_recovery_conflict }
+```
+
+`ancestor_task_keys`와 `current_suspension_child_task_key`는 §18.1f의 durable `parent_task_key`와 current
+suspension transition에서만 derive한다. TaskSource unavailable, unreadable Store, corrupt relation은
+`NOT_FOUND`가 아니라 validator 호출 전 operational failure이며 side effect 0이다(§9.2 authority boundary).
+
+V2/V3/V6 통과 뒤 V11 안에서 다음을 순서대로 검증한다:
+
+```text
+P1 parent.batch_id == child.batch_id
+   → SUBFLOW_PARENT_BATCH_MISMATCH
+P2 parent.platform_state == ACTIVE
+   AND current_attempt_state in {READY, IMPLEMENTING, VERIFYING, AUDITING, REWORKING}
+   AND has_open_blocker == false
+   AND has_recovery_conflict == false
+   → SUBFLOW_PARENT_INELIGIBLE
+P3 child task_key != parent task_key
+   AND child task_key not in parent.ancestor_task_keys
+   → SUBFLOW_CYCLE_DETECTED
+P4 parent.current_suspension_child_task_key == null
+   AND child has no current parent relation
+   → SUBFLOW_RELATION_CONFLICT
+P5 §9.2e projected admission rules 1–3 pass
+```
+
+P1–P5는 validation pass가 authority를 장기간 lease한다는 뜻이 아니다. §19.5 admission transaction이
+child/parent/current Attempt/Contract/batch/cycle/conflict를 모두 다시 읽고 exact equality로 재검사한다.
+하나라도 바뀌면 child admission, parent suspension, relation write 모두 0이다. 새 relationship engine이나
+subflow scheduler table은 만들지 않는다.
 
 ---
 
@@ -2157,6 +2258,31 @@ task_contract_snapshot:            # = envelope body
 `backend_requirements`로 인해 "이 Attempt는 어떤 Backend capability 조건에서 시작되었는가"가
 immutable execution context의 일부가 된다. restart 시 현재 Manifest와의 재대조는 §22.2, 실제 적용
 확인은 §12.6 `CapabilityEnforcementReceipt`가 담당한다.
+
+### 10.1a Subflow Task Contract v2 relation freeze (v1.5 PR #43 amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] ordinary `START_TASK`는 `platform/task-contract` v1을 그대로 쓴다.
+`SubflowSelectionProposalV1`로 admitted된 child만 `schema_version = 2`를 사용한다. v2 body는 v1의 exact
+12개 field에 아래 **한 required top-level field**를 더한 exact 13-field body다:
+
+```yaml
+subflow_binding:
+  parent_task_key: ...
+  parent_attempt_key: ...
+  parent_task_contract_hash: sha256:...
+  parent_attempt_state_at_suspend: READY | IMPLEMENTING | VERIFYING | AUDITING | REWORKING
+  suspension_transition_ref: transition:<decision_log.seq>
+```
+
+이 값은 Proposal을 그대로 복사하지 않는다. §19.5의 atomic admission이 E의 parent 관측과 fresh durable
+rows의 exact equality를 확인하고 suspension을 commit한 **뒤**, child activation builder가 그 authoritative
+rows/transition에서 구성한다. 따라서 Task Contract 생성 단계는 parent를 선택하지 않고 이미 validated된
+relation만 freeze한다. `parent_attempt_state_at_suspend`는 parent Attempt가 suspension 동안 변하지 않는다는
+continuation point이고, restart 후 current Attempt와 불일치하면 normal resume는 fail-closed한다(§19.5.3).
+
+v2 child Contract의 `pipeline_id`가 가리키는 frozen pipeline은 terminal step `RESUME_PARENT`여야 한다.
+v1 ordinary Contract에 nullable parent field를 넣거나 `START_TASK`에 무의미한 placeholder를 강제하지 않는다.
+새 Contract store/table은 없으며 기존 content-addressed snapshot/blob 저장을 재사용한다.
 
 ### 10.2 Contract Source 보관 방식 — **Decision: content copy + raw sha256**
 
@@ -4274,8 +4400,61 @@ capacity 변화       → POLICY_REJECTED(BATCH_MAX_TASKS_REACHED | CONCURRENCY_
 Human Gate 생성 시 task가 `HELD(BLOCKED_BY_DECISION:<id>)`였다면 `START_TASK` 승인의 적용은
 `HELD(BLOCKED_BY_DECISION:<same id>) → SELECTED`라는 explicit admission transition이며, ordinary
 `DISCOVERED→SELECTED`와 **동일한 fresh durable admission guard**(§19.3a)를 사용한다. `CLOSE_BATCH`
-승인의 적용은 `batch.admission_closed = true`다. `START_SUBFLOW`/`RESUME_PARENT`의 lifecycle 적용은
-MVP 3 extension으로 남으며 B8은 `SUSPENDED`를 만들지 않는다(§19.1).
+승인의 적용은 `batch.admission_closed = true`다. `START_SUBFLOW` human-gate 적용은 prospective MVP 3에서
+§9.2f/§19.5의 parent guard와 atomic admission을 **동일하게** 사용한다. normal `RESUME_PARENT`는 human-gate
+또는 Supervisor discretion이 아니라 §19.5.3의 deterministic eligibility가 소유한다.
+
+### 17.4 PendingDecision resolution application contract (v1.5 PR #43 amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] **Decision resolution is not itself a lifecycle effect.** 사람/authority의
+선택을 durable `RESOLVED`로 기록하는 것과 그 선택을 Task/Attempt lifecycle에 적용하는 것은 서로 다른
+판정이다. category별 새 state machine은 만들지 않고 §19의 기존 transition command만 호출한다.
+
+**공통 protocol (순서 고정):**
+
+```text
+resolved choice candidate
+→ OPEN record/body/hash/options/category/created_from exact validation
+→ fresh owner reads + Task/Attempt/Contract/Profile/Repository state revalidation
+→ category + created_from origin + chosen_option exact mapping lookup
+→ allowed source-state guard
+→ existing deterministic transition command
+   OR current-world START_TASK Proposal re-entry marker
+→ success: RESOLVED record + state transition + applied_transition_ref, one transaction
+→ guard/application failure: RESOLVED(applied_transition_ref=null), safe-held state 유지
+```
+
+- `record_hash`, `subject`, `created_from`, `evidence_refs`가 지목한 exact Attempt/candidate/Contract/transition을
+  다시 읽는다. category 이름만 보고 "가장 최근 Attempt"를 고르지 않는다.
+- mapping에 없는 category/origin/option, owner unavailable, stale/mismatched subject, changed authority,
+  illegal source state는 적용하지 않는다. resolution text를 다른 option으로 재해석하거나 old Attempt를
+  부활시키지 않는다.
+- successful application만 `applied_transition_ref`를 갖는다. resolution terminal immutability 때문에
+  `RESOLVED(null)`을 background retry로 나중에 재적용하지 않는다. current world에서 계속하려면 아래 mapping이
+  요구하는 fresh Proposal 또는 새 PendingDecision/approved operator action을 통상 경로로 만든다.
+- transition command가 실패하면 partial lifecycle write는 rollback하고 resolution fact만 `RESOLVED(null)`로
+  commit한다. 사람의 답을 `STALE`/`OPEN`으로 되돌리지 않는다. task/batch는 기존 safe-held/paused 상태를
+  보존한다.
+- 아래 table은 **현재 v1 Core-created option/origin의 exhaustive mapping**이다. 새 `created_from` grammar나
+  option을 추가하는 구현은 같은 변경에서 fresh read set, owner, allowed source, effect, Attempt reuse,
+  successor artifact, fallback을 이 절에 추가해야 한다. generic "resolve any decision" dispatcher는 금지다.
+
+| category / origin / chosen option | fresh authority/read set + allowed source | application owner / deterministic effect | old Attempt / successor | failure fallback |
+|---|---|---|---|---|
+| `AUDIT_DECISION`, `audit:<attempt>:<candidate>`, `REQUEST_REWORK` | exact audit evidence/candidate/Task Contract; task `HELD(BLOCKED_BY_DECISION:<id>)`; same Attempt `AUDITING`; remaining rework > 0; current drift/capability gates pass | Platform Coordinator → existing `AUDITING→REWORKING` + task `HELD→ACTIVE` in one transaction | same Attempt/Contract continues; no Proposal/Contract/Attempt creation | `RESOLVED(null)` + existing HELD; no rework side effect |
+| `AUDIT_DECISION`, same origin, `ABANDON` | exact audit/Attempt/Contract; same blocker; task non-terminal; source Attempt still `AUDITING` | §19 state machine → Attempt `FAILED` + Task `FAILED(ABANDONED_BY_DECISION:<id>)` | old Attempt terminates; no successor | `RESOLVED(null)` + HELD |
+| `REATTEMPT_DECISION`, `drift:<attempt>:<target>` or `merge-rejected:<attempt>:<candidate>`, `REATTEMPT_WITH_NEW_SNAPSHOT` | exact origin facts; same blocker; source Attempt is respectively `INVALIDATED` or `READY_TO_MERGE`; no newer Attempt; task non-terminal | §19 state machine: non-terminal source는 `INVALIDATED(REATTEMPT_REQUESTED)`, already INVALIDATED는 유지; Task reason을 `REATTEMPT_REQUIRED:<id>`로 바꾸는 `HELD→HELD` transition | old Attempt continuation **금지**; fresh `START_TASK` Proposal must pass V1–V11, then new Task Contract + Attempt `n+1` | `RESOLVED(null)` + existing HELD; old Attempt 불변 |
+| `REATTEMPT_DECISION`, same origins, `ABANDON` | 위 exact origin/source guard | §19 state machine → non-terminal source Attempt `FAILED`, Task `FAILED(ABANDONED_BY_DECISION:<id>)`; already INVALIDATED는 그대로 | successor 없음 | `RESOLVED(null)` + existing HELD |
+| `CONTRACT_DECISION`, `drift:<attempt>:<target>`, `ALLOW_FROZEN_SNAPSHOT_TO_COMPLETE` | exact drift origin; same blocker; source Attempt가 §17.2의 current non-terminal validity set에 있음; frozen capability floor/current boundary 재검사 통과 | §19 state machine → Task `HELD→ACTIVE`; Attempt state/Task Contract 불변 | same Attempt/Contract continues; 새 artifact 없음 | `RESOLVED(null)` + existing HELD |
+| `CONTRACT_DECISION`, same origin, `INVALIDATE_ATTEMPT` | exact drift origin; same blocker; source Attempt current non-terminal; no newer Attempt | §19 state machine → Attempt `INVALIDATED(CONTRACT_DRIFT)` + Task `HELD→HELD(REATTEMPT_REQUIRED:<id>)` | old Attempt continuation 금지; fresh `START_TASK` Proposal → new Contract/Attempt `n+1` | `RESOLVED(null)` + existing HELD |
+| `RECOVERY_DECISION`, `merge-mismatch:<attempt>:<candidate>`, `REATTEMPT_WITH_NEW_SNAPSHOT` | exact Repository/Audit/Attempt/Contract binding; same blocker; source Attempt `APPROVED_FOR_MANUAL_MERGE`; candidate still not canonical; no newer Attempt | §19 state machine → Attempt `INVALIDATED(RECOVERY_CONFLICT)` + Task `HELD→HELD(REATTEMPT_REQUIRED:<id>)` | old Attempt continuation/merge 금지; fresh `START_TASK` Proposal → new Contract/Attempt `n+1` | `RESOLVED(null)` + existing HELD/PAUSED_SAFELY 유지 |
+| `RECOVERY_DECISION`, same origin, `ABANDON` | 위 exact recovery guard | §19 state machine → source Attempt `FAILED` + Task `FAILED(ABANDONED_BY_DECISION:<id>)`; batch pause는 별도 §22 authority가 해소할 때까지 유지 | successor 없음 | `RESOLVED(null)` + existing HELD/PAUSED_SAFELY |
+
+`REATTEMPT_REQUIRED:<decision_id>`는 execution authority가 아니라 **next-owner/re-entry reason**이다. 이를
+해소하는 `START_TASK`는 §9.2e의 `RESELECTION`으로 처리하여 이미 소비한 admission slot은 다시 소비하지
+않되, TaskDefinition/Compiled Profile/canonical HEAD/dependency/capability/batch/writable facts를 전부 fresh로
+검증한다. Proposal의 선택이 그대로 새 Task Contract가 되는 것이 아니라 §19.3a equality guard와 §12.7
+finalization을 다시 통과해야 한다.
 
 ---
 
@@ -4407,7 +4586,7 @@ task_attempt
 task_contract_snapshot                                                # immutable
   snapshot_id      TEXT PK          # §10.1 body의 snapshot_id와 일치해야 한다
   hash             TEXT NOT NULL UNIQUE
-  envelope_json    TEXT NOT NULL    # platform/task-contract v1 envelope 전체
+  envelope_json    TEXT NOT NULL    # platform/task-contract v1 또는 §10.1a subflow v2 envelope 전체
   created_at       TEXT NOT NULL
 
 capability_grant                                                      # immutable
@@ -4677,6 +4856,33 @@ selection_binding_json    explicit Platform-validated selection basis (§19.3a)
 `external_snapshot`의 refresh는 `selection_binding`을 **변경하지 않는다.** 전자를 selection authority로
 재해석하면 관측 갱신이 조용히 selection basis를 덮어쓰게 된다.
 
+### 18.1f MVP 3 subflow relation / terminal-success storage (v1.5 PR #43 amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] existing task/attempt/decision-log primitives로 restart reconstruction이
+injective하므로 새 table은 만들지 않는다. MVP 3 migration은 다음 additive semantic만 갖는다:
+
+```text
+task.platform_state        + SUSPENDED
+task.parent_task_key       TEXT NULL REFERENCES task(task_key)   # child row only
+task_attempt.state         + SUCCEEDED
+task_attempt current-index terminal set
+                           + SUCCEEDED
+tables                     unchanged
+```
+
+- `parent_task_key`는 §19.5 atomic `START_SUBFLOW` admission에서만 `NULL→exact parent`로 정해진다. Task
+  Contract build, scheduler, recovery, presentation이 값을 쓰거나 교체하지 않는다. 같은 child의 다른
+  parent로 rewrite하는 것은 conflict다.
+- parent `SUSPENDED` row는 `state_reason_code = SUBFLOW_CHILD:<child_task_key>`와
+  `state_reason_log_seq = suspension transition seq`를 **반드시** 가진다. child의 `parent_task_key`, parent
+  reason/ref, child Task Contract v2(§10.1a)를 합치면 parent/child/suspension cause/continuation point를
+  restart 후 재구성할 수 있다.
+- `SUCCEEDED`는 canonical publication을 뜻하지 않는다. frozen pipeline terminal-success가
+  `RESUME_PARENT`인 Attempt의 terminal state다(§19.2/§19.5.2). `MERGED`와 alias하지 않는다.
+- physical migration version number/table rewrite 방식은 implementation history가 정한다. 기존 v1–v6과
+  MVP 0/1 schema seal을 수정하지 않고 append하며, constraint/index rewrite는 한 migration transaction에서
+  수행한다.
+
 ### 18.2 트랜잭션/이력 규칙 (M0-32)
 
 - 하나의 state transition = 하나의 SQLite 트랜잭션: 상태 컬럼 갱신 + `decision_log` append +
@@ -4767,9 +4973,12 @@ DISCOVERED  SELECTED  ACTIVE  HELD  DEFERRED  COMPLETED  FAILED
   transition/Attempt에 기록된다(§11.4). 두 개념을 이 column 하나에 겹쳐 넣지 않는다.
 - `PAUSED_SAFELY`는 TaskState가 아니라 batch/run 수준 safety state이며 task 화면에는 투영만 된다.
 - `SUSPENDED`는 **MVP 3 extension state**다: parent/child subflow 관계에서 parent task에만 도입하며
-  (`task.parent_relation`과 함께), MVP 0/1 vocabulary에는 포함하지 않는다. Batch 8은 이 state를 만들지
-  않으며 `START_SUBFLOW`/`RESUME_PARENT`의 lifecycle 적용도 MVP 3로 남는다.
-- 종결: attempt가 `MERGED` → task `COMPLETED`.
+  (§18.1f `task.parent_task_key` + suspension reason/ref), MVP 0/1 vocabulary에는 포함하지 않는다. 생성·해소
+  authority는 §19.5 하나뿐이다. parent의 current Attempt는 suspension 동안 state/Contract를 바꾸지 않는다.
+- **Task completion은 frozen pipeline terminal-success predicate로 정한다.** MVP 0/1의
+  `MERGE_GATE` concrete path는 Attempt `MERGED` → Task `COMPLETED`다. MVP 3 foundation/
+  `RESUME_PARENT` path는 Attempt `SUCCEEDED` → Task `COMPLETED`다(§19.5.2). **Completion ≠ merge.**
+  canonical merge가 없는 pipeline을 `MERGED`로 표시하지 않는다.
 - **terminal set (M0-30).** `COMPLETED` / `FAILED` / `DEFERRED`가 terminal이다. **`HELD`는 terminal이
   아니다** — 정의상 사람 결정으로 재개되는 상태다(§17.2). `SELECTED`/`ACTIVE`도 당연히 아니다.
 - **state reason (M0-29).** `HELD`와 `FAILED`는 `state_reason_code` + `state_reason_log_seq`를 **반드시**
@@ -4783,7 +4992,9 @@ DISCOVERED  SELECTED  ACTIVE  HELD  DEFERRED  COMPLETED  FAILED
   않는다. `MERGED`를 "그냥 성공"으로 재해석해 repository merge가 없는 종결에 사용하는 경로는 만들지
   않으며, 새 terminal AttemptState도 만들지 않는다. review-only가 실제 실행 요구가 되면 그때
   typed lifecycle extension으로 설계한다. (§9.2e V11의 "ACTOR 없는 pipeline은 writable slot 불요"는
-  validation 단계의 pipeline shape 규칙이므로 그대로 유효하다.)
+  validation 단계의 pipeline shape 규칙이므로 그대로 유효하다.) **이 defer는 Spec §20/§47/§68이 이미
+  요구한 foundation `RESUME_PARENT` pipeline에는 적용되지 않는다** — 그 path의 typed terminal state와
+  predicate는 §19.5가 닫는다.
 
 ### 19.2 AttemptState (v1 vocabulary)
 
@@ -4800,6 +5011,9 @@ INVALIDATED  FAILED
   `HELD(BLOCKED_BY_DECISION:<decision_id>)`로 전이한다 (M1-12 — §17.2의 단일 blocking 규칙) —
   새 Attempt 생성은 언제나 명시 사람 결정의 적용 결과다 (§17.3, silent 재시작 없음).
 - `APPROVED_FOR_MANUAL_MERGE`는 MVP 1 human-merge 경로 전용(§19.4).
+- `SUCCEEDED`는 **MVP 3 additive terminal state**이며 v1 vocabulary에는 소급 삽입하지 않는다. frozen
+  pipeline의 terminal step이 `RESUME_PARENT`일 때 §19.5.2 predicate로만 진입한다. repository merge/
+  publication fact가 아니며 `MERGED`와 상호 대체하지 않는다.
 - **단일 state column (M0-30).** durable 표현은 `task_attempt.state` **하나**다(§18.1a). 기존 overview의
   `stage`+`status` 이중 컬럼은 같은 vocabulary를 둘로 쪼개 authority를 모호하게 만들고 drift를 허용하므로
   제거한다.
@@ -4813,9 +5027,10 @@ INVALIDATED  FAILED
 
 ```text
 I1  task.state == ACTIVE          → 정확히 하나의 current non-terminal Attempt가 존재
-I2  current non-terminal Attempt  → task.state ∈ { ACTIVE, HELD }
+I1a task.state == SUSPENDED       → 정확히 하나의 current non-terminal Attempt가 존재 (MVP 3)
+I2  current non-terminal Attempt  → task.state ∈ { ACTIVE, HELD, SUSPENDED }
 I3  task.state == HELD            → non-terminal Attempt가 있을 수도, 없을 수도 있다
-I4  Attempt terminal({MERGED, INVALIDATED, FAILED}) 진입 트랜잭션에서
+I4  Attempt terminal({MERGED, SUCCEEDED, INVALIDATED, FAILED}) 진입 트랜잭션에서
     TaskState도 같은 트랜잭션에서 deterministic하게 결정된다
 ```
 
@@ -4834,6 +5049,7 @@ B8 state machine production code는 어떤 Adapter도 import/call하지 않는�
 | Transition | 정의 |
 |---|---|
 | T: DISCOVERED→SELECTED | trigger: 검증된 START_TASK Proposal(V1–V11 통과, §9.2e) / pre: **§19.3a commit-time durable guard** + `hard_dependencies_clear == true`(§8.4a M1-5) / side: 없음 / write: task row(`platform_state`, selection fields = `classification`/`pipeline_id`/`actor_profile`/`verification_profile`/`repository_scope_id`(M1-6), `selection_binding_json`(M1-7), `admitted_at`) + batch(`admission_closed`) + decision_log / fail→ DISCOVERED (거부 기록) / op: — |
+| child T: DISCOVERED→SELECTED + parent T: ACTIVE→SUSPENDED (MVP 3) | trigger: validated `SubflowSelectionProposalV1`(§9.2f) / pre: §19.5.1 full commit-time parent/child/batch/cycle/conflict guard / side: 없음 / write: child selection + `parent_task_key`, parent `SUBFLOW_CHILD:<child>` reason/ref, both state changes in one transition transaction / fail→ both rows unchanged / op: — |
 | T: HELD→SELECTED (human gate) | trigger: RESOLVED `HUMAN_GATE_APPROVAL`의 §17.3 fresh revalidation ACCEPTED / pre: `held_reason == BLOCKED_BY_DECISION:<same decision_id>` + **§19.3a 동일 guard** + **재계산된** `hard_dependencies_clear == true`(§8.4a) / side: 없음 / write: 위와 동일 + `pending_human_decision.resolution.applied_transition_ref` / fail→ HELD 유지, transition 미발생(§17.3) / op: — |
 | T: SELECTED→ACTIVE + A: (생성)→READY | trigger: Coordinator contract build / pre: **§19.3a selection binding equality 통과(M1-7 — 실패 시 아래 HELD(SELECTION_STALE) 행)** → §12.7 finalization order대로 `task.repository_scope_id`를 batch-bound Compiled Profile에서 resolve(M1-6) → grant 발급(V10 재확인) 후 Task Contract Snapshot 생성 성공(backend_requirements + grant refs 포함, §10.1) / side: snapshot·grant immutable 기록 / fail→ T: FAILED(CONTRACT_BUILD_ERROR) 또는 HELD(POLICY_BACKEND_INCOMPATIBLE) / op: `op:<attempt>:contract` — **local logical operation reference이며 idempotency row를 요구하지 않는다(§21, M0-32)** |
 | T: SELECTED→HELD(SELECTION_STALE) (M1-7) | trigger: activation 직전 fresh TaskDefinition/canonical이 `selection_binding`과 불일치 / pre: Attempt 부재 / side: 없음 / write: task row(`platform_state`, `state_reason_code=SELECTION_STALE`, `state_reason_log_seq`) + decision_log(mismatch provenance) — `selection_binding_json`·selection fields·`admitted_at`은 **그대로 유지** / fail→ — / op: — |
@@ -4847,8 +5063,10 @@ B8 state machine production code는 어떤 Adapter도 import/call하지 않는�
 | A: READY_TO_MERGE→(MVP 1 경로) | §19.4 human-merge sequence |
 | A: READY_TO_MERGE→MERGING (MVP 2) | trigger: policy auto_merge=true + §14.5 전제 충족 / pre: Gate precondition 전체(G1–G5, §14.4) / side: merge intent INTENT / fail→ T: HELD(REPOSITORY_CONFLICT) — fail-closed / op: `op:<attempt>:merge:<candidate_sha>` |
 | A: MERGING→MERGED + T: ACTIVE→COMPLETED | trigger: ff-only 성공 + HEAD 재확인(RepositoryAdapter) / write: idempotency DONE, task COMPLETED, projection update(best-effort) / fail→ (HEAD 불일치) RECOVERY_CONFLICT→PAUSED_SAFELY |
+| child A: AUDITING→SUCCEEDED + T: ACTIVE→COMPLETED (MVP 3 foundation) | trigger: §19.5.2 frozen `RESUME_PARENT` terminal-success predicate / pre: exact verification PASS + settled AUDIT_PASS + no blocker/drift/recovery conflict, all bound to child Attempt/candidate/Task Contract / side: repository mutation 없음 / write: Attempt+Task terminal states / fail→ existing rework/HELD/recovery semantics, `SUCCEEDED` 미기록 |
+| parent T: SUSPENDED→ACTIVE (MVP 3 normal resume) | trigger: §19.5.3 eligibility를 Platform Coordinator가 authoritative rows에서 derive / pre: exact successful child relation + suspension cause/ref + parent continuation binding current + no blocker/drift/recovery conflict / side: 없음 / write: parent state + transition; parent Attempt state/Contract 불변 / fail→ SUSPENDED 유지 또는 §22의 existing HELD/PAUSED path |
 | A: (drift)→INVALIDATED | trigger: §11 `INVALIDATE_AT_BOUNDARY` 또는 명시 결정 / write: attempt terminal(reason `CONTRACT_DRIFT`) + `REATTEMPT_DECISION` + T: HELD(`BLOCKED_BY_DECISION:<id>`) — M1-12 |
-| T: HELD→(재개) | trigger: PendingDecision resolution의 §17.3 fresh revalidation ACCEPTED만 / 자동 재개 없음. 성공한 transition의 로그 ref가 `resolution.applied_transition_ref`에 기록된다(§17.1e) |
+| T: HELD→(재개/재진입) | Human Gate는 §17.3, 나머지 category는 §17.4의 exact origin×option mapping과 fresh guard만 사용한다. successful transition ref만 `resolution.applied_transition_ref`에 기록한다. mapping 없는 자동 재개 없음 |
 | T: any→FAILED | 회복 불가 오류. FAILED는 §24 taxonomy code를 반드시 동반 |
 | batch/run→PAUSED_SAFELY | §52 circuit breaker 조건 (task 투영) |
 
@@ -5362,6 +5580,97 @@ auto_merge                     MVP 1 = NO
 Platform이 하는 일은 정확히 셋이다: **승인을 기록하고, repository fact를 관측하고, 그 관측으로 lifecycle을
 정산한다.**
 
+### 19.5 MVP 3 subflow suspension / completion / normal resume (v1.5 PR #43 amendment)
+
+#### 19.5.1 Atomic START_SUBFLOW admission / suspend authority
+
+[계약, PROSPECTIVE_REQUIREMENT] successful `START_SUBFLOW` admission의 authority chain은 정확히 다음이다:
+
+```text
+SubflowSelectionProposalV1
+→ V1–V11 + §9.2f explicit parent validation
+→ commit-time fresh parent/child/batch/relation revalidation
+→ one transaction:
+     child DISCOVERED→SELECTED + selection/admission facts + parent_task_key
+     parent ACTIVE→SUSPENDED + SUBFLOW_CHILD:<child> reason + transition ref
+→ child Task Contract v2 freezes committed relation
+→ child Attempt may start
+```
+
+transaction은 E의 parent `task_key/attempt_key/task_contract_hash/attempt_state`, child freshness, same
+batch/project, parent source state, no blocker/recovery conflict, no cycle/current child relation, dependency,
+post-suspension concurrency/writable projection을 current durable rows에서 다시 확인한다. 하나라도 실패하면
+child SELECTED, parent SUSPENDED, relation, admission count가 모두 0이다. parent가 HELD/SUSPENDED/terminal이거나
+merge stage에 들어간 뒤에는 normal START_SUBFLOW를 적용하지 않는다.
+
+child execution의 첫 external INTENT보다 먼저 parent suspension provenance와 child `parent_task_key`가
+durable해야 한다. Task Contract v2 builder는 이 committed relation을 freeze할 뿐 parent를 고르지 않는다.
+child contract build/activation이 이후 실패하면 이미 기록된 parent relation을 지우거나 다른 parent로
+갈아끼우지 않는다. parent는 SUSPENDED를 유지하고 §22/current PendingDecision 경로가 recovery를 결정한다.
+
+#### 19.5.2 Frozen pipeline terminal-success authority
+
+[계약, PROSPECTIVE_REQUIREMENT] **Task completion = current Attempt가 frozen pipeline의 terminal-success
+predicate를 만족함**이다. owner는
+`Task Contract.pipeline_id + compiled_profile_hash → immutable Compiled Profile pipeline definition`이며
+현재 Project Profile이나 Supervisor 설명으로 terminal을 바꾸지 않는다.
+
+지원되는 두 concrete predicate는 다음뿐이다:
+
+```text
+terminal step MERGE_GATE
+  existing §14/§19.4 repository authority establishes MERGED
+  → Attempt MERGED + Task COMPLETED
+
+terminal step RESUME_PARENT
+  current child Task Contract is schema v2 and exact subflow_binding is current
+  AND every required Verification Evidence is PASS, binding_valid,
+      accepted assurance, exact child candidate + Task Contract hash
+  AND settled audit_record is AUDIT_PASS for the same Attempt/candidate/Task Contract
+  AND no unresolved PendingDecision, blocker, missing required ref,
+      contract drift, recovery conflict, or circuit-breaker condition
+  → Attempt AUDITING→SUCCEEDED + child Task ACTIVE→COMPLETED, one transaction
+  → repository prepare/commit/merge operation = 0
+```
+
+Verification backend `COMPLETED`, Model-reported PASS, TaskSource external CLOSED, canonical merge, issue closure
+중 어느 하나도 foundation terminal-success의 대체 authority가 아니다. predicate를 완전히 계산할 수 없으면
+`SUCCEEDED`를 만들지 않고 기존 rework/HELD/§22 semantics로 간다. review-only/HUMAN_GATE 등 다른 terminal
+shape는 이 amendment가 실행 의미를 발명하지 않으며 typed extension 전까지 fail-closed한다.
+
+#### 19.5.3 RESUME_PARENT eligibility / restart catch-up
+
+[계약, PROSPECTIVE_REQUIREMENT] normal resume eligibility owner는 Supervisor/Model이 아니라 deterministic
+Platform lifecycle/Coordinator다:
+
+```text
+child Attempt == SUCCEEDED
+AND child Task == COMPLETED
+AND child Task Contract v2 subflow_binding == current durable relation
+AND parent_task_key == bound parent
+AND parent Task == SUSPENDED
+AND parent.state_reason == SUBFLOW_CHILD:<exact child>
+AND parent suspension_transition_ref == bound ref
+AND parent current Attempt/Contract/state == frozen continuation binding
+AND parent Task/Attempt non-terminal
+AND no parent drift, OPEN blocker, recovery conflict, or circuit-breaker conflict
+→ RESUME_PARENT eligible
+→ parent SUSPENDED→ACTIVE; parent Attempt/Contract/state unchanged
+```
+
+child terminal commit과 parent resume는 각각 idempotent transition이다. 같은 Coordinator tick에서 연속 적용할
+수 있으나 하나의 거대 transaction일 필요는 없다. 둘 사이 crash가 나면 restart의 §22 reconciliation/
+ordinary tick이 child `SUCCEEDED` + durable relation에서 같은 eligibility를 재계산해 정확히 한 번 catch-up한다.
+parent identity, child identity, suspension cause/ref, continuation point는 §18.1f + child Contract v2만으로
+재구성한다.
+
+authoritative child PASS 뒤에 새 discretionary Supervisor Proposal을 기다리지 않는다. 기존 DecisionType
+`RESUME_PARENT`는 exceptional manual/recovery request로만 남는다. 그 Proposal 하나는 transition authority가
+아니며 normal predicate를 다시 관측하게 할 수 있을 뿐이다. predicate를 우회해야 하는 exceptional resume는
+exact relation에 bind된 RESOLVED `RECOVERY_DECISION` 또는 §7.6 approved operator action과 §17.4 mapping이
+먼저 필요하다. child failure/abandon, relation drift, parent continuation mismatch에서는 parent를 자동 resume
+하지 않고 SUSPENDED/HELD/PAUSED_SAFELY의 existing recovery authority를 보존한다.
+
 ## 20. Batch State Machine
 
 상태: `RUNNING WAITING COMPLETED PAUSED_SAFELY FAILED`.
@@ -5842,6 +6151,11 @@ DRIFT_CHECK_UNAVAILABLE          # M1-11 — drift 존재 여부를 authoritativ
                                  #   "변경되었음을 증명했다"와 "변경 여부를 알 수 없다"는 다른 사실이므로
                                  #   같은 code로 접지 않는다 — §11.3이 이미 이 이름을 쓰고 있었고
                                  #   taxonomy에 빠져 있던 것을 채운다.
+REATTEMPT_REQUIRED:<decision_id> # §17.4 — resolved choice가 old Attempt continuation을 금지하고
+                                 #   current-world START_TASK Proposal/새 Contract/Attempt를 요구하는 HELD reason
+REATTEMPT_REQUESTED              # §17.4 — 사람의 fresh-snapshot 선택으로 old Attempt를 INVALIDATED한 인과 fact
+ABANDONED_BY_DECISION:<decision_id> # §17.4 — exact resolved ABANDON의 terminal Task reason
+SUBFLOW_CHILD:<child_task_key>   # §18.1f/§19.5 — parent SUSPENDED의 exact relation/cause
 REPOSITORY_CONFLICT → HELD (merge fail-closed)
 HUMAN_MERGE_MISMATCH             # 승인과 다른 canonical 변화 관측 → HELD/PAUSED_SAFELY (§19.4)
 RECOVERY_CONFLICT → HELD 또는 PAUSED_SAFELY
@@ -6020,13 +6334,17 @@ Coordinator 발신 요청이다.
   retry, actuation을 소유하지 않는다.
 - MVP 2: RepositoryGate 활성(전제 §14.5) — 전략 A 구현 + G1–G5; 전략 B는
   `GitHubProtectedRepositoryAdapter`+`CIValidationAdapter` 추가로 동일 Gate contract 뒤에서 교체.
-- MVP 3: AUTO_SUBFLOW(parent SUSPENDED/RESUME — task 테이블 parent_key 컬럼은 MVP 0 schema에 선반영),
+- MVP 3: §9.2f/§10.1a/§18.1f/§19.5 AUTO_SUBFLOW — explicit parent Proposal, atomic
+  child admission+parent SUSPENDED binding, frozen-pipeline `SUCCEEDED`, deterministic normal RESUME_PARENT.
+  `parent_task_key`/`SUSPENDED`/`SUCCEEDED`는 sealed MVP 0/1 schema를 고치지 않는 additive migration이다.
   dependency graph 평가, PendingDecision queue UI 없이 Slack 목록 명령, batch≤N.
 - MVP 4: §22 전체 폭 reconciliation + §22.5 read-only monitoring/liveness trigger, circuit breaker 전 조건,
   장기 무인 운용(silent 정상 progress — §21 outbox 정책은 MVP 1부터 동일). operational anomaly는
   authoritative re-observation 없이 lifecycle fact가 되지 않으며, improvement loop는 §5.13의
   Finding→projection→normal admission을 사용한다. §5.12/§13.2a의 measurement와 §5.14 evaluation은
-  이 lifecycle 위의 read-only operability contract이고 MVP 4 state machine을 늘리지 않는다.
+  이 lifecycle 위의 read-only operability contract이고 MVP 4 state machine을 늘리지 않는다. 네 non-merge
+  decision category의 safe-held endpoint는 §17.4 exact origin×option application까지 구현해야 full
+  convergence를 claim할 수 있다.
 
 ## 28. Backend v1 Mapping 요약
 
@@ -6086,6 +6404,11 @@ D21 (v1.5 Operator-evidence amendment) PR #42 comment 5477209602의 measured ope
     collapse, state/stage-aware threshold resolution, prospective early read-only monitor_once, evaluation input
     completeness, material fail-closed falsification validation. §22.5의 observation≠authority를 강화하며
     Spec 변경/architecture reopening/retroactive seal impact/new monitoring state machine 없음
+D22 (v1.5 PR #43 contract-gap amendment) resolution≠application(§17.4 exact origin×option re-entry),
+    uniqueness≠relationship authority(§9.2f explicit parent + §19.5 atomic binding), completion≠merge
+    (§19.5 frozen pipeline terminal-success + MVP3 SUCCEEDED + deterministic normal RESUME_PARENT).
+    existing Proposal/Task Contract/Attempt/decision_log/§22 primitives만 재사용하며 Spec gap, architecture
+    reopening, new table, MVP0/MVP1 retroactive seal impact 없음
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
