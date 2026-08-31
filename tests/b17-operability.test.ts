@@ -293,3 +293,56 @@ test("OP-7 (regression): after a rework, IMPLEMENTING→VERIFYING waits for the 
     assert.equal(w.tick(), "VERIFICATION_STARTED");
   }, SINGLE);
 });
+
+test("OP-8: the improvement loop projects a Finding through the outbox and re-enters only via admission", async () => {
+  const { projectFindingToOutbox } = await import("../core/operability/index.ts");
+  const { deliverOneReport } = await import("../core/coordinator/report-delivery.ts");
+  const { FakeReportAdapter } = await import("../testdoubles/fake-report-adapter.ts");
+  await withWorld(async (world) => {
+    const w = driveToAuditing(world);
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    const evidence = w.store.verificationEvidence.forAttempt(attempt.attempt_key)[0]!;
+
+    const recorded = recordFinding(w.store, {
+      finding_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0FD9",
+      subject_ref: attempt.attempt_key,
+      classification: "IMPLEMENTATION_GAP",
+      summary: "the check misses the boundary case",
+      evidence_refs: [`evidence:${evidence.evidence_id}`],
+      observation_refs: [],
+      discovered_at: "2026-08-21T12:00:00Z",
+      classifier: "AUDITOR",
+      classifier_ref: "auditor-session",
+      escaped_from: null,
+      supersedes_finding_ref: null,
+    });
+
+    // Projection is the Report Outbox, idempotent by op_key; the route is configuration.
+    const projected = projectFindingToOutbox(w.store, recorded.finding_id, "issues");
+    assert.equal(projected.enqueued, true);
+    assert.deepEqual(projectFindingToOutbox(w.store, recorded.finding_id, "issues"), {
+      op_key: projected.op_key,
+      enqueued: false,
+    });
+
+    const report = new FakeReportAdapter();
+    report.results.push({ delivered: true });
+    // Drain until the finding notification goes out (other rows may precede it).
+    for (let i = 0; i < 10; i += 1) {
+      report.results.push({ delivered: true });
+      const outcome = deliverOneReport({ store: w.store, report, now: () => "t" });
+      if (outcome.kind === "NOTHING_PENDING") break;
+    }
+    assert.equal(
+      report.calls.some((call) =>
+        JSON.stringify(call.args).includes(recorded.finding_id),
+      ),
+      true,
+      "the projection was delivered as one idempotent notification",
+    );
+
+    // The projection changed no lifecycle state: re-execution needs the ordinary admission path.
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "AUDITING");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE");
+  }, SINGLE);
+});

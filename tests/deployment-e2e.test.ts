@@ -389,3 +389,158 @@ test("ALIVE-2: with a compliant backend and auto_merge policy, the Gate performs
     world.dispose();
   }
 });
+
+test("ALIVE-3: a platform restart mid-implementation resumes from durable state and completes", async () => {
+  const { recoverRun } = await import("../core/coordinator/production-recovery.ts");
+  const { submitProposal } = await import("../core/admission/submit-proposal.ts");
+
+  const world = pilotWorld();
+  // The backend outlives the platform process: the same gateway and verification instances span
+  // both compositions, exactly as a real runtime would.
+  const gateway = new ScriptedGateway();
+  const verification = new FakeVerificationAdapter();
+  let first: Composition | undefined;
+  let second: Composition | undefined;
+
+  try {
+    first = compose(world.config, {
+      runtime_gateway: gateway,
+      verification,
+      preflight: () => ({ status: "READY" }),
+    });
+    const opened = openRun(first);
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "SUPERVISOR_REQUESTED");
+    const definition = first.deps.taskSource.get_task(PILOT_TASK_REF);
+    const head = first.deps.repository.snapshot_canonical().head;
+    const submitted = submitProposal(
+      {
+        store: first.store,
+        taskSource: first.deps.taskSource,
+        repository: first.deps.repository,
+        manifests: first.deps.manifests,
+      },
+      {
+        run_id: opened.run_id,
+        batch_id: opened.batch_id,
+        observed_at: new Date().toISOString(),
+        proposal: {
+          proposal_id: ulid(),
+          decision: "START_TASK",
+          task_ref: PILOT_TASK_REF,
+          classification: PILOT_CLASSIFICATION,
+          pipeline_id: PILOT_PIPELINE,
+          actor_profile: PILOT_ACTOR_PROFILE,
+          verification_profile: PILOT_VERIFICATION_PROFILE,
+          repository_scope_id: PILOT_SCOPE,
+          expected: {
+            task_version: definition.version,
+            task_definition_hash: definition.definition_hash,
+            base_head: head,
+            compiled_profile_hash: first.compiled.compiled_hash,
+          },
+          reason_refs: [],
+        },
+      },
+    );
+    assert.deepEqual(submitted.result, { kind: "ACCEPTED" });
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "ACTIVATED");
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "IMPLEMENTATION_STARTED");
+
+    // --- crash: the platform process dies mid-implementation ---------------------------------
+    first.dispose();
+    first = undefined;
+
+    // --- restart: a new composition over the same directory -----------------------------------
+    second = compose(world.config, {
+      runtime_gateway: gateway,
+      verification,
+      preflight: () => ({ status: "READY" }),
+    });
+    const resumed = openRun(second);
+    assert.deepEqual(resumed, opened, "the same run, not a second one");
+
+    const report = recoverRun(second.deps, { run_id: opened.run_id });
+    assert.equal(report.classification, "CONSISTENT", "durable state reconciles after restart");
+
+    const { store, coordinator, deps } = second;
+    const attempt = () => store.attempts.current(TASK_KEY);
+    assert.equal(attempt()?.state, "IMPLEMENTING", "exactly where the crash left it");
+
+    // The model finishes its work in the real (still existing) worktree.
+    const workspace = store.adapterMetadata.get(
+      attempt()?.attempt_key ?? "",
+      REPOSITORY_ADAPTER,
+      WORKSPACE_METADATA_KEY,
+    )?.value as { path: string };
+    assert.equal(existsSync(workspace.path), true, "the worktree survived the restart");
+    const candidate = world.repo.commit({
+      path: "src/feature.txt",
+      content: "restart\n",
+      message: "feat: finished after the restart",
+      cwd: workspace.path,
+    });
+    const actorTurn = gateway.turns.at(-1)!;
+    gateway.complete(actorTurn.session, actorTurn.request_id);
+
+    assert.equal(coordinator.tickOnce(opened.run_id), "VERIFICATION_STARTED");
+    const contractHash = store.contracts.hashOf(attempt()?.contract_snapshot_id ?? "") as string;
+    verification.completeWith([
+      {
+        evidence_id: ulid(),
+        check_id: PILOT_CHECK,
+        result: "PASS",
+        assurance_level: "REEXECUTED",
+        target_commit: candidate,
+        task_contract_hash: contractHash,
+        executor_identity: "platform-verifier@pilot",
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+    assert.equal(coordinator.tickOnce(opened.run_id), "AUDIT_STARTED");
+
+    const auditorTurn = gateway.turns.at(-1)!;
+    const channel = new RuntimeResultChannel(world.config.result_channel_root);
+    channel.submit(
+      `${auditorTurn.session.agent_id}:${auditorTurn.session.session_id}`,
+      AUDITOR_VERDICT_PROTOCOL,
+      {
+        verdict: "AUDIT_PASS",
+        findings: [],
+        reviewed: {
+          candidate_commit: candidate,
+          task_contract_hash: contractHash,
+          evidence_ids: store.verificationEvidence
+            .forAttempt(attempt()?.attempt_key ?? "")
+            .filter((row) => row.target_commit === candidate)
+            .map((row) => row.evidence_id),
+        },
+      },
+    );
+    gateway.complete(auditorTurn.session, auditorTurn.request_id);
+    verification.settlement = { kind: "SETTLED" };
+    assert.equal(coordinator.tickOnce(opened.run_id), "AUDIT_COMPLETED");
+    assert.equal(coordinator.tickOnce(opened.run_id), "MERGE_APPROVAL_OPENED");
+
+    const decision = store.pendingDecisions.openFor(TASK_KEY)[0]!.body;
+    store.withTransaction(() => {
+      store.pendingDecisions.resolve(decision.decision_id, {
+        kind: "OPTION",
+        chosen_option: "APPROVE",
+        free_form: null,
+        resolved_by: "operator@pilot",
+        resolved_at: new Date().toISOString(),
+        approval_binding: null,
+        applied_transition_ref: null,
+      });
+    });
+    assert.equal(coordinator.tickOnce(opened.run_id), "MERGE_APPROVAL_APPLIED");
+    world.repo.git(["merge", "--ff-only", candidate]);
+    assert.equal(coordinator.tickOnce(opened.run_id), "MERGE_OBSERVED");
+    assert.equal(coordinator.tickOnce(opened.run_id), "RUN_COMPLETED");
+    assert.equal(deps.repository.snapshot_canonical().head, candidate);
+  } finally {
+    first?.dispose();
+    second?.dispose();
+    world.dispose();
+  }
+});

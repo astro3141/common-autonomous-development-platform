@@ -118,6 +118,42 @@ export function recordFinding(
   });
 }
 
+/**
+ * §5.13 — the optional external projection, through the existing Report Outbox and nothing else.
+ * `op_key` is the idempotency identity of the external create/update; the route/channel is
+ * deployment configuration, never guessed by Core. A Finding without a route stays durable with
+ * no external projection — that is a valid state, not a failure.
+ */
+export function projectFindingToOutbox(
+  store: PlatformStore,
+  finding_id: string,
+  channel: string,
+): { readonly op_key: string; readonly enqueued: boolean } {
+  const recorded = store.decisions.byKindAndRef(FINDING_RECORDED_KIND, finding_id);
+  const payload = recorded[0]?.payload as
+    | { finding_hash?: string; subject_ref?: string; classification?: string }
+    | undefined;
+  if (payload === undefined) {
+    throw new FindingError("FINDING_EVIDENCE_UNRESOLVED", `${finding_id} is not recorded`);
+  }
+  const op_key = `op:${payload.subject_ref}:report-finding:${finding_id}`;
+  if (store.outbox.get?.(op_key) !== undefined) return { op_key, enqueued: false };
+  store.withTransaction(() => {
+    store.outbox.enqueue({
+      op_key,
+      channel,
+      payload: {
+        event: "IMPROVEMENT_FINDING",
+        finding_id,
+        finding_hash: payload.finding_hash ?? "",
+        subject_ref: payload.subject_ref ?? "",
+        classification: payload.classification ?? "",
+      } as never,
+    });
+  });
+  return { op_key, enqueued: true };
+}
+
 export interface StoredFinding {
   readonly seq: number;
   readonly finding_hash: string;

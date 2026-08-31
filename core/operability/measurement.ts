@@ -187,3 +187,43 @@ function attribution(reason: string | null, attempt_key: string): FailureAttribu
   }
   return { ...base, domain: "UNKNOWN", reporter: "PLATFORM" };
 }
+
+/**
+ * §5.14 (Operator-evidence amendment) — evaluation input completeness for one sample.
+ *
+ * `PRESENT` is never claimed from mere Store existence: it requires operation-bound provenance
+ * that the role actually received (or could read) the context in that turn. The current Backend
+ * records no such delivery observation, so the honest derivation is `UNKNOWN` everywhere the
+ * proof is missing — and a sample whose completeness is UNKNOWN must not be pooled with a
+ * COMPLETE cohort.
+ */
+export interface EvaluationInputContextV1 {
+  readonly role_input_context_identity: Availability<string>;
+  readonly required_context_manifest_ref: string;
+  readonly contract_context: "PRESENT" | "ABSENT" | "UNKNOWN";
+  readonly acceptance_context: "PRESENT" | "ABSENT" | "UNKNOWN";
+  readonly authority_boundary_context: "PRESENT" | "ABSENT" | "UNKNOWN";
+  readonly input_completeness: "COMPLETE" | "PARTIAL" | "UNKNOWN";
+  readonly provenance_refs: readonly string[];
+}
+
+/** Derives the honest input-context statement for one attempt's Actor sample. */
+export function evaluationInputContext(
+  store: PlatformStore,
+  attempt_key: string,
+): EvaluationInputContextV1 {
+  const attempt = store.attempts.require(attempt_key);
+  const contract = store.contracts.get(attempt.contract_snapshot_id);
+  // The contract exists in the Store — but §5.14 forbids promoting that to PRESENT without
+  // operation-bound delivery provenance, which Backend v1 does not record. UNKNOWN it is.
+  void contract;
+  return {
+    role_input_context_identity: UNKNOWN,
+    required_context_manifest_ref: "platform/task-contract@v1",
+    contract_context: "UNKNOWN",
+    acceptance_context: "UNKNOWN",
+    authority_boundary_context: "UNKNOWN",
+    input_completeness: "UNKNOWN",
+    provenance_refs: [`attempt:${attempt_key}`],
+  };
+}

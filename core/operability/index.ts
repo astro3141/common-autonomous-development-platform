@@ -5,6 +5,7 @@ export {
   FINDING_SCHEMA,
   FindingError,
   listFindings,
+  projectFindingToOutbox,
   recordFinding,
   unsupersededFindingFor,
   type FindingClassification,
@@ -21,9 +22,11 @@ export {
   type NextOwner,
 } from "./diagnostics.ts";
 export {
+  evaluationInputContext,
   measurementPacket,
   UNKNOWN,
   type Availability,
+  type EvaluationInputContextV1,
   type FailureAttributionV1,
   type MeasurementPacketV1,
 } from "./measurement.ts";
