@@ -184,10 +184,11 @@ function workflowWorld() {
   const transport = new ScriptedTransport();
   const adapter = new BackendWorkflowAdapter({
     transport,
-    controller_binding: {
-      controller_agent_id: "platform-controller",
-      controller_session_id: "managed",
-    } as unknown as CanonicalObject,
+    controller_binding: () =>
+      ({
+        controller_agent_id: "platform-controller",
+        controller_session_id: "managed",
+      }) as unknown as CanonicalObject,
   });
   return { transport, adapter };
 }

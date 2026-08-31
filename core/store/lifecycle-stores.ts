@@ -78,6 +78,19 @@ export class RunStore {
     return this.require(runId);
   }
 
+  /** Non-COMPLETED runs of one project, oldest first. The durable run-discovery read (§53). */
+  activeForProject(projectId: string): readonly PlatformRunRow[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT run_id, project_id, compiled_profile_hash, status, created_at, updated_at
+           FROM platform_run
+          WHERE project_id = ? AND status <> 'COMPLETED'
+          ORDER BY run_id ASC`,
+      )
+      .all(projectId) as unknown as PlatformRunRow[];
+    return rows;
+  }
+
   get(runId: string): PlatformRunRow | undefined {
     const row = this.#database
       .prepare(

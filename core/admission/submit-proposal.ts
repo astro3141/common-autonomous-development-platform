@@ -75,7 +75,10 @@ export function submitProposal(
   command: SubmitProposalCommand,
 ): ProposalSubmissionResult {
   const assembled = assembleDecisionInput(authorities, command);
-  const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input);
+  const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input, {
+    run_id: command.run_id,
+    batch_id: command.batch_id,
+  });
 
   return act(authorities, command, assembled, recorded.result, recorded.entry.seq);
 }
@@ -113,7 +116,10 @@ export function resolveHumanGateAndAdmit(
   const entry = authorities.store.decisions.append({
     kind: DECISION_VALIDATION_LOG_KIND,
     refKey: authorization.normalized_gate_proposal.proposal_id,
-    payload: decisionPayload(assembled.input.proposal, result),
+    payload: decisionPayload(assembled.input.proposal, result, {
+      run_id: command.run_id,
+      batch_id: command.batch_id,
+    }),
   });
 
   return act(

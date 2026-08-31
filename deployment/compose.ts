@@ -8,9 +8,9 @@
  * backend, which replaces the backend, not the Platform.
  */
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 
 import {
   backendRuntimePreflight,
@@ -55,7 +55,7 @@ import type { CanonicalObject } from "../core/schemas/canonical-json.ts";
 import { PlatformStore } from "../core/store/platform-store.ts";
 import { ProjectDocumentTaskSource } from "../core/tasksource/index.ts";
 import type { TaskSourceV1 } from "../core/tasksource/types.ts";
-import type { DeploymentConfig } from "./config.ts";
+import { ConfigError, type DeploymentConfig } from "./config.ts";
 import { isoNow, ulid } from "./identities.ts";
 import { backendV1Manifests } from "./manifests.ts";
 
@@ -85,6 +85,21 @@ export interface Composition {
 
 /** Builds the full dependency graph. Fail-closed: any invalid piece refuses the whole composition. */
 export function compose(config: DeploymentConfig, overrides: ComposeOverrides = {}): Composition {
+  // I-TD6 (finding 17) — the result channel must be a surface no repository content can reach,
+  // judged **before** any directory is created or any store is opened.
+  assertResultChannelSeparation(config);
+
+  // TD §7.1d (finding 14) — a production unattended composition must bind its Supervisor in the
+  // frozen Profile (v2). Compiling first costs nothing durable; refusing here means a v1 profile
+  // never opens a store, never bootstraps a run and never writes an INTENT.
+  const compiled = compileProfileDocuments(config);
+  if ((compiled.body.effective.project as { supervisor_profile?: string }).supervisor_profile === undefined) {
+    throw new ConfigError(
+      "/profiles/project_profile_path",
+      "a production composition requires ProjectProfile v2 (supervisor_profile); supplementing a v1 profile with a deployment default is forbidden (TD §7.1d)",
+    );
+  }
+
   for (const dir of [
     dirname(config.store_path),
     config.report.root,
@@ -100,7 +115,6 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
     project_profile_path: config.profiles.project_profile_path,
     execution_policy_path: config.profiles.execution_policy_path,
   });
-  const compiled = compileProfileDocuments(config);
 
   const contractSources = new FileContractSourceReader(config.contract_source_root);
   const taskSource =
@@ -154,10 +168,11 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
     overrides.workflow ??
     new DurableJobsWorkflowAdapter({
       transport: workflow_transport,
-      controller_binding: {
-        controller_agent_id: config.backend.controller_agent_id,
-        controller_session_id: "managed",
-      } as unknown as CanonicalObject,
+      // Finding 2 — the binding is whatever the Runtime adapter's controller handle actually is,
+      // resolved lazily at first workflow use (post-preflight). No hard-coded stand-in exists for
+      // it: the Runtime issues the handle, the Workflow adapter checks against that same handle.
+      controller_binding: () =>
+        runtime.acquire_workflow_controller() as unknown as CanonicalObject,
     });
 
   const verification =
@@ -262,4 +277,43 @@ function pickEnv(names: readonly string[]): Record<string, string> {
     if (value !== undefined) env[name] = value;
   }
   return env;
+}
+
+/**
+ * I-TD6 (finding 17) — the RuntimeResultChannel root must not be, contain, or live inside the
+ * repository or its workspace root, judged after resolving symlinks on the nearest existing
+ * ancestor so an alias cannot smuggle the channel into repository reach. Runs before any mkdir.
+ */
+function assertResultChannelSeparation(config: DeploymentConfig): void {
+  const channel = canonicalPath(config.result_channel_root);
+  for (const [name, path] of [
+    ["repository root", config.repository.root],
+    ["workspace root", config.repository.workspace_root],
+  ] as const) {
+    const other = canonicalPath(path);
+    if (channel === other || isInside(channel, other) || isInside(other, channel)) {
+      throw new ConfigError(
+        "/result_channel_root",
+        `must be disjoint from the ${name} (${path}) — result artifacts may never share a surface with repository content (I-TD6)`,
+      );
+    }
+  }
+}
+
+/** The symlink-resolved form of a path that may not exist yet: realpath of its nearest existing ancestor. */
+function canonicalPath(path: string): string {
+  let current = resolve(path);
+  const pending: string[] = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    pending.unshift(current.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
+    current = parent;
+  }
+  const real = existsSync(current) ? realpathSync(current) : current;
+  return pending.length === 0 ? real : [real, ...pending].join(sep);
+}
+
+function isInside(candidate: string, ancestor: string): boolean {
+  return candidate.startsWith(ancestor.endsWith(sep) ? ancestor : `${ancestor}${sep}`);
 }

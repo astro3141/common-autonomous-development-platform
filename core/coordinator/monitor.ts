@@ -135,10 +135,15 @@ export function monitorOnce(
       }
 
       // --- EXTERNAL_COMPLETION_UNPROJECTED ----------------------------------------------------
+      // The *current* turn only (M1-15): after a rework, turn 1 is legitimately terminal while
+      // turn `rework_count+1` is still running — reading the first projection would manufacture
+      // a false anomaly out of an honest historical fact (finding 12 regression).
       if (attempt !== undefined && attempt.state === "IMPLEMENTING") {
-        const turn = store.adapterMetadata
-          .forEntity(attempt.attempt_key)
-          .find((row) => row.adapter_id === "runtime" && row.key.startsWith("actor_turn:"));
+        const turn = store.adapterMetadata.get(
+          attempt.attempt_key,
+          "runtime",
+          `actor_turn:${attempt.rework_count + 1}`,
+        );
         if (turn !== undefined) {
           try {
             const result = deps.runtime.get_turn_result(

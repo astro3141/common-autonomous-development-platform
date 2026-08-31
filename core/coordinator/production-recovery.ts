@@ -36,6 +36,7 @@ export interface RecoveryAction {
     | "CIRCUIT_BREAKER"
     | "CAPABILITY_HELD"
     | "CAPABILITY_PAUSED"
+    | "CAPABILITY_UNAVAILABLE"
     | "DECISION_STALE";
   readonly subject: string;
 }
@@ -100,7 +101,24 @@ function reconcileCapability(
   try {
     manifests = validateManifestSet(deps.manifests);
   } catch {
-    return; // An unreadable Manifest set blocks execution paths on its own; nothing to compare.
+    // §24 CAPABILITY_BOUNDARY_UNAVAILABLE — the capability re-verification §22.2 requires cannot
+    // run at all, which is a fail-closed condition, never "nothing to compare" (finding 5). Every
+    // batch stops, and the action is reported on every pass so the run can never reconcile to
+    // CONSISTENT (and can never be resumed) while the configured manifests are unreadable.
+    for (const batch of store.batches.forRun(run_id)) {
+      if (batch.status !== "PAUSED_SAFELY") {
+        try {
+          commitBatchFact(store, {
+            batch_id: batch.batch_id,
+            fact: { kind: "CIRCUIT_BREAKER", also_pause_run: true },
+          });
+        } catch {
+          // The pause guard refused (e.g. terminal batch); the reported action still stands.
+        }
+      }
+      actions.push({ kind: "CAPABILITY_UNAVAILABLE", subject: batch.batch_id });
+    }
+    return;
   }
   const currentRuntimeHash = manifests.runtime.hash;
 

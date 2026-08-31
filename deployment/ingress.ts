@@ -265,7 +265,10 @@ async function handle(
   if (resumeMatch !== null) {
     const run_id = decodeURIComponent(resumeMatch[1] ?? "");
     const report = recoverRun(deps, { run_id });
-    if (report.classification === "UNEXPLAINED") {
+    // Spec §52 — resumption requires the world to reconcile *completely*. A pass that had to
+    // apply anything (a hold, a pause, an unavailable capability boundary) is not a clean bill:
+    // resuming over it would re-enter exactly the state recovery just refused (finding 5).
+    if (report.classification !== "CONSISTENT") {
       return json(response, 409, { error: "the run does not reconcile", report });
     }
     const resumed: string[] = [];

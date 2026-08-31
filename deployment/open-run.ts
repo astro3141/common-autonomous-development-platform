@@ -3,11 +3,20 @@
  *
  *     compileProfile → bootstrapRun → issueSupervisorGrant → materializeDiscoveryPass
  *
- * The root calls the sealed use-cases and does none of their work itself. Re-entry is the
- * use-cases' own: an existing conforming run is re-used, a conflicting one refuses.
+ * The root calls the sealed use-cases and does none of their work itself.
+ *
+ * **Durable state is the discovery authority (finding 6).** The store's own `platform_run` rows —
+ * not a pointer file — decide whether this deployment already owns a run: a crash after the
+ * bootstrap transaction but before any bookmark write must resume the same run on restart, never
+ * open a second one, and a torn or deleted bookmark must change nothing. The pointer file is kept
+ * only as an operator breadcrumb; it is written, never read as authority.
+ *
+ * Resume completes any crashed opening idempotently: `issueSupervisorGrant` re-enters on the same
+ * logical grant and a repeated discovery pass is an observation refresh (§8.4), so the sequence is
+ * safe to run again from any crash point inside it.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 import { bootstrapRun } from "../core/admission/bootstrap.ts";
@@ -21,31 +30,39 @@ export interface OpenedRun {
   readonly batch_id: string;
 }
 
-/**
- * Opens a new run, or resumes the one this deployment already opened.
- *
- * Resume-over-restart is deliberately boring: the deployment keeps a pointer file next to the
- * store, and the pointer is *verified against durable state* before it is believed — the store is
- * the authority, the file is a bookmark. A pointer whose run is COMPLETED (or gone) simply means a
- * fresh run is opened.
- */
+/** Opens a new run, or resumes the project's single active one — from the store, fail-closed. */
 export function openRun(composition: Composition): OpenedRun {
   const { store, config, compiled, deps } = composition;
   const pointerPath = join(dirname(config.store_path), "current-run.json");
 
-  const pointed = readPointer(pointerPath);
-  if (pointed !== undefined) {
-    const run = store.runs.get(pointed.run_id);
-    const batch = store.batches.get(pointed.batch_id);
-    if (
-      run !== undefined &&
-      batch !== undefined &&
-      batch.run_id === run.run_id &&
-      run.project_id === config.project_id &&
-      run.status !== "COMPLETED"
-    ) {
-      return { run_id: run.run_id, batch_id: batch.batch_id };
-    }
+  const active = store.runs.activeForProject(config.project_id);
+  if (active.length > 1) {
+    // Structurally impossible through this path; if it is ever observed, choosing one would be
+    // authority invention. Stop and let a person look.
+    throw new Error(
+      `${config.project_id} has ${active.length} active runs; refusing to choose one`,
+    );
+  }
+
+  if (active.length === 1) {
+    const run = active[0]!;
+    const batches = store.batches.forRun(run.run_id);
+    const batch =
+      batches.find((row) => row.status === "RUNNING" || row.status === "WAITING") ??
+      batches.find((row) => row.status === "PAUSED_SAFELY") ??
+      batches[0];
+    if (batch === undefined) throw new Error(`${run.run_id} has no batch`);
+
+    // Complete a possibly-crashed opening: both re-entries are idempotent by contract.
+    issueSupervisorGrant(store, { run_id: run.run_id, grant_id: ulid(), manifests: deps.manifests });
+    materializeDiscoveryPass(store, deps.taskSource, {
+      run_id: run.run_id,
+      batch_id: batch.batch_id,
+      context: { observed_at: isoNow() },
+    });
+
+    writeFileSync(pointerPath, `${JSON.stringify({ run_id: run.run_id, batch_id: batch.batch_id })}\n`);
+    return { run_id: run.run_id, batch_id: batch.batch_id };
   }
 
   const run_id = `run:${ulid()}`;
@@ -67,17 +84,4 @@ export function openRun(composition: Composition): OpenedRun {
 
   writeFileSync(pointerPath, `${JSON.stringify({ run_id, batch_id })}\n`);
   return { run_id, batch_id };
-}
-
-function readPointer(path: string): OpenedRun | undefined {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return undefined;
-  }
-  const pointer = raw as { run_id?: unknown; batch_id?: unknown };
-  return typeof pointer.run_id === "string" && typeof pointer.batch_id === "string"
-    ? { run_id: pointer.run_id, batch_id: pointer.batch_id }
-    : undefined;
 }

@@ -290,8 +290,12 @@ function evidenceResolves(store: PlatformStore, ref: string): boolean {
     case "run":
       return store.runs.get(ref) !== undefined;
     case "transition": {
+      // The exact journal entry, and it must actually be a state transition (finding 18): an
+      // arbitrary journal kind at that seq is not transition evidence, whatever its number.
       const seq = Number(id);
-      return Number.isInteger(seq) && seq >= 1 && store.decisions.count() >= seq;
+      if (!Number.isInteger(seq) || seq < 1) return false;
+      const entry = store.decisions.read().find((row) => row.seq === seq);
+      return entry !== undefined && entry.kind === "state_transition";
     }
     default:
       return false;

@@ -476,10 +476,17 @@ export class ProductionCoordinator {
 
     // MVP 3 pacing — a next turn is requested only when the previous one has been answered (a
     // Proposal was validated, whatever its verdict) and a concurrency slot is actually free, so a
-    // turn is never spent on work V11 would refuse. Both inputs are durable: the turn operations
-    // and the `decision_validation` journal. There is still no `WAITING_FOR_PROPOSAL` state.
+    // turn is never spent on work V11 would refuse. Both inputs are durable and **batch-scoped**:
+    // the turn operations and the `decision_validation` journal entries whose submission context
+    // names this batch — a validation from another run or batch answers nothing here.
     const turns = supervisorTurnsIssued(store, batch_id);
-    const answered = store.decisions.countByKind(DECISION_VALIDATION_LOG_KIND);
+    const answered = store.decisions
+      .read()
+      .filter(
+        (entry) =>
+          entry.kind === DECISION_VALIDATION_LOG_KIND &&
+          (entry.payload as { batch_id?: string }).batch_id === batch_id,
+      ).length;
     if (turns > answered) return "SUPERVISOR_AWAITING_PROPOSAL";
     const view = store.batchView.project(batch_id);
     const policy = store.batchView.compiledProfileFor(batch_id).effective.policy.batch_policy;

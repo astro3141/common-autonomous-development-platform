@@ -29,10 +29,15 @@ import type {
 import { canonicalize } from "../../core/schemas/canonical-json.ts";
 import { sha256Digest } from "../../core/schemas/digest.ts";
 
-/** A file name that is total and injective over channel strings / op keys. */
+/**
+ * A file name that is total and **injective** over channel strings / op keys. `_` is escaped
+ * along with every unsafe character, so an escape sequence can never be forged by a literal
+ * key: `a/b` → `a_2f_b` and the literal `a_2f_b` → `a_5f_2f_5f_b` are different names
+ * (finding 7 — the previous safe-class included `_`, which collapsed the two).
+ */
 const fileNameFor = (value: string): string =>
   [...value]
-    .map((c) => (/[A-Za-z0-9._-]/.test(c) ? c : `_${c.codePointAt(0)?.toString(16)}_`))
+    .map((c) => (/[A-Za-z0-9.-]/.test(c) ? c : `_${c.codePointAt(0)?.toString(16)}_`))
     .join("");
 
 export class FileReportAdapter implements ReportAdapter {
@@ -66,11 +71,17 @@ export class FileReportAdapter implements ReportAdapter {
       return { delivered: true, backend_ref: this.#backendRef(request.op_key) };
     }
 
-    // Write the line first, fsync it, then the index — a crash between the two re-delivers the
-    // same material under the same op_key, which the line format makes an append of an identical
-    // record, never a different notification (Spec §58).
+    // Write the line first, fsync it, then the index. A crash between the two re-delivers under
+    // the same op_key — and the retry must yield **one** consumer-visible notification, so the
+    // append dedupes against the log itself by op_key before writing (finding 8): the log line,
+    // not the index, is what a consumer sees, and §21.1's "one logical notification" is judged
+    // at that surface.
     const line = `${JSON.stringify({ op_key: request.op_key, channel: request.channel, payload: request.payload })}\n`;
-    this.#appendDurably(join(this.#root, `${fileNameFor(request.channel)}.jsonl`), line);
+    this.#appendLineOnce(
+      join(this.#root, `${fileNameFor(request.channel)}.jsonl`),
+      request.op_key,
+      line,
+    );
     this.#appendDurably(indexPath, canonicalRequest);
     return { delivered: true, backend_ref: this.#backendRef(request.op_key) };
   }
@@ -86,6 +97,24 @@ export class FileReportAdapter implements ReportAdapter {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
+  }
+
+  /** Appends the line unless a line for this op_key is already durably present. */
+  #appendLineOnce(path: string, op_key: string, line: string): void {
+    try {
+      const existing = readFileSync(path, "utf8");
+      for (const row of existing.split("\n")) {
+        if (row.length === 0) continue;
+        try {
+          if ((JSON.parse(row) as { op_key?: string }).op_key === op_key) return;
+        } catch {
+          // A torn trailing line cannot claim an op_key; it never suppresses a delivery.
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    this.#appendDurably(path, line);
   }
 
   #appendDurably(path: string, text: string): void {

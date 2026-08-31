@@ -33,14 +33,25 @@ export interface RecordedDecision {
 export function validateAndRecordDecision(
   log: DecisionLogAppender,
   input: DecisionValidationInput,
+  context?: SubmissionJournalContext,
 ): RecordedDecision {
   const result = validateDecision(input);
   const entry = log.append({
     kind: DECISION_VALIDATION_LOG_KIND,
     refKey: identityOf(input.proposal).proposal_id ?? "",
-    payload: decisionPayload(input.proposal, result),
+    payload: decisionPayload(input.proposal, result, context),
   });
   return { result, entry };
+}
+
+/**
+ * The submission's routing context (TD §5.1), journaled with the outcome so downstream read
+ * models — Supervisor pacing in particular — can scope "this batch's answered proposals" without
+ * guessing from a global count. Journal metadata only; never validation input.
+ */
+export interface SubmissionJournalContext {
+  readonly run_id: string;
+  readonly batch_id: string;
 }
 
 /**
@@ -50,12 +61,14 @@ export function validateAndRecordDecision(
 export function decisionPayload(
   proposal: unknown,
   result: DecisionValidationResult,
+  context?: SubmissionJournalContext,
 ): CanonicalObject {
   const identity = identityOf(proposal);
   const payload: Record<string, unknown> = {
     proposal_id: identity.proposal_id,
     decision: identity.decision,
     result: result.kind,
+    ...(context === undefined ? {} : { run_id: context.run_id, batch_id: context.batch_id }),
   };
 
   if (result.kind === "POLICY_REJECTED") payload["reason_code"] = result.reason_code;

@@ -47,22 +47,25 @@ interface WorkflowHandleValue {
 export interface DurableJobsWorkflowAdapterDependencies {
   readonly transport: WorkflowToolTransport;
   /**
-   * The credential-free reference of the controller session this transport speaks as (I-TD7). Explicit
-   * controller arguments are checked against it; the trusted identity itself stays behind the
-   * transport.
+   * The credential-free reference of the controller session this transport speaks as (I-TD7),
+   * resolved **lazily at call time** so it can come from the Runtime adapter's own
+   * `acquire_workflow_controller()` — the one authority that actually issues the handle (TD §13.3;
+   * finding 2: a value hard-coded at composition time contradicted the handle the Runtime
+   * returns, so the two adapters could never agree in production). Explicit controller arguments
+   * are checked against this resolution; the trusted identity itself stays behind the transport.
    */
-  readonly controller_binding: CanonicalObject;
+  readonly controller_binding: () => CanonicalObject;
 }
 
 export class DurableJobsWorkflowAdapter implements WorkflowAdapter {
   readonly #transport: WorkflowToolTransport;
-  readonly #controllerBinding: string;
+  readonly #controllerBinding: () => string;
   /** Adapter-owned association: which controller each started workflow belongs to (TD §13.3). */
   readonly #associations = new Map<string, string>();
 
   constructor(dependencies: DurableJobsWorkflowAdapterDependencies) {
     this.#transport = dependencies.transport;
-    this.#controllerBinding = canonicalize(dependencies.controller_binding);
+    this.#controllerBinding = () => canonicalize(dependencies.controller_binding());
   }
 
   start(controller: WorkflowControllerHandle, workflow_spec: WorkflowSpec): WorkflowHandle {
@@ -74,7 +77,7 @@ export class DurableJobsWorkflowAdapter implements WorkflowAdapter {
     }
     const payload = this.#transport.invoke({ action: "start", requestId: request_id, spec });
     const workflow_id = readString(asObject(payload, "start result"), "workflowId");
-    this.#associations.set(workflow_id, this.#controllerBinding);
+    this.#associations.set(workflow_id, this.#controllerBinding());
     return { workflow_id } as unknown as WorkflowHandle;
   }
 
@@ -118,7 +121,7 @@ export class DurableJobsWorkflowAdapter implements WorkflowAdapter {
     this.#requireController(controller, "audit_decide");
     const workflow_id = this.#workflowId(handle);
     const association = this.#associations.get(workflow_id);
-    if (association !== undefined && association !== this.#controllerBinding) {
+    if (association !== undefined && association !== this.#controllerBinding()) {
       // Never fail-open on a mismatch (M0-8). An absent association after a restart is not a
       // mismatch — the backend's own owner-equality gate is the authority either way (RA-3).
       throw new WorkflowAdapterError(`${workflow_id} belongs to a different controller`);
@@ -152,7 +155,7 @@ export class DurableJobsWorkflowAdapter implements WorkflowAdapter {
 
   #requireController(controller: WorkflowControllerHandle, operation: string): void {
     const supplied = canonicalize(controller as unknown as CanonicalObject);
-    if (supplied !== this.#controllerBinding) {
+    if (supplied !== this.#controllerBinding()) {
       throw new WorkflowAdapterError(
         `${operation} was called with a controller this transport does not speak as`,
       );
