@@ -38,6 +38,7 @@ import {
 } from "../execution/automatic-merge.ts";
 import { completeAuditing } from "../execution/complete-auditing.ts";
 import { completeVerification } from "../execution/complete-verification.ts";
+import { applyResolvedDecisionForTask } from "../execution/apply-resolved-decision.ts";
 import {
   applyResolvedMergeApproval,
   observeHumanMerge,
@@ -111,6 +112,8 @@ export type TickStep =
   | "AUTO_MERGE_COMPLETED"
   | "MERGE_OBSERVED"
   | "PARENT_RESUMED"
+  | "DECISION_APPLIED"
+  | "DECISION_APPLICATION_REFUSED"
   | "BATCH_WAITING"
   | "BATCH_RESUMED"
   | "BATCH_COMPLETED"
@@ -184,9 +187,12 @@ export class ProductionCoordinator {
     const store = this.#deps.store;
     if (isTerminalTask(task.platform_state)) return undefined;
 
-    // A task blocked on a person stays blocked — unless the one decision MVP 1 knows how to apply
-    // has been answered. Every other category is a safe held endpoint (M1-15).
-    if (task.platform_state === "HELD") return this.#applyResolvedMerge(task);
+    // A task blocked on a person stays blocked — until a resolved decision's §17.4 exact
+    // category × origin × option mapping (or §19.4's merge approval) applies it. A refused
+    // application spends its one judgement and the task keeps its safe-held state.
+    if (task.platform_state === "HELD") {
+      return this.#applyResolvedMerge(task) ?? this.#applyResolvedDecision(task);
+    }
 
     // MVP 3 (Spec §47) — a suspended parent advances nothing itself; it resumes when every
     // subflow child COMPLETED. A child that failed or deferred leaves the parent suspended for an
@@ -346,11 +352,26 @@ export class ProductionCoordinator {
   }
 
   /**
-   * The one resolved-decision category MVP 1 applies. Everything else — `AUDIT_DECISION`,
-   * `REATTEMPT_DECISION`, `CONTRACT_DECISION`, `RECOVERY_DECISION` — is left exactly where it is:
-   * the durable record is the answer to a question MVP 1 has no contract for resuming, and
-   * guessing one would be inventing a lifecycle rule the TD does not define.
+   * §17.4 — the four non-merge categories, applied through the exact category × origin × option
+   * mapping with fresh revalidation. One judgement per resolution: a refusal leaves the record
+   * `RESOLVED(null)` and the task safe-held, and is never retried in the background.
    */
+  #applyResolvedDecision(task: TaskRow): TickStep | undefined {
+    const outcome = applyResolvedDecisionForTask(
+      { store: this.#deps.store, repository: this.#deps.repository },
+      { task_key: task.task_key },
+    );
+    switch (outcome.kind) {
+      case "APPLIED":
+        return "DECISION_APPLIED";
+      case "REFUSED":
+        return "DECISION_APPLICATION_REFUSED";
+      default:
+        return undefined;
+    }
+  }
+
+  /** §19.4 — the resolved MERGE_APPROVAL, applied through its own sealed narrow entry point. */
   #applyResolvedMerge(task: TaskRow): TickStep | undefined {
     const store = this.#deps.store;
     for (const record of store.pendingDecisions.forSubject(task.task_key)) {

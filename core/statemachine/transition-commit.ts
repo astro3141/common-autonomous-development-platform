@@ -18,7 +18,7 @@ import type { PendingDecisionV1 } from "../humandecision/types.ts";
 import { subjectKey } from "../humandecision/pending-decision.ts";
 import type { CanonicalObject } from "../schemas/canonical-json.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
-import { SELECTION_STALE } from "./types.ts";
+import { abandonedByDecision, reattemptRequired, isReattemptRequired, SELECTION_STALE } from "./types.ts";
 import {
   isTerminalTask,
   type AttemptState,
@@ -123,12 +123,15 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
     const task = store.tasks.require(command.task_key);
     const batch = store.batches.require(task.batch_id);
 
-    // §9.2e/§19.3a (M1-7) — a HELD(SELECTION_STALE) task is reselecting, not being admitted.
+    // §9.2e/§19.3a (M1-7) + §17.4 — a task held by `SELECTION_STALE` or by
+    // `REATTEMPT_REQUIRED:<decision_id>` is reselecting, not being admitted anew.
     const reselection =
-      task.platform_state === "HELD" && task.state_reason?.code === SELECTION_STALE;
+      task.platform_state === "HELD" &&
+      (task.state_reason?.code === SELECTION_STALE ||
+        isReattemptRequired(task.state_reason?.code));
     if (reselection) {
       if (task.admitted_at === null) {
-        throw illegal(`${task.task_key} is SELECTION_STALE without an admission marker`);
+        throw illegal(`${task.task_key} is reselecting without an admission marker`);
       }
       if (store.attempts.current(task.task_key) !== undefined) {
         throw illegal(`${task.task_key} still has a non-terminal attempt`);
@@ -389,6 +392,86 @@ export function commitTaskDeferral(store: PlatformStore, taskKey: string): Trans
     });
     // admitted_at is not touched: a deferral never gives back consumed admission.
     return { transition, task: store.tasks.write(taskKey, { platform_state: "DEFERRED" }) };
+  });
+}
+
+/**
+ * TD §17.4 — the `HELD→HELD` re-entry transition for a resolved `REATTEMPT_WITH_NEW_SNAPSHOT`
+ * whose source Attempt is *already terminal* (the drift path invalidated it before the question
+ * was answered). Only the task's reason changes — to `REATTEMPT_REQUIRED:<decision_id>` — so the
+ * next-owner becomes the fresh `START_TASK` re-entry (§9.2e RESELECTION). The old Attempt is not
+ * touched: terminal rows are immutable and continuation is forbidden either way.
+ */
+export function commitTaskReattemptReentry(
+  store: PlatformStore,
+  command: {
+    readonly task_key: string;
+    readonly decision_id: string;
+    readonly within?: (transition: TransitionRecord) => void;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const task = store.tasks.require(command.task_key);
+    if (task.platform_state !== "HELD") {
+      throw illegal(`a reattempt re-entry requires HELD, not ${task.platform_state}`);
+    }
+    if (store.attempts.current(command.task_key) !== undefined) {
+      throw illegal(`${command.task_key} still has a non-terminal Attempt`);
+    }
+    const reason = reattemptRequired(command.decision_id);
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "HELD", to: "HELD" },
+      reason_code: reason,
+      pending_decision_id: command.decision_id,
+    });
+    command.within?.(transition);
+    return {
+      transition,
+      task: store.tasks.write(command.task_key, {
+        platform_state: "HELD",
+        reason: { code: reason, log_seq: transition.seq },
+      }),
+    };
+  });
+}
+
+/**
+ * TD §17.4 — the terminal application of a resolved `ABANDON` whose source Attempt is *already
+ * terminal* (drift already invalidated it). The task alone fails, with the exact resolved
+ * decision as its §24 reason; the terminal Attempt row stays exactly as it is.
+ */
+export function commitTaskAbandonment(
+  store: PlatformStore,
+  command: {
+    readonly task_key: string;
+    readonly decision_id: string;
+    readonly within?: (transition: TransitionRecord) => void;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const task = store.tasks.require(command.task_key);
+    if (task.platform_state !== "HELD") {
+      throw illegal(`an abandonment application requires HELD, not ${task.platform_state}`);
+    }
+    if (store.attempts.current(command.task_key) !== undefined) {
+      throw illegal(`${command.task_key} still has a non-terminal Attempt`);
+    }
+    const reason = abandonedByDecision(command.decision_id);
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "HELD", to: "FAILED" },
+      reason_code: reason,
+      pending_decision_id: command.decision_id,
+    });
+    command.within?.(transition);
+    return {
+      transition,
+      task: store.tasks.write(command.task_key, {
+        platform_state: "FAILED",
+        reason: { code: reason, log_seq: transition.seq },
+      }),
+    };
   });
 }
 

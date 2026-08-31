@@ -26,7 +26,7 @@ import type {
   TaskBearingProposalV1,
   TaskLookupView,
 } from "../decision/types.ts";
-import { SELECTION_STALE } from "../statemachine/types.ts";
+import { isReattemptRequired, SELECTION_STALE } from "../statemachine/types.ts";
 import { taskKey as buildTaskKey } from "../schemas/identifiers.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
 import type {
@@ -181,13 +181,16 @@ export function assembleDecisionInput(
 }
 
 /**
- * §9.2e (M1-7) — a task held by `SELECTION_STALE` with an admission marker and no live attempt is
- * reselecting; anything else is an initial admission. Read off durable state, never proposed.
+ * §9.2e (M1-7) + §17.4 — a task held by `SELECTION_STALE` or `REATTEMPT_REQUIRED:<decision_id>`
+ * with an admission marker and no live attempt is reselecting; anything else is an initial
+ * admission. Read off durable state, never proposed.
  */
 function admissionKindFor(task: TaskRow | null): SelectionAdmissionKind {
   if (task === null) return "INITIAL_ADMISSION";
-  const stale = task.platform_state === "HELD" && task.state_reason?.code === SELECTION_STALE;
-  return stale && task.admitted_at !== null ? "RESELECTION" : "INITIAL_ADMISSION";
+  const reentry =
+    task.platform_state === "HELD" &&
+    (task.state_reason?.code === SELECTION_STALE || isReattemptRequired(task.state_reason?.code));
+  return reentry && task.admitted_at !== null ? "RESELECTION" : "INITIAL_ADMISSION";
 }
 
 // --- context ------------------------------------------------------------------------

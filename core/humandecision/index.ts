@@ -11,6 +11,15 @@ export {
   HUMAN_GATE_OPTIONS,
   type HumanGateRequestInput,
 } from "./gate-request.ts";
+/** TD §16.2 (M1-13) — the audit HUMAN_REQUIRED decision, its provenance and its validity. */
+export {
+  auditDecisionCause,
+  auditDecisionRemainsValid,
+  buildAuditDecision,
+  AUDIT_DECISION_OPTIONS,
+  type AuditDecisionBasis,
+  type AuditDecisionInput,
+} from "./audit-decision.ts";
 /** TD §19.4 (M1-14/B12) — the human-merge decisions, their provenance and their validity. */
 export {
   buildMergeApproval,
@@ -21,6 +30,8 @@ export {
   mergeRejectDecisionRemainsValid,
   MERGE_APPROVAL_OPTIONS,
   MERGE_FOLLOW_UP_OPTIONS,
+  MERGE_MISMATCH_PREFIX,
+  MERGE_REJECT_PREFIX,
   type MergeApprovalBasis,
   type MergeDecisionInput,
   type MergeFollowUpBasis,

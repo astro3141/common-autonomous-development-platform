@@ -144,6 +144,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP 4 §22.5 — TERMINAL_DIVERGENCE compares canonical lineage against the Platform's
     // projection. A lineage read for an anomaly *observation*; the monitor mutates nothing.
     "core/coordinator/monitor.ts",
+    // §17.4 (D22) — the RECOVERY_DECISION mapping row re-observes "candidate still not canonical"
+    // fresh at application time. A canonical read; the merge primitives stay unreachable.
+    "core/execution/apply-resolved-decision.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge
@@ -173,6 +176,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP 4 §22.5 — TERMINAL_DIVERGENCE reads canonical lineage as an observation. The monitor
     // owns no transition and no mutation; it may not even recommend one.
     "core/coordinator/monitor.ts",
+    // §17.4 (D22) — the RECOVERY_DECISION mapping row re-observes "candidate still not canonical"
+    // fresh at application time. A lineage read; the merge primitives stay unreachable.
+    "core/execution/apply-resolved-decision.ts",
   ];
   scan(
     core.filter((file) => !CANDIDATE_OBSERVERS.includes(relative(ROOT, file))),
