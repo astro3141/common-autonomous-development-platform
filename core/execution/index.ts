@@ -128,3 +128,13 @@ export {
   type DriftAssemblyInput,
   type DriftAuthorities,
 } from "./assemble-drift-observation.ts";
+
+export {
+  startAutomaticMerge,
+  completeAutomaticMerge,
+  mergeOp,
+  type AutomaticMergeAuthorities,
+  type AutomaticMergeCommand,
+  type StartAutomaticMergeOutcome,
+  type CompleteAutomaticMergeOutcome,
+} from "./automatic-merge.ts";

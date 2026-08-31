@@ -31,6 +31,10 @@ import type { VerificationAdapter } from "../../adapters/interfaces/verification
 import type { ManifestSetInput } from "../capability/manifest-set.ts";
 import type { ContractSourceReader } from "../contract/types.ts";
 import { activateSelectedTask } from "../admission/activate-task.ts";
+import {
+  completeAutomaticMerge,
+  startAutomaticMerge,
+} from "../execution/automatic-merge.ts";
 import { completeAuditing } from "../execution/complete-auditing.ts";
 import { completeVerification } from "../execution/complete-verification.ts";
 import {
@@ -101,6 +105,8 @@ export type TickStep =
   | "REWORK_STARTED"
   | "MERGE_APPROVAL_OPENED"
   | "MERGE_APPROVAL_APPLIED"
+  | "AUTO_MERGE_STARTED"
+  | "AUTO_MERGE_COMPLETED"
   | "MERGE_OBSERVED"
   | "BATCH_COMPLETED"
   | "RUN_COMPLETED"
@@ -197,7 +203,15 @@ export class ProductionCoordinator {
           IMPLEMENTING: "REWORK_STARTED",
         });
       case "READY_TO_MERGE":
-        return this.#openMergeApproval(task, attempt);
+        // Spec §67 — the automatic path exists only where the frozen policy enables it; every
+        // other run keeps MVP 1's mandatory human decision. Reading the flag is not a policy
+        // judgement: the Gate re-judges everything itself.
+        return store.batchView.compiledProfileFor(task.batch_id).effective.policy.auto_merge ===
+          true
+          ? this.#startAutoMerge(attempt)
+          : this.#openMergeApproval(task, attempt);
+      case "MERGING":
+        return this.#completeAutoMerge(attempt);
       case "APPROVED_FOR_MANUAL_MERGE":
         return this.#observeMerge(attempt);
       default:
@@ -279,6 +293,22 @@ export class ProductionCoordinator {
       default:
         return "BLOCKED";
     }
+  }
+
+  // --- automatic merge (MVP 2 Repository Gate) ----------------------------------------------------
+
+  #startAutoMerge(attempt: TaskAttemptRow): TickStep | undefined {
+    const outcome = startAutomaticMerge(this.#deps, {
+      attempt_key: attempt.attempt_key,
+      decision_id: this.#deps.identities.nextUlid(),
+      report_channel: this.#deps.identities.reportChannel,
+    });
+    return outcome.kind === "MERGING" ? "AUTO_MERGE_STARTED" : "BLOCKED";
+  }
+
+  #completeAutoMerge(attempt: TaskAttemptRow): TickStep | undefined {
+    const outcome = completeAutomaticMerge(this.#deps, { attempt_key: attempt.attempt_key });
+    return outcome.kind === "MERGED" ? "AUTO_MERGE_COMPLETED" : "BLOCKED";
   }
 
   // --- human merge (B12 composition) --------------------------------------------------------------

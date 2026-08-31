@@ -361,11 +361,15 @@ test("§24 / §25 + B9 §25/§26: evidence work is one module, and no module doe
     "core/execution/complete-auditing.ts",
     // MVP1-B12 reads the settled audit record the merge approval is bound to. Reads only.
     "core/execution/human-merge.ts",
+    // MVP 2 — the Repository Gate recomputes the verification gate from the immutable rows
+    // (§14.4 precondition). Reads only, writes none.
+    "core/execution/automatic-merge.ts",
   ];
-  /** MVP1-B11 writes them; MVP1-B12 reads the one its merge approval is bound to. */
+  /** MVP1-B11 writes them; MVP1-B12 and the MVP 2 Gate read the one their merge is bound to. */
   const AUDIT_RECORD_READERS = [
     "core/execution/complete-auditing.ts",
     "core/execution/human-merge.ts",
+    "core/execution/automatic-merge.ts",
   ];
   const execution = readdirSync(join(ROOT, "core/execution"))
     .filter((name) => name.endsWith(".ts"))

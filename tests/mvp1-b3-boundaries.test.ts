@@ -132,6 +132,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP1-B12 — §19.4e observes whether a *person* merged. Reading canonical is the whole point
     // of that observation, and the merge primitives below stay unreachable from it too.
     "core/execution/human-merge.ts",
+    // MVP 2 — the Gate's recovery decides between "effect exists" and "effect provably absent"
+    // by reading canonical (§21). Observation before actuation, exactly as everywhere else.
+    "core/execution/automatic-merge.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge
@@ -156,17 +159,23 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // MVP1-B12 — §19.4e/§19.4h ask whether the candidate reached canonical history, and whether
     // the attempt's own base is still in it. Both are lineage *reads*; neither merges anything.
     "core/execution/human-merge.ts",
+    // MVP 2 — the Repository Gate's own preconditions are lineage/cleanliness *facts* (§14.4).
+    "core/execution/automatic-merge.ts",
   ];
   scan(
     core.filter((file) => !CANDIDATE_OBSERVERS.includes(relative(ROOT, file))),
     "a candidate observation primitive",
     [/inspect_candidate/, /verify_lineage/, /verify_tracked_clean/],
   );
-  scan(core, "a merge or gate primitive", [
-    /prepare_merge|commit_merge/,
-    /verify_canonical_head|verify_expected_files/,
-    /get_diff\(/,
-  ]);
+  // MVP 2 (TD §14.4) — the Repository Gate now exists, and it is the *only* Core module that may
+  // reach a merge or gate primitive. The original "no Gate exists yet" reading of this guard is
+  // superseded by the stronger one: exactly one Gate, nowhere else.
+  const REPOSITORY_GATE = ["core/execution/automatic-merge.ts"];
+  scan(
+    core.filter((file) => !REPOSITORY_GATE.includes(relative(ROOT, file))),
+    "a merge or gate primitive",
+    [/prepare_merge|commit_merge/, /verify_canonical_head|verify_expected_files/, /get_diff\(/],
+  );
   for (const file of core) {
     if (!stripComments(readFileSync(file, "utf8")).includes("snapshot_canonical")) continue;
     assert.equal(
@@ -177,11 +186,13 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
   }
   scan(core, "a git invocation", [/execFile|spawnSync|execSync|child_process|["'`]git["'`]/]);
   // `automatic_merge` itself is the Profile's operation id from TD §12.2 and predates this batch;
-  // what must be absent is a Gate that acts on it.
-  scan(core, "gate orchestration", [
-    /RepositoryGate|MergeGate|merge --ff-only|commitMerge/,
-    /mergeIntent|merge_intent|:merge:/,
-  ]);
+  // MVP 2 added exactly one module that acts on it — the Repository Gate. Everything else stays
+  // clear of gate orchestration, which is the invariant that actually matters (TD §14.4 G1).
+  scan(
+    core.filter((file) => !REPOSITORY_GATE.includes(relative(ROOT, file))),
+    "gate orchestration",
+    [/RepositoryGate|MergeGate|merge --ff-only|commitMerge/, /mergeIntent|merge_intent|:merge:/],
+  );
 
   // The Coordinator in particular gained nothing.
   const coordinator = readFileSync(join(ROOT, "core/coordinator/coordinator.ts"), "utf8");

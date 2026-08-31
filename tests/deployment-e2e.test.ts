@@ -234,3 +234,158 @@ test("ALIVE-1: one task crosses the full lifecycle through the production compos
     world.dispose();
   }
 });
+
+test("ALIVE-2: with a compliant backend and auto_merge policy, the Gate performs a real ff-only merge", async () => {
+  const { CAPABILITY_NAMES } = await import("../core/schemas/capability-vocabulary.ts");
+  const { submitProposal } = await import("../core/admission/submit-proposal.ts");
+  const { mergeOp } = await import("../core/execution/automatic-merge.ts");
+  const { backendV1Manifests } = await import("../deployment/manifests.ts");
+
+  const world = pilotWorld({
+    auto_merge: true,
+    capability_requirements: {
+      actor_execution: {
+        "repository.feature_write": { accepted: ["ENFORCED", "AVAILABLE_WITH_REDUCED_ASSURANCE"] },
+        "shell.execute": { accepted: ["ENFORCED", "AVAILABLE_WITH_REDUCED_ASSURANCE", "NOT_YET_AUDITED"] },
+      },
+      auditor_execution: {
+        "repository.read": { accepted: ["ENFORCED", "AVAILABLE_WITH_REDUCED_ASSURANCE", "NOT_YET_AUDITED"] },
+      },
+      automatic_merge: {
+        "repository.canonical_write": { accepted: ["ENFORCED"] },
+        "repository.merge": { accepted: ["ENFORCED"] },
+      },
+    },
+  });
+  const gateway = new ScriptedGateway();
+  const verification = new FakeVerificationAdapter();
+
+  // A hypothetical audited backend (§14.5 P-a satisfied): every boundary ENFORCED. The honest
+  // Backend v1 manifests are proven to refuse in B14-2; this world states the activation
+  // precondition explicitly instead of weakening anything.
+  const manifests = backendV1Manifests({ backend_instance_id: "audited-host" }) as {
+    runtime: { body: Record<string, unknown> };
+    workflow: unknown;
+    repository: unknown;
+    verification: unknown;
+  };
+  const enforced: Record<string, { allow: string; deny: string }> = {};
+  for (const name of CAPABILITY_NAMES) enforced[name] = { allow: "ENFORCED", deny: "ENFORCED" };
+  manifests.runtime = {
+    ...manifests.runtime,
+    body: { ...manifests.runtime.body, capability_enforcement: enforced },
+  };
+
+  let composition: Composition | undefined;
+  try {
+    composition = compose(world.config, {
+      runtime_gateway: gateway,
+      verification,
+      manifests: manifests as never,
+      preflight: () => ({ status: "READY" }),
+    });
+    const { store, coordinator, deps } = composition;
+    const opened = openRun(composition);
+    const tick = (): TickStep => coordinator.tickOnce(opened.run_id);
+    const attempt = () => store.attempts.current(TASK_KEY);
+
+    assert.equal(tick(), "SUPERVISOR_REQUESTED");
+    const definition = deps.taskSource.get_task(PILOT_TASK_REF);
+    const head = deps.repository.snapshot_canonical().head;
+    const submitted = submitProposal(
+      { store, taskSource: deps.taskSource, repository: deps.repository, manifests: deps.manifests },
+      {
+        run_id: opened.run_id,
+        batch_id: opened.batch_id,
+        observed_at: new Date().toISOString(),
+        proposal: {
+          proposal_id: ulid(),
+          decision: "START_TASK",
+          task_ref: PILOT_TASK_REF,
+          classification: PILOT_CLASSIFICATION,
+          pipeline_id: PILOT_PIPELINE,
+          actor_profile: PILOT_ACTOR_PROFILE,
+          verification_profile: PILOT_VERIFICATION_PROFILE,
+          repository_scope_id: PILOT_SCOPE,
+          expected: {
+            task_version: definition.version,
+            task_definition_hash: definition.definition_hash,
+            base_head: head,
+            compiled_profile_hash: composition.compiled.compiled_hash,
+          },
+          reason_refs: [],
+        },
+      },
+    );
+    assert.deepEqual(submitted.result, { kind: "ACCEPTED" });
+
+    assert.equal(tick(), "ACTIVATED");
+    assert.equal(tick(), "IMPLEMENTATION_STARTED");
+    const workspace = store.adapterMetadata.get(
+      attempt()?.attempt_key ?? "",
+      REPOSITORY_ADAPTER,
+      WORKSPACE_METADATA_KEY,
+    )?.value as { path: string };
+    const candidate = world.repo.commit({
+      path: "src/feature.txt",
+      content: "auto\n",
+      message: "feat: auto-merged marker",
+      cwd: workspace.path,
+    });
+    const actorTurn = gateway.turns.at(-1)!;
+    gateway.complete(actorTurn.session, actorTurn.request_id);
+    assert.equal(tick(), "VERIFICATION_STARTED");
+
+    const contractHash = store.contracts.hashOf(attempt()?.contract_snapshot_id ?? "") as string;
+    verification.completeWith([
+      {
+        evidence_id: ulid(),
+        check_id: PILOT_CHECK,
+        result: "PASS",
+        assurance_level: "REEXECUTED",
+        target_commit: candidate,
+        task_contract_hash: contractHash,
+        executor_identity: "platform-verifier@pilot",
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+    assert.equal(tick(), "AUDIT_STARTED");
+
+    const auditorTurn = gateway.turns.at(-1)!;
+    const channel = new RuntimeResultChannel(world.config.result_channel_root);
+    channel.submit(
+      `${auditorTurn.session.agent_id}:${auditorTurn.session.session_id}`,
+      AUDITOR_VERDICT_PROTOCOL,
+      {
+        verdict: "AUDIT_PASS",
+        findings: [],
+        reviewed: {
+          candidate_commit: candidate,
+          task_contract_hash: contractHash,
+          evidence_ids: store.verificationEvidence
+            .forAttempt(attempt()?.attempt_key ?? "")
+            .filter((row) => row.target_commit === candidate)
+            .map((row) => row.evidence_id),
+        },
+      },
+    );
+    gateway.complete(auditorTurn.session, auditorTurn.request_id);
+    verification.settlement = { kind: "SETTLED" };
+    assert.equal(tick(), "AUDIT_COMPLETED");
+
+    // --- MVP 2: the Gate merges, for real, with git as the executor -----------------------------
+    const key = attempt()?.attempt_key ?? "";
+    assert.equal(tick(), "AUTO_MERGE_STARTED");
+    assert.equal(deps.repository.snapshot_canonical().head, head, "INTENT precedes the effect");
+    assert.equal(tick(), "AUTO_MERGE_COMPLETED");
+    assert.equal(deps.repository.snapshot_canonical().head, candidate, "a real ff-only merge");
+    assert.equal(world.repo.head(), candidate);
+    assert.equal(store.idempotency.get(mergeOp(key, candidate))?.state, "DONE");
+    assert.equal(store.tasks.require(TASK_KEY).platform_state, "COMPLETED");
+    assert.equal(store.pendingDecisions.openFor(TASK_KEY).length, 0, "no human decision opened");
+    assert.equal(tick(), "RUN_COMPLETED");
+  } finally {
+    composition?.dispose();
+    world.dispose();
+  }
+});
