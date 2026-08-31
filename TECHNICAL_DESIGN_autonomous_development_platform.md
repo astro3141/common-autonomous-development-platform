@@ -17,6 +17,16 @@
 > 남김. 새 WorkflowProfile, telemetry authority store, monitoring state machine, IO mechanism은 만들지 않는다.
 > 전부 **PROSPECTIVE_REQUIREMENT**이며 MVP 0/1 FORMAL seal과 기존 D1–D19를 소급 무효화하지 않는다.
 >
+> **v1.5 Operator-evidence amendment (PR #42 comment `5477209602`, Design Evidence이지 authority가 아님):**
+> IO self-hosting 운영에서 측정된 false positive·partial observation·alert fatigue·stage duration 차이·평가
+> input 누락·unwired fail-closed guard를 portable failure mode로만 번역했다. §22.5의
+> **Monitoring is observation, not authority / An anomaly is not a lifecycle fact**는 반증되지 않았고, 네 건의
+> confident false signal이 actuation으로 번지지 않은 실측으로 강화되었다. amendment는 (a) durable하게
+> 재구성 가능한 signal·absence/coverage 정직성, (b) Finding 기반 presentation collapse, (c) state/stage-aware
+> threshold resolution, (d) sealed MVP 1과 구분된 prospective early read-only monitoring, (e) evaluation input
+> completeness, (f) material fail-closed boundary의 bounded falsification validation만 추가한다. 전부
+> **PROSPECTIVE_REQUIREMENT**이며 Spec 변경, architecture reopening, 새 store/state machine은 없다.
+>
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
 > (2) §1.1에 TRANSFER_KIND 이전 규율(#1 AMENDMENT-1), (3) §5.11 Diagnostic Projection + §5.12
@@ -574,6 +584,14 @@ ImprovementFindingV1Body {
 - persistence는 기존 content-addressed `blob` + append-only `decision_log(kind=finding_recorded)`로 충분하다.
   별도 Finding authority DB/event bus를 만들지 않는다. immutable envelope는 같은 identity+같은 hash만
   idempotent하며 정정/재분류는 `supersedes_finding_ref`를 가진 새 record다.
+- **반복 anomaly의 acknowledgement/presentation ([계약], v1.5 Operator-evidence amendment).** 같은
+  `subject_ref` + 같은 `classification`에 대해 다른 valid Finding이 supersede하지 않은 Finding이 이미
+  존재하는지는 위 immutable record chain에서 derive한다. 별도 acknowledgement row/state machine을 만들지
+  않는다. presentation/notification layer는 그 `finding_ref`에 bind된 반복 anomaly를 하나의 continuing
+  item으로 collapse하거나 후속 notification을 suppress할 수 있다. 이는 **표현 계층의 중복 억제일 뿐**
+  anomaly 관측·Diagnostic Projection·raw observation 조회를 없애거나 lifecycle/reconciliation을 바꾸지
+  않는다. subject/classification binding이 불명확하거나 unsuperseded Finding을 세울 수 없으면 이 규칙으로
+  collapse하지 않는다.
 - issue/task-system projection은 §21.1 Report Outbox를 재사용한다. `op_key`가 external create/update의
   idempotency identity이고 확인된 `backend_ref`는 `idempotency.DONE.result_json`에 durable receipt로
   보존한다. **Finding semantic record ≠ GitHub/Jira Issue**다. 외부 issue는 continuing work의
@@ -605,8 +623,8 @@ authoritative evidence/observation
 ### 5.14 Role-specific evaluation / routing recommendation (v1.5)
 
 [계약, PROSPECTIVE_REQUIREMENT] evaluation은 하나의 global best-model score를 만들지 않는다. unit은
-`role × task/corpus class × runtime binding × assurance context`이며 provider/runtime/infrastructure
-failure를 model quality denominator에 조용히 넣지 않는다.
+`role × task/corpus class × runtime binding × assurance context × role-input-context cohort`이며
+provider/runtime/infrastructure failure를 model quality denominator에 조용히 넣지 않는다.
 
 | role | 최소 quality signal | 기존 source |
 |---|---|---|
@@ -614,6 +632,32 @@ failure를 model quality denominator에 조용히 넣지 않는다.
 | Auditor / Reviewer | seeded material-defect detection, false block, authority/provenance finding, PASS 뒤 escaped defect | corpus ground truth, verdict/audit_record, Finding |
 | Supervisor / planning | contract-gap recognition, bounded decomposition, architecture invention, executable-vs-governance classification | TaskDefinition/corpus ground truth, Proposal/decision_log, Finding |
 
+- **evaluation input completeness ([계약], v1.5 Operator-evidence amendment).** 같은 provider/model이라도 role이
+  실제로 받은 contract/acceptance/authority context가 다르면 같은 benchmark condition이 아니다. 각 sample은
+  provider-specific prompt format이나 raw prompt를 Core에 고정하지 않고 다음 최소 provenance를 보존한다:
+
+  ```text
+  EvaluationInputContextV1 {
+    role_input_context_identity        # 실제 전달/읽기 가능하게 한 normalized manifest의 hash/ref
+    required_context_manifest_ref      # corpus/profile이 요구한 context category/version
+    contract_context:          PRESENT | ABSENT | UNKNOWN
+    acceptance_context:        PRESENT | ABSENT | UNKNOWN
+    authority_boundary_context:PRESENT | ABSENT | UNKNOWN
+    input_completeness: COMPLETE | PARTIAL | UNKNOWN
+    provenance_refs[]                  # Platform input manifest + Runtime/backend delivery observation
+  }
+  ```
+
+  `PRESENT`는 해당 contract가 Store에 존재한다는 사실만으로 만들지 않는다. 그 role의 해당 turn에서 실제로
+  전달되었거나 capability 안에서 읽을 수 있었음이 operation-bound provenance로 확인되어야 한다. 모든 required
+  category가 확인될 때만 `COMPLETE`, 하나라도 known `ABSENT`이면 `PARTIAL`, 전달 여부를 증명할 수 없으면
+  `UNKNOWN`이다. manifest는 전달된 authoritative ref/category의 identity이고 raw prompt·secret·provider-native
+  serialization을 저장하지 않는다(I-TD7). 기존 content-addressed blob + runtime operation receipt를 재사용하며
+  evaluation-input table이나 prompt framework를 만들지 않는다.
+- material하게 다른 `required_context_manifest_ref` 또는 `input_completeness`를 가진 sample은 같은 comparable
+  cohort로 pool하지 않는다. 별도 stratum으로 보고하거나 제외하고 그 사유를 `exclusions/limitations`에 남긴다.
+  context를 우연히 추론해 맞춘 run은 context-complete run으로 승격하지 않는다. `assurance_context`는 검증
+  assurance이고, role에게 실제 제공된 input context와 서로 대체되지 않는다.
 - harness topology는 새 Core subsystem이 아니다. versioned/immutable corpus를 TaskSource로 제공하고, 후보를
   `roles`, 허용 stage를 `pipelines`, oracle/regression/E2E를 `verification_profiles`, mutation boundary를
   `repository_scopes`로 선언한다. 실제 ADP/IO에서 재현 가능한 failure class를 우선하되 IO state machine,
@@ -3704,6 +3748,25 @@ Spec §41의 accepted_assurance set 방식 그대로: check별 `result==PASS ∧
 (auto_merge=true인 policy에서 accepted가 이 둘만인 check 존재 시). durable-jobs의
 `SUFFICIENT_VERIFICATION_LEVELS` 강제와 이중 방어가 된다.
 
+### 15.4 Material fail-closed falsification validation (v1.5 Operator-evidence amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] 신규 구현하거나 material하게 변경하는 **safety / authority /
+fail-closed boundary**의 acceptance evidence에는, guarding behavior 또는 필요한 production wiring을 의도적으로
+제거·우회한 bounded negative control에서 retained test가 실제로 실패함을 보이는 falsification validation이
+최소 하나 포함되어야 한다. happy-path test의 존재나 owner implementation unit test PASS만으로 그 boundary의
+보장을 주장하지 않는다.
+
+- 적용 대상은 capability/authorization gate, exact-target/evidence binding, write-ahead/recovery refusal,
+  canonical mutation guard처럼 제거 시 unsafe acceptance 또는 authority bypass가 가능한 material boundary다.
+  모든 `[계약]` 문장과 모든 일반 validation에 mutation testing을 기계적으로 요구하지 않는다.
+- 보장이 production composition root의 owner wiring에 의존하면 adapter/owner unit test만으로 충분하지 않다.
+  production composition 또는 그 exact wiring contract를 통과하는 test가 owner 미주입/우회 시 실패해야 한다.
+- negative fixture, guard를 제거한 injectable test double, disposable mutation 중 가장 작은 수단을 사용할 수
+  있다. 전역 mutation-testing framework나 새 Verification backend는 요구하지 않는다. 남기는 회귀 test와
+  falsification evidence는 §15.2의 exact candidate/Task Contract binding 규율을 따른다.
+- 이 원칙은 sealed MVP 0/1 acceptance를 소급 재채점하지 않는다. expanded production/MVP 4 구현의 새
+  material boundary와 이후 변경부터 binding이다.
+
 ---
 
 ## 16. Auditor TD
@@ -5612,7 +5675,7 @@ fact, Platform Decision record→human fact)는 향후 Coordinator가 직접 수
 - Failure behavior: reconcile 중 adapter 질의 실패 → 해당 attempt UNEXPLAINED 취급.
 - MVP impact: MVP 1은 위 절차의 단선 구현(attempt 1개)으로 충분; MVP 4에서 전체 폭 적용.
 
-### 22.5 Monitoring / liveness trigger contract (v1.5, MVP 4)
+### 22.5 Monitoring / liveness trigger contract (v1.5, prospective production slice + MVP 4 full loop)
 
 [계약, PROSPECTIVE_REQUIREMENT] **Monitoring is observation, not authority. An anomaly is not a lifecycle
 fact.** time/staleness/retry-count는 authoritative re-observation을 요청할 수 있을 뿐, 그 자체로 state
@@ -5638,10 +5701,49 @@ AnomalyObservationV1 {
   subject_ref
   signal_refs[]                  # Store/adapter 관측 ref + per-field provenance
   observed_at
+  observed_window: { from, to }  # point observation이면 from == to
+  coverage: COMPLETE | PARTIAL | JOINED_MID_SUBJECT
+  coverage_basis_refs[]          # durable/re-readable source와 window coverage 근거
   trigger_config_ref
   recommended_reobservation_scope
 }
 ```
+
+**durable observability / coverage ([계약], v1.5 Operator-evidence amendment).** historical window에 대한
+derived signal의 material fact는 durable Store record 또는 subscriber/observer의 존재와 무관하게
+authoritative owner에서 재조회 가능한 fact로 재구성되어야 한다. subscriber가 있을 때만 materialize되는
+ephemeral stream, UI buffer, process-local callback은 보조 signal일 수 있으나 단독 근거가 될 수 없다. persisted
+payload가 encoded/opaque이면 declared producer/decoder contract로 읽기에 성공해야 `readable`이다. raw text
+search가 0건이라는 사실은 payload 내부 fact의 부재 증거가 아니다.
+
+- `COMPLETE`는 signal이 요구하는 전체 `observed_window`를 위 source로 재구성할 수 있을 때만 사용한다.
+  monitor가 restart/rejoin했어도 durable source로 전 window를 재구성하면 COMPLETE일 수 있다. 재구성하지
+  못한 일부 window가 있으면 `PARTIAL`, subject를 처음 본 시점 이전 구간을 보지 못했고 재구성도 못하면
+  `JOINED_MID_SUBJECT`다. restart 직후 0개를 관측했다는 이유로 과거 window를 COMPLETE로 만들지 않는다.
+- coverage는 confidence score나 lifecycle fact가 아니다. PARTIAL/JOINED observation도 authoritative
+  re-observation을 요청할 수 있지만, 완전 관측과 같은 표현으로 보고하거나 과거 반복/absence를 단정하지
+  않는다. 이 metadata는 §5.11 provenance/freshness의 window 적용이며 새 monitor state machine을 요구하지
+  않는다.
+
+**absence-derived anomaly precondition ([계약]).** `INTENT_UNRESOLVED`, `EXPECTED_SUCCESSOR_MISSING`,
+`REQUIRED_REF_MISSING`, `NEXT_OWNER_MISSING` 및 향후 모든 absence-derived signal은 단순히 record/event를 찾지
+못했다는 이유만으로 `ABSENT`를 주장하지 않는다. 최소한 다음을 해당 window에 대해 증명해야 한다:
+
+```text
+authoritative owner readable
++ source available
++ required observation/materialization path active independent of subscribers
++ declared representation/decoder successfully applied
++ coverage sufficient to have observed presence
+→ absence-derived anomaly may be emitted
+
+otherwise → UNKNOWN / UNAVAILABLE / PARTIAL observation
+            (re-observation request는 가능, confident ABSENT 주장은 금지)
+```
+
+이 일반 규칙이 아래 `REQUIRED_REF_MISSING`의 owner 조회 분리를 포함한다. 각 signal은 자기 presence가
+무엇이며 어느 durable/re-readable source에서 보였어야 하는지를 `signal_refs/coverage_basis_refs`로 설명해야
+한다. 별도 monitoring store나 event materializer를 만들라는 요구가 아니다.
 
 MVP 4 monitor는 최소 아래 signal을 표현할 수 있어야 한다. 이름은 diagnostic vocabulary이며 state/reason
 enum에 추가하지 않는다.
@@ -5671,6 +5773,12 @@ enum에 추가하지 않는다.
 duration, repetition window/count는 **deployment/operational config**가 소유한다. 이유는 이 값들이 오직
 read-only re-observation을 scheduling하기 때문이다; Core invariant에 숫자를 고정하지 않고 Compiled
 Profile에 복제하지 않는다. injected clock을 사용하며 wall clock 자체는 lifecycle authority가 아니다.
+단 threshold resolver는 deployment-wide 숫자 하나만 가정하지 않고, subject에 해당 identity가 존재하면
+최소한 frozen `pipeline_id` + current lifecycle `state` + concrete `stage/operation kind`로 threshold를
+해소할 수 있어야 한다. 여러 key에 같은 값을 명시하는 것은 허용하지만 key를 잃고 우연히 같은 global
+default를 적용한 것으로 표현하지 않는다. 해소된 key/value/version은 `trigger_config_ref` 또는 signal
+provenance에서 확인 가능해야 한다. pipeline/stage가 없는 run/batch signal은 명시적 typed default를 쓸 수
+있으며, 새 `WorkflowProfile`은 만들지 않는다.
 향후 어떤 threshold가 retry/transition/actuation을 직접 허용하게 하려면 그것은 observation config가
 아니라 automation authority이므로 새 `ExecutionPolicy` version + Compiled Profile freeze + explicit TD
 개정이 필요하다. 현재 계약에서는 금지한다.
@@ -5678,6 +5786,14 @@ Profile에 복제하지 않는다. injected clock을 사용하며 wall clock 자
 Anomaly는 §5.11 Diagnostic Projection에 표시하거나, authoritative evidence가 확보된 뒤 §5.13 Finding의
 `observation_refs`로 승격할 수 있다. 둘 어느 것도 두 번째 state store/monitoring state machine을 만들지
 않는다. implementation은 caller-driven read-only scan + 기존 scoped reconciliation entry point면 충분하다.
+
+**implementation timing / seal boundary ([계약]).** Spec §65의 sealed MVP 1 FORMAL acceptance와 기존 구현은
+변경하지 않는다. 다만 그 baseline에서 시작하는 **신규 production/live integration이 unattended operation을
+claim하기 전**에는 caller-driven read-only `monitor_once`가 최소 `DURABLE_PROGRESS_STALE`,
+`INTENT_UNRESOLVED`, `EXTERNAL_COMPLETION_UNPROJECTED`를 위 provenance/coverage 계약으로 표현할 수 있어야
+한다. 이는 `PROSPECTIVE_REQUIREMENT`이며 MVP 1 seal의 새 합격조건이나 기존 구현의 retroactive defect가
+아니다. 전체 anomaly vocabulary, anomaly→Finding promotion, full-width/background reconciliation과 그
+operational config surface는 계속 Spec §69/§27의 MVP 4 범위다.
 
 ## 23. Trust / Security Model
 
@@ -5898,6 +6014,10 @@ Coordinator 발신 요청이다.
 
 ## 27. MVP 2–4 Extension Points
 
+- **MVP 1 이후 production/live integration operability slice (PROSPECTIVE, sealed MVP 1 acceptance 아님):**
+  unattended claim 전 §22.5의 caller-driven read-only `monitor_once` 최소 3-signal과 provenance/coverage를
+  제공한다. 이 slice는 observation만 반환하며 Finding promotion, reconciliation scheduling, transition,
+  retry, actuation을 소유하지 않는다.
 - MVP 2: RepositoryGate 활성(전제 §14.5) — 전략 A 구현 + G1–G5; 전략 B는
   `GitHubProtectedRepositoryAdapter`+`CIValidationAdapter` 추가로 동일 Gate contract 뒤에서 교체.
 - MVP 3: AUTO_SUBFLOW(parent SUSPENDED/RESUME — task 테이블 parent_key 컬럼은 MVP 0 schema에 선반영),
@@ -5961,6 +6081,11 @@ D20 (v1.5) MVP 4 operability closure — §22.5 monitoring observation≠authori
     ProjectProfile/CompiledProfile v2는 Supervisor profile ref 하나만 additive로 동결하며 v1 seal 불변.
     automatic evidence-based routing/fallback은 미채택 future Execution Policy authority seam.
     IO #23은 observed-need/evidence source일 뿐 mechanism/state topology는 이전하지 않음
+D21 (v1.5 Operator-evidence amendment) PR #42 comment 5477209602의 measured operations를 portable
+    failure mode로 번역 — durable/re-readable signal + absence/coverage honesty, Finding-derived presentation
+    collapse, state/stage-aware threshold resolution, prospective early read-only monitor_once, evaluation input
+    completeness, material fail-closed falsification validation. §22.5의 observation≠authority를 강화하며
+    Spec 변경/architecture reopening/retroactive seal impact/new monitoring state machine 없음
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
