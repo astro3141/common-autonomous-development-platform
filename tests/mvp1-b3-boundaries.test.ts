@@ -138,6 +138,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // v1.5 §5.11 — the diagnostic packet may carry a *fresh* canonical observation with explicit
     // provenance. A read presented as a read, never a merge and never authority.
     "core/operability/diagnostics.ts",
+    // MVP 4 §22.2/§22.3 — the recovery pass queries the repository as one of the authoritative
+    // owners (canonical reachability under merge-pending states). Observation, never mutation.
+    "core/coordinator/production-recovery.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge

@@ -15,10 +15,10 @@
 
 import { parseArgs } from "node:util";
 
+import { bootRun } from "./boot.ts";
 import { compose } from "./compose.ts";
 import { loadConfig } from "./config.ts";
 import { startIngress } from "./ingress.ts";
-import { openRun } from "./open-run.ts";
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -34,14 +34,27 @@ async function main(): Promise<void> {
 
   const config = loadConfig(values.config);
   const composition = compose(config);
-  const { run_id, batch_id } = openRun(composition);
   const log = (line: string): void => {
     process.stdout.write(`${new Date().toISOString()} ${line}\n`);
   };
+
+  // §22.2 (finding 3) — reconciliation runs before the ingress exists and before any tick: a
+  // restarted mid-flight run is either CONSISTENT, explained fail-closed, or stopped. Nothing
+  // external can start ahead of this line.
+  const { opened, report } = bootRun(composition);
+  const { run_id, batch_id } = opened;
   log(`run ${run_id} batch ${batch_id} store ${config.store_path}`);
+  log(
+    `startup reconciliation: ${report.classification}` +
+      (report.actions.length === 0
+        ? ""
+        : ` (${report.actions.map((action) => `${action.kind}:${action.subject}`).join(", ")})`),
+  );
 
   // The RA-4 verdict is reported at startup for the operator; the Platform's own fail-closed
   // gating does not depend on this log line — every execution path asks the preflight itself.
+  // (An UNEXPLAINED reconciliation already paused the run above; ticks below deliver reports
+  // only and start nothing external — Spec §52 requires the explicit human resume.)
   const readiness = composition.deps.preflight();
   log(
     readiness.status === "READY"

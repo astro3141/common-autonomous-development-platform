@@ -53,8 +53,12 @@ export function openRun(composition: Composition): OpenedRun {
       batches[0];
     if (batch === undefined) throw new Error(`${run.run_id} has no batch`);
 
-    // Complete a possibly-crashed opening: both re-entries are idempotent by contract.
-    issueSupervisorGrant(store, { run_id: run.run_id, grant_id: ulid(), manifests: deps.manifests });
+    // Complete a possibly-crashed opening. The grant is issued only when the crash left none:
+    // an existing grant is frozen authorization, and re-deriving it under possibly-changed
+    // manifests is §22.2 recovery's question, never a silent re-issue here.
+    if (store.grants.forRun(run.run_id).length === 0) {
+      issueSupervisorGrant(store, { run_id: run.run_id, grant_id: ulid(), manifests: deps.manifests });
+    }
     materializeDiscoveryPass(store, deps.taskSource, {
       run_id: run.run_id,
       batch_id: batch.batch_id,

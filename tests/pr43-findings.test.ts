@@ -560,3 +560,358 @@ test("F14: a v1 project profile (no supervisor binding) refuses to compose — n
     world.dispose();
   }
 });
+
+// --- F3: startup runs §22.2 reconciliation before anything else ----------------------------------
+
+test("F3: bootRun reconciles a persisted mid-flight run before any tick can start an external op", async () => {
+  const { bootRun } = await import("../deployment/boot.ts");
+  const { backendV1Manifests } = await import("../deployment/manifests.ts");
+  const { CAPABILITY_NAMES } = await import("../core/schemas/capability-vocabulary.ts");
+  const { submitProposal } = await import("../core/admission/submit-proposal.ts");
+  const { ulid } = await import("../deployment/identities.ts");
+  const {
+    PILOT_TASK_REF,
+    PILOT_CLASSIFICATION,
+    PILOT_PIPELINE,
+    PILOT_ACTOR_PROFILE,
+    PILOT_VERIFICATION_PROFILE,
+    PILOT_SCOPE,
+  } = await import("./support/deployment-fixtures.ts");
+
+  // The frozen policy demands ENFORCED shell; the first composition's backend claims it.
+  const world = pilotWorld({
+    capability_requirements: {
+      actor_execution: { "shell.execute": { accepted: ["ENFORCED"] } },
+      auditor_execution: {
+        "repository.read": { accepted: ["ENFORCED", "AVAILABLE_WITH_REDUCED_ASSURANCE", "NOT_YET_AUDITED"] },
+      },
+    },
+  });
+  const gateway = new ScriptedGateway();
+  const strong = backendV1Manifests({ backend_instance_id: "audited-host" }) as {
+    runtime: { body: Record<string, unknown> };
+    workflow: unknown;
+    repository: unknown;
+    verification: unknown;
+  };
+  const enforced: Record<string, { allow: string; deny: string }> = {};
+  for (const name of CAPABILITY_NAMES) enforced[name] = { allow: "ENFORCED", deny: "ENFORCED" };
+  strong.runtime = { ...strong.runtime, body: { ...strong.runtime.body, capability_enforcement: enforced } };
+
+  let first: Composition | undefined;
+  let second: Composition | undefined;
+  try {
+    first = compose(world.config, {
+      runtime_gateway: gateway,
+      manifests: strong as never,
+      preflight: () => ({ status: "READY" }),
+    });
+    const opened = openRun(first);
+    first.coordinator.tickOnce(opened.run_id); // SUPERVISOR_REQUESTED
+    const definition = first.deps.taskSource.get_task(PILOT_TASK_REF);
+    const head = first.deps.repository.snapshot_canonical().head;
+    submitProposal(
+      { store: first.store, taskSource: first.deps.taskSource, repository: first.deps.repository, manifests: first.deps.manifests },
+      {
+        run_id: opened.run_id,
+        batch_id: opened.batch_id,
+        observed_at: new Date().toISOString(),
+        proposal: {
+          proposal_id: ulid(),
+          decision: "START_TASK",
+          task_ref: PILOT_TASK_REF,
+          classification: PILOT_CLASSIFICATION,
+          pipeline_id: PILOT_PIPELINE,
+          actor_profile: PILOT_ACTOR_PROFILE,
+          verification_profile: PILOT_VERIFICATION_PROFILE,
+          repository_scope_id: PILOT_SCOPE,
+          expected: {
+            task_version: definition.version,
+            task_definition_hash: definition.definition_hash,
+            base_head: head,
+            compiled_profile_hash: first.compiled.compiled_hash,
+          },
+          reason_refs: [],
+        },
+      },
+    );
+    first.coordinator.tickOnce(opened.run_id); // ACTIVATED
+    first.coordinator.tickOnce(opened.run_id); // IMPLEMENTATION_STARTED (mid-flight)
+    first.dispose();
+    first = undefined;
+
+    // Restart with the honest Backend v1 (shell NOT_YET_AUDITED — weaker than the frozen policy).
+    second = compose(world.config, {
+      runtime_gateway: gateway,
+      preflight: () => ({ status: "READY" }),
+    });
+    const boot = bootRun(second);
+    assert.equal(boot.opened.run_id, opened.run_id);
+    assert.equal(boot.report.classification, "EXPLAINABLE");
+    assert.equal(
+      boot.report.actions.some((action) => action.kind === "CAPABILITY_HELD"),
+      true,
+      "the weakened backend was fail-closed by reconciliation, before any tick",
+    );
+    const task = second.store.tasks.require("task:pilot:T-1");
+    assert.equal(task.platform_state, "HELD");
+    assert.equal(task.state_reason?.code, "CAPABILITY_BOUNDARY_CHANGED");
+    // The first tick after boot starts nothing external for this task.
+    assert.equal(gateway.turns.length, 2, "supervisor + actor turns from before the restart only");
+    second.coordinator.tickOnce(opened.run_id);
+    assert.equal(gateway.turns.length, 2, "no new external turn after the fail-closed boot");
+  } finally {
+    first?.dispose();
+    second?.dispose();
+    world.dispose();
+  }
+});
+
+// --- F4: full-width reconciliation over the authoritative owners ---------------------------------
+
+test("F4: a lost runtime session with a surviving valid candidate catches up to VERIFYING (§22.3 R-1)", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick();
+    w.tick(); // IMPLEMENTING
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+
+    // The runtime reports the session as gone; the repository still holds the candidate.
+    w.repository.candidate = CANDIDATE;
+    const stored = w.store.adapterMetadata.get(attempt.attempt_key, "runtime", "actor_turn:1");
+    w.runtime.turnResults.set(JSON.stringify(stored?.value), {
+      session_handle: {} as never,
+      turn_handle: stored?.value as never,
+      backend_status: "SESSION_LOST",
+      termination_reason: "gateway restarted",
+      started_at: "t1",
+      completed_at: "t2",
+      provenance: { runtime_backend: "fake", identity_authority: "BACKEND", result_channel: "TURN_TEXT" },
+    });
+
+    const report = recoverRun(w, { run_id: RUN_ID });
+    assert.equal(report.classification, "EXPLAINABLE");
+    assert.equal(
+      report.actions.some((action) => action.kind === "TURN_LOSS_CAUGHT_UP"),
+      true,
+    );
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "VERIFYING");
+    assert.equal(w.store.attempts.current(TASK_KEY)?.candidate_commit, CANDIDATE);
+
+    // Second-pass idempotency: the caught-up world reconciles clean.
+    const second = recoverRun(w, { run_id: RUN_ID });
+    assert.deepEqual(second.classification, "CONSISTENT");
+  }, SINGLE);
+});
+
+test("F4: a lost session with no usable candidate reworks through the sealed rejection branch", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick();
+    w.tick();
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    w.repository.candidate = null; // nothing was produced
+    const stored = w.store.adapterMetadata.get(attempt.attempt_key, "runtime", "actor_turn:1");
+    w.runtime.turnResults.set(JSON.stringify(stored?.value), {
+      session_handle: {} as never,
+      turn_handle: stored?.value as never,
+      backend_status: "RUNTIME_ERROR",
+      termination_reason: "runtime died",
+      started_at: "t1",
+      completed_at: "t2",
+      provenance: { runtime_backend: "fake", identity_authority: "BACKEND", result_channel: "TURN_TEXT" },
+    });
+
+    const report = recoverRun(w, { run_id: RUN_ID });
+    assert.equal(
+      report.actions.some((action) => action.kind === "TURN_LOSS_CAUGHT_UP"),
+      true,
+    );
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "REWORKING", "rework budget remains");
+  }, SINGLE);
+});
+
+test("F4: an unanswerable verification authority fail-closes the attempt (owner-unavailable rule)", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick();
+    w.tick();
+    actorProduced(w, CANDIDATE, 1);
+    w.tick(); // VERIFYING
+
+    const broken = {
+      ...w,
+      verification: new Proxy(w.verification, {
+        get(target, property) {
+          if (property === "get_verification_result") {
+            return () => {
+              throw new Error("verification backend unreachable");
+            };
+          }
+          return Reflect.get(target, property);
+        },
+      }),
+    };
+    const report = recoverRun(broken as never, { run_id: RUN_ID });
+    assert.equal(
+      report.actions.some((action) => action.kind === "ATTEMPT_HELD_RECOVERY_CONFLICT"),
+      true,
+    );
+    const task = w.store.tasks.require(TASK_KEY);
+    assert.equal(task.platform_state, "HELD");
+    assert.equal(task.state_reason?.code, "RECOVERY_CONFLICT");
+  }, SINGLE);
+});
+
+test("F4: a READY attempt with an indeterminate actor-turn INTENT fail-closes, never resends", async () => {
+  const { actorTurnOp } = await import("../core/execution/actor-operations.ts");
+  await withWorld(async (world) => {
+    const w = coordinatorWorld(world);
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick(); // ACTIVATED → READY
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    // The reviewed crash window: the turn INTENT is durable, the call's outcome is unknown.
+    w.store.idempotency.beginIntent(actorTurnOp(attempt.attempt_key, 1));
+
+    const sends = w.runtime.sendCalls.length;
+    const report = recoverRun(w, { run_id: RUN_ID });
+    assert.equal(
+      report.actions.some((action) => action.kind === "ATTEMPT_HELD_RECOVERY_CONFLICT"),
+      true,
+    );
+    assert.equal(w.store.tasks.require(TASK_KEY).state_reason?.code, "RECOVERY_CONFLICT");
+    assert.equal(w.runtime.sendCalls.length, sends, "the indeterminate turn was never resent");
+  }, SINGLE);
+});
+
+test("F4: an unanswerable repository under MERGING stops the batch (canonical-mutation rule)", async () => {
+  const { commitAttemptFact } = await import("../core/statemachine/transition-commit.ts");
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    // Fabricate the narrow durable state directly at the state machine: MERGING with a repository
+    // that cannot answer. (The full auto-merge drive is proven in b14; this isolates §22.2.)
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick();
+    w.tick();
+    actorProduced(w, CANDIDATE, 1);
+    w.tick(); // VERIFYING
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    // VERIFYING → ... → MERGING is a long drive; enter MERGING through the sealed guard chain.
+    const hash = w.store.contracts.hashOf(attempt.contract_snapshot_id) as string;
+    w.verification.completeWith([
+      evidenceItem({ check_id: REQUIRED_CHECK, target_commit: CANDIDATE, task_contract_hash: hash }),
+    ]);
+    w.tick(); // AUDIT_STARTED
+    const review = {
+      candidate_commit: CANDIDATE,
+      task_contract_hash: hash,
+      evidence_ids: w.store.verificationEvidence
+        .forAttempt(attempt.attempt_key)
+        .filter((row) => row.target_commit === CANDIDATE)
+        .map((row) => row.evidence_id),
+    };
+    const handle = w.store.adapterMetadata
+      .forEntity(attempt.attempt_key)
+      .find((row) => row.key.startsWith("auditor_turn-1:") && row.key.endsWith(CANDIDATE));
+    w.runtime.turnResults.set(
+      JSON.stringify(handle?.value),
+      auditorTurnResult({ body: auditorVerdict(review), protocol: AUDITOR_VERDICT_PROTOCOL }),
+    );
+    w.verification.settlement = { kind: "SETTLED" };
+    w.tick(); // AUDIT_COMPLETED → READY_TO_MERGE
+    commitAttemptFact(w.store, {
+      attempt_key: attempt.attempt_key,
+      fact: { kind: "AUTOMATIC_MERGE_STARTED", gate_preconditions_met: true },
+    });
+    assert.equal(w.store.attempts.current(TASK_KEY)?.state, "MERGING");
+
+    const broken = {
+      ...w,
+      repository: new Proxy(w.repository, {
+        get(target, property) {
+          if (property === "snapshot_canonical") {
+            return () => {
+              throw new Error("repository unreachable");
+            };
+          }
+          return Reflect.get(target, property);
+        },
+      }),
+    };
+    const report = recoverRun(broken as never, { run_id: RUN_ID });
+    assert.equal(
+      report.actions.some((action) => action.kind === "CANONICAL_PAUSED"),
+      true,
+    );
+    assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
+    assert.equal(w.store.runs.require(RUN_ID).status, "PAUSED_SAFELY");
+  }, SINGLE);
+});
+
+test("F4: external CLOSED under an open decision goes STALE and parks the task (§22.3 row 4)", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    w.tick();
+    submitSupervisorProposal(w, world);
+    w.tick();
+    w.tick();
+    actorProduced(w, CANDIDATE, 1);
+    w.tick();
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    const hash = w.store.contracts.hashOf(attempt.contract_snapshot_id) as string;
+    w.verification.completeWith([
+      evidenceItem({ check_id: REQUIRED_CHECK, target_commit: CANDIDATE, task_contract_hash: hash }),
+    ]);
+    w.tick();
+    const review = {
+      candidate_commit: CANDIDATE,
+      task_contract_hash: hash,
+      evidence_ids: w.store.verificationEvidence
+        .forAttempt(attempt.attempt_key)
+        .filter((row) => row.target_commit === CANDIDATE)
+        .map((row) => row.evidence_id),
+    };
+    const handle = w.store.adapterMetadata
+      .forEntity(attempt.attempt_key)
+      .find((row) => row.key.startsWith("auditor_turn-1:") && row.key.endsWith(CANDIDATE));
+    w.runtime.turnResults.set(
+      JSON.stringify(handle?.value),
+      auditorTurnResult({ body: auditorVerdict(review), protocol: AUDITOR_VERDICT_PROTOCOL }),
+    );
+    w.verification.settlement = { kind: "SETTLED" };
+    w.tick(); // READY_TO_MERGE
+    w.tick(); // MERGE_APPROVAL_OPENED — an open human decision now exists
+    const open = w.store.pendingDecisions.openFor(TASK_KEY);
+    assert.equal(open.length, 1);
+
+    // The authoritative external source closed the task while the question was open.
+    w.tasks.externalStates["T-101"] = "CLOSED";
+    const report = recoverRun(w, { run_id: RUN_ID });
+    assert.equal(
+      report.actions.some((action) => action.kind === "EXTERNAL_CLOSED_HELD"),
+      true,
+    );
+    assert.equal(
+      w.store.pendingDecisions.require(open[0]!.body.decision_id).body.status,
+      "STALE",
+    );
+    const task = w.store.tasks.require(TASK_KEY);
+    assert.equal(task.platform_state, "HELD");
+    assert.equal(task.state_reason?.code, "EXTERNAL_CLOSED");
+    // One idempotent STALE notification was enqueued.
+    assert.equal(
+      w.store.outbox
+        .pending()
+        .some((row) => row.op_key.includes(`report-stale:${open[0]!.body.decision_id}`)),
+      true,
+    );
+  }, SINGLE);
+});

@@ -73,6 +73,15 @@ export interface VerificationAuthorities {
 
 export interface StartVerificationCommand {
   readonly attempt_key: string;
+  /**
+   * TD §22.3 (R-1) — set only by the recovery pass, after the RuntimeAdapter itself reported the
+   * session/turn as lost (`SESSION_LOST`/`RUNTIME_ERROR`). It lets the candidate the repository
+   * actually holds be judged on its own facts ("검증이 model 무관하게 판정") instead of waiting
+   * forever for a turn that will never complete. It never bypasses the repository checks, and a
+   * merely-unobservable turn (no terminal projection) is *not* a loss — the caller must have an
+   * authoritative terminal answer in hand.
+   */
+  readonly recovered_turn_loss?: boolean;
 }
 
 export type StartVerificationOutcome =
@@ -130,9 +139,16 @@ export function startVerification(
   );
   const result = authorities.runtime.get_turn_result(turn_handle as unknown as RuntimeTurnHandle);
   if (result.backend_status !== "COMPLETED") {
-    // §7 — the other terminal states belong to the existing failure/recovery rules, and §22.3's
-    // catch-up is a recovery pass, not this transition. Nothing is written either way.
-    return { kind: "TURN_NOT_COMPLETED", backend_status: result.backend_status };
+    const recoverable_loss =
+      command.recovered_turn_loss === true &&
+      (result.backend_status === "SESSION_LOST" || result.backend_status === "RUNTIME_ERROR");
+    if (!recoverable_loss) {
+      // §7 — the other terminal states belong to the existing failure/recovery rules, and §22.3's
+      // catch-up is a recovery pass, not this transition. Nothing is written either way.
+      return { kind: "TURN_NOT_COMPLETED", backend_status: result.backend_status };
+    }
+    // §22.3 R-1 — the turn is treated as failed; what was actually produced is the repository's
+    // question from here on, exactly as in the ordinary path below.
   }
   // §5.12 (durable source minimum) — the completed turn's redacted envelope is preserved as a
   // durable measurement source when the transition that consumes it commits. Structured bodies,
