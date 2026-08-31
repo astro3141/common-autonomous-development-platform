@@ -43,8 +43,23 @@ const token = (...parts: readonly string[]): string => parts.join("");
  */
 const BACKEND_ADAPTER_PREFIX = "adapters/backend-runtime-preflight/";
 
+/**
+ * IG-2/IG-3 (TD §13.1, §14.1) added the two production backend *mapping* adapters, whose job is
+ * naming the backend they map. I-TD1's own text places backend vocabulary exactly there — "등장
+ * 위치는 Adapter/Profile config뿐이다" — so the allowance grows by those directories plus the
+ * neutral re-export barrel that lets everything else import them without naming a backend. Core,
+ * `testdoubles/` and every *test* stay under the full check, and the credential rule below is not
+ * relaxed anywhere. The prefixes are assembled from fragments for the same reason the patterns are.
+ */
+const BACKEND_NAMING_ALLOWED: readonly string[] = [
+  BACKEND_ADAPTER_PREFIX,
+  token("adapters/", "open", "claw", "-runtime/"),
+  token("adapters/", "durable", "-jobs", "-workflow/"),
+  "adapters/backend-v1/",
+];
+
 const namesBackend = (relativePath: string): boolean =>
-  relativePath.startsWith(BACKEND_ADAPTER_PREFIX);
+  BACKEND_NAMING_ALLOWED.some((prefix) => relativePath.startsWith(prefix));
 
 /** Backend/Project vocabulary that must never appear in Core (TD I-TD1). */
 const FORBIDDEN_VOCABULARY: ReadonlyArray<readonly [string, RegExp]> = [
