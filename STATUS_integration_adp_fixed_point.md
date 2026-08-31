@@ -19,7 +19,7 @@
 ## 0. Verdict
 
 ```text
-tests       1099 / 1099 PASS      (baseline 1045; +54, no test deleted to pass)
+tests       1127 / 1127 PASS      (baseline 1045; +82, no test deleted to pass)
 typecheck   PASS
 schema      v7 / 17 tables        (v7 = subflow-parent: SUSPENDED + task.parent_task_key)
 
@@ -70,10 +70,11 @@ has exactly one production caller (source guard).
 ### MVP 3 (Spec §47/§48/§68)
 
 Migration v7 (`SUSPENDED`, `task.parent_task_key`; FK-off rewrite with in-transaction
-`foreign_key_check`). START_SUBFLOW admission links the child to the batch's unique in-flight
-parent and suspends an ACTIVE parent in the same transaction; an ambiguous parent is a durable,
-observable refusal (no guessed parent — see §3 below). Automatic parent resume when every child
-COMPLETED; explicit RESUME_PARENT and DEFER_TASK are applied decisions. Coordinator: multi-task
+`foreign_key_check`). START_SUBFLOW is validated but not
+applied (the parent binding is an unresolved CONTRACT_AMBIGUITY — see §3 below); the sealed
+explicit-parent admission linkage suspends an ACTIVE parent in the same transaction and is proven
+directly at the state machine. Automatic parent resume when every child COMPLETED; explicit
+RESUME_PARENT and DEFER_TASK are applied decisions. Coordinator: multi-task
 Supervisor pacing from durable facts, §20.1 WAITING/RESUME through the sealed batch guard.
 
 ### MVP 4 (TD §22.2/§22.5, Spec §52/§69)
