@@ -491,7 +491,7 @@ export class AttemptStore {
     const row = this.#database
       .prepare(
         `${ATTEMPT_COLUMNS} WHERE task_key = ?
-            AND state NOT IN ('MERGED', 'INVALIDATED', 'FAILED')`,
+            AND state NOT IN ('MERGED', 'SUCCEEDED', 'INVALIDATED', 'FAILED')`,
       )
       .get(taskKey) as AttemptDbRow | undefined;
     return row === undefined ? undefined : toAttemptRow(row);

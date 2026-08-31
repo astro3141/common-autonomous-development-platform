@@ -99,11 +99,20 @@ test("M1B4-AC4 / AC32 / AC37: the front half touches no Runtime, Workflow or Ver
     /audit_decide|acquire_workflow_controller|run_verification|deliver\(/,
     /create_feature_workspace|inspect_candidate|prepare_merge|commit_merge/,
   ]);
-  scan(frontHalf, "a forbidden adapter", [
+  // §9.2f (D22) — fact assembly reads the parent's *frozen* Task Contract hash for the E parent
+  // view. A store read of an immutable artifact; it still builds no contract and issues no grant.
+  const FACT_ASSEMBLY = "core/admission/fact-assembly.ts";
+  scan(frontHalf.filter((file) => relative(ROOT, file) !== FACT_ASSEMBLY), "a forbidden adapter", [
     /RuntimeAdapter|WorkflowAdapter|VerificationAdapter|ReportAdapter/,
     /RuntimeTurnResult|structured_output|spawn_session|send_turn|get_turn_result/,
     /audit_decide|acquire_workflow_controller|run_verification|deliver\(/,
     /buildTaskContract|CapabilityGrant|issueGrant|contract_snapshot/,
+  ]);
+  scan([join(ROOT, FACT_ASSEMBLY)], "a forbidden adapter", [
+    /RuntimeAdapter|WorkflowAdapter|VerificationAdapter|ReportAdapter/,
+    /RuntimeTurnResult|structured_output|spawn_session|send_turn|get_turn_result/,
+    /audit_decide|acquire_workflow_controller|run_verification|deliver\(/,
+    /buildTaskContract|CapabilityGrant|issueGrant/,
   ]);
 
   // The IG-1 exemption is exactly one grant: the run-scoped SUPERVISOR one. It builds no Task
@@ -235,6 +244,7 @@ test("M1B4-AC41 ~ AC44: the schema and the B1/B2/B3 surfaces are untouched", () 
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
   assert.deepEqual(

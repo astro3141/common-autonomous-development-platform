@@ -18,7 +18,7 @@ import type { PendingDecisionV1 } from "../humandecision/types.ts";
 import { subjectKey } from "../humandecision/pending-decision.ts";
 import type { CanonicalObject } from "../schemas/canonical-json.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
-import { abandonedByDecision, reattemptRequired, isReattemptRequired, SELECTION_STALE } from "./types.ts";
+import { abandonedByDecision, reattemptRequired, isReattemptRequired, SELECTION_STALE, subflowChild } from "./types.ts";
 import {
   isTerminalTask,
   type AttemptState,
@@ -107,11 +107,17 @@ export interface AdmissionCommand {
    */
   readonly resolved_decision_id?: string;
   /**
-   * MVP 3 (Spec §47/§68) — present for a `START_SUBFLOW` admission: the child is linked to this
-   * parent, and an ACTIVE parent is suspended in the same transaction. A parent that is already
-   * HELD keeps its own blocker — suspension never erases a held reason.
+   * §9.2f/§19.5.1 (MVP 3) — present for a `START_SUBFLOW` admission: the E Proposal's exact
+   * parent observation. The transaction re-reads the parent's current rows and requires exact
+   * equality on all four fields before it links the child and suspends the parent — validation
+   * never leases authority across the gap (§9.2f "P1–P5는 … lease가 아니다").
    */
-  readonly subflow_parent_task_key?: string;
+  readonly subflow_parent?: {
+    readonly task_key: string;
+    readonly attempt_key: string;
+    readonly task_contract_hash: string;
+    readonly attempt_state: string;
+  };
 }
 
 /**
@@ -202,42 +208,89 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       store.pendingDecisions.recordAppliedTransition(command.resolved_decision_id, transition.seq);
     }
 
-    if (command.subflow_parent_task_key !== undefined) {
-      linkSubflowParent(store, task.task_key, command.subflow_parent_task_key);
+    if (command.subflow_parent !== undefined) {
+      linkSubflowParent(store, task.task_key, command.subflow_parent);
     }
 
     return { transition, task: store.tasks.require(task.task_key), batch: currentBatch };
   });
 }
 
+/** §9.2f P2 — the parent Attempt states a subflow may interrupt. */
+const SUBFLOW_PARENT_ATTEMPT_STATES: readonly string[] = [
+  "READY",
+  "IMPLEMENTING",
+  "VERIFYING",
+  "AUDITING",
+  "REWORKING",
+];
+
 /**
- * MVP 3 — links an admitted subflow child to its parent and suspends an ACTIVE parent
- * (Spec §47: Parent Task → SUSPENDED). Runs inside the admission transaction: a subflow whose
- * parent cannot be linked is not admitted at all.
+ * §19.5.1 (MVP 3) — links an admitted subflow child to its explicit parent and suspends the
+ * ACTIVE parent, inside the admission transaction. Everything E claimed about the parent is
+ * re-read and re-checked here against current durable rows — child link, parent suspension,
+ * relation provenance and admission all commit together or not at all. A parent that is HELD,
+ * SUSPENDED, terminal or in a merge stage is not a normal-subflow parent.
  */
-function linkSubflowParent(store: PlatformStore, childKey: string, parentKey: string): void {
+function linkSubflowParent(
+  store: PlatformStore,
+  childKey: string,
+  intent: {
+    readonly task_key: string;
+    readonly attempt_key: string;
+    readonly task_contract_hash: string;
+    readonly attempt_state: string;
+  },
+): void {
+  const parentKey = intent.task_key;
   if (childKey === parentKey) throw illegal(`${childKey} cannot be its own subflow parent`);
   const child = store.tasks.require(childKey);
   const parent = store.tasks.require(parentKey);
   if (parent.batch_id !== child.batch_id) {
     throw illegal(`subflow parent ${parentKey} is not in ${child.batch_id}`);
   }
-  if (
-    parent.platform_state !== "ACTIVE" &&
-    parent.platform_state !== "HELD" &&
-    parent.platform_state !== "SUSPENDED"
-  ) {
-    throw illegal(`subflow parent ${parentKey} is ${parent.platform_state}; nothing to suspend`);
+  if (parent.platform_state !== "ACTIVE") {
+    throw illegal(`a normal subflow parent must be ACTIVE, not ${parent.platform_state}`);
+  }
+  if (child.parent_task_key !== null) {
+    throw illegal(`${childKey} already has a parent relation`);
+  }
+  // No cycle through the durable chain (P3) and no competing current relation (P4).
+  let cursor = parent.parent_task_key;
+  while (cursor !== null) {
+    if (cursor === childKey || cursor === parentKey) {
+      throw illegal(`linking ${childKey} under ${parentKey} would close a parent cycle`);
+    }
+    cursor = store.tasks.require(cursor).parent_task_key;
+  }
+  for (const sibling of store.tasks.childrenOf(parentKey)) {
+    if (!isTerminalTask(sibling.platform_state)) {
+      throw illegal(`${parentKey} already has a non-terminal child relation (${sibling.task_key})`);
+    }
+  }
+  // E's exact parent observation must still be true of the current rows (§19.5.1).
+  const attempt = store.attempts.current(parentKey);
+  if (attempt === undefined || attempt.attempt_key !== intent.attempt_key) {
+    throw illegal(`${parentKey} no longer runs the Attempt the Proposal observed`);
+  }
+  if (attempt.state !== intent.attempt_state || !SUBFLOW_PARENT_ATTEMPT_STATES.includes(attempt.state)) {
+    throw illegal(`${parentKey}'s Attempt is ${attempt.state}; the observed continuation point is stale`);
+  }
+  if (store.contracts.hashOf(attempt.contract_snapshot_id) !== intent.task_contract_hash) {
+    throw illegal(`${parentKey}'s frozen Task Contract is not the one the Proposal observed`);
   }
 
   store.tasks.write(childKey, { platform_state: child.platform_state, parent_task_key: parentKey });
-  if (parent.platform_state === "ACTIVE") {
-    appendTransition(store, {
-      primary_entity_key: parentKey,
-      task: { from: "ACTIVE", to: "SUSPENDED" },
-    });
-    store.tasks.write(parentKey, { platform_state: "SUSPENDED" });
-  }
+  // §18.1f — the parent SUSPENDED row must carry the exact relation/cause and its transition ref.
+  const suspension = appendTransition(store, {
+    primary_entity_key: parentKey,
+    task: { from: "ACTIVE", to: "SUSPENDED" },
+    reason_code: subflowChild(childKey),
+  });
+  store.tasks.write(parentKey, {
+    platform_state: "SUSPENDED",
+    reason: { code: subflowChild(childKey), log_seq: suspension.seq },
+  });
 }
 
 /**

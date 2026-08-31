@@ -317,6 +317,7 @@ test("M1B3-AC36 ~ AC39: the schema and the MVP1-B1/B2 surfaces are untouched", (
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
   assert.deepEqual(

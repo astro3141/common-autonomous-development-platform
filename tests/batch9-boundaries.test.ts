@@ -160,6 +160,7 @@ test("B9-AC4 / B9-AC22: no migration and no new table were added", () => {
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
 

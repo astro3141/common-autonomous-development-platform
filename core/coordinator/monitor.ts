@@ -420,5 +420,5 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
 }
 
 function isTerminalAttemptState(state: string): boolean {
-  return state === "MERGED" || state === "INVALIDATED" || state === "FAILED";
+  return state === "MERGED" || state === "SUCCEEDED" || state === "INVALIDATED" || state === "FAILED";
 }

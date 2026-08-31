@@ -44,6 +44,9 @@ import {
   type ProposalV1,
   type RepositoryValidationView,
   type SelectionAdmissionKind,
+  type SelectionProposalV1,
+  type SubflowChildContextV1,
+  type SubflowParentValidationView,
   type TaskBearingProposalV1,
   type TaskLookupView,
 } from "./types.ts";
@@ -68,6 +71,10 @@ export interface DecisionValidationInput {
    * is still re-judged.
    */
   readonly admission_kind?: SelectionAdmissionKind;
+  /** §9.2f — required for variant E (V2/V3/V11 P1–P4). Built by the caller from durable owners. */
+  readonly subflow_parent?: SubflowParentValidationView;
+  /** §9.2f — the child-side durable facts P1/P3/P4 compare against. Required for variant E. */
+  readonly subflow_child?: SubflowChildContextV1;
 }
 
 const ACCEPTED: DecisionValidationResult = { kind: "ACCEPTED" };
@@ -114,11 +121,17 @@ function runValidation(
   const policy = input.compiled_profile.effective.policy;
   const taskBearing = proposal.variant !== "BATCH_CONTROL";
 
-  // --- V2 task existence (A/B/C) ----------------------------------------------------
+  // --- V2 task existence (A/B/C/E) --------------------------------------------------
   let lookup: TaskLookupView | undefined;
   if (taskBearing) {
     lookup = requireTask(input);
     if (lookup.status === "NOT_FOUND") return rejected("TASK_NOT_FOUND");
+  }
+  // §9.2f — E additionally requires the explicit parent to exist as a durable Platform row.
+  let parentView: SubflowParentValidationView | undefined;
+  if (proposal.variant === "SUBFLOW_SELECTION") {
+    parentView = requireSubflowParent(input);
+    if (parentView.status === "NOT_FOUND") return rejected("SUBFLOW_PARENT_NOT_FOUND");
   }
 
   // --- V3 expected freshness --------------------------------------------------------
@@ -132,8 +145,21 @@ function runValidation(
   if (proposal.expected.compiled_profile_hash !== input.compiled_profile_hash) {
     return rejected("PROFILE_DRIFT");
   }
+  // §9.2f V3 — the E parent stale guard: every proposed parent field must equal the fresh view
+  // exactly. The Supervisor's observation of the parent's continuation point may not be stale.
+  if (proposal.variant === "SUBFLOW_SELECTION" && parentView?.status === "FOUND") {
+    const stale =
+      proposal.parent.task_key !== parentView.task_key ||
+      proposal.parent.attempt_key !== parentView.current_attempt_key ||
+      proposal.parent.task_contract_hash !== parentView.current_task_contract_hash ||
+      proposal.parent.attempt_state !== parentView.current_attempt_state;
+    if (stale) return rejected("SUBFLOW_PARENT_STALE");
+  }
 
-  const selection = proposal.variant === "TASK_SELECTION" ? proposal : undefined;
+  const selection: SelectionProposalV1 | undefined =
+    proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"
+      ? proposal
+      : undefined;
 
   // --- V4 classification membership (selection only) --------------------------------
   if (selection !== undefined && !Object.hasOwn(project.classifications, selection.classification)) {
@@ -156,6 +182,14 @@ function runValidation(
       // TD §9.2 (M1-6) — the fourth declared reference. Same reason code; no new V-step.
       Object.hasOwn(project.repository_scopes, selection.repository_scope_id);
     if (!known) return rejected("PROFILE_REFERENCE_UNKNOWN");
+    // §9.2f — an E child's frozen pipeline must terminate in RESUME_PARENT: a subflow child's
+    // completion is the parent's resumption predicate, never a canonical merge (§19.5.2).
+    if (proposal.variant === "SUBFLOW_SELECTION") {
+      const steps = project.pipelines[selection.pipeline_id]?.steps ?? [];
+      if (steps.length === 0 || steps[steps.length - 1] !== "RESUME_PARENT") {
+        return rejected("SUBFLOW_PIPELINE_INVALID");
+      }
+    }
   }
 
   // --- V7 Human Gate ----------------------------------------------------------------
@@ -167,8 +201,12 @@ function runValidation(
     }
   }
 
-  // --- V8 repository expected state (A/B) -------------------------------------------
-  if (proposal.variant === "TASK_SELECTION" || proposal.variant === "REPOSITORY_SENSITIVE_TASK_CONTROL") {
+  // --- V8 repository expected state (A/B/E) -----------------------------------------
+  if (
+    proposal.variant === "TASK_SELECTION" ||
+    proposal.variant === "SUBFLOW_SELECTION" ||
+    proposal.variant === "REPOSITORY_SENSITIVE_TASK_CONTROL"
+  ) {
     const repository = requireRepository(input);
     if (proposal.expected.base_head !== repository.canonical_head) {
       return rejected("REPOSITORY_STATE_MISMATCH");
@@ -216,11 +254,44 @@ function runValidation(
     const batch = requireBatch(input);
     const limits = policy.batch_policy;
     const kind = admissionKind(input);
+
+    // §9.2f P1–P4 — the parent relation checks run first, in order, inside V11.
+    if (selection.variant === "SUBFLOW_SELECTION" && parentView?.status === "FOUND") {
+      const child = requireSubflowChild(input);
+      if (parentView.batch_id !== child.batch_id) return rejected("SUBFLOW_PARENT_BATCH_MISMATCH");
+      const eligible =
+        parentView.platform_state === "ACTIVE" &&
+        parentView.current_attempt_state !== null &&
+        ["READY", "IMPLEMENTING", "VERIFYING", "AUDITING", "REWORKING"].includes(
+          parentView.current_attempt_state,
+        ) &&
+        !parentView.has_open_blocker &&
+        !parentView.has_recovery_conflict;
+      if (!eligible) return rejected("SUBFLOW_PARENT_INELIGIBLE");
+      if (
+        child.task_key === parentView.task_key ||
+        parentView.ancestor_task_keys.includes(child.task_key)
+      ) {
+        return rejected("SUBFLOW_CYCLE_DETECTED");
+      }
+      if (parentView.current_suspension_child_task_key !== null || child.has_parent_relation) {
+        return rejected("SUBFLOW_RELATION_CONFLICT");
+      }
+    }
+
     // §9.2e — rule 1 is a *new admission* rule; a reselection re-uses the slot it already holds.
     if (kind === "INITIAL_ADMISSION" && batch.admitted_task_count >= limits.max_tasks) {
       return rejected("BATCH_MAX_TASKS_REACHED");
     }
-    if (batch.active_task_count >= limits.concurrency) return rejected("CONCURRENCY_LIMIT_REACHED");
+    // §9.2f P5 — E's admission is *projected*: parent ACTIVE→SUSPENDED and child
+    // DISCOVERED→SELECTED commit in one transaction, so the parent's active slot and the child's
+    // are exchanged atomically, never counted as two. The parent's writable candidate does NOT
+    // vanish with suspension, so rule 3 counts it exactly as it stands.
+    const projected_active =
+      selection.variant === "SUBFLOW_SELECTION"
+        ? Math.max(0, batch.active_task_count - 1)
+        : batch.active_task_count;
+    if (projected_active >= limits.concurrency) return rejected("CONCURRENCY_LIMIT_REACHED");
 
     // A pipeline without an ACTOR step never produces a writable candidate, so it does not
     // compete for the writable slot. No new pipeline classification is introduced for this.
@@ -249,7 +320,9 @@ function rolesRequiringDerivation(
   proposal: ProposalV1,
   policy: ExecutionPolicyV1Body,
 ): readonly CoreExecutionRole[] {
-  if (proposal.variant === "TASK_SELECTION") return ["ACTOR", "AUDITOR"];
+  if (proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION") {
+    return ["ACTOR", "AUDITOR"];
+  }
   if (proposal.decision === "PROPOSE_MERGE" && policy.auto_merge) return ["ACTOR"];
   return [];
 }
@@ -262,7 +335,7 @@ function operationsFor(
   proposal: ProposalV1,
   policy: ExecutionPolicyV1Body,
 ): ReadonlyArray<readonly [string, CoreExecutionRole]> {
-  if (proposal.variant === "TASK_SELECTION") {
+  if (proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION") {
     return [
       [ACTOR_EXECUTION_OPERATION, "ACTOR"],
       [AUDITOR_EXECUTION_OPERATION, "AUDITOR"],
@@ -332,6 +405,22 @@ function admissionKind(input: DecisionValidationInput): SelectionAdmissionKind {
     throw inputInvalid("/admission_kind", `unknown selection admission kind ${String(kind)}`);
   }
   return kind;
+}
+
+function requireSubflowParent(input: DecisionValidationInput): SubflowParentValidationView {
+  const view = input.subflow_parent;
+  if (view === undefined) {
+    throw inputInvalid("/subflow_parent", "a subflow parent validation view is required for E");
+  }
+  return view;
+}
+
+function requireSubflowChild(input: DecisionValidationInput): SubflowChildContextV1 {
+  const view = input.subflow_child;
+  if (view === undefined) {
+    throw inputInvalid("/subflow_child", "a subflow child context is required for E");
+  }
+  return view;
 }
 
 function requireBatch(input: DecisionValidationInput): DecisionValidationBatchView {

@@ -55,7 +55,8 @@ import {
 } from "../execution/supervisor-session.ts";
 import { mergeDecisionCause } from "../humandecision/merge-decision.ts";
 import type { ProfileSource } from "../profile/types.ts";
-import { commitBatchFact, commitParentResume } from "../statemachine/transition-commit.ts";
+import { commitBatchFact } from "../statemachine/transition-commit.ts";
+import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
 import { DECISION_VALIDATION_LOG_KIND } from "../decision/decision-log.ts";
 import type { TaskAttemptRow, TaskRow } from "../store/domain-types.ts";
 import { isTerminalTask } from "../store/domain-types.ts";
@@ -194,16 +195,14 @@ export class ProductionCoordinator {
       return this.#applyResolvedMerge(task) ?? this.#applyResolvedDecision(task);
     }
 
-    // MVP 3 (Spec §47) — a suspended parent advances nothing itself; it resumes when every
-    // subflow child COMPLETED. A child that failed or deferred leaves the parent suspended for an
-    // explicit RESUME_PARENT or human decision — never a guessed resume.
+    // §19.5.3 (D22, MVP 3) — a suspended parent advances nothing itself; the deterministic
+    // eligibility predicate over durable rows (child SUCCEEDED+COMPLETED, exact v2 binding,
+    // exact suspension cause/ref, untouched continuation point, no blocker) is the only normal
+    // resume authority. A failed/abandoned child or a drifted relation leaves the parent
+    // SUSPENDED for the existing recovery paths — never a guessed resume.
     if (task.platform_state === "SUSPENDED") {
-      const children = store.tasks.childrenOf(task.task_key);
-      const allComplete =
-        children.length > 0 && children.every((child) => child.platform_state === "COMPLETED");
-      if (!allComplete) return undefined;
-      commitParentResume(store, task.task_key);
-      return "PARENT_RESUMED";
+      const outcome = resumeParentIfEligible(store, task.task_key);
+      return outcome.kind === "RESUMED" ? "PARENT_RESUMED" : undefined;
     }
 
     const attempt = store.attempts.current(task.task_key);

@@ -63,6 +63,7 @@ export type AttemptState =
   | "APPROVED_FOR_MANUAL_MERGE"
   | "MERGING"
   | "MERGED"
+  | "SUCCEEDED"
   | "INVALIDATED"
   | "FAILED";
 export const ATTEMPT_STATES: readonly AttemptState[] = [
@@ -75,12 +76,16 @@ export const ATTEMPT_STATES: readonly AttemptState[] = [
   "APPROVED_FOR_MANUAL_MERGE",
   "MERGING",
   "MERGED",
+  // §19.5.2 (D22, MVP 3) — frozen-pipeline terminal-success for a RESUME_PARENT terminal step.
+  // Not a repository/publication fact and never interchangeable with MERGED.
+  "SUCCEEDED",
   "INVALIDATED",
   "FAILED",
 ];
 
 export const TERMINAL_ATTEMPT_STATES: readonly AttemptState[] = [
   "MERGED",
+  "SUCCEEDED",
   "INVALIDATED",
   "FAILED",
 ];

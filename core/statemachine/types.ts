@@ -93,14 +93,23 @@ export const ABANDONED_BY_DECISION = "ABANDONED_BY_DECISION";
 export const abandonedByDecision = (decisionId: string): string =>
   `${ABANDONED_BY_DECISION}:${decisionId}`;
 
+/** TD §18.1f/§19.5 — `SUBFLOW_CHILD:<child_task_key>`: the parent SUSPENDED row's exact cause. */
+export const SUBFLOW_CHILD = "SUBFLOW_CHILD";
+export const subflowChild = (childTaskKey: string): string => `${SUBFLOW_CHILD}:${childTaskKey}`;
+export function subflowChildOf(reason: string | undefined): string | undefined {
+  if (reason === undefined || !reason.startsWith(`${SUBFLOW_CHILD}:`)) return undefined;
+  const child = reason.slice(SUBFLOW_CHILD.length + 1);
+  return child.length === 0 ? undefined : child;
+}
+
 /**
  * True for a fixed §24 code or one of the three parameterized forms
- * (`BLOCKED_BY_DECISION:`, `REATTEMPT_REQUIRED:`, `ABANDONED_BY_DECISION:`). Nothing else is a
- * reason.
+ * (`BLOCKED_BY_DECISION:`, `REATTEMPT_REQUIRED:`, `ABANDONED_BY_DECISION:`, `SUBFLOW_CHILD:`).
+ * Nothing else is a reason.
  */
 export function isReasonCode(value: string): boolean {
   if ((TRANSITION_REASON_CODES as readonly string[]).includes(value)) return true;
-  for (const prefix of [BLOCKED_BY_DECISION, REATTEMPT_REQUIRED, ABANDONED_BY_DECISION]) {
+  for (const prefix of [BLOCKED_BY_DECISION, REATTEMPT_REQUIRED, ABANDONED_BY_DECISION, SUBFLOW_CHILD]) {
     if (value.startsWith(`${prefix}:`) && value.slice(prefix.length + 1).length > 0) return true;
   }
   return false;
@@ -142,6 +151,21 @@ export type AttemptFact =
       readonly kind: "AUDIT_DECIDED";
       readonly verdict: "AUDIT_PASS" | "FIX_REQUIRED" | "HUMAN_REQUIRED";
       readonly drift_clear: boolean;
+    }
+  /**
+   * §19.5.2 (D22, MVP 3) — the frozen RESUME_PARENT terminal-success predicate held: the child
+   * Contract is subflow v2 with a current binding, every required verification evidence is PASS
+   * and bound to this exact candidate/Contract, the audit settled AUDIT_PASS for the same cycle,
+   * and no blocker/drift/recovery/circuit condition stands. Booleans are the caller's *observed*
+   * predicate legs — a false one is rejected, never reinterpreted. No repository operation exists
+   * on this path at all.
+   */
+  | {
+      readonly kind: "FOUNDATION_SUCCEEDED";
+      readonly subflow_binding_current: boolean;
+      readonly required_checks_bound: boolean;
+      readonly settlement_is_pass: boolean;
+      readonly blockers_clear: boolean;
     }
   /** §19.3 REWORKING→IMPLEMENTING. */
   | { readonly kind: "REWORK_STARTED"; readonly snapshot_valid: boolean }

@@ -26,10 +26,10 @@ import { buildHumanGateDecision } from "../humandecision/gate-request.ts";
 import { resolvedHumanGateAuthorization } from "../humandecision/gate-authorization.ts";
 import {
   commitAdmission,
-  commitParentResume,
   commitPendingDecision,
   commitTaskDeferral,
 } from "../statemachine/transition-commit.ts";
+import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
 import type { TaskDependency } from "../tasksource/types.ts";
 import { AdmissionError } from "./errors.ts";
 import { evaluateHardDependencies } from "./dependency-admission.ts";
@@ -212,36 +212,25 @@ function act(
   }
 
   if (proposal.decision === "RESUME_PARENT" && assembled.task_key !== null) {
-    // MVP 3 (Spec §47/§68) — an explicit, validated resume of a suspended subflow parent.
-    const resumed = commitParentResume(authorities.store, assembled.task_key);
-    return { ...base, transition_seq: resumed.transition.seq };
-  }
-
-  if (proposal.variant !== "TASK_SELECTION") return base;
-  if (assembled.task_key === null) return base;
-
-  // CONTRACT_AMBIGUITY (Spec §47; PR #43 finding 9) — a validated START_SUBFLOW names no parent:
-  // `TaskSelectionProposalV1` carries no parent reference and no contract rule determines one.
-  // Any selection rule here — including "the batch's unique in-flight admitted task" — would be
-  // implementation-decided contract semantics, which this module has no authority to invent. The
-  // Proposal is therefore validated-but-not-applied: nothing is admitted, no parent is chosen,
-  // and the refusal is a durable observation for governance to resolve. The sealed linkage and
-  // resume mechanisms (`subflow_parent_task_key` on admission, `commitParentResume`) stay proven
-  // and unreachable from here until the contract fixes an explicit parent reference.
-  if (proposal.decision === "START_SUBFLOW") {
+    // §19.5.3 (D22) — the Proposal's V5 PASS is *not* resume authority. Normal resume is owned by
+    // the deterministic eligibility predicate; this validated request only causes it to be
+    // re-observed now. When the predicate does not hold, nothing moves and the refusal is a
+    // durable observation — bypassing it takes a §17.4-mapped RECOVERY_DECISION or an approved
+    // operator action, never a Supervisor Proposal.
+    const outcome = resumeParentIfEligible(authorities.store, assembled.task_key);
+    if (outcome.kind === "RESUMED") {
+      return { ...base, transition_seq: outcome.transition_seq };
+    }
     authorities.store.decisions.append({
-      kind: "contract_ambiguity_observed",
+      kind: "resume_predicate_not_met",
       refKey: assembled.task_key,
-      payload: {
-        classification: "CONTRACT_AMBIGUITY",
-        subject: "subflow_parent_binding",
-        contract_refs: ["spec:§47", "platform/task-selection-proposal@v1"],
-        question: "which task is the subflow parent; the proposal vocabulary names none",
-      } as never,
+      payload: { reason: outcome.reason } as never,
     });
     return base;
   }
-  if (proposal.decision !== "START_TASK") return base;
+
+  if (proposal.variant !== "TASK_SELECTION" && proposal.variant !== "SUBFLOW_SELECTION") return base;
+  if (assembled.task_key === null) return base;
 
   // TD §8.4a — computed as late as possible, from this invocation's own fresh observations, and
   // recomputed on the resolved-gate path too: a human approval does not carry a dependency fact.
@@ -260,6 +249,9 @@ function act(
     );
   }
 
+  // §19.5.1 — an E admission carries the Proposal's exact parent observation into the commit,
+  // where the transaction re-reads and re-checks it against current durable rows. Child
+  // selection, parent suspension and the relation land together or not at all.
   const admitted = commitAdmission(authorities.store, {
     task_key: assembled.task_key,
     hard_dependencies_clear,
@@ -273,6 +265,7 @@ function act(
     },
     admitted_at: command.observed_at,
     ...(resolvedDecisionId === undefined ? {} : { resolved_decision_id: resolvedDecisionId }),
+    ...(proposal.variant === "SUBFLOW_SELECTION" ? { subflow_parent: proposal.parent } : {}),
   });
 
   return { ...base, admitted: true, transition_seq: admitted.transition.seq };

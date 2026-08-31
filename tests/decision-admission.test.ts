@@ -61,9 +61,18 @@ test("B7-AC10 / B7-AC11: the result kinds and the reject vocabulary are exact", 
       "BATCH_MAX_TASKS_REACHED",
       "CONCURRENCY_LIMIT_REACHED",
       "WRITABLE_CONCURRENCY_CONFLICT",
+      // §9.2f (D22) — the seven subflow parent-binding reasons. The twelve MVP 0/1 reasons above
+      // are sealed and unchanged.
+      "SUBFLOW_PARENT_NOT_FOUND",
+      "SUBFLOW_PARENT_STALE",
+      "SUBFLOW_PARENT_INELIGIBLE",
+      "SUBFLOW_PARENT_BATCH_MISMATCH",
+      "SUBFLOW_RELATION_CONFLICT",
+      "SUBFLOW_CYCLE_DETECTED",
+      "SUBFLOW_PIPELINE_INVALID",
     ],
   );
-  assert.equal(DECISION_REJECT_REASONS.length, 12);
+  assert.equal(DECISION_REJECT_REASONS.length, 19);
 });
 
 // --- B7-AC8 read model ------------------------------------------------------------------

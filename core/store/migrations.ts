@@ -351,6 +351,51 @@ DROP TABLE task;
 ALTER TABLE task_v7 RENAME TO task;
 `;
 
+/**
+ * §18.1f/§19.2 (D22, MVP 3) — adds the additive terminal AttemptState `SUCCEEDED` to the
+ * `task_attempt` CHECK and to the single-non-terminal index's terminal set. `SUCCEEDED` is a
+ * frozen-pipeline terminal-success fact (§19.5.2), never an alias for `MERGED`. Same FK-off
+ * rewrite discipline as v7; table count unchanged; MVP 0/1 rows are copied verbatim.
+ */
+const MIGRATION_V8 = `
+CREATE TABLE task_attempt_v8 (
+  attempt_key          TEXT PRIMARY KEY,
+  task_key             TEXT NOT NULL REFERENCES task(task_key),
+  n                    INTEGER NOT NULL CHECK (n >= 1),
+  contract_snapshot_id TEXT NOT NULL UNIQUE REFERENCES task_contract_snapshot(snapshot_id),
+  state                TEXT NOT NULL CHECK (state IN
+                         ('READY', 'IMPLEMENTING', 'VERIFYING', 'AUDITING', 'REWORKING',
+                          'READY_TO_MERGE', 'APPROVED_FOR_MANUAL_MERGE', 'MERGING', 'MERGED',
+                          'SUCCEEDED', 'INVALIDATED', 'FAILED')),
+  base_head            TEXT NOT NULL,
+  candidate_commit     TEXT,
+  rework_count         INTEGER NOT NULL CHECK (rework_count >= 0),
+  state_reason_code    TEXT,
+  state_reason_log_seq INTEGER REFERENCES decision_log(seq),
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
+  UNIQUE (task_key, n),
+  CHECK (state <> 'FAILED'
+         OR (state_reason_code IS NOT NULL AND state_reason_log_seq IS NOT NULL))
+) STRICT;
+
+INSERT INTO task_attempt_v8
+  (attempt_key, task_key, n, contract_snapshot_id, state, base_head, candidate_commit,
+   rework_count, state_reason_code, state_reason_log_seq, created_at, updated_at)
+SELECT
+  attempt_key, task_key, n, contract_snapshot_id, state, base_head, candidate_commit,
+  rework_count, state_reason_code, state_reason_log_seq, created_at, updated_at
+FROM task_attempt;
+
+DROP TABLE task_attempt;
+
+ALTER TABLE task_attempt_v8 RENAME TO task_attempt;
+
+CREATE UNIQUE INDEX task_attempt_single_non_terminal
+  ON task_attempt (task_key)
+  WHERE state NOT IN ('MERGED', 'SUCCEEDED', 'INVALIDATED', 'FAILED');
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "foundation", statements: MIGRATION_V1 },
   { version: 2, name: "domain", statements: MIGRATION_V2 },
@@ -359,6 +404,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 5, name: "selection-binding", statements: MIGRATION_V5 },
   { version: 6, name: "audit-decision-category", statements: MIGRATION_V6 },
   { version: 7, name: "subflow-parent", statements: MIGRATION_V7, disable_foreign_keys: true },
+  { version: 8, name: "subflow-succeeded", statements: MIGRATION_V8, disable_foreign_keys: true },
 ];
 
 const BOOTSTRAP = `

@@ -54,6 +54,7 @@ test("M1B2-AC1 / AC2 / AC48: no migration was added and the v3 foundation is unt
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
   assert.deepEqual(

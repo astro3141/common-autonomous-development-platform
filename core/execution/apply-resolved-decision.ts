@@ -463,7 +463,7 @@ function auditEvidenceBinds(
 }
 
 function isTerminal(state: TaskAttemptRow["state"]): boolean {
-  return state === "MERGED" || state === "INVALIDATED" || state === "FAILED";
+  return state === "MERGED" || state === "SUCCEEDED" || state === "INVALIDATED" || state === "FAILED";
 }
 
 /**

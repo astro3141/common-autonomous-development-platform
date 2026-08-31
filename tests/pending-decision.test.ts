@@ -24,7 +24,9 @@ import {
   type PendingDecisionV1,
 } from "../core/humandecision/types.ts";
 import { validateProposal } from "../core/decision/proposal.ts";
-import { batchControl, selection, taskControl } from "./support/decision-fixtures.ts";
+import { batchControl, selection,
+  SUBFLOW_PARENT_INTENT,
+  subflowSelection, taskControl } from "./support/decision-fixtures.ts";
 import {
   gateDecision,
   proposalFor,
@@ -210,7 +212,11 @@ test("B8-AC22: gate construction is deterministic for every gated Proposal shape
       { proposal: proposalFor(world), task_key: TASK_KEY },
       {
         proposal: validateProposal(
-          selection({ profile: world.profile, decision: "START_SUBFLOW", classification: "SPLIT_NEEDED" }),
+          subflowSelection({
+            profile: world.profile,
+            classification: "SPLIT_NEEDED",
+            parent: SUBFLOW_PARENT_INTENT,
+          }),
         ),
         task_key: TASK_KEY,
       },

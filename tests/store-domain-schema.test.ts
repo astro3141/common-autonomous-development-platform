@@ -71,6 +71,9 @@ test("B8-AC4 / B8-AC5 / B8-AC6 / B8-AC7: the four state vocabularies are exact",
       "APPROVED_FOR_MANUAL_MERGE",
       "MERGING",
       "MERGED",
+      // §19.5.2 (D22, MVP 3) — additive terminal-success for a RESUME_PARENT terminal pipeline.
+      // Completion ≠ merge: SUCCEEDED never aliases MERGED.
+      "SUCCEEDED",
       "INVALIDATED",
       "FAILED",
     ],
@@ -79,7 +82,7 @@ test("B8-AC4 / B8-AC5 / B8-AC6 / B8-AC7: the four state vocabularies are exact",
   // HELD is deliberately not terminal; SUSPENDED (MVP 3) is not terminal either — a suspended
   // parent resumes when its subflow children complete (Spec §47).
   assert.deepEqual([...TERMINAL_TASK_STATES], ["COMPLETED", "FAILED", "DEFERRED"]);
-  assert.deepEqual([...TERMINAL_ATTEMPT_STATES], ["MERGED", "INVALIDATED", "FAILED"]);
+  assert.deepEqual([...TERMINAL_ATTEMPT_STATES], ["MERGED", "SUCCEEDED", "INVALIDATED", "FAILED"]);
   assert.equal((TERMINAL_TASK_STATES as readonly string[]).includes("SUSPENDED"), false);
 });
 

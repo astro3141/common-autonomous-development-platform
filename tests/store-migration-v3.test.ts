@@ -108,6 +108,7 @@ test("V3-M2 / M1B1-AC5 / AC6: an existing v2 database gains only v3, keeping its
         { version: 5, name: "selection-binding" },
         { version: 6, name: "audit-decision-category" },
         { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
       ],
     );
   } finally {

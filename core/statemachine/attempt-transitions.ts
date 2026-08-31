@@ -118,6 +118,17 @@ export function nextAttemptOutcome(
       break;
     }
 
+    case "FOUNDATION_SUCCEEDED": {
+      expect(from === "AUDITING", `foundation terminal-success requires AUDITING, not ${from}`);
+      if (!fact.subflow_binding_current) throw precondition("the subflow v2 binding is not current");
+      if (!fact.required_checks_bound) throw precondition("the verification gate did not pass for this candidate");
+      if (!fact.settlement_is_pass) throw precondition("no settled AUDIT_PASS binds to this cycle");
+      if (!fact.blockers_clear) throw precondition("a blocker/drift/recovery condition stands");
+      // Completion ≠ merge: SUCCEEDED is the frozen pipeline's terminal-success, `MERGED` is the
+      // MERGE_GATE path's repository fact, and neither aliases the other (§19.5.2).
+      return { attempt_state: "SUCCEEDED", task_state: "COMPLETED" };
+    }
+
     case "REWORK_STARTED": {
       expect(from === "REWORKING", `rework requires REWORKING, not ${from}`);
       if (!fact.snapshot_valid) throw precondition("the frozen contract snapshot is no longer valid");

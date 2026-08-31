@@ -79,5 +79,8 @@ export function requiresHumanGate(
   disposition: ExecutionDisposition | undefined,
 ): boolean {
   if (policy.human_gate_policy.required_decisions.includes(proposal.decision)) return true;
-  return proposal.variant === "TASK_SELECTION" && disposition === "HOLD_HUMAN";
+  return (
+    (proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION") &&
+    disposition === "HOLD_HUMAN"
+  );
 }

@@ -18,6 +18,10 @@ import {
   manifests,
   repositoryControl,
   selection,
+  subflowChildContext,
+  subflowParentView,
+  SUBFLOW_PARENT_INTENT,
+  subflowSelection,
   task,
   taskControl,
   HEAD,
@@ -177,9 +181,23 @@ test("B7-AC17: START_TASK follows the disposition table", () => {
 });
 
 test("B7-AC17: START_SUBFLOW follows the disposition table when subflows are allowed", () => {
+  // §9.2f — the applying shape is E: explicit parent intent + fresh parent/child views, and a
+  // pipeline whose frozen terminal is RESUME_PARENT (§19.5.2).
   const subflow = (classification: string): DecisionValidationResult =>
     validateDecision(
-      inputFor(selection({ profile, decision: "START_SUBFLOW", classification }), profile),
+      inputFor(
+        subflowSelection({
+          profile,
+          classification,
+          pipeline_id: "foundation",
+          parent: SUBFLOW_PARENT_INTENT,
+        }),
+        profile,
+        {
+          subflow_parent: subflowParentView() as never,
+          subflow_child: subflowChildContext() as never,
+        },
+      ),
     );
 
   assert.deepEqual(subflow("SPLIT_NEEDED"), ACCEPTED);
@@ -197,8 +215,17 @@ test("B7-AC18: allow_auto_subflow=false cannot be bypassed by a human gate", () 
     assert.deepEqual(
       validateDecision(
         inputFor(
-          selection({ profile: closed, decision: "START_SUBFLOW", classification }),
+          subflowSelection({
+            profile: closed,
+            classification,
+            pipeline_id: "foundation",
+            parent: SUBFLOW_PARENT_INTENT,
+          }),
           closed,
+          {
+            subflow_parent: subflowParentView() as never,
+            subflow_child: subflowChildContext() as never,
+          },
         ),
       ),
       rejected("DECISION_NOT_ALLOWED"),

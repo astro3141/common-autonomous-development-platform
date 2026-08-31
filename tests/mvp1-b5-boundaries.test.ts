@@ -71,7 +71,7 @@ test("M1B5-AC50 / AC51: activation writes no adapter_metadata and no idempotency
 test("M1B5-AC56: no new table, framework or durable draft was introduced", () => {
   const temp = tempStore();
   const store = temp.open();
-  assert.equal(store.schemaVersion, 7);
+  assert.equal(store.schemaVersion, 8);
   store.close();
   try {
     const database = openDatabase(temp.path);
@@ -161,6 +161,7 @@ test("M1B5-AC1 / AC2 / AC3: the migration list is exactly v1..v5 and adds no tab
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
   assert.deepEqual(
