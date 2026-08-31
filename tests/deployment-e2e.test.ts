@@ -544,3 +544,121 @@ test("ALIVE-3: a platform restart mid-implementation resumes from durable state 
     world.dispose();
   }
 });
+
+test("ALIVE-4: total backend loss across a restart — no duplicate turn, honest waiting, fail-closed catch-up", async () => {
+  const { recoverRun } = await import("../core/coordinator/production-recovery.ts");
+  const { submitProposal } = await import("../core/admission/submit-proposal.ts");
+  const { RUNTIME_ADAPTER } = await import("../core/execution/start-implementation.ts");
+  const { actorTurnMetadataKey } = await import("../core/execution/actor-operations.ts");
+
+  const world = pilotWorld();
+  const gateway = new ScriptedGateway();
+  let first: Composition | undefined;
+  let second: Composition | undefined;
+
+  try {
+    first = compose(world.config, {
+      runtime_gateway: gateway,
+      verification: new FakeVerificationAdapter(),
+      preflight: () => ({ status: "READY" }),
+    });
+    const opened = openRun(first);
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "SUPERVISOR_REQUESTED");
+    const definition = first.deps.taskSource.get_task(PILOT_TASK_REF);
+    const head = first.deps.repository.snapshot_canonical().head;
+    const submitted = submitProposal(
+      {
+        store: first.store,
+        taskSource: first.deps.taskSource,
+        repository: first.deps.repository,
+        manifests: first.deps.manifests,
+      },
+      {
+        run_id: opened.run_id,
+        batch_id: opened.batch_id,
+        observed_at: new Date().toISOString(),
+        proposal: {
+          proposal_id: ulid(),
+          decision: "START_TASK",
+          task_ref: PILOT_TASK_REF,
+          classification: PILOT_CLASSIFICATION,
+          pipeline_id: PILOT_PIPELINE,
+          actor_profile: PILOT_ACTOR_PROFILE,
+          verification_profile: PILOT_VERIFICATION_PROFILE,
+          repository_scope_id: PILOT_SCOPE,
+          expected: {
+            task_version: definition.version,
+            task_definition_hash: definition.definition_hash,
+            base_head: head,
+            compiled_profile_hash: first.compiled.compiled_hash,
+          },
+          reason_refs: [],
+        },
+      },
+    );
+    assert.deepEqual(submitted.result, { kind: "ACCEPTED" });
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "ACTIVATED");
+    assert.equal(first.coordinator.tickOnce(opened.run_id), "IMPLEMENTATION_STARTED");
+    assert.equal(gateway.turns.length >= 1, true, "the actor turn was spawned before the crash");
+
+    // --- crash: platform AND backend die together ---------------------------------------------
+    first.dispose();
+    first = undefined;
+    const freshGateway = new ScriptedGateway(); // the backend restarted: no session, no status
+
+    second = compose(world.config, {
+      runtime_gateway: freshGateway,
+      verification: new FakeVerificationAdapter(),
+      preflight: () => ({ status: "READY" }),
+    });
+    const resumed = openRun(second);
+    assert.deepEqual(resumed, opened, "the same run, not a second one");
+    const { store, coordinator, deps } = second;
+    const attempt = () => store.attempts.current(TASK_KEY)!;
+    const attemptKey = attempt().attempt_key;
+
+    // 1) No authority answers about the turn → that is honest waiting, never a re-spawn.
+    const silent = recoverRun(deps, { run_id: opened.run_id });
+    assert.equal(silent.classification, "CONSISTENT", "no terminal projection = still running");
+    assert.equal(attempt().state, "IMPLEMENTING");
+    assert.equal(freshGateway.turns.length, 0, "recovery spawned nothing");
+    // The ordinary tick polls the turn, finds no terminal projection and fails *loudly* — a
+    // failed tick is logged by main and harms nothing durable; it never manufactures a result.
+    assert.throws(() => coordinator.tickOnce(opened.run_id), /no terminal projection/);
+    assert.equal(attempt().state, "IMPLEMENTING");
+    assert.equal(freshGateway.turns.length, 0, "the tick spawned nothing either — zero duplicate turns");
+
+    // 2) The backend answers through the durable handle: the session is gone (§22.3 R-1).
+    const handle = store.adapterMetadata.get(attemptKey, RUNTIME_ADAPTER, actorTurnMetadataKey(1))
+      ?.value as { agent_id: string; session_id: string; request_id: string };
+    freshGateway.lose(
+      { agent_id: handle.agent_id, session_id: handle.session_id },
+      handle.request_id,
+    );
+
+    const caught = recoverRun(deps, { run_id: opened.run_id });
+    assert.equal(caught.classification, "EXPLAINABLE");
+    assert.equal(
+      caught.actions.some((action) => action.kind === "TURN_LOSS_CAUGHT_UP"),
+      true,
+      "the loss is reconciled through the sealed judge, not improvised",
+    );
+    // No commit ever landed in the worktree, so the repository judges the candidate ABSENT and
+    // the sealed policy answers with a rework — the lost turn itself is never replayed.
+    assert.equal(attempt().attempt_key, attemptKey, "same attempt; nothing was cloned");
+    assert.equal(attempt().state, "REWORKING");
+    assert.equal(freshGateway.turns.length, 0, "catch-up spawned no turn");
+
+    // 3) The rework turn cannot safely go out: the lost turn's result-channel slot is still armed
+    // and a restarted adapter refuses to guess which slot to destroy (I-TD12). The attempt parks
+    // fail-closed for a person — and still nothing was spawned. Zero duplicate turns, ever.
+    assert.equal(coordinator.tickOnce(opened.run_id), "BLOCKED");
+    assert.equal(store.tasks.require(TASK_KEY).platform_state, "HELD");
+    assert.equal(store.tasks.require(TASK_KEY).state_reason?.code, "RECOVERY_CONFLICT");
+    assert.equal(freshGateway.turns.length, 0, "no turn was ever replayed or spawned");
+  } finally {
+    first?.dispose();
+    second?.dispose();
+    world.dispose();
+  }
+});

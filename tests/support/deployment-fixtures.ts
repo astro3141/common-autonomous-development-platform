@@ -250,6 +250,16 @@ export class ScriptedGateway implements BackendGatewaySeam {
     });
   }
 
+  /** The test states the backend fact: the session vanished (backend restart — ALIVE-4). */
+  lose(session: GatewaySessionRef, request_id: string): void {
+    this.#statuses.set(`${session.agent_id}:${session.session_id}:${request_id}`, {
+      backend_status: "SESSION_LOST",
+      termination_reason: "session_lost",
+      started_at: "t1",
+      completed_at: "t2",
+    });
+  }
+
   session_status(session: GatewaySessionRef): Record<string, unknown> {
     return { ...session };
   }

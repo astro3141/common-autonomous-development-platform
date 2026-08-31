@@ -9,6 +9,7 @@
  */
 
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { monitorOnce } from "../core/coordinator/monitor.ts";
@@ -101,26 +102,40 @@ test("B16-1: an intact mid-flight run reconciles CONSISTENT and applies nothing"
   }, SINGLE);
 });
 
-test("B16-2: durable-state corruption trips the circuit breaker — batch and run stop", () => {
+test("B16-2: real durable corruption — a tampered contract envelope trips the circuit breaker", () => {
   withWorld((world) => {
     const w = driveToImplementing(world);
-    // Falsification control: destroy the referential basis (the auditor grant row) directly.
-    (w.store as unknown as { grants: { delete?: unknown } });
     const attempt = w.store.attempts.current(TASK_KEY)!;
-    const contract = w.store.contracts.get(attempt.contract_snapshot_id)!;
-    const grants = (contract.body as unknown as {
-      capability_grants: Record<string, { grant_id: string }>;
-    }).capability_grants;
-    // The store exposes no delete (immutability); reach the database file through a raw handle is
-    // out of bounds too. The honest corruption available at this level is a contract that names a
-    // grant that never existed — build the condition by deleting via SQL is not exposed, so use
-    // the integrity classifier's own sensitivity: point the run at a batch whose profile is gone.
-    void grants;
-    // Simplest reachable corruption: a task row whose attempt references a contract snapshot id
-    // that is absent. Absent rows cannot be created through the sealed API, so instead corrupt
-    // the *root*: ask recovery about a run that does not exist.
-    const report = recoverRun(w, { run_id: "run:01JQ8ZK5T7RC9V2W4X6Y8Z0XX0" });
+
+    // Corrupt the durable artifact itself: a second raw connection tears the frozen contract
+    // envelope's bytes — the disk-level fault (torn write, external tamper) the sealed store API
+    // can never produce and §22.4's load/re-hash path must catch.
+    const raw = new DatabaseSync(world.temp.path);
+    try {
+      raw
+        .prepare("UPDATE task_contract_snapshot SET envelope_json = substr(envelope_json, 1, 16) WHERE snapshot_id = ?")
+        .run(attempt.contract_snapshot_id);
+    } finally {
+      raw.close();
+    }
+
+    const report = recoverRun(w, { run_id: RUN_ID });
     assert.equal(report.classification, "UNEXPLAINED");
+    assert.equal(
+      report.actions.some((action) => action.kind === "CIRCUIT_BREAKER"),
+      true,
+    );
+    assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
+    assert.equal(w.store.runs.require(RUN_ID).status, "PAUSED_SAFELY");
+
+    // Falsification control: a second pass never launders the corruption into CONSISTENT.
+    assert.equal(recoverRun(w, { run_id: RUN_ID }).classification, "UNEXPLAINED");
+
+    // The original probe stays: a recovery root that does not exist is UNEXPLAINED too.
+    assert.equal(
+      recoverRun(w, { run_id: "run:01JQ8ZK5T7RC9V2W4X6Y8Z0XX0" }).classification,
+      "UNEXPLAINED",
+    );
   }, SINGLE);
 });
 

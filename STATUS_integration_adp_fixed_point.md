@@ -147,7 +147,39 @@ current-turn regression (OP-7)                                     restart resum
 finding evidence must resolve; conflicts refuse (OP-5)             ingress+real git full lifecycle (ALIVE-1/2)
 ```
 
-## 5. The candidate
+## 5. PR #43 independent review — disposition of the 18 findings
+
+Every finding from review comment 5479029297 was reproduced at head `b32289d` before any fix, and
+every fix carries a regression + falsification control in `tests/pr43-findings.test.ts` (F-numbered)
+or the reworked suite tests.
+
+| # | Verdict | Disposition |
+|---|---------|-------------|
+| 1 | BUG | Production gateway resolves the backend entry via package exports, validates shape before any call, refuses async `ensureSession`/thenable results, requires deployment-supplied `derive_session_input` (I-TD5) — commit `f46cf51` (F1) |
+| 2 | BUG | Workflow adapter takes a lazy `controller_binding` provider resolved at call time — `f46cf51` (F2) |
+| 3 | BUG | `bootRun` runs §22.2 reconciliation before ingress/ticks; startup logs the classification — `beb7c75` (F3) |
+| 4 | IMPLEMENTATION_GAP | Full-width recovery: attempt reconciliation per state (READY INTENT probe, IMPLEMENTING turn catch-up via sealed `startVerification({recovered_turn_loss})`, VERIFYING/MERGING/approved repo+verification probes), external CLOSED sweep, outbox drain, `recovery_pass` journal — `beb7c75` (F4) |
+| 5 | BUG | Malformed manifest set → pause + `CAPABILITY_UNAVAILABLE` every pass; never launders to CONSISTENT — `f46cf51` (F5) |
+| 6 | BUG | Run discovery is store-authoritative (`activeForProject`); pointer file is written, never read; >1 active refuses — `f46cf51` (F6) |
+| 7 | BUG | Report file naming injective (underscore escaped) — `f46cf51` (F7) |
+| 8 | BUG | §21.1 exactly-one line across the crash window (`#appendLineOnce` scans by op_key) — `f46cf51` (F8) |
+| 9 | **CONTRACT_AMBIGUITY — separated, not decided** | The "unique in-flight parent" reading reverted; START_SUBFLOW is validated-but-not-applied with a durable `contract_ambiguity_observed` entry; sealed linkage/resume proven directly (B15-3/6) — see §3 |
+| 10 | BUG | `safe_independent_runnable_exists` judges policy slots, writable slot and fresh HARD deps (TaskSource throw = unsafe) — `172b3f5` (F10) |
+| 11 | BUG | Supervisor pacing counts batch-scoped `decision_validation` entries only — `f46cf51` (F11) |
+| 12 | BUG | Monitor observes the current rework turn, not the terminal turn-1 — `f46cf51` (F12) |
+| 13 | IMPLEMENTATION_GAP | Full §22.5 vocabulary (8 kinds incl. TERMINAL_DIVERGENCE over both merge-pending states), keyed thresholds with `threshold_ref` provenance, `authority_coverage` partial results — `172b3f5` (F13) |
+| 14 | BUG | v2 Compiled Profile requires `supervisor_profile`; compose fails closed — `f46cf51` (F14) |
+| 15 | IMPLEMENTATION_GAP | Observation schema v2: Core-stamped frozen role chain (§13.2a/§13.5), inline failure attribution; adapter claims never override — `172b3f5` (F15) |
+| 16 | IMPLEMENTATION_GAP | §5.14 evaluation units (role×class×binding×assurance×completeness) with per-category measurement refs — `172b3f5` (F16) |
+| 17 | BUG | Result-channel separation asserted before any mkdir, via realpath of nearest existing ancestor, both directions — `f46cf51` (F17) |
+| 18 | BUG | Finding transition refs resolve only an exact `state_transition` at that seq — `f46cf51` (F18) |
+
+Evidence strengthening beyond the findings: B16-2 now corrupts a real durable artifact (raw SQLite
+tamper of `envelope_json` → circuit breaker), and ALIVE-4 proves total backend loss across a
+restart: honest waiting while no authority answers, §22.3 R-1 catch-up through the sealed judge,
+and the armed result-channel slot forcing `HELD(RECOVERY_CONFLICT)` with **zero** duplicate turns.
+
+## 5a. The candidate
 
 ```text
 branch: integration/adp-fixed-point
