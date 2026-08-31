@@ -1,10 +1,31 @@
-# Common Autonomous Development Platform — Technical Design v1.4 (design-track canonical)
+# Common Autonomous Development Platform — Technical Design v1.5 (design-track canonical)
 
 > **Authority provenance ([원장], ADP #6 AMENDMENT-1 계보):** v1.2~v1.4는 **TD 개선축(design track)의
 > working canonical**로 개발되었다. **PR #18 머지 전까지 repository authority는 main의 TD v1.1이었고**,
 > **이 파일이 main에 올라간 시점부터 이 문서가 Spec v0.3 아래의 repository TD authority다.** 이후의
 > 개선축 산출물은 다시 별도 sync를 거치며, 참조는 exact commit SHA로 한다(#1 AMENDMENT-1).
 > authority 서열 자체는 불변: Spec v0.3 > 이 TD > Backend Capability Contract > STATUS 문서들.
+>
+> **v1.5 revision (MVP 4 operability closure — IO #23은 evidence source로만 사용,
+> ARCH_REOPENING 없음):** 기존 primitive를 유지한 채 향후 production implementation에 필요한 네 경계만
+> 보강한다 — (1) §22.5 monitoring/liveness는 observation trigger일 뿐 authority가 아니며 반드시
+> authoritative re-observation → §22 reconciliation → 기존 deterministic recovery로 이어짐,
+> (2) §5.13 `ImprovementFindingV1`은 evidence-derived semantic record이고 issue/task-system은 projection일
+> 뿐 lifecycle/policy authority가 아님, (3) §5.12/§13.2a/§24.1은 실제 role/provider/model/usage/cost와
+> failure domain을 추정 없이 귀속, (4) §5.14/§7.1d/§13.5는 role-specific evaluation → read-only routing
+> recommendation까지만 허용하고 automatic policy routing·mid-attempt fallback은 future authority seam으로
+> 남김. 새 WorkflowProfile, telemetry authority store, monitoring state machine, IO mechanism은 만들지 않는다.
+> 전부 **PROSPECTIVE_REQUIREMENT**이며 MVP 0/1 FORMAL seal과 기존 D1–D19를 소급 무효화하지 않는다.
+>
+> **v1.5 Operator-evidence amendment (PR #42 comment `5477209602`, Design Evidence이지 authority가 아님):**
+> IO self-hosting 운영에서 측정된 false positive·partial observation·alert fatigue·stage duration 차이·평가
+> input 누락·unwired fail-closed guard를 portable failure mode로만 번역했다. §22.5의
+> **Monitoring is observation, not authority / An anomaly is not a lifecycle fact**는 반증되지 않았고, 네 건의
+> confident false signal이 actuation으로 번지지 않은 실측으로 강화되었다. amendment는 (a) durable하게
+> 재구성 가능한 signal·absence/coverage 정직성, (b) Finding 기반 presentation collapse, (c) state/stage-aware
+> threshold resolution, (d) sealed MVP 1과 구분된 prospective early read-only monitoring, (e) evaluation input
+> completeness, (f) material fail-closed boundary의 bounded falsification validation만 추가한다. 전부
+> **PROSPECTIVE_REQUIREMENT**이며 Spec 변경, architecture reopening, 새 store/state machine은 없다.
 >
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
@@ -482,17 +503,24 @@ ADP 번역. 신규 수집기가 아니라 **기존 durable 기록의 도출**이
 
 ```text
 per attempt (key: task_contract_hash + attempt_key):
-  role / provider / model           ← grant + adapter_metadata (non-secret)
+  role / role_profile / runtime_profile
+                                    ← frozen selection + Compiled Profile + grant
+  requested/actual provider/model   ← §13.5 binding + §13.2a RuntimeExecutionObservationV1
+                                      (backend가 보고하지 않으면 UNKNOWN; profile 이름에서 추정 금지)
   wall-clock / stage 시간            ← state transition 타임스탬프
-  verification/gate 시간             ← evidence timestamp + run_reference
+  verification/gate 시간             ← verify INTENT + evidence timestamp/run_reference + gate transition
   attempts / review rounds / rework  ← attempt.n, rework_count, audit_record
   human_handoffs                     ← next-owner=HUMAN 레코드 수 (I-TD8이 측정을 정의로 만든다)
   human_interventions (optional)     ← resolved decision / operator action 등 실제 human action
                                        record에 bind해 별도 derive — handoffs와 동일 metric 금지
-  typed outcome / failure class      ← §24 taxonomy (이미 typed)
+  provider/runtime/infrastructure failures
+  model/task/protocol failures       ← §24 lifecycle code + §24.1 FailureAttributionV1
+                                      (서로 합치거나 한쪽을 다른 쪽으로 추정 금지)
+  final typed outcome                ← Task/Attempt terminal state + reason code
   usage/cost                         ← { kind: REPORTED | ESTIMATED | UNKNOWN, value,
                                          estimator_version(ESTIMATED일 때만) } — 관측값과
                                        추정값을 합산 가능한 동급 fact로 승격하지 않는다
+  escaped defect discovered later   ← §5.13 Finding의 escaped_from ref가 존재할 때만
 ```
 
 [계약] **귀속 정밀화 (v1.4 — #9 PRACTITIONER-DELTA 채택):** normative measurement unit은
@@ -502,11 +530,156 @@ derived하며 새 durable measurement identity(`measurement_cycle_id` 류)를 �
 Measurement Projection은 새 telemetry authority가 아니라 실행된 계약/기록의 정확한
 read-only 도출이라는 경계를 유지한다.
 
+[계약] **availability와 귀속.** 위 metric은 source record가 존재할 때만 `AVAILABLE`이다. source가 없거나
+backend가 값을 제공하지 않으면 `UNKNOWN/UNAVAILABLE`로 남기며, profile 이름·wall-clock·요금표·평균 token
+비율에서 실제 provider usage나 cost를 역산해 `REPORTED`로 기록하지 않는다. `ESTIMATED` cost는 currency,
+estimator version, price-source ref, 계산 시점을 함께 가져야 하며 reported cost와 별도 series다. 여러
+provider/model이 한 Attempt에 관측되면 하나로 뭉개지 않고 runtime operation별 observation을 먼저 내고,
+attempt aggregate에는 mixed binding임을 표시한다. §13.5가 금지한 unapproved mid-attempt switch가
+관측되면 measurement normalization으로 숨기지 않고 finding 후보로 노출한다.
+
+[계약] **durable source minimum (PROSPECTIVE_REQUIREMENT).** completed Runtime turn의
+`idempotency.DONE.result_json`은 redacted `RuntimeTurnResult`와 §13.2a observation을 보존한다. 이는 기존
+write-ahead operation receipt의 result를 정밀화하는 것이며 `runtime_turn`/telemetry event table을 새로
+만들지 않는다. 저장할 수 없는 provider-native field는 버리고 availability를 낮춘다(I-TD7). 기존 v1
+receipt에 이 데이터가 없으면 과거 metric은 `UNKNOWN`이며 소급 합성하지 않는다.
+
 [설명] **확장 규율 (baseline-first, IO #23 body[8] 준용):** 측정된 실패 클래스 없이 role/pipeline
 stage/topology를 늘리지 않는다 — `observed failure class → missing capability 가설 → bounded
 실험 → 비교 → 채택/폐기`. 이 규율은 MVP 3의 pipeline/role 확장에 대한 사전 구속이다. 목적 함수
 (completed useful work ÷ (AI cost + human handling + failure cost))는 방향 지시용이며 텔레메트리
 확보 전 문자 그대로 최적화하지 않는다.
+
+### 5.13 Improvement Finding (v1.5 — derived semantic record, issue가 아님)
+
+[계약, PROSPECTIVE_REQUIREMENT] 운영/E2E/verification/audit에서 관측된 이상을 continuing work로 넘길 때
+사용하는 최소 generic record다. Finding은 **evidence에 근거한 분류된 진단 record**이지 Task/Attempt
+lifecycle fact, Execution Policy, contract 변경 승인, repository mutation authority가 아니다.
+
+Envelope은 `schema = "platform/improvement-finding"`, `schema_version = 1`이다. `finding_hash`는 envelope
+전체의 hash이며 self-reference를 피하기 위해 body에 넣지 않는다(§6/§7.7 규율 재사용).
+
+```text
+ImprovementFindingV1Body {
+  finding_id
+  subject_ref                    # run/task/attempt/op/evidence 중 기존 generic ref
+  classification: BUG | IMPLEMENTATION_GAP | BACKEND_GAP | OPERABILITY_GAP |
+                  CONTRACT_GAP | CONTRACT_AMBIGUITY | CONTRACT_CONTRADICTION |
+                  NON_BLOCKING_NIT
+  summary
+  evidence_refs[]                # non-empty; authoritative owner/provenance 확인 가능
+  observation_refs[]             # optional; §22.5 anomaly/diagnostic packet ref
+  discovered_at
+  classifier: DETERMINISTIC_RULE | AUDITOR | HUMAN | MODEL_PROPOSAL
+  classifier_ref
+  escaped_from:                  # optional; 존재할 때만 escaped-defect metric이 성립
+    { attempt_key, audit_id? }
+  supersedes_finding_ref?        # 정정은 새 immutable record로만
+}
+```
+
+- `MODEL_PROPOSAL` classification은 다른 classifier보다 높은 truth가 아니며 provenance가 보이는 제안이다.
+  evidence ref의 존재·integrity·subject binding을 Platform이 검증하지 못하면 record 생성과 projection을
+  fail-closed한다. classification confidence를 숫자로 지어내지 않는다.
+- persistence는 기존 content-addressed `blob` + append-only `decision_log(kind=finding_recorded)`로 충분하다.
+  별도 Finding authority DB/event bus를 만들지 않는다. immutable envelope는 같은 identity+같은 hash만
+  idempotent하며 정정/재분류는 `supersedes_finding_ref`를 가진 새 record다.
+- **반복 anomaly의 acknowledgement/presentation ([계약], v1.5 Operator-evidence amendment).** 같은
+  `subject_ref` + 같은 `classification`에 대해 다른 valid Finding이 supersede하지 않은 Finding이 이미
+  존재하는지는 위 immutable record chain에서 derive한다. 별도 acknowledgement row/state machine을 만들지
+  않는다. presentation/notification layer는 그 `finding_ref`에 bind된 반복 anomaly를 하나의 continuing
+  item으로 collapse하거나 후속 notification을 suppress할 수 있다. 이는 **표현 계층의 중복 억제일 뿐**
+  anomaly 관측·Diagnostic Projection·raw observation 조회를 없애거나 lifecycle/reconciliation을 바꾸지
+  않는다. subject/classification binding이 불명확하거나 unsuperseded Finding을 세울 수 없으면 이 규칙으로
+  collapse하지 않는다.
+- issue/task-system projection은 §21.1 Report Outbox를 재사용한다. `op_key`가 external create/update의
+  idempotency identity이고 확인된 `backend_ref`는 `idempotency.DONE.result_json`에 durable receipt로
+  보존한다. **Finding semantic record ≠ GitHub/Jira Issue**다. 외부 issue는 continuing work의
+  receipt/index일 수 있으나 Core lifecycle/policy authority가 아니다. projection route/channel은
+  deployment/operator가 명시적으로 구성해야 하며 Core가 repository URL이나 tracker를 추측하지 않는다.
+  issue create/update를 수행하는 ReportAdapter primitive는 I-TD9 mutation reach와 가능한 operation을
+  선언해야 한다; route가 없으면 Finding만 durable하게 남고 external projection은 없다.
+- projected item이 다시 실행되려면 반드시 기존
+  `TaskSource → Supervisor Proposal → Decision Validation → Immutable Task Contract` 경로로 재진입한다.
+  Finding이나 issue 생성이 Task admission, retry, state transition, contract edit를 직접 일으키는 경로는
+  없다. repair의 regression/E2E replay는 selected `verification_profile`이 수행하고, 그 Evidence가 repair
+  Task Contract/candidate에 bind되어야 closure evidence가 된다.
+- `CONTRACT_GAP` / `CONTRACT_AMBIGUITY` / `CONTRACT_CONTRADICTION`은 구현자가 TD/Spec 의미를 임의로
+  정하는 authority가 아니다. 기존 `CONTRACT_DECISION`/Human-Governance 경로로 보낸다. Spec 변경이
+  필요한 finding은 TD에서 봉합하지 않고 `SPEC_GAP`으로 STOP한다.
+
+따라서 improvement loop의 portable form은 정확히 다음이다:
+
+```text
+authoritative evidence/observation
+→ ImprovementFindingV1
+→ optional issue/task-system projection receipt
+→ normal TaskSource/admission/Task Contract
+→ implementation repair
+→ bound regression verification
+→ bound E2E replay
+```
+
+### 5.14 Role-specific evaluation / routing recommendation (v1.5)
+
+[계약, PROSPECTIVE_REQUIREMENT] evaluation은 하나의 global best-model score를 만들지 않는다. unit은
+`role × task/corpus class × runtime binding × assurance context × role-input-context cohort`이며
+provider/runtime/infrastructure failure를 model quality denominator에 조용히 넣지 않는다.
+
+| role | 최소 quality signal | 기존 source |
+|---|---|---|
+| Actor / implementer | first-pass acceptance, deterministic acceptance coverage, scope/architecture invention, rework, later escaped defects | Task Contract, Evidence, audit_record, Finding |
+| Auditor / Reviewer | seeded material-defect detection, false block, authority/provenance finding, PASS 뒤 escaped defect | corpus ground truth, verdict/audit_record, Finding |
+| Supervisor / planning | contract-gap recognition, bounded decomposition, architecture invention, executable-vs-governance classification | TaskDefinition/corpus ground truth, Proposal/decision_log, Finding |
+
+- **evaluation input completeness ([계약], v1.5 Operator-evidence amendment).** 같은 provider/model이라도 role이
+  실제로 받은 contract/acceptance/authority context가 다르면 같은 benchmark condition이 아니다. 각 sample은
+  provider-specific prompt format이나 raw prompt를 Core에 고정하지 않고 다음 최소 provenance를 보존한다:
+
+  ```text
+  EvaluationInputContextV1 {
+    role_input_context_identity        # 실제 전달/읽기 가능하게 한 normalized manifest의 hash/ref
+    required_context_manifest_ref      # corpus/profile이 요구한 context category/version
+    contract_context:          PRESENT | ABSENT | UNKNOWN
+    acceptance_context:        PRESENT | ABSENT | UNKNOWN
+    authority_boundary_context:PRESENT | ABSENT | UNKNOWN
+    input_completeness: COMPLETE | PARTIAL | UNKNOWN
+    provenance_refs[]                  # Platform input manifest + Runtime/backend delivery observation
+  }
+  ```
+
+  `PRESENT`는 해당 contract가 Store에 존재한다는 사실만으로 만들지 않는다. 그 role의 해당 turn에서 실제로
+  전달되었거나 capability 안에서 읽을 수 있었음이 operation-bound provenance로 확인되어야 한다. 모든 required
+  category가 확인될 때만 `COMPLETE`, 하나라도 known `ABSENT`이면 `PARTIAL`, 전달 여부를 증명할 수 없으면
+  `UNKNOWN`이다. manifest는 전달된 authoritative ref/category의 identity이고 raw prompt·secret·provider-native
+  serialization을 저장하지 않는다(I-TD7). 기존 content-addressed blob + runtime operation receipt를 재사용하며
+  evaluation-input table이나 prompt framework를 만들지 않는다.
+- material하게 다른 `required_context_manifest_ref` 또는 `input_completeness`를 가진 sample은 같은 comparable
+  cohort로 pool하지 않는다. 별도 stratum으로 보고하거나 제외하고 그 사유를 `exclusions/limitations`에 남긴다.
+  context를 우연히 추론해 맞춘 run은 context-complete run으로 승격하지 않는다. `assurance_context`는 검증
+  assurance이고, role에게 실제 제공된 input context와 서로 대체되지 않는다.
+- harness topology는 새 Core subsystem이 아니다. versioned/immutable corpus를 TaskSource로 제공하고, 후보를
+  `roles`, 허용 stage를 `pipelines`, oracle/regression/E2E를 `verification_profiles`, mutation boundary를
+  `repository_scopes`로 선언한다. 실제 ADP/IO에서 재현 가능한 failure class를 우선하되 IO state machine,
+  labels, planning lane을 복제하지 않는다.
+- 한 benchmark run은 평가 대상 role/runtime binding을 하나로 고정한다. 평가 대상 Model이 자기 binding,
+  ground truth, accepted assurance를 선택하게 하지 않는다. corpus version/hash, seed/expected material
+  finding, Task Contract, verifier identity를 보존해야 rerun 비교가 가능하다.
+- `RoutingRecommendationV1`은 Measurement Projection에서 만드는 read-only operability output이다:
+
+  ```text
+  { role, task_or_corpus_class, assurance_context, candidate_runtime_profile,
+    observed_provider, observed_model, sample_size, quality/failure/latency/usage/cost refs,
+    exclusions, limitations, generated_at }
+  ```
+
+  값이 없는 metric은 UNKNOWN이며 composite leaderboard 숫자를 필수로 만들지 않는다. recommendation은
+  Project Profile change proposal이나 Supervisor decision context의 evidence가 될 수 있지만, Coordinator,
+  RuntimeAdapter, Profile Compiler가 직접 소비하는 policy input은 아니다(I-TD10).
+- **automatic evidence-based routing은 채택되지 않았다.** 추가하려면 새 Execution Policy version에서
+  eligibility, evidence window/sample sufficiency, assurance/capability floor, fallback order, rebind boundary,
+  failure/reconciliation semantics를 명시하고 Compiled Profile/Task binding에 동결해야 한다. 그 전에는
+  recommendation이 runtime/model을 바꾸거나 provider failure를 fallback으로 재해석할 수 없다.
 
 - **책임 경계 (M0-5).** Outbox는 **Platform Core 소유**다. ReportAdapter는 Outbox를 소유하지도,
   읽지도, 그 저장 표현(§18.1 `report_outbox` row)을 보지도 않는다. Core가 outbox row를
@@ -868,6 +1041,30 @@ v1에서 override **금지**: `classification_policy`, `verification_policy`, `c
 `contract_drift_policy`, `recovery_policy`, 그리고 모든 Project Profile field. 확장이 필요하면 schema
 version up 또는 명시적 TD 개정으로만 한다 — **arbitrary JSON path override를 만들지 않는다.**
 
+### 7.1d Project Profile schema v2 — Supervisor role binding (v1.5, prospective)
+
+[계약, PROSPECTIVE_REQUIREMENT] sealed MVP 0/1의 `ProjectProfileV1`은 변경하지 않는다. production MVP 4와
+role-specific Supervisor evaluation에서 §13.4 `spawn_session(role=SUPERVISOR, runtime_profile=?)`의
+`?`를 구현자/deployment가 임의로 채우지 않도록 v2는 v1 body에 **정확히 한 required field**를 더한다.
+
+```yaml
+project_profile:                       # platform/project-profile schema_version: 2
+  # ProjectProfileV1Body의 모든 field 그대로
+  supervisor_profile: <role_profile_id> # roles의 key를 참조
+```
+
+- `supervisor_profile`은 non-empty이고 `roles`에 존재해야 한다. missing/unknown reference는
+  `COMPILE_ERROR`; roles의 첫 entry, 이름 `"supervisor"`, 설치된 유일 runtime profile, deployment default로
+  추론하지 않는다.
+- v2의 나머지 shape/normalization/authority는 v1과 동일하다. 새 role registry, Workflow Profile,
+  per-stage DSL을 만들지 않는다. Supervisor의 `runtime_profile`은
+  `roles[supervisor_profile].runtime_profile`에서만 해소한다.
+- Project Profile은 허용된 role/runtime preference의 source이고 Grant 확대 authority가 아니다(§12.4).
+  runtime/model 자동 교체 권한은 이 field가 만들지 않는다(§5.14/§13.5).
+- v1 artifact와 sealed test는 계속 v1로 유효하다. v1을 production unattended composition에 사용하면서
+  Supervisor runtime profile을 외부 default로 보완하는 것은 금지한다; 해당 composition은 v2로 명시적으로
+  승격해야 한다.
+
 ### 7.2 합성 규칙 (deterministic, versioned = `merge_rules_version: 1`)
 
 1. **영역 분리는 schema가 강제한다.** Project Profile v1(§7.1a)에는 automation-authority field가
@@ -1100,6 +1297,23 @@ body:
   merge_rules_version + effective`가 모두 존재하므로 구성요소 무결성과 **merge algorithm 버전까지 hash에
   bind**된다. 동일 Profile/Policy/Override라도 `merge_rules_version`이 달라지면 다른 `compiled_hash`가
   생성되어야 한다 — silent compiler-semantic migration을 금지한다. 새 hashing rule은 만들지 않는다(§6 재사용).
+
+### 7.7a Compiled Profile schema v2 (v1.5, prospective)
+
+[계약, PROSPECTIVE_REQUIREMENT] `ProjectProfileV2`를 소비하는 compiler output은
+`platform/compiled-profile` schema_version/compiled_version `2`다. body shape와 merge rules는 v1과
+동일하고 다음 두 차이만 있다:
+
+```text
+project_profile ref/body version = ProjectProfileV2
+effective.project                = ProjectProfileV2Body (supervisor_profile 포함)
+compiled_version                 = 2
+```
+
+`merge_rules_version`은 여전히 `1`이다 — 새 field는 Project Profile semantic을 그대로 동결할 뿐 policy
+merge algorithm을 바꾸지 않는다. Supervisor session의 requested runtime binding은 이 immutable
+`effective.project.supervisor_profile → roles[...].runtime_profile` chain에서만 해소한다. v1 compiled
+artifact를 v2로 silent reinterpret하거나 v1 Attempt에 v2 field를 주입하지 않는다(§7.4).
 
 ---
 
@@ -2882,6 +3096,53 @@ attempt의 authoritative record(envelope, audit verdict, evidence run ref)가 �
 한다. Auditor verdict envelope는 structured 필수이므로 손실 기록으로 대체 불가 — `AUDIT_UNUSABLE`
 경로를 탄다.
 
+### 13.2a Runtime execution observation (v1.5, prospective measurement source)
+
+[계약, PROSPECTIVE_REQUIREMENT] sealed `platform/runtime-turn-result` v1은 변경하지 않는다. production
+measurement를 지원하는 RuntimeAdapter는 schema_version `2`를 반환하며, v2는 v1 body에 다음 required
+`execution_observation` 하나를 추가한다. 값이 없다는 이유로 field를 생략하지 않고 availability를
+`UNKNOWN`으로 기록한다.
+
+```text
+RuntimeExecutionObservationV1 {
+  op_key
+  subject: { run_id } | { attempt_key }
+  role: SUPERVISOR | ACTOR | AUDITOR
+  role_profile_id
+  runtime_profile
+  requested_binding_ref?          # non-secret, adapter-resolved ref가 있을 때만
+  actual:
+    provider: { availability: REPORTED | UNKNOWN, value? }
+    model:    { availability: REPORTED | UNKNOWN, value? }
+    binding_ref: { availability: REPORTED | UNKNOWN, value? } # non-secret stable fingerprint/ref
+  timing: { started_at, completed_at }
+  usage:
+    { kind: REPORTED, quantities: { <provider_metric>: { value, unit } }, source_ref? }
+    | { kind: UNKNOWN }
+  cost:
+    { kind: REPORTED, value, currency, source_ref? }
+    | { kind: ESTIMATED, value, currency, estimator_version, price_source_ref, calculated_at }
+    | { kind: UNKNOWN }
+  failure_attribution: FailureAttributionV1 | null
+}
+```
+
+- `role_profile_id`/`runtime_profile`은 §13.5의 frozen authority chain에서 Core가 공급한다. Adapter가
+  자연어 output이나 provider response에서 role/profile을 추론하지 않는다. provider/model/usage/cost는
+  Backend가 실제 operation에 대해 보고한 값만 `REPORTED`다. model alias를 실제 underlying model로
+  추측하거나 elapsed time에서 token/cost를 역산하지 않는다.
+- `provider_metric`은 provider-owned 이름을 opaque하게 보존하되 numeric value와 unit을 함께 둔다.
+  서로 다른 unit을 Core가 합산하지 않는다. raw provider response, prompt, secret-bearing id는 저장하지
+  않는다(I-TD7).
+- `started_at/completed_at`은 Runtime backend의 operation fact이며 `completed_at >= started_at`을
+  validation한다. Platform stage duration은 이 값으로 덮지 않고 Store transition timestamps에서 별도로
+  derive한다(§5.12).
+- `failure_attribution`은 operation이 실패했을 때도 가능한 범위에서 반환한다. attribution을 세울 수
+  없으면 `domain=UNKNOWN`; opaque `termination_reason` 문자열을 Core가 분류기로 파싱하지 않는다.
+- completed turn의 redacted v2 envelope는 §5.12/§21대로 해당 op의
+  `idempotency.DONE.result_json`에 보존한다. 이것은 measurement/evidence source이지 Task 성공,
+  Verification PASS, retry, state transition authority가 아니다.
+
 ### 13.3 WorkflowControllerHandle (v1.1 신설)
 
 Backend가 trusted context를 요구하는 workflow-control 호출(`workflow.start`/`audit_decide`)을 위해
@@ -3045,6 +3306,57 @@ next n = (이미 할당된 op:<batch_id>:supervisor-turn:<n> 중 최대 n) + 1
   못했다면 `supervisor-turn:<n>`을 다시 보내지도, `supervisor-turn:<n+1>`을 추측 대체로 쓰지도 않는다 —
   기존 indeterminate Runtime-turn semantics(`RECOVERY_CONFLICT` 계열)로 fail-closed한다. 새 recovery
   framework를 만들지 않으며 전면 background reconciliation은 MVP 4다.
+
+### 13.5 Role/runtime/model binding authority (v1.5)
+
+[계약, PROSPECTIVE_REQUIREMENT] provider/model 선택의 Platform-side authority는 Measurement Projection이
+아니라 **frozen Project Profile role selection**이다. 세 role의 해소 chain은 다음뿐이다:
+
+```text
+SUPERVISOR
+  batch-bound CompiledProfileV2.effective.project.supervisor_profile
+  → roles[supervisor_profile].runtime_profile
+
+ACTOR
+  task.actor_profile (validated START_TASK selection)
+  + task_contract.compiled_profile_hash
+  → frozen effective.project.roles[actor_profile].runtime_profile
+
+AUDITOR
+  task_contract.pipeline_id
+  + task_contract.compiled_profile_hash
+  → frozen effective.project.pipelines[pipeline_id].auditor_profile
+  → frozen effective.project.roles[auditor_profile].runtime_profile
+```
+
+- `runtime_profile`은 RuntimeAdapter가 해석하는 **requested binding ref**다. role/profile config가
+  CapabilityGrant를 확대할 수 없고(§12.4), provider/model 실제 identity는 Backend observation이다(§13.2a).
+  profile 이름에서 실제 model을 추정하지 않는다.
+- exact model 비교/evaluation 대상이 되려면 RuntimeAdapter가 같은 Attempt 동안 stable한 non-secret
+  `actual.binding_ref`를 보고할 수 있어야 한다. 보고할 수 없으면 실행 identity는 `UNKNOWN`으로 남고 그
+  run을 exact provider/model 비교나 future automatic-routing evidence로 사용할 수 없다; 가장 가까운
+  model alias로 보완하지 않는다.
+- Actor selection fields와 resolved chain은 `SELECTED→ACTIVE`에서 Task Contract가 생성된 뒤 해당 Attempt
+  동안 immutable하다. rework는 같은 Attempt/binding을 사용한다. binding 변경은 explicit Attempt
+  invalidation + fresh Compiled Profile + new Task Contract + new Attempt로만 가능하다(§7.4/§11).
+- Auditor는 pipeline이 고정한 profile을 쓰며 evaluation recommendation이 직접 교체하지 않는다.
+  Supervisor binding은 batch-bound다. run-scoped Supervisor session을 다음 batch에서 재사용할 수 있는 것은
+  resolved `runtime_profile`이 동일할 때뿐이다; 달라지면 첫 turn 전에 기존 session을 닫고 새 binding으로
+  spawn한다. conversation memory는 authority가 아니다.
+- 같은 logical Runtime session/Attempt에서 Backend가 `actual.binding_ref` 변경을 보고하면 그것을
+  정상 fallback으로 정규화하지 않는다. lifecycle은 기존 `RUNTIME_FAILED` fail-closed 경로를 사용하고
+  §24.1 `BINDING_CHANGED` attribution + §5.13 finding 후보를 남긴다. actual binding이 UNKNOWN이면 변화도
+  미변화도 주장하지 않는다.
+- **현재 automatic fallback은 없다.** provider unavailable/capacity/auth/config failure는 §24.1에 귀속한
+  뒤 기존 recovery/HOLD semantics를 따른다. 더 싸거나 가용한 provider/model로 ongoing Attempt를
+  자동 변경하지 않는다.
+- 향후 fallback/automatic routing은 §5.14의 future Execution Policy seam을 통과해야 하며, 대체 binding도
+  현재 operation과 동일한 CapabilityGrant, Backend Compatibility Gate, verification/audit assurance floor를
+  만족해야 한다. 낮은 cost/latency는 capability/assurance floor를 완화하는 근거가 아니다.
+- `RoutingRecommendationV1`은 Supervisor가 explicit `actor_profile` Proposal을 고를 때 evidence로 볼 수는
+  있다. 그 경우에도 `Model proposes → Platform validates(V1–V11) → selection freeze` 경로가 유지된다.
+  이는 ordinary model proposal이지 deterministic automatic-routing policy가 아니다. recommendation을
+  읽은 Coordinator/RuntimeAdapter가 Proposal 없이 profile을 바꾸는 경로는 금지한다.
 
 ---
 
@@ -3435,6 +3747,25 @@ Spec §41의 accepted_assurance set 방식 그대로: check별 `result==PASS ∧
 `WORKER_REPORTED`/`INFERRED`만으로 충족되는 구성은 Profile Compiler가 COMPILE_ERROR로 거부한다
 (auto_merge=true인 policy에서 accepted가 이 둘만인 check 존재 시). durable-jobs의
 `SUFFICIENT_VERIFICATION_LEVELS` 강제와 이중 방어가 된다.
+
+### 15.4 Material fail-closed falsification validation (v1.5 Operator-evidence amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] 신규 구현하거나 material하게 변경하는 **safety / authority /
+fail-closed boundary**의 acceptance evidence에는, guarding behavior 또는 필요한 production wiring을 의도적으로
+제거·우회한 bounded negative control에서 retained test가 실제로 실패함을 보이는 falsification validation이
+최소 하나 포함되어야 한다. happy-path test의 존재나 owner implementation unit test PASS만으로 그 boundary의
+보장을 주장하지 않는다.
+
+- 적용 대상은 capability/authorization gate, exact-target/evidence binding, write-ahead/recovery refusal,
+  canonical mutation guard처럼 제거 시 unsafe acceptance 또는 authority bypass가 가능한 material boundary다.
+  모든 `[계약]` 문장과 모든 일반 validation에 mutation testing을 기계적으로 요구하지 않는다.
+- 보장이 production composition root의 owner wiring에 의존하면 adapter/owner unit test만으로 충분하지 않다.
+  production composition 또는 그 exact wiring contract를 통과하는 test가 owner 미주입/우회 시 실패해야 한다.
+- negative fixture, guard를 제거한 injectable test double, disposable mutation 중 가장 작은 수단을 사용할 수
+  있다. 전역 mutation-testing framework나 새 Verification backend는 요구하지 않는다. 남기는 회귀 test와
+  falsification evidence는 §15.2의 exact candidate/Task Contract binding 규율을 따른다.
+- 이 원칙은 sealed MVP 0/1 acceptance를 소급 재채점하지 않는다. expanded production/MVP 4 구현의 새
+  material boundary와 이후 변경부터 binding이다.
 
 ---
 
@@ -5344,6 +5675,126 @@ fact, Platform Decision record→human fact)는 향후 Coordinator가 직접 수
 - Failure behavior: reconcile 중 adapter 질의 실패 → 해당 attempt UNEXPLAINED 취급.
 - MVP impact: MVP 1은 위 절차의 단선 구현(attempt 1개)으로 충분; MVP 4에서 전체 폭 적용.
 
+### 22.5 Monitoring / liveness trigger contract (v1.5, prospective production slice + MVP 4 full loop)
+
+[계약, PROSPECTIVE_REQUIREMENT] **Monitoring is observation, not authority. An anomaly is not a lifecycle
+fact.** time/staleness/retry-count는 authoritative re-observation을 요청할 수 있을 뿐, 그 자체로 state
+transition, failure, retry, external actuation을 승인하지 않는다. I-TD10의 monitoring 적용은 다음
+단일 흐름이다:
+
+```text
+derived anomaly signal
+→ authoritative owner별 re-observation (§22.1)
+→ §22.2 CONSISTENT | EXPLAINABLE | UNEXPLAINED reconciliation
+→ 기존 §19/§20 transition command 또는 §21 retry-safety semantics
+```
+
+Monitor가 직접 `HELD`, `FAILED`, `PAUSED_SAFELY`, retry, session spawn, workflow resume, issue creation을
+수행하는 API는 없다. 특히 오래된 `INTENT`도 §21의 "효과 부재를 authoritative하게 증명할 때만 재수행"
+조건을 우회하지 않는다.
+
+`AnomalyObservationV1`은 §5.11과 같은 derived read model이며 authority artifact가 아니다:
+
+```text
+AnomalyObservationV1 {
+  anomaly_kind
+  subject_ref
+  signal_refs[]                  # Store/adapter 관측 ref + per-field provenance
+  observed_at
+  observed_window: { from, to }  # point observation이면 from == to
+  coverage: COMPLETE | PARTIAL | JOINED_MID_SUBJECT
+  coverage_basis_refs[]          # durable/re-readable source와 window coverage 근거
+  trigger_config_ref
+  recommended_reobservation_scope
+}
+```
+
+**durable observability / coverage ([계약], v1.5 Operator-evidence amendment).** historical window에 대한
+derived signal의 material fact는 durable Store record 또는 subscriber/observer의 존재와 무관하게
+authoritative owner에서 재조회 가능한 fact로 재구성되어야 한다. subscriber가 있을 때만 materialize되는
+ephemeral stream, UI buffer, process-local callback은 보조 signal일 수 있으나 단독 근거가 될 수 없다. persisted
+payload가 encoded/opaque이면 declared producer/decoder contract로 읽기에 성공해야 `readable`이다. raw text
+search가 0건이라는 사실은 payload 내부 fact의 부재 증거가 아니다.
+
+- `COMPLETE`는 signal이 요구하는 전체 `observed_window`를 위 source로 재구성할 수 있을 때만 사용한다.
+  monitor가 restart/rejoin했어도 durable source로 전 window를 재구성하면 COMPLETE일 수 있다. 재구성하지
+  못한 일부 window가 있으면 `PARTIAL`, subject를 처음 본 시점 이전 구간을 보지 못했고 재구성도 못하면
+  `JOINED_MID_SUBJECT`다. restart 직후 0개를 관측했다는 이유로 과거 window를 COMPLETE로 만들지 않는다.
+- coverage는 confidence score나 lifecycle fact가 아니다. PARTIAL/JOINED observation도 authoritative
+  re-observation을 요청할 수 있지만, 완전 관측과 같은 표현으로 보고하거나 과거 반복/absence를 단정하지
+  않는다. 이 metadata는 §5.11 provenance/freshness의 window 적용이며 새 monitor state machine을 요구하지
+  않는다.
+
+**absence-derived anomaly precondition ([계약]).** `INTENT_UNRESOLVED`, `EXPECTED_SUCCESSOR_MISSING`,
+`REQUIRED_REF_MISSING`, `NEXT_OWNER_MISSING` 및 향후 모든 absence-derived signal은 단순히 record/event를 찾지
+못했다는 이유만으로 `ABSENT`를 주장하지 않는다. 최소한 다음을 해당 window에 대해 증명해야 한다:
+
+```text
+authoritative owner readable
++ source available
++ required observation/materialization path active independent of subscribers
++ declared representation/decoder successfully applied
++ coverage sufficient to have observed presence
+→ absence-derived anomaly may be emitted
+
+otherwise → UNKNOWN / UNAVAILABLE / PARTIAL observation
+            (re-observation request는 가능, confident ABSENT 주장은 금지)
+```
+
+이 일반 규칙이 아래 `REQUIRED_REF_MISSING`의 owner 조회 분리를 포함한다. 각 signal은 자기 presence가
+무엇이며 어느 durable/re-readable source에서 보였어야 하는지를 `signal_refs/coverage_basis_refs`로 설명해야
+한다. 별도 monitoring store나 event materializer를 만들라는 요구가 아니다.
+
+MVP 4 monitor는 최소 아래 signal을 표현할 수 있어야 한다. 이름은 diagnostic vocabulary이며 state/reason
+enum에 추가하지 않는다.
+
+| anomaly_kind | derived signal | re-observation owner |
+|---|---|---|
+| `DURABLE_PROGRESS_STALE` | non-terminal machine-owned state의 최근 committed transition이 threshold보다 오래됨 | Store + 현재 stage의 adapter |
+| `EXTERNAL_COMPLETION_UNPROJECTED` | external operation terminal 관측과 Platform non-terminal projection 불일치 | Runtime/Workflow/Repository/Verification adapter + Store |
+| `INTENT_UNRESOLVED` | `idempotency.INTENT`가 오래 미해소 | 해당 external-effect owner + §21 |
+| `TERMINAL_DIVERGENCE` | Backend/Repository terminal과 Platform non-terminal 불일치 | 해당 adapter + Store |
+| `EXPECTED_SUCCESSOR_MISSING` | committed transition 뒤 pipeline/state-machine이 요구하는 next op의 INTENT/DONE이 없음 | Store/idempotency; 필요 시 해당 adapter |
+| `RECOVERY_OR_HOLD_REPEATED` | 같은 subject/reason의 recovery/hold가 설정된 window에서 반복 | decision_log + Store |
+| `REQUIRED_REF_MISSING` | active state가 요구하는 contract/grant/evidence/receipt/ref를 세울 수 없음 | 그 artifact authority (§22.1) |
+| `NEXT_OWNER_MISSING` | terminal/HELD/blocked record에서 I-TD8 derivation 불가 | Store/PendingDecision projection |
+
+- `EXPECTED_SUCCESSOR_MISSING`의 expected는 새 workflow engine이 아니라 frozen `pipeline_id`, §19/§20
+  transition table, §21의 existing op-key grammar에서만 도출한다. Model prose/issue label/UI 상태로
+  successor를 발명하지 않는다.
+- `REQUIRED_REF_MISSING`은 missing 자체를 곧 실패로 승격하지 않는다. authoritative owner 조회에서
+  진짜 ABSENT/corruption인지, projection delay인지, owner unavailable인지 분리한 뒤 §22가 판정한다.
+- `HELD/BLOCKED`의 next-owner는 §5.11/I-TD8의 deterministic derivation이다. owner가 없다는 관측은 finding
+  후보지만 monitor가 사람/Coordinator를 임의 배정하지 않는다.
+- 한 authority 조회 실패는 전체 monitor packet을 폐기하지 않는다. §5.11 partial-result/provenance를
+  재사용하고 미관측 값을 stale/fresh로 추정하지 않는다.
+
+**threshold/cadence owner.** `monitor_once(scope, now, trigger_config)`의 invocation cadence, staleness
+duration, repetition window/count는 **deployment/operational config**가 소유한다. 이유는 이 값들이 오직
+read-only re-observation을 scheduling하기 때문이다; Core invariant에 숫자를 고정하지 않고 Compiled
+Profile에 복제하지 않는다. injected clock을 사용하며 wall clock 자체는 lifecycle authority가 아니다.
+단 threshold resolver는 deployment-wide 숫자 하나만 가정하지 않고, subject에 해당 identity가 존재하면
+최소한 frozen `pipeline_id` + current lifecycle `state` + concrete `stage/operation kind`로 threshold를
+해소할 수 있어야 한다. 여러 key에 같은 값을 명시하는 것은 허용하지만 key를 잃고 우연히 같은 global
+default를 적용한 것으로 표현하지 않는다. 해소된 key/value/version은 `trigger_config_ref` 또는 signal
+provenance에서 확인 가능해야 한다. pipeline/stage가 없는 run/batch signal은 명시적 typed default를 쓸 수
+있으며, 새 `WorkflowProfile`은 만들지 않는다.
+향후 어떤 threshold가 retry/transition/actuation을 직접 허용하게 하려면 그것은 observation config가
+아니라 automation authority이므로 새 `ExecutionPolicy` version + Compiled Profile freeze + explicit TD
+개정이 필요하다. 현재 계약에서는 금지한다.
+
+Anomaly는 §5.11 Diagnostic Projection에 표시하거나, authoritative evidence가 확보된 뒤 §5.13 Finding의
+`observation_refs`로 승격할 수 있다. 둘 어느 것도 두 번째 state store/monitoring state machine을 만들지
+않는다. implementation은 caller-driven read-only scan + 기존 scoped reconciliation entry point면 충분하다.
+
+**implementation timing / seal boundary ([계약]).** Spec §65의 sealed MVP 1 FORMAL acceptance와 기존 구현은
+변경하지 않는다. 다만 그 baseline에서 시작하는 **신규 production/live integration이 unattended operation을
+claim하기 전**에는 caller-driven read-only `monitor_once`가 최소 `DURABLE_PROGRESS_STALE`,
+`INTENT_UNRESOLVED`, `EXTERNAL_COMPLETION_UNPROJECTED`를 위 provenance/coverage 계약으로 표현할 수 있어야
+한다. 이는 `PROSPECTIVE_REQUIREMENT`이며 MVP 1 seal의 새 합격조건이나 기존 구현의 retroactive defect가
+아니다. 전체 anomaly vocabulary, anomaly→Finding promotion, full-width/background reconciliation과 그
+operational config surface는 계속 Spec §69/§27의 MVP 4 범위다.
+
 ## 23. Trust / Security Model
 
 | Threat | Authoritative owner | Prevention | Detection | Failure state |
@@ -5400,6 +5851,41 @@ PAUSED_SAFELY                    # circuit breaker 종착 — 자동 복구 없�
 ```
 
 모든 FAILED/HELD 레코드는 taxonomy code + decision_log ref를 동반한다. generic FAILED 단독 사용 금지.
+
+### 24.1 Diagnostic failure attribution (v1.5 — lifecycle code와 분리)
+
+[계약, PROSPECTIVE_REQUIREMENT] 위 taxonomy는 lifecycle/recovery routing용이다. quality/cost 평가에서는
+같은 `RUNTIME_FAILED`라도 provider capacity와 model task failure를 분리해야 하므로 다음 read-only
+attribution을 함께 보존한다. 이것은 state transition reason을 대체하거나 retry를 승인하지 않는다.
+
+```text
+FailureAttributionV1 {
+  domain: PROVIDER_AVAILABILITY | PROVIDER_AUTH_CONFIG |
+          RUNTIME_INFRASTRUCTURE | WORKFLOW_INFRASTRUCTURE |
+          VERIFICATION_INFRASTRUCTURE | REPOSITORY_INFRASTRUCTURE |
+          MODEL_TASK | MODEL_PROTOCOL | CONTRACT_OR_AUTHORITY |
+          HUMAN_PENDING | UNKNOWN
+  detail_code                      # typed backend/adapter code가 있을 때; 없으면 UNKNOWN
+  source_ref
+  reporter: BACKEND | PLATFORM | VERIFIER | AUDITOR | HUMAN
+  retryable: { availability: REPORTED | UNKNOWN, value? }
+}
+```
+
+- `PROVIDER_AVAILABILITY`는 unavailable/capacity/rate-limit처럼 provider가 task quality를 판정하지 못한
+  failure, `PROVIDER_AUTH_CONFIG`는 credential/config/model-access failure다. 둘 다 `MODEL_TASK` denominator에
+  넣지 않는다.
+- `MODEL_TASK`는 provider/runtime가 정상 completion을 제공했지만 task의 semantic/acceptance 결과가 실패한
+  경우, `MODEL_PROTOCOL`은 required structured result malformed/missing 등 protocol failure다. Auditor
+  `AUDIT_INVALID/AUDIT_UNUSABLE`은 원인 ref가 있을 때 후자에 귀속할 수 있다.
+- `RUNTIME/WORKFLOW/VERIFICATION/REPOSITORY_INFRASTRUCTURE`는 각 authoritative adapter/verification
+  observation으로만 판정한다. timeout 하나만 보고 provider 또는 model을 추정하지 않는다.
+- `BINDING_CHANGED`는 §13.5의 actual binding change를 나타내는 `RUNTIME_INFRASTRUCTURE` detail code다.
+  lifecycle은 기존 `RUNTIME_FAILED`를 유지한다.
+- `retryable=true`는 Backend observation일 뿐 실행 authority가 아니다. 실제 retry는 §21 effect-absence,
+  idempotency, Execution Policy, state guard를 모두 통과해야 한다.
+- 근거가 없으면 `UNKNOWN`이다. dashboard/evaluation 구현이 UNKNOWN을 가장 가까운 known bucket에 강제
+  배분하는 것은 금지한다.
 
 ## 25. MVP 0 Detailed Design
 
@@ -5528,12 +6014,19 @@ Coordinator 발신 요청이다.
 
 ## 27. MVP 2–4 Extension Points
 
+- **MVP 1 이후 production/live integration operability slice (PROSPECTIVE, sealed MVP 1 acceptance 아님):**
+  unattended claim 전 §22.5의 caller-driven read-only `monitor_once` 최소 3-signal과 provenance/coverage를
+  제공한다. 이 slice는 observation만 반환하며 Finding promotion, reconciliation scheduling, transition,
+  retry, actuation을 소유하지 않는다.
 - MVP 2: RepositoryGate 활성(전제 §14.5) — 전략 A 구현 + G1–G5; 전략 B는
   `GitHubProtectedRepositoryAdapter`+`CIValidationAdapter` 추가로 동일 Gate contract 뒤에서 교체.
 - MVP 3: AUTO_SUBFLOW(parent SUSPENDED/RESUME — task 테이블 parent_key 컬럼은 MVP 0 schema에 선반영),
   dependency graph 평가, PendingDecision queue UI 없이 Slack 목록 명령, batch≤N.
-- MVP 4: §22 전체 폭 reconciliation, circuit breaker 전 조건, 장기 무인 운용(silent 정상 progress —
-  §21 outbox 정책은 MVP 1부터 동일).
+- MVP 4: §22 전체 폭 reconciliation + §22.5 read-only monitoring/liveness trigger, circuit breaker 전 조건,
+  장기 무인 운용(silent 정상 progress — §21 outbox 정책은 MVP 1부터 동일). operational anomaly는
+  authoritative re-observation 없이 lifecycle fact가 되지 않으며, improvement loop는 §5.13의
+  Finding→projection→normal admission을 사용한다. §5.12/§13.2a의 measurement와 §5.14 evaluation은
+  이 lifecycle 위의 read-only operability contract이고 MVP 4 state machine을 늘리지 않는다.
 
 ## 28. Backend v1 Mapping 요약
 
@@ -5582,6 +6075,17 @@ D19 (v1.4 rev.2) main-sync 준비 완료 — §31a Gate-B rev.2(소스 재대조
     PROSPECTIVE/MEASURED, I-TD10 근거 교체, I-TD11 근거 보강, I-TD12 close/호출부 정정),
     §31 gate row RESOLVED, authority provenance 문구를 승격 후에도 참이 되게 교체.
     조건 B 충족 → MAIN_SYNC=GO. D18은 조건 A 시점의 기록으로 소급 수정하지 않는다([원장] 규율)
+D20 (v1.5) MVP 4 operability closure — §22.5 monitoring observation≠authority,
+    §5.13 evidence-derived Finding≠issue/task authority, §5.12/§13.2a/§24.1 honest measurement source and
+    failure attribution, §5.14/§7.1d/§13.5 role-specific evaluation + recommendation-only routing seam.
+    ProjectProfile/CompiledProfile v2는 Supervisor profile ref 하나만 additive로 동결하며 v1 seal 불변.
+    automatic evidence-based routing/fallback은 미채택 future Execution Policy authority seam.
+    IO #23은 observed-need/evidence source일 뿐 mechanism/state topology는 이전하지 않음
+D21 (v1.5 Operator-evidence amendment) PR #42 comment 5477209602의 measured operations를 portable
+    failure mode로 번역 — durable/re-readable signal + absence/coverage honesty, Finding-derived presentation
+    collapse, state/stage-aware threshold resolution, prospective early read-only monitor_once, evaluation input
+    completeness, material fail-closed falsification validation. §22.5의 observation≠authority를 강화하며
+    Spec 변경/architecture reopening/retroactive seal impact/new monitoring state machine 없음
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
@@ -6486,6 +6990,7 @@ STATUS/HANDOFF가 이긴다. (형식은 IO fork Atlas #309의 hotspot 규율 준
 | High | **C-03** — strong Spec/TD → bounded work graph **one-shot Plan Compilation seam** (pre-TaskSource compiler) | Spec/TD-only 프로젝트를 ADP가 직접 받으려면 필요. Supervisor 즉석 계획·TaskSource 내부 inference로 넣으면 read boundary/semantics confinement 침범 — 별도 compiler + 승인 + idempotent publish 형상만 허용. **ARCHITECTURE REOPENING 필요 — 채택 아님** | CANDIDATE (material assessment; "one-shot 충분성"은 hypothesis, MEASURED 아님) | (a) 수동 graph 작성 비용/오류 실측, (b) compiler input/output·provenance·approval·idempotency·graph validity 계약 합의, (c) 수동 대비 bounded one-shot 실험 유의미 — 셋 충족 시 reopening 절차 |
 | Medium | **C-12** — exact-approved deterministic finalization + expected-old-head **CAS publication**의 composed transaction | 구성 원리(exact binding, frozen proposal, fresh revalidation, CAS, write-ahead)는 각각 보유하나 native composed path 부재. **ARCHITECTURE REOPENING 필요 — 채택 아님.** #5(DELTA-3)와 원리는 같고 대상이 다름 — C-12=Task candidate publication chain, #5=플랫폼 자기 배포 승격. 중복 생성 금지 | CANDIDATE (IO Foundation #20 단일 사례; upstream native 존재는 INFERRED 부정 — C-13) | Foundation 외 두 번째 use case 출현, 또는 ADP 자기 deployment promotion에서 Human-authorized deterministic transform이 실제 필요 + exact input/output/failure/reconciliation 계약 합의 |
 | Low | Diagnostic/Measurement Projection의 component 승격 여부 | §5.11/§5.12는 contract로 시작 — heavyweight component화는 미결정 | FACT (v1.3 신설) | 라이브 파일럿에서 구현 경험 축적 후 |
+| Medium | automatic evidence-based model routing authority | §5.14 recommendation은 read-only이고 current Runtime binding은 §13.5로 고정. Measurement를 policy로 직접 소비하거나 mid-attempt fallback할 authority는 없음 | DEFERRED / CANDIDATE (v1.5; 채택 아님) | role별 comparable corpus와 충분한 sample이 축적되고, Human이 Execution Policy의 eligibility/window/floor/fallback/rebind/recovery contract를 승인할 때 |
 | ~~Low~~ | ~~§13.1 기존 행의 증거 등급 소급 표기~~ | **RESOLVED (v1.3)** — §13.1 하단에 행별 명시 등급 목록 추가 | 원장 | — |
 
 ---
@@ -6521,4 +7026,4 @@ I-TD10 근거 교체, I-TD11 근거 보강, I-TD12의 존재하지 않는 `disca
 
 ---
 
-*End of Technical Design v1.4 (design-track canonical). 이 문서 이후 구현은 시작하지 않는다.*
+*End of Technical Design v1.5 (design-track canonical). 이 문서 이후 구현은 시작하지 않는다.*
