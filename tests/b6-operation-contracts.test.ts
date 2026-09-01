@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -92,7 +92,7 @@ test("B6-3 (B): the workspace request is exactly two fields and the result is un
 const OP_A = "op:attempt:task:alpha:T-101:1:workspace";
 const OP_B = "op:attempt:task:alpha:T-102:1:workspace";
 
-test("B6-4 / B6-5 (C): the same op key names the same workspace and makes no second worktree", () => {
+test("B6-4 / B6-5 (C): the same op key names the same isolated clone", () => {
   withGitRepo((repo) => {
     const base = repo.commit({ path: "a.txt", content: "a\n", message: "A" });
     const adapter = new LocalGitRepositoryAdapter(repo.config());
@@ -101,11 +101,12 @@ test("B6-4 / B6-5 (C): the same op key names the same workspace and makes no sec
     const again = adapter.create_feature_workspace({ base_head: base, op_key: OP_A });
 
     assert.deepEqual(again, first, "same path, same branch, same base");
-    const worktrees = repo
+    const linkedWorktrees = repo
       .git(["worktree", "list", "--porcelain"])
       .split("\n")
       .filter((line) => line.startsWith("worktree ") && line.includes("ws-"));
-    assert.equal(worktrees.length, 1, "exactly one worktree exists");
+    assert.equal(linkedWorktrees.length, 0, "the workspace is not linked to canonical metadata");
+    assert.equal(statSync(join(first.path, ".git")).isDirectory(), true);
 
     // The name is derived from the operation, not from a first-free scan.
     assert.equal(first.branch.startsWith("ws-"), true);
@@ -137,12 +138,12 @@ test("B6-6 (C): the same op key against a different base fails closed", () => {
     assert.throws(() => adapter.create_feature_workspace({ base_head: b, op_key: OP_A }));
 
     // No second workspace was created by the failed call.
-    const worktrees = repo
+    const linkedWorktrees = repo
       .git(["worktree", "list", "--porcelain"])
       .split("\n")
       .filter((line) => line.startsWith("worktree ") && line.includes("ws-"));
-    assert.equal(worktrees.length, 1);
-    assert.equal(worktrees[0]?.endsWith(workspace.branch), true);
+    assert.equal(linkedWorktrees.length, 0);
+    assert.equal(statSync(join(workspace.path, ".git")).isDirectory(), true);
   });
 });
 

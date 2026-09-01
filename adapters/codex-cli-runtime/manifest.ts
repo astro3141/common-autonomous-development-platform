@@ -7,6 +7,7 @@ import {
   CODEX_CLI_INSPECTED_SOURCE_COMMIT,
   CODEX_CLI_INSPECTED_SOURCE_TAG,
   CODEX_CLI_INSPECTED_VERSION,
+  CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE,
 } from "./codex-cli-runtime-adapter.ts";
 import type { CodexCliRuntimeAdapterConfig } from "./types.ts";
 
@@ -46,6 +47,11 @@ export function codexCliPilotManifests(
           explicit_thread_resume: true,
           structured_turn_result: "STRUCTURED_PROTOCOL",
           authoritative_thread_identity: true,
+          isolated_workspace_git_commit: true,
+          workspace_git_permission_profile: CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE,
+          git_config_write: false,
+          git_hooks_write: false,
+          approval_elevation: false,
           effective_provider_identity: "UNAVAILABLE_IN_JSONL",
           resolved_model_identity: "UNAVAILABLE_IN_JSONL",
           model_catalog: "UNAVAILABLE",

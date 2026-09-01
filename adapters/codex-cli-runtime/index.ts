@@ -6,6 +6,7 @@ export {
   CODEX_CLI_INSPECTED_VERSION,
   CODEX_CLI_RUNTIME_BACKEND,
   CODEX_CLI_SUPERVISOR_PROPOSAL_PROTOCOL,
+  CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE,
   CodexCliBackendCapabilityGap,
   CodexCliRuntimeAdapter,
   CodexCliRuntimeOperationConflict,

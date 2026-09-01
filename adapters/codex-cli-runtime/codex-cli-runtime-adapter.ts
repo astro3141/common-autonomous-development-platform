@@ -39,6 +39,8 @@ export const CODEX_CLI_INSPECTED_VERSION = "codex-cli 0.151.0";
 export const CODEX_CLI_INSPECTED_SOURCE_TAG = "rust-v0.151.0";
 export const CODEX_CLI_INSPECTED_SOURCE_COMMIT =
   "78c290807ce710180111df227df3b7a4fe845452";
+export const CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE =
+  "adp-isolated-workspace-commit";
 export const CODEX_CLI_SUPERVISOR_PROPOSAL_PROTOCOL = "platform-supervisor-proposal-v1";
 export const CODEX_CLI_ACTOR_RESULT_PROTOCOL = "codex-cli-actor-turn-result-v1";
 export const CODEX_CLI_AUDITOR_VERDICT_PROTOCOL = "platform-auditor-verdict-v1";
@@ -115,6 +117,9 @@ export interface CodexCliCapabilityAdvertisement {
     readonly explicit_thread_resume: true;
     readonly jsonl_result_observation: true;
     readonly usage_observation: true;
+    readonly isolated_workspace_git_commit: true;
+    readonly git_config_write: false;
+    readonly git_hooks_write: false;
     readonly create_only_session: false;
     readonly backend_session_status_query: false;
     readonly backend_session_close: false;
@@ -166,6 +171,9 @@ export class CodexCliRuntimeAdapter implements RuntimeAdapter {
         explicit_thread_resume: true,
         jsonl_result_observation: true,
         usage_observation: true,
+        isolated_workspace_git_commit: true,
+        git_config_write: false,
+        git_hooks_write: false,
         create_only_session: false,
         backend_session_status_query: false,
         backend_session_close: false,
@@ -497,8 +505,7 @@ export class CodexCliRuntimeAdapter implements RuntimeAdapter {
       "--json",
       "--model",
       binding.model,
-      "--sandbox",
-      binding.sandbox,
+      ...sandboxArgs(binding),
       "--output-schema",
       schemaPath,
       "-C",
@@ -577,6 +584,25 @@ export class CodexCliRuntimeAdapter implements RuntimeAdapter {
 
 export const codexCliRuntimePreflight = (adapter: CodexCliRuntimeAdapter): RuntimePreflight =>
   () => adapter.preflight();
+
+/**
+ * The built-in workspace-write profile deliberately protects `.git`, so it cannot create a
+ * candidate commit. The inspected named-profile seam can reopen only the isolated workspace's Git
+ * metadata. Config, hooks and object-store redirection remain read-only, network remains disabled,
+ * and there is no approval/elevation path that could escape the assigned workspace.
+ */
+function sandboxArgs(binding: CodexCliRuntimeProfileBinding): readonly string[] {
+  if (binding.sandbox === "read-only") return ["--sandbox", "read-only"];
+  const profile = CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE;
+  return [
+    "--config",
+    `default_permissions=${JSON.stringify(profile)}`,
+    "--config",
+    `permissions.${profile}.filesystem={\":root\"=\"read\", \":workspace_roots\"={\".\"=\"write\", \".git/\"=\"write\", \".git/config\"=\"read\", \".git/config.worktree\"=\"read\", \".git/hooks/\"=\"read\", \".git/objects/info/\"=\"read\"}}`,
+    "--config",
+    `permissions.${profile}.network.enabled=false`,
+  ];
+}
 
 function initializationPrompt(role: string, bootstrap: CanonicalObject): string {
   return [

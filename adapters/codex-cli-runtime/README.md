@@ -16,14 +16,26 @@ checked at tag `rust-v0.151.0`, commit
 - `codex-rs/exec/src/event_processor_with_jsonl_output.rs`: emitted terminal semantics
 - `codex-rs/exec/src/lib.rs`: thread start/resume and turn submission flow
 - `codex-rs/exec/tests/suite/resume.rs`: persisted-thread reuse behavior
+- `codex-rs/config/src/permissions_toml.rs` and `codex-rs/core/src/config/permissions.rs`:
+  named permission-profile syntax and exact `:workspace_roots` lowering
+- `codex-rs/core/README.md`: built-in workspace-write keeps `.git` and a resolved gitdir read-only
 
 The adapter invokes argv directly, with no shell:
 
 ```text
 codex exec --strict-config --ignore-user-config --ignore-rules --json \
-  --model <configured> --sandbox <read-only|workspace-write> \
+  --model <configured> <bounded-sandbox-args> \
   --output-schema <host-owned-schema> -C <workspace> [resume <thread-id>] -
 ```
+
+Read-only profiles use `--sandbox read-only`. The inspected CLI's built-in `workspace-write`
+profile intentionally makes `.git` read-only, so it cannot satisfy the Actor candidate-commit
+contract. Workspace-write Actor bindings therefore use an inline named permission profile that
+allows writes only below the assigned workspace and its `.git/`, while carving `.git/config`,
+`.git/config.worktree`, `.git/hooks/`, and `.git/objects/info/` back to read-only and keeping
+network disabled. This profile is paired with LocalGit's isolated clone workspace: no canonical
+gitdir is included in the writable roots. The adapter never passes `--approve-for-me`, an
+approval override, or a full-access flag.
 
 The first `spawn_session` must execute a bounded acknowledgement turn because this CLI surface has
 no create-only session command. The returned handle contains the backend-emitted thread id. ADP
@@ -50,6 +62,11 @@ The manifest records these unsupported capabilities rather than inferring them:
 - no active-turn cancellation in the synchronous pilot adapter
 - no spawn-op, turn-op, or in-flight-turn reacquisition after an adapter restart
 - no WorkflowControllerHandle
+
+Git commit support is narrower than general Git administration: an Actor may update the isolated
+workspace index, objects, and branch ref, but may not change Git config/hooks, use a repository
+remote, or write canonical. A linked-worktree `.git` pointer is rejected by LocalGit as
+`BACKEND_CAPABILITY_GAP`; it is not repaired by granting access to the canonical gitdir.
 
 Explicit thread resume across separate CLI processes is supported. That is narrower than ADP
 operation reacquisition and must not be treated as recovery authority. CapabilityGrant translation

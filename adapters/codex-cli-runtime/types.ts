@@ -7,7 +7,10 @@ export interface CodexCliRuntimeProfileBinding {
   readonly provider: "openai";
   /** Exact model request passed to `codex exec --model`; not an observed resolved model id. */
   readonly model: string;
-  /** Fixed for the lifetime of the persisted CLI thread. */
+  /**
+   * Fixed for the lifetime of the persisted CLI thread. `workspace-write` is lowered to the
+   * inspected isolated-workspace commit profile, not to an approval or full-access mode.
+   */
   readonly sandbox: CodexCliSandbox;
 }
 

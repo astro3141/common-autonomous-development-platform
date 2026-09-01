@@ -12,6 +12,7 @@ import type {
 import {
   CODEX_CLI_INSPECTED_SOURCE_COMMIT,
   CODEX_CLI_INSPECTED_VERSION,
+  CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE,
   CodexCliBackendCapabilityGap,
   CodexCliRuntimeAdapter,
   CodexCliRuntimeOperationConflict,
@@ -177,7 +178,22 @@ test("spawn uses a bounded real initialization turn and send uses explicit threa
     assert.equal(execInvocations[1]?.args.includes("--ignore-rules"), true);
     assert.equal(execInvocations[1]?.args.includes("--json"), true);
     assert.equal(execInvocations[1]?.args.includes("--output-schema"), true);
-    assert.equal(execInvocations[1]?.args.includes("workspace-write"), true);
+    assert.equal(execInvocations[1]?.args.includes("workspace-write"), false);
+    assert.equal(execInvocations[1]?.args.includes("--approve-for-me"), false);
+    assert.equal(execInvocations[1]?.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
+    assert.equal(
+      execInvocations[1]?.args.includes(
+        `default_permissions=${JSON.stringify(CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE)}`,
+      ),
+      true,
+    );
+    const filesystem = execInvocations[1]?.args.find((arg) =>
+      arg.startsWith(`permissions.${CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE}.filesystem=`),
+    );
+    assert.match(filesystem ?? "", /"\."="write"/);
+    assert.match(filesystem ?? "", /"\.git\/"="write"/);
+    assert.match(filesystem ?? "", /"\.git\/config"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/hooks\/"="read"/);
 
     assert.equal(result.backend_status, "COMPLETED");
     assert.equal(result.structured_output?.protocol, "codex-cli-actor-turn-result-v1");
@@ -289,6 +305,14 @@ test("manifest records the exact matrix and unsupported restart/reacquisition ho
     assert.equal(features["in_flight_turn_reacquisition"], false);
     assert.equal(features["explicit_thread_resume_across_cli_processes"], true);
     assert.equal(features["resolved_model_identity"], "UNAVAILABLE_IN_JSONL");
+    assert.equal(features["isolated_workspace_git_commit"], true);
+    assert.equal(
+      features["workspace_git_permission_profile"],
+      CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE,
+    );
+    assert.equal(features["git_config_write"], false);
+    assert.equal(features["git_hooks_write"], false);
+    assert.equal(features["approval_elevation"], false);
     assert.equal(manifests.runtime.body.receipt_supported, false);
   } finally {
     rmSync(root, { recursive: true, force: true });

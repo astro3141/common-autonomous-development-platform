@@ -7,6 +7,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { delimiter } from "node:path";
 
 export class GitError extends Error {
   /** What the adapter was doing, e.g. `resolve canonical ref`. */
@@ -29,12 +30,30 @@ export interface GitRun {
   readonly stderr: string;
 }
 
+export interface GitRunOptions {
+  /** Additional object stores visible to this invocation only; no repository config is changed. */
+  readonly alternate_object_directories?: readonly string[];
+}
+
 /** Runs git in `cwd`. Never throws for a non-zero exit; the caller decides what that means. */
-export function runGit(cwd: string, argv: readonly string[]): GitRun {
+export function runGit(
+  cwd: string,
+  argv: readonly string[],
+  options: GitRunOptions = {},
+): GitRun {
+  const alternates = options.alternate_object_directories;
+  const env =
+    alternates === undefined || alternates.length === 0
+      ? process.env
+      : {
+          ...process.env,
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
+        };
   try {
     const stdout = execFileSync("git", [...argv], {
       cwd,
       encoding: "utf8",
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { ok: true, stdout, stderr: "" };
@@ -49,13 +68,23 @@ export function runGit(cwd: string, argv: readonly string[]): GitRun {
 }
 
 /** Runs git and turns a non-zero exit into a `GitError`, for operations that must succeed. */
-export function git(cwd: string, operation: string, argv: readonly string[]): string {
-  const run = runGit(cwd, argv);
+export function git(
+  cwd: string,
+  operation: string,
+  argv: readonly string[],
+  options: GitRunOptions = {},
+): string {
+  const run = runGit(cwd, argv, options);
   if (!run.ok) throw new GitError(operation, argv, run.stderr.trim());
   return run.stdout;
 }
 
 /** Single-line output with the trailing newline removed. */
-export function gitLine(cwd: string, operation: string, argv: readonly string[]): string {
-  return git(cwd, operation, argv).trim();
+export function gitLine(
+  cwd: string,
+  operation: string,
+  argv: readonly string[],
+  options: GitRunOptions = {},
+): string {
+  return git(cwd, operation, argv, options).trim();
 }

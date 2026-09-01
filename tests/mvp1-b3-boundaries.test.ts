@@ -257,17 +257,13 @@ test("M1B3-AC33: no production Repository Gate module was added", () => {
 
 // --- git usage hygiene ---------------------------------------------------------------------
 
-test("M1B3-AC40 / AC41: no remote, network or destructive git operation is reachable", () => {
+test("M1B3-AC40 / AC41 / #46: only bounded local transfer, no network or destructive git", () => {
   const forbiddenSubcommands = [
-    "fetch",
     "pull",
     "push",
-    "remote",
-    "clone",
     "rebase",
     "reset",
     "clean",
-    "checkout",
     "switch",
     "tag",
     "update-ref",
@@ -280,14 +276,44 @@ test("M1B3-AC40 / AC41: no remote, network or destructive git operation is reach
   }
   assert.deepEqual(
     [...used].filter((value) => value !== "").sort(),
-    ["diff", "merge", "merge-base", "rev-parse", "status", "symbolic-ref", "worktree"],
+    [
+      "checkout",
+      "clone",
+      "config",
+      "diff",
+      "fetch",
+      "merge",
+      "merge-base",
+      "remote",
+      "rev-parse",
+      "status",
+      "symbolic-ref",
+    ],
   );
 
-  // No dangerous flag anywhere, and the one merge that exists is fast-forward only.
+  // Clone and fetch are path-local and bounded: no URL, push, tracking ref or recursive transfer.
   scan(adapterSources(), "a dangerous flag", [
     /"--force"|"-f"|"--hard"|"--no-ff"|"--allow-unrelated-histories"|"--rebase"/,
-    /"origin"|"--set-upstream"|"https?:\/\//,
+    /"--set-upstream"|"https?:\/\/|"ssh:\/\/|"git@/,
   ]);
+  const clones = gitArgv().filter((argv) => argv[0] === "clone");
+  assert.deepEqual(clones, [["clone", "--no-hardlinks", "--no-checkout", "--"]]);
+  const fetches = gitArgv().filter((argv) => argv[0] === "fetch");
+  assert.deepEqual(fetches, [
+    [
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "--no-write-fetch-head",
+      "--no-recurse-submodules",
+    ],
+  ]);
+  const checkouts = gitArgv().filter((argv) => argv[0] === "checkout");
+  assert.deepEqual(checkouts, [["checkout", "--quiet", "-b"]]);
+  const remotes = gitArgv().filter((argv) => argv[0] === "remote");
+  assert.deepEqual(remotes, [["remote", "remove", "origin"], ["remote"]]);
+
+  // The one canonical branch update stays fast-forward-only.
   const merges = gitArgv().filter((argv) => argv[0] === "merge");
   assert.equal(merges.length, 1, "exactly one merge invocation exists");
   assert.deepEqual(merges[0]?.slice(0, 2), ["merge", "--ff-only"]);
