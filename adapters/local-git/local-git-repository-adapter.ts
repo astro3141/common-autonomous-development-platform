@@ -185,13 +185,16 @@ export class LocalGitRepositoryAdapter implements RepositoryAdapter {
     }
 
     // `--no-hardlinks` makes the workspace's object store independent as well as keeping its
-    // index, refs and locks inside `path`. The source is a local configured path, never a remote.
+    // index, refs and locks inside `path`. A verification workspace based on an unmerged candidate
+    // clones from the adapter-owned workspace that already holds it; canonical remains untouched.
+    // Every source is a validated local path, never a remote.
+    const source = this.#cloneSourceFor(base);
     git(this.#workspaceRoot, "create isolated feature workspace", [
       "clone",
       "--no-hardlinks",
       "--no-checkout",
       "--",
-      this.#root,
+      source,
       path,
     ]);
     git(path, "detach canonical source", ["remote", "remove", "origin"]);
@@ -506,6 +509,20 @@ export class LocalGitRepositoryAdapter implements RepositoryAdapter {
 
   #canonicalHasCommit(commit: string): boolean {
     return runGit(this.#root, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]).ok;
+  }
+
+  /** Selects only canonical or an already validated adapter-owned workspace as a local source. */
+  #cloneSourceFor(base: string): string {
+    if (this.#canonicalHasCommit(base)) return this.#root;
+    const workspacePath = this.#candidateWorkspaces.get(base);
+    if (workspacePath === undefined || !this.#workspacePaths.has(workspacePath)) {
+      throw new GitError(
+        "locate workspace base",
+        ["clone", "--no-hardlinks", "--no-checkout"],
+        `BACKEND_CAPABILITY_GAP: no isolated workspace owns base ${base}`,
+      );
+    }
+    return workspacePath;
   }
 
   /** Copies only commit identity settings; no hooks, remotes or arbitrary config cross the boundary. */

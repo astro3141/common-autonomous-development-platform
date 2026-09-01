@@ -259,6 +259,26 @@ test("#46: candidate observation cannot import objects or mutate canonical", () 
   });
 });
 
+test("#46: verification can clone an unmerged candidate without importing it into canonical", () => {
+  withCandidate(({ repo, adapter, base, candidate }) => {
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    const canonicalStatus = repo.git(["status", "--porcelain"]);
+
+    const verification = adapter.create_feature_workspace({
+      base_head: candidate,
+      op_key: "op:attempt:task:test:1:verify:candidate",
+    });
+
+    assert.equal(repo.git(["rev-parse", "HEAD"], verification.path).trim(), candidate);
+    assert.equal(statSync(join(verification.path, ".git")).isDirectory(), true);
+    assert.equal(repo.git(["remote"], verification.path).trim(), "");
+    assert.equal(adapter.inspect_candidate(verification).present, false);
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    assert.equal(repo.head(), base);
+    assert.equal(repo.git(["status", "--porcelain"]), canonicalStatus);
+  });
+});
+
 test("#46: workspace handles outside the assigned clone fail closed", () => {
   withCandidate(({ repo, adapter, workspace }) => {
     assert.throws(

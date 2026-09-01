@@ -67,6 +67,8 @@ Git commit support is narrower than general Git administration: an Actor may upd
 workspace index, objects, and branch ref, but may not change Git config/hooks, use a repository
 remote, or write canonical. A linked-worktree `.git` pointer is rejected by LocalGit as
 `BACKEND_CAPABILITY_GAP`; it is not repaired by granting access to the canonical gitdir.
+Verification workspaces for unmerged candidates are cloned from the adapter-owned Actor workspace,
+so observation and re-execution do not import candidate objects into canonical.
 
 Explicit thread resume across separate CLI processes is supported. That is narrower than ADP
 operation reacquisition and must not be treated as recovery authority. CapabilityGrant translation
