@@ -364,6 +364,9 @@ test("§24 / §25 + B9 §25/§26: evidence work is one module, and no module doe
     // MVP 2 — the Repository Gate recomputes the verification gate from the immutable rows
     // (§14.4 precondition). Reads only, writes none.
     "core/execution/automatic-merge.ts",
+    // #52 — the PR delivery projection re-reads the exact-candidate evidence rows its receipt
+    // must cite (delivery, not lifecycle). Reads only, writes none.
+    "core/execution/project-pull-request.ts",
   ];
   /** MVP1-B11 writes them; MVP1-B12 and the MVP 2 Gate read the one their merge is bound to. */
   const AUDIT_RECORD_READERS = [
@@ -373,6 +376,9 @@ test("§24 / §25 + B9 §25/§26: evidence work is one module, and no module doe
     // §17.4 (D22) — the AUDIT_DECISION mapping row re-reads the settled record its question was
     // opened on ("the audit evidence still binds to this exact cycle"). Reads only, writes none.
     "core/execution/apply-resolved-decision.ts",
+    // #52 — the PR projection cites the settled AUDIT_PASS record of the exact candidate.
+    // Reads only, writes none.
+    "core/execution/project-pull-request.ts",
   ];
   const execution = readdirSync(join(ROOT, "core/execution"))
     .filter((name) => name.endsWith(".ts"))
