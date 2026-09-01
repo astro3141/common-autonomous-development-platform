@@ -32,10 +32,11 @@ Read-only profiles use `--sandbox read-only`. The inspected CLI's built-in `work
 profile intentionally makes `.git` read-only, so it cannot satisfy the Actor candidate-commit
 contract. Workspace-write Actor bindings therefore use an inline named permission profile that
 allows writes only below the assigned workspace and its `.git/`, while carving `.git/config`,
-`.git/config.worktree`, `.git/hooks/`, and `.git/objects/info/` back to read-only and keeping
-network disabled. This profile is paired with LocalGit's isolated clone workspace: no canonical
-gitdir is included in the writable roots. The adapter never passes `--approve-for-me`, an
-approval override, or a full-access flag.
+`.git/config.worktree`, `.git/hooks/`, `.git/objects/info/`, `.git/commondir`, `.git/gitdir`, and
+`.git/worktrees/` back to read-only and keeping network disabled. The last three carve-outs prevent
+Git-directory indirection from redirecting the otherwise narrow metadata writes. This profile is
+paired with LocalGit's isolated clone workspace: no canonical gitdir is included in the writable
+roots. The adapter never passes `--approve-for-me`, an approval override, or a full-access flag.
 
 The first `spawn_session` must execute a bounded acknowledgement turn because this CLI surface has
 no create-only session command. The returned handle contains the backend-emitted thread id. ADP
@@ -69,6 +70,10 @@ remote, or write canonical. A linked-worktree `.git` pointer is rejected by Loca
 `BACKEND_CAPABILITY_GAP`; it is not repaired by granting access to the canonical gitdir.
 Verification workspaces for unmerged candidates are cloned from the adapter-owned Actor workspace,
 so observation and re-execution do not import candidate objects into canonical.
+
+The opt-in `codex-cli-runtime-sandbox-enforcement` regression runs the exact production named
+profile through `codex sandbox`. It holds commit success inside the isolated workspace while
+falsifying writes to protected Git indirection/config/hook paths and to canonical.
 
 Explicit thread resume across separate CLI processes is supported. That is narrower than ADP
 operation reacquisition and must not be treated as recovery authority. CapabilityGrant translation

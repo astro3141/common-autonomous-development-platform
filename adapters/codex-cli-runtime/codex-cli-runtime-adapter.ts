@@ -41,6 +41,15 @@ export const CODEX_CLI_INSPECTED_SOURCE_COMMIT =
   "78c290807ce710180111df227df3b7a4fe845452";
 export const CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE =
   "adp-isolated-workspace-commit";
+/** Exact argv shared by production execution and the local sandbox-enforcement regression. */
+export const CODEX_CLI_WORKSPACE_COMMIT_SANDBOX_ARGS: readonly string[] = Object.freeze([
+  "--config",
+  `default_permissions=${JSON.stringify(CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE)}`,
+  "--config",
+  `permissions.${CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE}.filesystem={\":root\"=\"read\", \":workspace_roots\"={\".\"=\"write\", \".git/\"=\"write\", \".git/config\"=\"read\", \".git/config.worktree\"=\"read\", \".git/hooks/\"=\"read\", \".git/objects/info/\"=\"read\", \".git/commondir\"=\"read\", \".git/gitdir\"=\"read\", \".git/worktrees\"=\"read\", \".git/worktrees/\"=\"read\"}}`,
+  "--config",
+  `permissions.${CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE}.network.enabled=false`,
+]);
 export const CODEX_CLI_SUPERVISOR_PROPOSAL_PROTOCOL = "platform-supervisor-proposal-v1";
 export const CODEX_CLI_ACTOR_RESULT_PROTOCOL = "codex-cli-actor-turn-result-v1";
 export const CODEX_CLI_AUDITOR_VERDICT_PROTOCOL = "platform-auditor-verdict-v1";
@@ -120,6 +129,10 @@ export interface CodexCliCapabilityAdvertisement {
     readonly isolated_workspace_git_commit: true;
     readonly git_config_write: false;
     readonly git_hooks_write: false;
+    readonly git_object_redirection_write: false;
+    readonly git_commondir_write: false;
+    readonly git_gitdir_write: false;
+    readonly git_worktrees_metadata_write: false;
     readonly create_only_session: false;
     readonly backend_session_status_query: false;
     readonly backend_session_close: false;
@@ -174,6 +187,10 @@ export class CodexCliRuntimeAdapter implements RuntimeAdapter {
         isolated_workspace_git_commit: true,
         git_config_write: false,
         git_hooks_write: false,
+        git_object_redirection_write: false,
+        git_commondir_write: false,
+        git_gitdir_write: false,
+        git_worktrees_metadata_write: false,
         create_only_session: false,
         backend_session_status_query: false,
         backend_session_close: false,
@@ -593,15 +610,7 @@ export const codexCliRuntimePreflight = (adapter: CodexCliRuntimeAdapter): Runti
  */
 function sandboxArgs(binding: CodexCliRuntimeProfileBinding): readonly string[] {
   if (binding.sandbox === "read-only") return ["--sandbox", "read-only"];
-  const profile = CODEX_CLI_WORKSPACE_COMMIT_PERMISSION_PROFILE;
-  return [
-    "--config",
-    `default_permissions=${JSON.stringify(profile)}`,
-    "--config",
-    `permissions.${profile}.filesystem={\":root\"=\"read\", \":workspace_roots\"={\".\"=\"write\", \".git/\"=\"write\", \".git/config\"=\"read\", \".git/config.worktree\"=\"read\", \".git/hooks/\"=\"read\", \".git/objects/info/\"=\"read\"}}`,
-    "--config",
-    `permissions.${profile}.network.enabled=false`,
-  ];
+  return CODEX_CLI_WORKSPACE_COMMIT_SANDBOX_ARGS;
 }
 
 function initializationPrompt(role: string, bootstrap: CanonicalObject): string {

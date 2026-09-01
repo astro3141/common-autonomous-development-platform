@@ -194,6 +194,11 @@ test("spawn uses a bounded real initialization turn and send uses explicit threa
     assert.match(filesystem ?? "", /"\.git\/"="write"/);
     assert.match(filesystem ?? "", /"\.git\/config"="read"/);
     assert.match(filesystem ?? "", /"\.git\/hooks\/"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/objects\/info\/"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/commondir"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/gitdir"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/worktrees"="read"/);
+    assert.match(filesystem ?? "", /"\.git\/worktrees\/"="read"/);
 
     assert.equal(result.backend_status, "COMPLETED");
     assert.equal(result.structured_output?.protocol, "codex-cli-actor-turn-result-v1");
@@ -312,6 +317,10 @@ test("manifest records the exact matrix and unsupported restart/reacquisition ho
     );
     assert.equal(features["git_config_write"], false);
     assert.equal(features["git_hooks_write"], false);
+    assert.equal(features["git_object_redirection_write"], false);
+    assert.equal(features["git_commondir_write"], false);
+    assert.equal(features["git_gitdir_write"], false);
+    assert.equal(features["git_worktrees_metadata_write"], false);
     assert.equal(features["approval_elevation"], false);
     assert.equal(manifests.runtime.body.receipt_supported, false);
   } finally {
