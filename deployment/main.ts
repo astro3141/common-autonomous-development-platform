@@ -19,6 +19,7 @@ import { bootRun } from "./boot.ts";
 import { compose } from "./compose.ts";
 import { loadConfig } from "./config.ts";
 import { startIngress } from "./ingress.ts";
+import { startObserver, type ObserverHandle } from "./observer.ts";
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -69,6 +70,18 @@ async function main(): Promise<void> {
   });
   log(`ingress listening on ${config.ingress.host}:${ingress.port()}`);
 
+  // #55 — the read-only observation server lives on its own worker thread with its own read-only
+  // store connection, so it keeps answering while a tick blocks this thread inside a model turn.
+  let observer: ObserverHandle | null = null;
+  if (config.observation !== null) {
+    observer = await startObserver({
+      store_path: config.store_path,
+      port: config.observation.port,
+      host: config.observation.host,
+    });
+    log(`observation surface listening on ${config.observation.host}:${observer.port} (read-only)`);
+  }
+
   let ticking = false;
   let stopped = false;
   const tick = (): void => {
@@ -87,6 +100,7 @@ async function main(): Promise<void> {
   if (values.once === true) {
     tick();
     await ingress.close();
+    await observer?.stop();
     composition.dispose();
     return;
   }
@@ -100,6 +114,7 @@ async function main(): Promise<void> {
     clearInterval(interval);
     log("shutting down");
     await ingress.close();
+    await observer?.stop();
     composition.dispose();
     process.exit(0);
   };
