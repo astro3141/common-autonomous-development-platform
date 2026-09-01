@@ -278,8 +278,9 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
               });
             }
           } catch {
-            // A turn without a terminal projection is an honest UNKNOWN — never a confident
-            // absence claim, and not an unavailability of the whole authority (§22.5).
+            // The runtime authority was queried but did not answer, so its coverage is
+            // UNAVAILABLE; no anomaly can be claimed from that failed observation (§22.5).
+            coverage["runtime"] = "UNAVAILABLE";
           }
         }
       }
