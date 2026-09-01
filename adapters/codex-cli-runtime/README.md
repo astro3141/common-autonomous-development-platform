@@ -110,3 +110,9 @@ that still-unmerged candidate without importing it into canonical, the Auditor r
 `AUDIT_PASS`, and ADP stopped at the human `MERGE_APPROVAL` boundary. Attempts made under the exact
 Actor permission profile to commit or write in canonical, or to modify workspace `.git/config`,
 were rejected by the OS sandbox.
+
+An independent adversarial review of that evidence found three omitted Git indirection paths and
+correctly returned `NOT PASS` for commit `3e1e80a5301dec8a552696057c2122dfcc8e2a71`.
+`issue-46-adversarial-repair-evidence.json` preserves the reproduction, targeted carve-out repair,
+and a real post-repair `codex sandbox` run covering both the new negative controls and the held
+positive candidate-commit path.
