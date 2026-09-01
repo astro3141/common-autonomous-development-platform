@@ -16,6 +16,8 @@ import { compileProfile } from "../core/profile/compiler.ts";
 import { validateProposal } from "../core/decision/proposal.ts";
 import { submitProposal, resolveHumanGateAndAdmit } from "../core/admission/submit-proposal.ts";
 import {
+  materializationReservedSeats,
+  advanceMaterializations,
   applyRejectedMaterializationGate,
   commitMaterializationIntent,
   materializationOperations,
@@ -24,6 +26,7 @@ import {
 import { sealMaterializationSnapshot, materializeChildOp } from "../core/materialization/snapshot.ts";
 import { hashTaskDefinitionBody } from "../core/tasksource/task-definition.ts";
 import { ProductionCoordinator } from "../core/coordinator/production-coordinator.ts";
+import { assembleSupervisorDecisionContext } from "../core/execution/supervisor-decision-context.ts";
 import { BATCH_ID, discover, PROJECT, RUN_ID, TASK_KEY, TASK_REF, withWorld } from "./support/domain-fixtures.ts";
 import {
   compiled,
@@ -597,3 +600,249 @@ test("D24-14/15: an E with the wrong parent is a conflict; a drifted child body 
   );
 });
 
+
+// === PR #69 review 5493230285 — required regressions (findings 2–5; finding 1 is D23-R1) ========
+
+/** An adapter that creates the child and then throws, with an unreadable reconciler. */
+class CreateThenThrowMaterializer extends FakeChildMaterializer {
+  createThenThrowOnce = false;
+  reconcileThrows = false;
+  override materialize_child(request: Parameters<FakeChildMaterializer["materialize_child"]>[0]) {
+    if (this.createThenThrowOnce) {
+      this.createThenThrowOnce = false;
+      super.materialize_child(request); // the external effect happens
+      throw new Error("network dropped after create");
+    }
+    return super.materialize_child(request);
+  }
+  override reconcile_child_materialization(op_key: string) {
+    if (this.reconcileThrows) throw new Error("observer down");
+    return super.reconcile_child_materialization(op_key);
+  }
+}
+
+test("R2: create-then-throw with an unreadable reconciler is UNKNOWN — one create, ever", () => {
+  withWorld((world) => {
+    const m = new CreateThenThrowMaterializer();
+    const w = coordinatorWorld(world, { materializer: m });
+    const id = acceptF(w);
+
+    m.createThenThrowOnce = true;
+    m.reconcileThrows = true;
+    assert.equal(w.tick(), "MATERIALIZATION_UNKNOWN", "unproven either way is UNKNOWN, never bare INTENT");
+    assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
+    assert.equal(
+      w.store.decisions.read().some((e) => e.kind === "materialization_reconcile_unknown"),
+      true,
+      "same-op provenance persists",
+    );
+
+    // Repeated ticks and a rebuilt Coordinator never call materialize_child again.
+    const creates = () => m.calls.filter((c) => c.startsWith("materialize:")).length;
+    const before = creates();
+    m.reconcileThrows = false; // reconciler heals but keeps answering honestly (COMMITTED known)
+    w.tick();
+    new ProductionCoordinator({ ...w, materializer: m }).tickOnce(RUN_ID);
+    assert.equal(creates(), before, "duplicate create count 0");
+
+    // A later same-identity COMMITTED reconciliation converges without another publish: the
+    // recovery pass promotes the exact receipt to DONE through the same single handler.
+    const op = materializeChildOp(BATCH_ID, id);
+    // Direct bounded pass over the paused batch (read-only reconcile is allowed while UNKNOWN):
+    const step = advanceMaterializations(
+      { store: w.store, taskSource: w.tasks, materializer: m },
+      { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T11:00:00Z" },
+    );
+    assert.equal(step, "MATERIALIZATION_PUBLISHED");
+    assert.equal(w.store.idempotency.get(op)?.state, "DONE");
+    assert.equal(creates(), before, "convergence promoted the receipt; it did not re-create");
+  }, POLICY, V3_OPTIONS);
+});
+
+/** Receipt-corrupting adapters for the three COMMITTED paths. */
+class BadReceiptMaterializer extends FakeChildMaterializer {
+  corruption: "id" | "hash" | "ref" = "id";
+  mode: "direct" | "no-effect-retry" | "reconcile" = "direct";
+  #phase = 0;
+  #bad(request: { materialization_id: string; materialization_hash: string }) {
+    return {
+      status: "COMMITTED" as const,
+      receipt: {
+        materialization_id: this.corruption === "id" ? "01JQ8ZK5T7RC9V2W4X6Y8Z0BAD" : request.materialization_id,
+        materialization_hash: this.corruption === "hash" ? "sha256:" + "f".repeat(64) : request.materialization_hash,
+        external_task_ref: this.corruption === "ref" ? "" : "CHILD-FOREIGN",
+      },
+    };
+  }
+  override materialize_child(request: Parameters<FakeChildMaterializer["materialize_child"]>[0]) {
+    this.#phase += 1;
+    if (this.mode === "direct") return this.#bad(request);
+    if (this.mode === "no-effect-retry") {
+      if (this.#phase === 1) throw new Error("ambiguous first call");
+      return this.#bad(request);
+    }
+    throw new Error("always ambiguous");
+  }
+  override reconcile_child_materialization(op_key: string) {
+    void op_key;
+    if (this.mode === "no-effect-retry") return { status: "NO_EFFECT_CONFIRMED" as const };
+    if (this.mode === "reconcile") {
+      return this.#bad({ materialization_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0BAD", materialization_hash: "sha256:" + "f".repeat(64) });
+    }
+    return { status: "UNKNOWN" as const };
+  }
+}
+
+test("R3: a mismatched or empty-ref COMMITTED receipt never reaches DONE on any path", () => {
+  for (const mode of ["direct", "no-effect-retry", "reconcile"] as const) {
+    for (const corruption of ["id", "hash", "ref"] as const) {
+      withWorld((world) => {
+        const m = new BadReceiptMaterializer();
+        m.mode = mode;
+        m.corruption = corruption;
+        const w = coordinatorWorld(world, { materializer: m });
+        const id = acceptF(w);
+        const step = w.tick();
+        assert.equal(step, "MATERIALIZATION_CONFLICT", `${mode}/${corruption}`);
+        const record = w.store.idempotency.get(materializeChildOp(BATCH_ID, id));
+        assert.notEqual(record?.state, "DONE", `${mode}/${corruption}: no DONE`);
+        assert.equal(
+          w.store.tasks.inBatch(BATCH_ID).some((t) => t.materialization_binding !== null),
+          false,
+          `${mode}/${corruption}: no binding`,
+        );
+        assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
+      }, POLICY, V3_OPTIONS);
+    }
+  }
+});
+
+test("R4: pending materialisation seats cannot be stolen by an unrelated admission", () => {
+  withWorld((world) => {
+    const m = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer: m });
+    discover(world, "UNRELATED");
+    w.tasks.definitions.set("UNRELATED", task({ task_ref: "UNRELATED" }));
+    acceptF(w); // reserves the child seat + the unadmitted DISCOVERED parent's seat
+
+    // max_tasks = 2: both seats are reserved — the context projection says capacity 0…
+    const context = assembleSupervisorDecisionContext(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never },
+      { run_id: RUN_ID, batch_id: BATCH_ID, proposal_id: ULID_F2, observed_at: "2026-09-01T11:00:00Z" },
+    ) as { subflow_materialization?: { remaining_task_capacity: number } };
+    assert.equal(context.subflow_materialization?.remaining_task_capacity, 0);
+
+    // …an unrelated A rejects at validation and cannot slip through the commit-time guard either…
+    const unrelated = selection({ profile: world.profile, definition: task({ task_ref: "UNRELATED" }) });
+    seedProposalAllocation(w.store, BATCH_ID, unrelated["proposal_id"] as string);
+    const stolen = submitProposal(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+      { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T11:00:00Z", proposal: unrelated },
+    );
+    assert.deepEqual(stolen.result, { kind: "POLICY_REJECTED", reason_code: "BATCH_MAX_TASKS_REACHED" });
+    assert.equal(w.store.tasks.require(`task:${PROJECT}:UNRELATED`).platform_state, "DISCOVERED");
+
+    // …while the exact reserved parent consumes its own seat and admits normally.
+    const parentA = selection({ profile: world.profile });
+    seedProposalAllocation(w.store, BATCH_ID, parentA["proposal_id"] as string);
+    const parent = submitProposal(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+      { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T11:01:00Z", proposal: parentA },
+    );
+    assert.deepEqual(parent.result, { kind: "ACCEPTED" });
+    assert.equal(parent.admitted, true);
+
+    // Restart changes nothing: the reservation derives from durable rows alone.
+    assert.equal(materializationReservedSeats(w.store, BATCH_ID), 1, "the child seat still stands");
+    const again = selection({ profile: world.profile, definition: task({ task_ref: "UNRELATED" }) });
+    seedProposalAllocation(w.store, BATCH_ID, again["proposal_id"] as string);
+    const post = submitProposal(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+      { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T11:02:00Z", proposal: again },
+    );
+    assert.deepEqual(post.result, { kind: "POLICY_REJECTED", reason_code: "BATCH_MAX_TASKS_REACHED" });
+  }, { batch_policy: { max_tasks: 2, max_rework: 2, concurrency: 2 } }, V3_OPTIONS);
+});
+
+test("R5: a cross-batch F parent fails closed everywhere, and a legacy row still blocks dispatch", () => {
+  withWorld((world) => {
+    const m = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer: m });
+    world.store.withTransaction(() => {
+      world.store.batches.create({
+        batch_id: "batch:other:1",
+        run_id: RUN_ID,
+        ordinal: 2,
+        compiled_profile_hash: w.store.batches.require(BATCH_ID).compiled_profile_hash,
+      });
+    });
+    const OTHER_KEY = `task:${PROJECT}:OTHER-1`;
+    world.store.withTransaction(() => {
+      world.store.decisions.append({ kind: "state_transition", refKey: OTHER_KEY, payload: {} as never });
+      world.store.tasks.discover({
+        task_key: OTHER_KEY,
+        batch_id: "batch:other:1",
+        project_id: PROJECT,
+        external_task_ref: "OTHER-1",
+        external_snapshot: {
+          external_state: "READY",
+          version: "1",
+          definition_hash: task({ task_ref: "OTHER-1" }).definition_hash,
+          observed_at: "t",
+        },
+      });
+    });
+    w.tasks.definitions.set("OTHER-1", task({ task_ref: "OTHER-1" }));
+
+    // Validation: a batch-1 F naming the batch-2 parent is a batch mismatch, zero effect.
+    const cross = {
+      proposal_id: ULID_F,
+      decision: "START_SUBFLOW",
+      parent: {
+        kind: "DISCOVERED_TASK",
+        task_key: OTHER_KEY,
+        task_ref: "OTHER-1",
+        task_version: "1",
+        task_definition_hash: task({ task_ref: "OTHER-1" }).definition_hash,
+      },
+      child: { task_definition_body: childBody() },
+      expected: { compiled_profile_hash: w.store.batches.require(BATCH_ID).compiled_profile_hash },
+      reason_refs: [],
+    };
+    const refused = submitF(w, cross);
+    assert.deepEqual(refused.result, {
+      kind: "POLICY_REJECTED",
+      reason_code: "SUBFLOW_PARENT_BATCH_MISMATCH",
+    });
+    assert.equal(w.store.materializations.count(), 0, "no snapshot, no INTENT, no effect");
+
+    // Commit path: the intent transaction itself refuses a cross-batch parent, atomically.
+    const body = childBody();
+    const sealed = sealMaterializationSnapshot({
+      materialization_id: ULID_F2,
+      batch_id: BATCH_ID,
+      compiled_profile_hash: w.store.batches.require(BATCH_ID).compiled_profile_hash,
+      task_source_id: "primary",
+      parent_intent: {
+        kind: "DISCOVERED_TASK",
+        task_key: OTHER_KEY,
+        task_ref: "OTHER-1",
+        task_version: "1",
+        task_definition_hash: task({ task_ref: "OTHER-1" }).definition_hash,
+      },
+      child_definition_body: body as never,
+      child_definition_hash: hashTaskDefinitionBody(body as never),
+      reason_refs: [],
+    });
+    assert.throws(() => commitMaterializationIntent(w.store, { sealed }));
+    assert.equal(w.store.materializations.count(), 0, "the rejected transaction left nothing behind");
+
+    // Fence: a legacy/corrupt cross-batch snapshot (planted below the commit guard) still blocks
+    // the parent's Actor dispatch — the fence queries by parent association, not by batch.
+    w.store.withTransaction(() => {
+      w.store.materializations.put(sealed);
+      w.store.idempotency.beginIntent(materializeChildOp(BATCH_ID, ULID_F2));
+    });
+    assert.equal(pendingMaterializationsFor(w.store, OTHER_KEY).length, 1, "the fence sees it");
+  }, { batch_policy: { max_tasks: 5, max_rework: 2, concurrency: 2 } }, V3_OPTIONS);
+});

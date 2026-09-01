@@ -326,6 +326,8 @@ export type ChildMaterializationCapabilityViewV1 =
 
 /** §9.2g — the reservation/recovery facts of the F local guard. */
 export interface ChildMaterializationBatchViewV1 {
+  /** The submission's own batch — the only batch an F parent may belong to (review finding 5). */
+  readonly batch_id: string;
   readonly run_status: string;
   readonly batch_status: string;
   readonly has_unresolved_unknown_materialization: boolean;

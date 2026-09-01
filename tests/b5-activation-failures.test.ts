@@ -205,6 +205,7 @@ test("FC2 / §10: the hold is durable — no retry, no decision, no reselection 
       assert.equal(domain.store.outbox.count(), 0);
 
       // §18 — a backend hold is not a SELECTION_STALE hold, so START_TASK does not reselect it.
+      seedAllocationForProposal(domain.store, BATCH_ID, selection({ profile: domain.profile }));
       assert.throws(() =>
         submitProposal(authorities, {
           run_id: RUN_ID,

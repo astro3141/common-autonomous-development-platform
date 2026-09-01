@@ -71,6 +71,14 @@ export function commitMaterializationIntent(
   const body = command.sealed.body;
   const op_key = materializeChildOp(body.batch_id, body.materialization_id);
   return store.withTransaction(() => {
+    // §19.5.1-analogue commit-time recheck (review finding 5): the snapshot's parent must exist
+    // and be owned by the snapshot's own batch — validation never leases this across the gap.
+    const parent = store.tasks.get(body.parent_intent.task_key);
+    if (parent === undefined || parent.batch_id !== body.batch_id) {
+      throw new MaterializationFailedError(
+        `${body.parent_intent.task_key} is not a task of ${body.batch_id}; cross-batch materialisation is refused`,
+      );
+    }
     store.materializations.put(command.sealed);
     const entry = store.decisions.append({
       kind: MATERIALIZATION_INTENT_KIND,
@@ -120,22 +128,28 @@ export function materializationOperations(
   store: PlatformStore,
   batch_id: string,
 ): readonly MaterializationOperationView[] {
-  return store.materializations.forBatch(batch_id).map((snapshot) => {
-    const op_key = materializeChildOp(batch_id, snapshot.materialization_id);
-    const record = store.idempotency.get(op_key);
-    const bound = boundChild(store, snapshot);
-    if (record?.state === "FAILED") {
-      return view(snapshot, op_key, "FAILED", null, false);
-    }
-    if (bound !== undefined) {
-      return view(snapshot, op_key, "OBSERVED", bound.external_task_ref, bound.admitted_at !== null);
-    }
-    if (record?.state === "DONE") {
-      const receipt = record.result as unknown as ChildTaskMaterializationReceiptV1 | undefined;
-      return view(snapshot, op_key, "COMMITTED_NOT_OBSERVED", receipt?.external_task_ref ?? null, false);
-    }
-    return view(snapshot, op_key, "INTENT", null, false);
-  });
+  return store.materializations.forBatch(batch_id).map((snapshot) => operationView(store, snapshot));
+}
+
+/** One snapshot's phase projection — always keyed by the snapshot's own batch op identity. */
+function operationView(
+  store: PlatformStore,
+  snapshot: StoredMaterializationSnapshot,
+): MaterializationOperationView {
+  const op_key = materializeChildOp(snapshot.batch_id, snapshot.materialization_id);
+  const record = store.idempotency.get(op_key);
+  const bound = boundChild(store, snapshot);
+  if (record?.state === "FAILED") {
+    return view(snapshot, op_key, "FAILED", null, false);
+  }
+  if (bound !== undefined) {
+    return view(snapshot, op_key, "OBSERVED", bound.external_task_ref, bound.admitted_at !== null);
+  }
+  if (record?.state === "DONE") {
+    const receipt = record.result as unknown as ChildTaskMaterializationReceiptV1 | undefined;
+    return view(snapshot, op_key, "COMMITTED_NOT_OBSERVED", receipt?.external_task_ref ?? null, false);
+  }
+  return view(snapshot, op_key, "INTENT", null, false);
 }
 
 function view(
@@ -170,14 +184,14 @@ export function pendingMaterializationsFor(
   store: PlatformStore,
   parent_task_key: string,
 ): readonly MaterializationOperationView[] {
-  const parent = store.tasks.get(parent_task_key);
-  if (parent === undefined) return [];
-  return materializationOperations(store, parent.batch_id).filter(
-    (operation) =>
-      operation.parent_task_key === parent_task_key &&
-      operation.phase !== "FAILED" &&
-      !operation.admitted,
-  );
+  // Defensive by parent *association*, not by the parent's batch (review finding 5): even a
+  // legacy/corrupt cross-batch snapshot still blocks this parent's Actor/rework dispatch.
+  const pending: MaterializationOperationView[] = [];
+  for (const snapshot of store.materializations.forParent(parent_task_key)) {
+    const operation = operationView(store, snapshot);
+    if (operation.phase !== "FAILED" && !operation.admitted) pending.push(operation);
+  }
+  return pending;
 }
 
 /** §9.2g — true while an op is INTENT with same-op UNKNOWN provenance journaled. */
@@ -192,6 +206,44 @@ export function hasUnresolvedUnknown(store: PlatformStore, batch_id: string): bo
             entry.kind === MATERIALIZATION_RECONCILE_UNKNOWN_KIND && entry.refKey === operation.op_key,
         ),
   );
+}
+
+/**
+ * §9.2g (D24, review finding 4) — the durable reservation-aware seat count every admission
+ * consumer shares: validator V11, the §19.3a commit-time guard and the context v2 capacity
+ * projection. Reserved seats are (a) every non-FAILED materialisation whose child is not yet
+ * admitted and (b) each such operation's own unadmitted parent, counted once. `exclude_task_key`
+ * names the admission target so the exact reserved parent (A) or the exact bound child (E)
+ * consumes its own seat instead of being blocked by it — an unrelated A/E can never steal one.
+ */
+export function materializationReservedSeats(
+  store: PlatformStore,
+  batch_id: string,
+  exclude_task_key?: string,
+): number {
+  const operations = materializationOperations(store, batch_id).filter(
+    (operation) => operation.phase !== "FAILED" && !operation.admitted,
+  );
+  let childSeats = 0;
+  const parentSeats = new Set<string>();
+  for (const operation of operations) {
+    const boundKey =
+      operation.task_ref === null ? undefined : buildTaskKey(runProject(store, batch_id), operation.task_ref);
+    if (boundKey !== undefined && boundKey === exclude_task_key) {
+      // The exact bound child consumes its own reserved seat.
+    } else {
+      childSeats += 1;
+    }
+    const parent = store.tasks.get(operation.parent_task_key);
+    if (parent !== undefined && parent.admitted_at === null && operation.parent_task_key !== exclude_task_key) {
+      parentSeats.add(operation.parent_task_key);
+    }
+  }
+  return childSeats + parentSeats.size;
+}
+
+function runProject(store: PlatformStore, batch_id: string): string {
+  return store.runs.require(store.batches.require(batch_id).run_id).project_id;
 }
 
 /** §9.2g — the F local-guard/reservation facts, derived from durable exact state only. */
@@ -243,8 +295,11 @@ export function advanceMaterializations(
           (entry) =>
             entry.kind === MATERIALIZATION_RECONCILE_UNKNOWN_KIND && entry.refKey === operation.op_key,
         );
+      // A flagged UNKNOWN op stays read-only-reconcilable through the same single handler: an
+      // exact COMMITTED converges, a target-authoritative NO_EFFECT authorizes the one same-op
+      // retry, and anything unproven idempotently re-asserts UNKNOWN — never a bare-INTENT call.
       const step = unknown
-        ? reconcileIntent(authorities, snapshot, operation.op_key)
+        ? resolveAmbiguity(authorities, snapshot, operation.op_key, false)
         : publish(authorities, snapshot, operation.op_key);
       if (step !== undefined) return step;
       continue;
@@ -258,6 +313,19 @@ export function advanceMaterializations(
     if (step !== undefined) return step;
   }
   return undefined;
+}
+
+/** Every COMMITTED receipt, on every path, binds exactly or it is nothing (review finding 3). */
+function receiptBindsExactly(
+  snapshot: StoredMaterializationSnapshot,
+  receipt: ChildTaskMaterializationReceiptV1,
+): boolean {
+  return (
+    receipt.materialization_id === snapshot.materialization_id &&
+    receipt.materialization_hash === snapshot.hash &&
+    typeof receipt.external_task_ref === "string" &&
+    receipt.external_task_ref.length > 0
+  );
 }
 
 /** CM2 — the same-op adapter call after a durable INTENT. */
@@ -282,17 +350,22 @@ function publish(
       // The only failure that ends the operation: target-authoritative proof of no effect.
       return failDefinitively(store, snapshot, op_key, error.message);
     }
-    // CM3 — the effect is unproven either way; reconcile through the same op identity.
-    return reconcileIntent(authorities, snapshot, op_key);
+    // CM3 — the effect is unproven either way; one shared handler decides, and nothing here
+    // ever falls back to a retryable bare INTENT (review finding 2).
+    return resolveAmbiguity(authorities, snapshot, op_key, false);
   }
+  return acceptCommitted(store, snapshot, op_key, committed.receipt);
+}
 
-  const receipt = committed.receipt;
-  if (
-    receipt.materialization_id !== snapshot.materialization_id ||
-    receipt.materialization_hash !== snapshot.hash ||
-    receipt.external_task_ref.length === 0
-  ) {
-    return pauseConflict(store, snapshot, op_key, "the adapter receipt does not bind to this exact snapshot");
+/** The one gate every COMMITTED result passes before DONE — direct, reconcile or retry path. */
+function acceptCommitted(
+  store: PlatformStore,
+  snapshot: StoredMaterializationSnapshot,
+  op_key: string,
+  receipt: ChildTaskMaterializationReceiptV1,
+): MaterializationStep {
+  if (!receiptBindsExactly(snapshot, receipt)) {
+    return pauseConflict(store, snapshot, op_key, "the COMMITTED receipt does not bind to this exact snapshot");
   }
   store.withTransaction(() => {
     store.idempotency.markDone(op_key, receipt as unknown as CanonicalValue);
@@ -300,11 +373,19 @@ function publish(
   return "MATERIALIZATION_PUBLISHED";
 }
 
-/** §21 CM3 / §22 — the same-op reconciliation with exact D24 answer semantics. */
-function reconcileIntent(
+/**
+ * §21 CM3 / §22 — the single ambiguous-outcome handler. Unless the reconciler proves an exact
+ * `COMMITTED` or a target-authoritative `NO_EFFECT_CONFIRMED`, the operation is `UNKNOWN`:
+ * journaled with same-op provenance and paused atomically. An unreadable reconciler proves
+ * nothing and is therefore UNKNOWN too — never a licence to call `materialize_child` again.
+ * `retry_authorized` marks the one bounded NO_EFFECT-authorized retry; if that retry is itself
+ * ambiguous it lands back here with the authorization spent, so it can only go UNKNOWN.
+ */
+function resolveAmbiguity(
   authorities: MaterializationAuthorities,
   snapshot: StoredMaterializationSnapshot,
   op_key: string,
+  retry_authorized: boolean,
 ): MaterializationStep | undefined {
   const { store, materializer } = authorities;
   if (materializer === undefined) return undefined;
@@ -313,48 +394,27 @@ function reconcileIntent(
   try {
     answer = materializer.reconcile_child_materialization(op_key);
   } catch {
-    return undefined; // an unreadable reconciler proves nothing; try again later
+    return markUnknown(store, snapshot, op_key);
   }
 
   if (answer.status === "COMMITTED") {
-    if (
-      answer.receipt.materialization_id !== snapshot.materialization_id ||
-      answer.receipt.materialization_hash !== snapshot.hash
-    ) {
+    if (!receiptBindsExactly(snapshot, answer.receipt)) {
       return pauseConflict(store, snapshot, op_key, "reconcile returned a receipt for a different snapshot");
     }
-    store.withTransaction(() => {
-      store.idempotency.markDone(op_key, answer.receipt as unknown as CanonicalValue);
-    });
-    return "MATERIALIZATION_PUBLISHED";
+    return acceptCommitted(store, snapshot, op_key, answer.receipt);
   }
   if (answer.status === "NO_EFFECT_CONFIRMED") {
-    // Authoritative no-effect: the same op may be called again. The INTENT simply stands.
+    if (retry_authorized) {
+      // The authorization was already spent on a retry that came back ambiguous; treating a
+      // second NO_EFFECT answer as a fresh licence would loop blind calls around ambiguity.
+      return markUnknown(store, snapshot, op_key);
+    }
     return publishAfterNoEffect(authorities, snapshot, op_key);
   }
-  // UNKNOWN — no blind retry, no second identity: the batch pauses with same-op provenance, and
-  // the §9.2g guard keeps every new F INTENT closed until this op reaches a terminal state.
-  const alreadyFlagged = store.decisions
-    .read()
-    .some((entry) => entry.kind === MATERIALIZATION_RECONCILE_UNKNOWN_KIND && entry.refKey === op_key);
-  const batch = store.batches.require(snapshot.batch_id);
-  if (alreadyFlagged && batch.status === "PAUSED_SAFELY") return undefined;
-  commitBatchFact(store, {
-    batch_id: snapshot.batch_id,
-    fact: { kind: "CIRCUIT_BREAKER", also_pause_run: false },
-    within: () => {
-      if (!alreadyFlagged) {
-        store.decisions.append({
-          kind: MATERIALIZATION_RECONCILE_UNKNOWN_KIND,
-          refKey: op_key,
-          payload: { materialization_id: snapshot.materialization_id } as never,
-        });
-      }
-    },
-  });
-  return "MATERIALIZATION_UNKNOWN";
+  return markUnknown(store, snapshot, op_key);
 }
 
+/** The exactly-once NO_EFFECT-authorized same-op retry (review findings 2/3). */
 function publishAfterNoEffect(
   authorities: MaterializationAuthorities,
   snapshot: StoredMaterializationSnapshot,
@@ -374,12 +434,49 @@ function publishAfterNoEffect(
     if (error instanceof MaterializationFailedError) {
       return failDefinitively(store, snapshot, op_key, error.message);
     }
-    return undefined; // still unproven; the INTENT stands for the next pass
+    // The authorized retry was itself ambiguous: back through the one handler, retry spent.
+    return resolveAmbiguity(authorities, snapshot, op_key, true);
   }
-  store.withTransaction(() => {
-    store.idempotency.markDone(op_key, committed.receipt as unknown as CanonicalValue);
+  return acceptCommitted(store, snapshot, op_key, committed.receipt);
+}
+
+/** UNKNOWN — same-op provenance + safe pause, atomically; the §9.2g F guard closes with it. */
+function markUnknown(
+  store: PlatformStore,
+  snapshot: StoredMaterializationSnapshot,
+  op_key: string,
+): MaterializationStep {
+  const alreadyFlagged = store.decisions
+    .read()
+    .some((entry) => entry.kind === MATERIALIZATION_RECONCILE_UNKNOWN_KIND && entry.refKey === op_key);
+  const batch = store.batches.require(snapshot.batch_id);
+  if (alreadyFlagged && batch.status === "PAUSED_SAFELY") return "MATERIALIZATION_UNKNOWN";
+  if (batch.status === "PAUSED_SAFELY") {
+    if (!alreadyFlagged) {
+      store.withTransaction(() => {
+        store.decisions.append({
+          kind: MATERIALIZATION_RECONCILE_UNKNOWN_KIND,
+          refKey: op_key,
+          payload: { materialization_id: snapshot.materialization_id } as never,
+        });
+      });
+    }
+    return "MATERIALIZATION_UNKNOWN";
+  }
+  commitBatchFact(store, {
+    batch_id: snapshot.batch_id,
+    fact: { kind: "CIRCUIT_BREAKER", also_pause_run: false },
+    within: () => {
+      if (!alreadyFlagged) {
+        store.decisions.append({
+          kind: MATERIALIZATION_RECONCILE_UNKNOWN_KIND,
+          refKey: op_key,
+          payload: { materialization_id: snapshot.materialization_id } as never,
+        });
+      }
+    },
   });
-  return "MATERIALIZATION_PUBLISHED";
+  return "MATERIALIZATION_UNKNOWN";
 }
 
 /** CM4/CM5 — the exact TaskSource round-trip and the one-transaction DISCOVERED+binding commit. */

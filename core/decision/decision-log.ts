@@ -34,23 +34,37 @@ export interface SupervisorProposalAllocation {
 }
 
 /**
- * The active turn's Platform allocation for a batch: the most recently journaled allocation.
+ * The active turn's Platform allocation for a batch: the most recently journaled allocation
+ * **that no ordinary structured validation has consumed yet**. One turn ↔ one Proposal (D23):
+ * the first `decision_validation` entry journaled with `consumed_allocation` equal to the
+ * allocation closes it, whatever the verdict — an answered turn exposes no active identity, so
+ * a replayed id (sequential, concurrent or post-restart) rejects at V1 with zero effect.
  * `undefined` means no Supervisor turn context is active — V1 then rejects any Proposal
- * (`PROPOSAL_SCHEMA_INVALID` at `/proposal_id`), which is D23's fail-closed answer to a Proposal
- * that no active turn asked for. No replacement id is ever fabricated around a returned output.
+ * (`PROPOSAL_SCHEMA_INVALID` at `/proposal_id`). No replacement id is ever fabricated around a
+ * returned output, and the §17.3 gate-bound identity is a separate non-consuming path.
  */
 export function activeSupervisorProposalAllocation(
   log: { read(): readonly DecisionLogEntry[] },
   batch_id: string,
 ): SupervisorProposalAllocation | undefined {
-  let latest: SupervisorProposalAllocation | undefined;
-  for (const entry of log.read()) {
+  let latest: (SupervisorProposalAllocation & { readonly seq: number }) | undefined;
+  const entries = log.read();
+  for (const entry of entries) {
     if (entry.kind !== SUPERVISOR_PROPOSAL_ALLOCATION_KIND) continue;
     const payload = entry.payload as unknown as SupervisorProposalAllocation;
     if (payload.batch_id !== batch_id) continue;
-    if (latest === undefined || payload.turn >= latest.turn) latest = payload;
+    if (latest === undefined || payload.turn >= latest.turn) latest = { ...payload, seq: entry.seq };
   }
-  return latest;
+  if (latest === undefined) return undefined;
+  for (const entry of entries) {
+    if (entry.kind !== DECISION_VALIDATION_LOG_KIND || entry.seq <= latest.seq) continue;
+    const payload = entry.payload as { batch_id?: string; consumed_allocation?: string };
+    if (payload.batch_id === batch_id && payload.consumed_allocation === latest.proposal_id) {
+      return undefined;
+    }
+  }
+  const { seq: _seq, ...allocation } = latest;
+  return allocation;
 }
 
 /** The Batch 2 journal, narrowed to the one operation this seam needs. */
@@ -86,6 +100,15 @@ export function validateAndRecordDecision(
 export interface SubmissionJournalContext {
   readonly run_id: string;
   readonly batch_id: string;
+  /**
+   * D23 — the active turn allocation this *ordinary* submission consumed. One turn authorizes
+   * exactly one structured validation outcome, whatever its verdict: the journal entry that
+   * carries this field is the atomic consumption record, and the allocation reader treats the
+   * allocation as closed from then on. §17.3 gate revalidation never sets it — the stored
+   * gate-bound identity is a separate path that must not reopen or consume ordinary active-turn
+   * authority.
+   */
+  readonly consumed_allocation?: string;
 }
 
 /**
@@ -103,6 +126,9 @@ export function decisionPayload(
     decision: identity.decision,
     result: result.kind,
     ...(context === undefined ? {} : { run_id: context.run_id, batch_id: context.batch_id }),
+    ...(context?.consumed_allocation === undefined
+      ? {}
+      : { consumed_allocation: context.consumed_allocation }),
   };
 
   if (result.kind === "POLICY_REJECTED") payload["reason_code"] = result.reason_code;

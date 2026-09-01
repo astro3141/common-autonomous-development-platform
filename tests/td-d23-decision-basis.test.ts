@@ -110,13 +110,54 @@ test("D23-1: a valid ULID that is not the active turn's allocation is PROPOSAL_S
     assert.equal(wrong.admitted, false);
     assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "DISCOVERED");
 
-    // Non-ULID stays rejected; the exact active id passes V1 and proceeds normally.
+    // One turn ↔ one Proposal: the wrong-id submission was this turn's one structured
+    // validation, so even the originally allocated id is closed now (review finding 1).
+    const late = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: active });
+    assert.deepEqual(late.result, { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" });
+
+    // A fresh allocation (new turn) accepts the exact id; non-ULID grammar stays rejected.
+    seedProposalAllocation(w.store, BATCH_ID, active!);
     const garbage = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: "not-a-ulid" });
     assert.deepEqual(garbage.result, { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" });
+    seedProposalAllocation(w.store, BATCH_ID, active!);
     const exact = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: active });
     assert.deepEqual(exact.result, { kind: "ACCEPTED" });
     assert.equal(exact.admitted, true);
   }, SINGLE);
+});
+
+// --- review finding 1 regression: an answered turn's allocation is never reusable ----------------
+
+test("D23-R1: an answered allocation admits at most once — sequential, restart and gate paths", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    discover(world, "T-2");
+    w.tasks.definitions.set("T-2", task({ task_ref: "T-2" }));
+    assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+    const active = activeProposalId(w.store, BATCH_ID)!;
+
+    // First ordinary submission consumes the turn and admits.
+    const first = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: active });
+    assert.deepEqual(first.result, { kind: "ACCEPTED" });
+    assert.equal(first.admitted, true);
+
+    // A second distinct Proposal replaying the same id rejects with zero effect.
+    const second = submit(w, world, {
+      ...selection({ profile: world.profile, definition: task({ task_ref: "T-2" }) }),
+      proposal_id: active,
+    });
+    assert.deepEqual(second.result, { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" });
+    assert.equal(second.admitted, false);
+    assert.equal(w.store.tasks.require(`task:alpha:T-2`).platform_state, "DISCOVERED");
+
+    // Restart replay: consumption is durable, so a rebuilt caller sees no active identity.
+    assert.equal(activeProposalId(w.store, BATCH_ID), undefined);
+    const replayed = submit(w, world, {
+      ...selection({ profile: world.profile, definition: task({ task_ref: "T-2" }) }),
+      proposal_id: active,
+    });
+    assert.deepEqual(replayed.result, { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" });
+  }, { batch_policy: { max_tasks: 3, max_rework: 2, concurrency: 2 } });
 });
 
 test("D23-1a: with no active turn allocation at all, every Proposal is rejected at /proposal_id", () => {
@@ -149,7 +190,9 @@ test("D23-2/3/4: freshness echoes are revalidated against newly observed authori
       },
     };
 
-    // …but the world moves after the turn. 2: the task version drifts → TASK_DRIFT.
+    // …but the world moves after the turn. Each rejected submission answers its turn, so a new
+    // allocation is seeded per attempt (the platform-caller side of "POLICY_REJECTED → re-ask").
+    // 2: the task version drifts → TASK_DRIFT.
     w.tasks.definitions.set(TASK_REF, task({ task_ref: TASK_REF, version: "2" }));
     const drifted = submit(w, world, echoed);
     assert.deepEqual(drifted.result, { kind: "POLICY_REJECTED", reason_code: "TASK_DRIFT" });
@@ -158,6 +201,7 @@ test("D23-2/3/4: freshness echoes are revalidated against newly observed authori
     // 4: canonical moves after the turn → REPOSITORY_STATE_MISMATCH from the fresh head.
     const originalHead = w.repository.head;
     w.repository.head = "1111111111111111111111111111111111111111";
+    seedProposalAllocation(w.store, BATCH_ID, active);
     const moved = submit(w, world, echoed);
     assert.deepEqual(moved.result, { kind: "POLICY_REJECTED", reason_code: "REPOSITORY_STATE_MISMATCH" });
     w.repository.head = originalHead;
@@ -167,6 +211,7 @@ test("D23-2/3/4: freshness echoes are revalidated against newly observed authori
       ...echoed,
       expected: { ...echoed.expected, compiled_profile_hash: "sha256:" + "0".repeat(64) },
     };
+    seedProposalAllocation(w.store, BATCH_ID, active);
     assert.deepEqual(submit(w, world, wrongProfile).result, {
       kind: "POLICY_REJECTED",
       reason_code: "PROFILE_DRIFT",
@@ -182,7 +227,8 @@ test("D23-5/8: undeclared or missing semantic selections are rejected as-is — 
     assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
     const active = activeProposalId(w.store, BATCH_ID)!;
 
-    // 5 — an undeclared selection fails the existing membership/reference steps.
+    // 5 — an undeclared selection fails the existing membership/reference steps. Each rejected
+    // submission answers its turn; the fixture opens a fresh allocation per attempt.
     assert.deepEqual(
       submit(w, world, {
         ...selection({ profile: world.profile }),
@@ -191,6 +237,7 @@ test("D23-5/8: undeclared or missing semantic selections are rejected as-is — 
       }).result,
       { kind: "POLICY_REJECTED", reason_code: "CLASSIFICATION_UNKNOWN" },
     );
+    seedProposalAllocation(w.store, BATCH_ID, active);
     assert.deepEqual(
       submit(w, world, {
         ...selection({ profile: world.profile }),
@@ -202,6 +249,7 @@ test("D23-5/8: undeclared or missing semantic selections are rejected as-is — 
 
     // 8 — a Proposal missing a Supervisor-selected field is schema-invalid; nothing fills a
     // "declared default" after model output and nothing durable moves.
+    seedProposalAllocation(w.store, BATCH_ID, active);
     const missing = { ...selection({ profile: world.profile }), proposal_id: active } as Record<string, unknown>;
     delete missing["actor_profile"];
     const rejected = submit(w, world, missing);
@@ -210,6 +258,7 @@ test("D23-5/8: undeclared or missing semantic selections are rejected as-is — 
     assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "DISCOVERED");
 
     // A missing freshness echo is equally unrepaired.
+    seedProposalAllocation(w.store, BATCH_ID, active);
     const noExpected = { ...selection({ profile: world.profile }), proposal_id: active } as Record<string, unknown>;
     delete (noExpected["expected"] as Record<string, unknown>)["base_head"];
     assert.deepEqual(submit(w, world, noExpected).result, {

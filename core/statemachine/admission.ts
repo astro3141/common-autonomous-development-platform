@@ -37,6 +37,11 @@ export interface AdmissionCheck {
    * TaskSource (§19.3b), so the caller computes it and this guard only consumes it.
    */
   readonly hard_dependencies_clear: boolean;
+  /**
+   * §9.2g (D24) — seats held by pending child materialisations (and their unadmitted parents),
+   * already excluding the admission target itself. Defaults to 0 in pre-D24 worlds.
+   */
+  readonly reserved_materialization_seats?: number;
 }
 
 /** Returns the rejection, or `undefined` when the admission may proceed. */
@@ -44,7 +49,8 @@ export function evaluateAdmission(check: AdmissionCheck): AdmissionRejection | u
   if (check.admission_closed) return "BATCH_ADMISSION_CLOSED";
   if (
     check.consumes_admission_slot !== false &&
-    check.view.admitted_task_count >= check.policy.max_tasks
+    check.view.admitted_task_count + (check.reserved_materialization_seats ?? 0) >=
+      check.policy.max_tasks
   ) {
     return "BATCH_MAX_TASKS_REACHED";
   }

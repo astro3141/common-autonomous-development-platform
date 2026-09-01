@@ -42,7 +42,7 @@ import type {
   TaskSourceV1,
 } from "../tasksource/types.ts";
 import { ExecutionStartError } from "./start-implementation.ts";
-import { materializationOperations } from "../materialization/materialize-child.ts";
+import { materializationOperations, materializationReservedSeats } from "../materialization/materialize-child.ts";
 
 export interface SupervisorCompiledProfileDecisionViewV1 {
   readonly hash: string;
@@ -285,12 +285,16 @@ export function assembleSupervisorDecisionContext(
   let subflow_materialization: SupervisorSubflowMaterializationViewV1 | undefined;
   if (v3) {
     const operations = materializationOperations(store, command.batch_id);
-    const unadmitted = operations.filter((op) => op.phase !== "FAILED" && !op.admitted).length;
     const view = store.batchView.project(command.batch_id);
     const maxTasks = effective.policy.batch_policy.max_tasks;
     subflow_materialization = {
       available: true,
-      remaining_task_capacity: Math.max(0, maxTasks - view.admitted_task_count - unadmitted),
+      // The same durable reservation computation the validator and commit guard use (§9.2g) —
+      // a projection of it, never a second authority.
+      remaining_task_capacity: Math.max(
+        0,
+        maxTasks - view.admitted_task_count - materializationReservedSeats(store, command.batch_id),
+      ),
       operations: operations
         .filter((op) => op.phase !== "FAILED" && !op.admitted)
         .map((op) => ({

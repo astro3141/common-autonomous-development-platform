@@ -35,6 +35,7 @@ import {
   assertAdmissible,
   pipelineHasActor,
 } from "./admission.ts";
+import { materializationReservedSeats } from "../materialization/materialize-child.ts";
 import { nextAttemptOutcome } from "./attempt-transitions.ts";
 import { nextBatchOutcome, type BatchTaskCounts } from "./batch-transitions.ts";
 import type { BatchOutcome } from "./types.ts";
@@ -190,6 +191,13 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       consumes_admission_slot: !reselection,
       pipeline_has_actor: pipelineHasActor(compiled, command.selection.pipeline_id),
       hard_dependencies_clear: command.hard_dependencies_clear,
+      // §9.2g (D24) — pending materialisations keep their seats at commit time too; the exact
+      // reserved parent/bound child consumes its own seat via the exclusion.
+      reserved_materialization_seats: materializationReservedSeats(
+        store,
+        batch.batch_id,
+        command.task_key,
+      ),
     });
 
     const transition = appendTransition(store, {

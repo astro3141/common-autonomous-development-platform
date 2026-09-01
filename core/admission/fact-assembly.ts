@@ -47,7 +47,7 @@ import { normalizeTaskDefinition } from "../tasksource/task-definition.ts";
 import type { TaskDefinition, TaskDependency, TaskSourceV1 } from "../tasksource/types.ts";
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import { AdmissionError } from "./errors.ts";
-import { materializationBatchFacts } from "../materialization/materialize-child.ts";
+import { materializationBatchFacts, materializationReservedSeats } from "../materialization/materialize-child.ts";
 
 /** The authoritative owners one submission reads from. Every one is an interface, not a class. */
 export interface DecisionAuthorities {
@@ -170,7 +170,16 @@ export function assembleDecisionInput(
     ...(task === undefined ? {} : { task }),
     ...(canonical_head === null ? {} : { repository: { canonical_head } }),
     ...(proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"
-      ? { batch: store.batchView.project(batch.batch_id) }
+      ? {
+          batch: store.batchView.project(batch.batch_id),
+          materialization_reservation: {
+            reserved_seats_excluding_target: materializationReservedSeats(
+              store,
+              batch.batch_id,
+              task_key ?? undefined,
+            ),
+          },
+        }
       : {}),
     // §9.2f — the fresh parent/child read-models an E submission carries into V2/V3/V11.
     ...(proposal.variant === "SUBFLOW_SELECTION" && task_key !== null && durable_task !== null
@@ -381,6 +390,7 @@ function materializationBatchView(
   const batch = store.batches.require(batch_id);
   const facts = materializationBatchFacts(store, batch_id);
   return {
+    batch_id,
     run_status: store.runs.require(run.run_id).status,
     batch_status: batch.status,
     has_unresolved_unknown_materialization: facts.has_unresolved_unknown_materialization,

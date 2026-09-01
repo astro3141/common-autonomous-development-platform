@@ -89,6 +89,11 @@ export interface DecisionValidationInput {
   readonly materialization_parent?: ChildMaterializationParentViewV1;
   readonly materialization_capability?: ChildMaterializationCapabilityViewV1;
   readonly materialization_batch?: ChildMaterializationBatchViewV1;
+  /**
+   * §9.2g (D24, review finding 4) — seats held by pending materialisations for an A/E admission,
+   * already excluding the admission target. Absent in pre-D24 worlds (treated as 0).
+   */
+  readonly materialization_reservation?: { readonly reserved_seats_excluding_target: number };
 }
 
 const ACCEPTED: DecisionValidationResult = { kind: "ACCEPTED" };
@@ -322,6 +327,11 @@ function runValidation(
   // --- V11 / §9.2g F reservation ----------------------------------------------------
   if (materializationF !== undefined && fParentView?.status === "FOUND") {
     const view = requireMaterializationBatch(input);
+    // §9.2g (review finding 5) — the F parent must be owned by this exact submission batch;
+    // a cross-batch (or cross-run) parent is a batch mismatch, never an accepted intent.
+    if (fParentView.batch_id !== view.batch_id) {
+      return rejected("SUBFLOW_PARENT_BATCH_MISMATCH");
+    }
     // Parent rule: only a DISCOVERED whole-intent parent or a live ACTIVE attempt may decompose.
     // §17.3 (D24) — on the resolved-gate path the parent is HELD by that exact gate; the tagged
     // origin basis was already required exact by V3, and the intent commit re-checks the precise
@@ -405,7 +415,10 @@ function runValidation(
     }
 
     // §9.2e — rule 1 is a *new admission* rule; a reselection re-uses the slot it already holds.
-    if (kind === "INITIAL_ADMISSION" && batch.admitted_task_count >= limits.max_tasks) {
+    // §9.2g (D24) — pending materialisations and their unadmitted parents hold seats an
+    // unrelated A/E may not steal; the exact reserved parent/bound child was already excluded.
+    const reservedSeats = input.materialization_reservation?.reserved_seats_excluding_target ?? 0;
+    if (kind === "INITIAL_ADMISSION" && batch.admitted_task_count + reservedSeats >= limits.max_tasks) {
       return rejected("BATCH_MAX_TASKS_REACHED");
     }
     // §9.2f P5 — E's admission is *projected*: parent ACTIVE→SUSPENDED and child

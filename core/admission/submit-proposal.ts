@@ -78,9 +78,13 @@ export function submitProposal(
   command: SubmitProposalCommand,
 ): ProposalSubmissionResult {
   const assembled = assembleDecisionInput(authorities, command);
+  // D23 — this ordinary submission consumes the active turn allocation atomically with its own
+  // validation journal entry, whatever the verdict: the turn is answered exactly once.
+  const consumed = assembled.input.proposal_identity?.proposal_id;
   const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input, {
     run_id: command.run_id,
     batch_id: command.batch_id,
+    ...(consumed === undefined ? {} : { consumed_allocation: consumed }),
   });
 
   return act(authorities, command, assembled, recorded.result, recorded.entry.seq);

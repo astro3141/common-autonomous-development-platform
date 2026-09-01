@@ -37,7 +37,8 @@ import {
   SUBFLOW_PARENT_INTENT,
   task,
 } from "./support/decision-fixtures.ts";
-import { coordinatorWorld, submitSupervisorProposal, type CoordinatorWorld } from "./support/coordinator-fixtures.ts";
+import {
+  seedAllocationForProposal, coordinatorWorld, submitSupervisorProposal, type CoordinatorWorld } from "./support/coordinator-fixtures.ts";
 import { TASK_KEY } from "./support/domain-fixtures.ts";
 import { ProductionCoordinator } from "../core/coordinator/production-coordinator.ts";
 
@@ -269,6 +270,19 @@ test("9.2f-5: a stale E submission through the production path rejects and admit
     const definition = task({ task_ref: "C-1" });
     w.tasks.definition = definition;
 
+    const stalePayload = subflowSelection({
+      profile: world.profile,
+      definition,
+      classification: "SPLIT_NEEDED",
+      pipeline_id: "foundation",
+      parent: {
+        task_key: TASK_KEY,
+        attempt_key: parent.attempt_key,
+        task_contract_hash: w.store.contracts.hashOf(parent.contract_snapshot_id) as string,
+        attempt_state: "VERIFYING", // stale: the parent is READY
+      },
+    });
+    seedAllocationForProposal(w.store, BATCH_ID, stalePayload);
     const outcome = submitProposal(
       { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
       {

@@ -173,10 +173,18 @@ export function seedProposalAllocation(
 ): void {
   const active = activeSupervisorProposalAllocation(store.decisions, batch_id);
   if (active?.proposal_id === proposal_id) return;
+  // D23 — every seed is a *new* turn allocation; consumed allocations still occupy their turn
+  // ordinals, so the next ordinal comes from the maximum journaled turn, consumed or not.
+  let maxTurn = 0;
+  for (const entry of store.decisions.read()) {
+    if (entry.kind !== SUPERVISOR_PROPOSAL_ALLOCATION_KIND) continue;
+    const payload = entry.payload as { batch_id: string; turn: number };
+    if (payload.batch_id === batch_id && payload.turn > maxTurn) maxTurn = payload.turn;
+  }
   store.decisions.append({
     kind: SUPERVISOR_PROPOSAL_ALLOCATION_KIND,
     refKey: batch_id,
-    payload: { batch_id, turn: (active?.turn ?? 0) + 1, proposal_id } as never,
+    payload: { batch_id, turn: maxTurn + 1, proposal_id } as never,
   });
 }
 

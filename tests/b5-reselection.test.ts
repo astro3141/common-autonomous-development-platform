@@ -91,6 +91,7 @@ test("B5-R1: a fresh START_TASK reselects a SELECTION_STALE task", () => {
     const before = world.store.tasks.require(TASK_KEY);
     assert.equal(before.state_reason?.code, "SELECTION_STALE");
 
+    seedAllocationForProposal(world.store, BATCH_ID, freshProposal(world));
     const result = submitProposal(authorities, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
@@ -139,6 +140,7 @@ test("B5-R3 / B5-R4: reselection re-uses its slot and ignores a closed admission
       assert.equal(world.store.batches.require(BATCH_ID).admission_closed, true);
       assert.equal(world.store.batchView.admitted(BATCH_ID), 1);
 
+      seedAllocationForProposal(world.store, BATCH_ID, freshProposal(world));
       const result = submitProposal(authorities, {
         run_id: RUN_ID,
         batch_id: BATCH_ID,
@@ -161,6 +163,7 @@ test("B5-R3: an initial admission still fails closed once max_tasks is reached",
       const other = discover(world, "T-202");
       authorities.taskSource.definition = task({ task_ref: "T-202" });
 
+      seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile, definition: task({ task_ref: "T-202" }) }));
       const result = submitProposal(authorities, {
         run_id: RUN_ID,
         batch_id: BATCH_ID,
@@ -192,6 +195,7 @@ test("B5-R5 / B5-R6: concurrency and the writable slot are re-checked", () => {
         snapshot_index: 4,
       });
 
+      seedAllocationForProposal(world.store, BATCH_ID, freshProposal(world));
       const result = submitProposal(authorities, {
         run_id: RUN_ID,
         batch_id: BATCH_ID,
@@ -222,6 +226,7 @@ test("B5-R7: the direct HARD dependency guard is re-evaluated on reselection", (
     ];
     authorities.taskSource.externalStates["T-100"] = "IN_PROGRESS";
 
+    seedAllocationForProposal(world.store, BATCH_ID, freshProposal(world));
     assert.throws(
       () =>
         submitProposal(authorities, {
@@ -237,6 +242,7 @@ test("B5-R7: the direct HARD dependency guard is re-evaluated on reselection", (
 
     // Once the prerequisite closes, the same reselection succeeds.
     authorities.taskSource.externalStates["T-100"] = "CLOSED";
+    seedAllocationForProposal(world.store, BATCH_ID, freshProposal(world));
     const result = submitProposal(authorities, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
@@ -257,6 +263,7 @@ test("B5-R8 ~ B5-R11: selection fields and the binding are replaced atomically",
 
     const drifted = task({ version: "2" });
     authorities.repository.head = "head-canonical-2";
+    seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile }));
     const result = submitProposal(authorities, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
@@ -302,6 +309,7 @@ test("B5-R8: repeated reselection never consumes another admission slot", () => 
     for (let round = 0; round < 3; round += 1) {
       const version = `${round + 2}`;
       authorities.taskSource.definition = task({ version });
+      seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile, definition: task({ version }) }));
       const accepted = submitProposal(authorities, {
         run_id: RUN_ID,
         batch_id: BATCH_ID,
