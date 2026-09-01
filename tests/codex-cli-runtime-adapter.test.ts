@@ -293,9 +293,9 @@ test("SUPERVISOR schema exposes the complete Core vocabulary and exact subflow p
     assert.equal(subflow.properties.parent.type, "object");
     assert.equal(subflow.required.includes("parent"), true);
     assert.deepEqual(validateProposal(proposal), {
+      ...proposal,
       variant: "SUBFLOW_SELECTION",
       decision: "START_SUBFLOW",
-      ...proposal,
     });
     const parentlessSubflow = variants.find(
       (variant) =>
