@@ -38,6 +38,20 @@
 > (§19.2/§19.5). 전부 **PROSPECTIVE_REQUIREMENT**다. Spec 변경, architecture reopening, 새 workflow/
 > decision state machine, 새 table, IO mechanism 이전은 없고 MVP 0/1 FORMAL seal은 불변이다.
 >
+> **v1.5 Issue #60 Supervisor decision-basis contract amendment (Issue #52 RUN #3 comment
+> `5489088308`, Design Evidence이지 authority가 아님):** Core의 fail-closed rejection은 기존 계약대로
+> 동작했지만, §13.4의 fresh context assembly가 model-facing exact projection을 고정하지 않아
+> `SupervisorProposalV1`의 선택값·freshness 값·ULID identity를 구현이 생략할 수 있었다. §9.1/§9.2와
+> §13.4에 `SupervisorDecisionContextV1` 및 Platform-allocated `proposal_id` echo binding을 추가한다.
+> Supervisor는 declared semantic choice를 직접 선택하고 turn에서 관측한 freshness basis를 Proposal에
+> 명시하며, Platform/Harness는 model output 뒤에 누락값을 채우지 않는다. Runtime structured-output
+> constraint는 generation aid일 뿐 Core authority가 아니다. **SPEC_CHANGE=NO / TD_CHANGE=YES /
+> BACKEND_CHANGE=NO**, 전부 **PROSPECTIVE_REQUIREMENT**다. 새 store/state machine/framework,
+> OpenClaw/durable-jobs 변경이나 MVP 0/1 schema/state/validator seal의 소급 무효화는 없다. 다만 B13의
+> 기존 model-facing context evidence는 이 prospective contract의 충족 증거가 아니며, production
+> Coordinator의 기존 §13.4 축약은 후속 implementation verification 대상이다. #59 child materialisation
+> gap은 OPEN으로 남는다.
+>
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
 > (2) §1.1에 TRANSFER_KIND 이전 규율(#1 AMENDMENT-1), (3) §5.11 Diagnostic Projection + §5.12
@@ -1848,6 +1862,21 @@ non-empty, **입력 순서 보존, 중복 허용** — semantic set이 아니므
 `:`를 허용하고 Core는 내부 syntax를 해석하지 않는다(§6.1 D+). selection variant의 `classification`,
 `pipeline_id`, `actor_profile`, `verification_profile`, `repository_scope_id`는 모두 non-empty string이다.
 
+**`proposal_id` authority (#60).** Supervisor가 제출하는 Proposal의 `proposal_id`는 semantic choice가
+아니라 Platform-assigned Proposal identity다. Coordinator/Platform input layer가 Supervisor turn을 보내기
+**전에** valid ULID 하나를 할당하고 §13.4 `SupervisorDecisionContextV1.proposal_id`로 제공한다.
+Supervisor는 그 값을 Proposal에 **변경 없이 echo**한다. V1은 ULID grammar와 active turn의 allocated
+value와의 exact equality를 모두 검증하며, active context가 없거나 값이 다르면
+`POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID)`(`/proposal_id`)다.
+
+allocation은 snapshot/grant/decision id와 같은 existing caller-supplied ULID factory seam을 재사용한다.
+Core 내부 clock/random generator, identifier service, allocation registry를 만들지 않는다.
+
+Platform/Harness가 model output을 받은 **뒤** 새 id를 넣거나 교체하는 경로는 없다. active turn context를
+restart 뒤 안전하게 correlate할 수 없으면 기존 indeterminate Runtime-turn/recovery semantics로
+fail-closed하며, 반환된 output 주위에 새 id를 만들어 acceptance를 복구하지 않는다. Proposal snapshot
+table, proposal store, identity registry는 만들지 않는다.
+
 **`repository_scope_id`의 authority 경계 (M1-6).** Supervisor는 `repository_scope` body를 제안하지 않는다 —
 `allowed_paths`/`forbidden_paths`를 Proposal에 담을 자리가 아예 없고, Model이 고를 수 있는 것은 Project
 Profile이 이미 선언한 **id 하나**뿐이다. 따라서 Model은 Profile에 존재하지 않는 임의 path scope를 만들 수
@@ -1885,7 +1914,14 @@ RepositoryValidationView { canonical_head }     # RepositoryAdapter fact의 proj
 BackendManifestSet                              # B5 validated
 DecisionValidationBatchView                     # §V11
 SubflowParentValidationView | null               # §9.2f; E에서만 non-null
+SupervisorProposalIdentityView { proposal_id }     # active §13.4 turn의 Platform allocation
 ```
+
+ordinary submission에서 `SupervisorProposalIdentityView`의 source는 active
+`SupervisorDecisionContextV1`이다. §17.3 post-Human-Gate revalidation에서는 새 id를 할당하지 않고,
+terminal `record_hash`가 bind한 `gate_proposal.proposal_id`와 `created_from = proposal:<same id>`의 exact
+equality를 검증해 같은 view를 재구성한다. 이 특례는 이미 최초 V1을 통과한 exact Proposal copy 하나에만
+적용되며 generic bypass가 아니다.
 
 TaskSource unavailable/malformed/IO failure는 **`NOT_FOUND`로 가장하지 않는다** — 그런 operational failure
 에서는 caller가 validator를 호출하지 않으며 매핑은 Coordinator 소관이다. raw Model fact는 어떤 단계에서도
@@ -1898,6 +1934,8 @@ V1  Proposal structural/domain validation (variant exact shape, unknown field re
       prospective MVP 3에서 parent 없는 legacy-shaped START_SUBFLOW는 E가 아니므로
       POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID). validated-but-unapplied acceptance로 parent를 나중에
       고르는 경로도 금지한다.
+      proposal_id가 valid ULID가 아니거나 SupervisorProposalIdentityView.proposal_id와 exact
+      equality가 아니면 POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID) at /proposal_id.
 
 V2  task 존재 — task-bearing variant(A/B/C/E)에만 적용, CLOSE_BATCH는 N/A
       TaskLookupView.status == NOT_FOUND → POLICY_REJECTED(TASK_NOT_FOUND)
@@ -3367,10 +3405,122 @@ Platform API/MCP Proposal 제출 지침 (§5.1)
 decisions, repository fact는 **각 turn의 fresh decision context**로 전달한다. 새 Prompt DSL을 만들지
 않으며 실제 자연어 표현은 adapter implementation detail이다.
 
-**turn decision context.** §26 step 4의 각 turn마다 Coordinator가 fresh하게 조립한다: TaskSource
-candidate/read model · 현재 batch/task durable state · compiled profile · pending decisions · 필요한
-Repository fact projection. 이 context는 **Model 판단 입력일 뿐 Platform authority가 아니다**(I-TD3).
-Supervisor가 Platform에 되돌려 주는 것은 기존 `SupervisorProposalV1` 하나다.
+**turn decision context — exact model-facing projection (#60).** §26 step 4의 각 Supervisor turn마다
+Coordinator는 아래 exact field set의 `SupervisorDecisionContextV1` 하나를 조립한다. 이것은 새 generic
+DecisionContext framework가 아니라 `SupervisorProposalV1` producer 하나를 위한 좁은 typed DTO다.
+
+```text
+SupervisorDecisionContextV1 {
+  run_id
+  batch_id
+  proposal_id
+
+  compiled_profile: SupervisorCompiledProfileDecisionViewV1
+  candidates: SupervisorTaskDecisionViewV1[]
+  current_state: SupervisorCurrentStateViewV1
+  repository: RepositoryValidationView
+  open_decisions: PendingHumanDecisionV1[]
+}
+
+SupervisorCompiledProfileDecisionViewV1 {
+  hash
+  classifications       # effective.policy.classification_policy exact map
+  pipelines             # effective.project.pipelines exact map
+  actor_profiles        # effective.project.roles exact map; v1에는 role-type filter가 없음
+  verification_profiles # effective.project.verification_profiles exact map
+  repository_scopes     # effective.project.repository_scopes exact map
+}
+
+SupervisorTaskDecisionViewV1 {
+  task_ref
+  external_state: ExternalTaskState
+  task_definition: TaskDefinition
+  dependencies: TaskDependency[]
+}
+
+SupervisorCurrentStateViewV1 {
+  batch: {
+    status: BatchState
+    admission_closed: boolean
+    validation: DecisionValidationBatchView
+  }
+  tasks: SupervisorPlatformTaskStateViewV1[]
+}
+
+SupervisorPlatformTaskStateViewV1 {
+  task_key
+  task_ref
+  platform_state: TaskState
+  selection: {
+    classification, pipeline_id, actor_profile, verification_profile,
+    repository_scope_id, selection_binding: SelectionBindingV1
+  } | null
+  state_reason: StateReason | null
+  current_attempt: {
+    attempt_key, n, state: AttemptState, task_contract_hash,
+    base_head, candidate_commit, rework_count, state_reason
+  } | null
+}
+```
+
+위 하위 타입과 vocabulary는 §7/§8/§9.2/§17/§18/§19의 기존 것을 그대로 재사용한다. `hash`는 해당
+batch가 동결한 `compiled_profile_hash`이며 `compiled_profile`의 다섯 map은 그 immutable snapshot의
+`effective`에서만 projection한다. 현재 Profile Registry나 bootstrap 시점의 다른 profile을 섞지 않는다.
+`task_contract_hash`는 current Attempt의 `contract_snapshot_id`가 가리키는 immutable Task Contract hash다.
+`current_state.tasks`에는 current batch의 durable task row가 ref당 정확히 하나씩 들어간다. admitted
+task의 `selection`이 partial/null이거나 current Attempt/Contract binding을 exact하게 projection할 수 없으면
+정상 context로 보정하지 않고 assembly를 실패시킨다.
+
+**한 turn basis의 assembly.** `candidates`의 ref set은 같은 turn의 fresh `discover_tasks` 결과와
+Supervisor decision이 필요한 current non-terminal durable task ref의 합집합이며 duplicate ref는 하나로
+합친다. 각 ref에 대해 fresh `get_task` normalization, `get_dependencies`, `get_task_state`를 수행하되,
+fresh discover 결과가 같은 ref의 `external_state`를 이미 제공했다면 §8.4처럼 그 한 관측을 사용하고
+`get_task_state`를 중복 호출해 두 external-state 관측을 섞지 않는다. `task_ref ==
+task_definition.task_ref`이고 `version`/`definition_hash`/`body`는 하나의 normalized TaskDefinition
+관측에서 함께 와야 한다. `repository.canonical_head`는 RepositoryAdapter의 fresh projection,
+`current_state`와 `open_decisions`는 조립 시점의 durable Platform state projection이다. 필수 read 실패,
+identity mismatch, partial candidate assembly가 있으면 context를 보내지 않는다. stale durable
+`external_snapshot`으로 missing TaskSource fields를 보완하지 않는다.
+
+이 context는 authoritative sources의 **model-facing projection**이지 두 번째 authority가 아니다.
+Supervisor가 Proposal에 넣는 값의 binding은 다음과 같다.
+
+```text
+proposal_id                    ← context.proposal_id를 exact echo
+
+classification                ← keys(context.compiled_profile.classifications) 중 Supervisor 선택
+pipeline_id                   ← keys(context.compiled_profile.pipelines) 중 Supervisor 선택
+actor_profile                 ← keys(context.compiled_profile.actor_profiles) 중 Supervisor 선택
+verification_profile          ← keys(context.compiled_profile.verification_profiles) 중 Supervisor 선택
+repository_scope_id           ← keys(context.compiled_profile.repository_scopes) 중 Supervisor 선택
+
+expected.task_version         ← selected candidate.task_definition.version
+expected.task_definition_hash ← selected candidate.task_definition.definition_hash
+expected.compiled_profile_hash← context.compiled_profile.hash
+expected.base_head            ← context.repository.canonical_head
+```
+
+앞의 다섯 field는 **Supervisor-selected semantics**다. Coordinator/Core/Harness가 model result 뒤에
+"declared default"를 채우거나 다른 choice로 교체하지 않는다. 뒤의 네 `expected` field는
+**Supervisor가 그 turn에 본 authoritative basis를 명시적으로 bind하는 값**이다. 누락·오기는 Proposal
+validation 실패이며 post-output completion 대상이 아니다. 제출 시 V3/V8은 context snapshot을 자기
+자신과 비교하지 않고 TaskSource/Compiled Profile/Repository의 **fresh authoritative fact를 다시
+관측**하므로 turn 뒤 drift를 계속 검출한다.
+
+`open_decisions`는 category 문자열 목록이 아니라 existing `PendingHumanDecisionV1`의 OPEN record
+projection이다. current project/batch 또는 `current_state.tasks`의 task를 subject로 하거나 그 범위를
+blocking하는 record만 포함한다. `current_state`는 durable lifecycle을 보여줄 뿐 새로운 transition authority가 아니며,
+Model이 그 값을 되돌려 썼다고 state가 바뀌지 않는다.
+
+**Runtime structured-output 경계.** RuntimeAdapter/backend가 지원하면 위 context로 output schema의
+`enum`(declared choice keys), `const`(`proposal_id`와 applicable expected 값), ULID `pattern` 등을 좁힐 수
+있다. 이는 presentation/generation aid다. dynamic schema를 지원하지 않아도 같은 context + 기존
+`SupervisorProposalV1` + Decision Validator로 Core architecture가 성립해야 하며, Runtime/backend는
+Proposal authority나 validation owner가 아니다.
+
+**#59 독립 경계.** `candidates`와 `current_state`는 이미 TaskSource/durable state에 존재하는 task만
+projection한다. 이 contract는 child task를 만들거나 parent를 cardinality로 추론하거나
+`START_SUBFLOW` materialisation authority를 부여하지 않는다. 따라서 #60을 닫아도 #59는 OPEN이다.
 
 **turn ↔ Proposal 관계.** 한 turn의 `RuntimeTurnResult`는 **turn 완료 / Runtime health / structured
 diagnostics**용이다. Proposal 수락은 §5.1의 별도 MCP 제출로 결정된다. 따라서 turn result 본문에
@@ -6246,7 +6396,9 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
  1 Human→Core: run 개시 (CLI/MCP)          | write: platform_run, batch | fail: 시작 안 함
  2 Core(Profile Compiler): compile          | write: compiled snapshot   | fail: COMPILE_ERROR 보고
  3 Core(TaskSource Coordinator): discover   | write: external_snapshot   | fail: 보고 후 대기
- 4 Core→RuntimeAdapter: Supervisor turn 요청 ("후보와 read model 제공, Proposal 요청")
+ 4 Core: §13.4의 authoritative reads로 exact SupervisorDecisionContextV1 조립 + proposal_id 사전 할당
+  → RuntimeAdapter Supervisor turn 요청 ("context의 declared choice에서 선택하고, 같은 turn freshness
+  basis와 proposal_id를 명시한 Proposal 제출")
                                             | write: turn op INTENT      | fail: HELD(RUNTIME_FAILED)
  5 Supervisor→MCP Adapter: Proposal 제출
  6 Core(Decision Validator): V1–V11         | write: decision_log        | fail: POLICY_REJECTED → 4 재요청
@@ -6409,6 +6561,11 @@ D22 (v1.5 PR #43 contract-gap amendment) resolution≠application(§17.4 exact o
     (§19.5 frozen pipeline terminal-success + MVP3 SUCCEEDED + deterministic normal RESUME_PARENT).
     existing Proposal/Task Contract/Attempt/decision_log/§22 primitives만 재사용하며 Spec gap, architecture
     reopening, new table, MVP0/MVP1 retroactive seal impact 없음
+D23 (v1.5 Issue #60 decision-basis amendment) SupervisorDecisionContextV1 exact projection +
+    Platform-allocated proposal_id echo binding + semantic-choice/freshness-echo 분리. 제출 뒤 field completion
+    금지, V3/V8 fresh re-observation 유지, Runtime schema constraint는 generation aid only.
+    Spec/Backend contract/new store/state machine/MVP0·1 schema·state·validator retroactive seal impact 없음.
+    B13 context evidence는 충족 증거가 아니며 #59는 독립 OPEN.
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
