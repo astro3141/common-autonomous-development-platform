@@ -16,6 +16,16 @@ export const TRANSITION_REASON_CODES = [
   "RUNTIME_FAILED",
   "CAPABILITY_BOUNDARY_CHANGED",
   "VERIFICATION_FAILED",
+  /**
+   * #48 (F3) / §19.3 — the Actor turn ran to completion and yielded nothing to review: the
+   * rework's cause, written down where the Platform learned it. Journal/diagnostic provenance
+   * only — the transition itself is unchanged and this is never a second source of truth.
+   */
+  "NO_CANDIDATE_PRODUCED",
+  /** #48 (F3) — a candidate exists but fails the §19.3 binding guard (lineage/tracked-clean). */
+  "CANDIDATE_INVALID",
+  /** #48 (F3) — the audit verdict that sent this attempt back; mirrors the settled record. */
+  "AUDIT_FIX_REQUIRED",
   "VERIFICATION_INFRA",
   "AUDIT_HUMAN_REQUIRED",
   /**
@@ -147,7 +157,11 @@ export type AttemptFact =
    * is not a child of `base_head`, or a workspace that is not tracked-clean. Carries no detail
    * because the guard is not re-evaluated here; the caller already asked the RepositoryAdapter.
    */
-  | { readonly kind: "CANDIDATE_REJECTED" }
+  | {
+      readonly kind: "CANDIDATE_REJECTED";
+      /** #48 — what the caller observed; becomes the rework transition's reason provenance. */
+      readonly reason: "ABSENT" | "LINEAGE" | "TRACKED_CLEAN";
+    }
   /** §19.3 VERIFYING→AUDITING: every required check produced accepted, bound evidence. */
   | { readonly kind: "VERIFICATION_PASSED" }
   /**
