@@ -98,3 +98,10 @@ the Auditor returned `AUDIT_PASS`, and ADP stopped at `READY_TO_MERGE` with an o
 the disposable repository; the canonical branch remained unchanged and the repository was then
 removed. The exact bounded result and reported usage are preserved in
 `live-pilot-evidence.json`.
+
+Issue #46's fresh self-hosting falsification and repair evidence is separately preserved in
+`issue-46-live-evidence.json`: the Actor created a commit in an isolated clone, verification cloned
+that still-unmerged candidate without importing it into canonical, the Auditor returned
+`AUDIT_PASS`, and ADP stopped at the human `MERGE_APPROVAL` boundary. Attempts made under the exact
+Actor permission profile to commit or write in canonical, or to modify workspace `.git/config`,
+were rejected by the OS sandbox.

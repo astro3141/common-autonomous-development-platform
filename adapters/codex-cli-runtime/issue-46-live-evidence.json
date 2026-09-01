@@ -1,0 +1,123 @@
+{
+  "schema": "adp/codex-cli-issue-46-live-evidence",
+  "schema_version": 1,
+  "recorded_at": "2026-09-01T02:02:49Z",
+  "repair_tip": "0a273ade2db39c9e6f7e9390fb9cc635bcd07799",
+  "run_1_repair": {
+    "human_approved_candidate": "33776e99465e7babb070c041861d735631d3561e",
+    "preserved_commit": "7dadbb3067c03c26c542ddfe8578c4e09918dc08",
+    "stable_patch_id": "a39311a1f6112f3db17b3a31901de487759cebc1"
+  },
+  "cli": {
+    "version": "codex-cli 0.151.0",
+    "inspected_source_tag": "rust-v0.151.0",
+    "inspected_source_commit": "78c290807ce710180111df227df3b7a4fe845452"
+  },
+  "bounds": {
+    "fresh_run": true,
+    "disposable_repository": true,
+    "public_ingress": false,
+    "auto_merge": false,
+    "batch_max_tasks": 1,
+    "human_merge": true,
+    "canonical_main_before_and_after": "20264c439c65d07d3ce7f546fa3a6b63b8b2a163"
+  },
+  "reproduction": {
+    "workspace_layout": "linked-worktree",
+    "thread_id": "01a05a96-db7e-7ae2-9cd1-9328bf7907d8",
+    "actor_mutation_created": true,
+    "candidate_commit_created": false,
+    "failure": "canonical .git/worktrees/<name>/index.lock was outside built-in workspace-write"
+  },
+  "falsification": {
+    "clone_with_builtin_workspace_write": "REJECTED: the inspected built-in profile also protects an in-workspace .git",
+    "approve_for_me": {
+      "result": "REJECTED_AS_UNSAFE",
+      "workspace_candidate": "5faa0e654079f3caca2efebb34fa9af207697a33",
+      "escaped_disposable_canonical_commit": "98c256475e195d979a319bdcd8ca9c352cc5792d"
+    },
+    "selected_seam": "named permission profile with workspace and .git write, config/hooks/object-redirection read, network disabled"
+  },
+  "first_post_repair_run": {
+    "disposable_root": "/Users/astro3141/.adp-selfhost-issue46.X0fBeb",
+    "baseline_commit": "84509f35ab9e4d67dd09ee137e1c03c6071bf341",
+    "actor_candidate": "29a21e26c5641997952ba458bc7d612788a10eb4",
+    "result": "STOPPED",
+    "failure": "verification clone tried to check out the unmerged candidate from canonical; candidate tree was intentionally absent"
+  },
+  "fresh_vertical": {
+    "disposable_root": "/Users/astro3141/.adp-selfhost-issue46-fresh.Kle6m6",
+    "run_id": "run:01M1DAZGXMG7QPWDEPNFEX5DPT",
+    "baseline_commit": "ce59b3b67c64918c82875a287988dab9cc598c2b",
+    "candidate_commit": "a56aa9520394f30f6e8e2500edcf6ae65f655333",
+    "changed_paths": [
+      "tests/local-git-repository.test.ts"
+    ],
+    "actor_workspace_clean": true,
+    "candidate_absent_from_canonical_object_store": true,
+    "verification": {
+      "check_id": "unit",
+      "result": "PASS",
+      "assurance_level": "REEXECUTED",
+      "evidence_id": "01M1DB4P1M26ZZPJGNR3PX08TY"
+    },
+    "supervisor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05aaf-c405-7de3-8f31-5b7b5ec5fb35",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "platform-supervisor-proposal-v1"
+    },
+    "actor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05ab0-0823-7211-8024-829a4f370cd5",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "codex-cli-actor-turn-result-v1"
+    },
+    "auditor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05ab2-58cc-7f63-9974-0166cc4fe8d2",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "platform-auditor-verdict-v1",
+      "verdict": "AUDIT_PASS"
+    },
+    "final_attempt_state": "READY_TO_MERGE",
+    "pending_decision": "MERGE_APPROVAL",
+    "canonical_unchanged": true
+  },
+  "negative_control": {
+    "canonical_commit": {
+      "exit_code": 128,
+      "result": "REJECTED",
+      "reason": "canonical .git/index.lock: Operation not permitted"
+    },
+    "canonical_file_mutation": {
+      "exit_code": 1,
+      "result": "REJECTED",
+      "reason": "Operation not permitted"
+    },
+    "workspace_git_config_mutation": {
+      "exit_code": 1,
+      "result": "REJECTED",
+      "reason": "Operation not permitted"
+    },
+    "canonical_head_after": "ce59b3b67c64918c82875a287988dab9cc598c2b",
+    "canonical_status_after": "",
+    "candidate_absent_from_canonical_object_store_after": true
+  },
+  "regression": {
+    "tests": 1163,
+    "passed": 1161,
+    "failed": 0,
+    "skipped": 2,
+    "typecheck": "PASS"
+  }
+}
