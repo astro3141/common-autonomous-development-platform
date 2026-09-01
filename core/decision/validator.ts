@@ -44,8 +44,13 @@ import {
   type ProposalV1,
   type RepositoryValidationView,
   type SelectionAdmissionKind,
+  type PendingMaterializedChildWritableSlotViewV1,
+  type ChildMaterializationBatchViewV1,
+  type ChildMaterializationCapabilityViewV1,
+  type ChildMaterializationParentViewV1,
   type SelectionProposalV1,
   type SubflowChildContextV1,
+  type SupervisorProposalIdentityView,
   type SubflowParentValidationView,
   type TaskBearingProposalV1,
   type TaskLookupView,
@@ -71,10 +76,31 @@ export interface DecisionValidationInput {
    * is still re-judged.
    */
   readonly admission_kind?: SelectionAdmissionKind;
+  /**
+   * D23 — the active turn's Platform allocation. V1 requires the Proposal's `proposal_id` to be
+   * this exact value; a missing view means no active turn context exists and every Proposal is
+   * rejected at `/proposal_id`.
+   */
+  readonly proposal_identity?: SupervisorProposalIdentityView;
   /** §9.2f — required for variant E (V2/V3/V11 P1–P4). Built by the caller from durable owners. */
   readonly subflow_parent?: SubflowParentValidationView;
   /** §9.2f — the child-side durable facts P1/P3/P4 compare against. Required for variant E. */
   readonly subflow_child?: SubflowChildContextV1;
+  /** §9.2g (D24) — required for variant F. */
+  readonly materialization_parent?: ChildMaterializationParentViewV1;
+  readonly materialization_capability?: ChildMaterializationCapabilityViewV1;
+  readonly materialization_batch?: ChildMaterializationBatchViewV1;
+  /**
+   * §9.2g (D24, review finding 4) — seats held by pending materialisations for an A/E admission,
+   * already excluding the admission target. Absent in pre-D24 worlds (treated as 0).
+   */
+  readonly materialization_reservation?: { readonly reserved_seats_excluding_target: number };
+  /**
+   * D25 (§19.3c/§9.2e rule 3) — the writable owner-set projection for a selection admission.
+   * `null`/absent means a legacy batch with no D24 materialisation state; rule 3 then judges the
+   * bare `active_writable_candidate_count` exactly as before.
+   */
+  readonly writable_slot?: PendingMaterializedChildWritableSlotViewV1 | null;
 }
 
 const ACCEPTED: DecisionValidationResult = { kind: "ACCEPTED" };
@@ -117,9 +143,36 @@ function runValidation(
     throw error;
   }
 
+  // D23 — active-turn identity binding, still V1 (`/proposal_id`): the id is Platform-assigned
+  // identity, not a semantic choice, and a Proposal no active turn asked for is schema-invalid.
+  // ULID grammar was already enforced by the parser above.
+  if (
+    input.proposal_identity === undefined ||
+    proposal.proposal_id !== input.proposal_identity.proposal_id
+  ) {
+    return rejected("PROPOSAL_SCHEMA_INVALID");
+  }
+
   const project = input.compiled_profile.effective.project;
   const policy = input.compiled_profile.effective.policy;
-  const taskBearing = proposal.variant !== "BATCH_CONTROL";
+  const taskBearing =
+    proposal.variant !== "BATCH_CONTROL" && proposal.variant !== "SUBFLOW_CHILD_MATERIALIZATION";
+  const materializationF =
+    proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION" ? proposal : undefined;
+
+  // §9.2g (D24) — the F local recovery guard applies before any capability/parent/reservation
+  // judgement: a paused run/batch or one unresolved UNKNOWN materialisation admits no new F
+  // occurrence, so no snapshot, no INTENT and no adapter call can follow this validation.
+  if (materializationF !== undefined) {
+    const recovery = requireMaterializationBatch(input);
+    if (
+      recovery.run_status === "PAUSED_SAFELY" ||
+      recovery.batch_status === "PAUSED_SAFELY" ||
+      recovery.has_unresolved_unknown_materialization
+    ) {
+      return rejected("DECISION_NOT_ALLOWED");
+    }
+  }
 
   // --- V2 task existence (A/B/C/E) --------------------------------------------------
   let lookup: TaskLookupView | undefined;
@@ -133,6 +186,12 @@ function runValidation(
     parentView = requireSubflowParent(input);
     if (parentView.status === "NOT_FOUND") return rejected("SUBFLOW_PARENT_NOT_FOUND");
   }
+  // §9.2g — F's child lookup is N/A; its explicit parent must exist as a durable row.
+  let fParentView: ChildMaterializationParentViewV1 | undefined;
+  if (materializationF !== undefined) {
+    fParentView = requireMaterializationParent(input);
+    if (fParentView.status === "NOT_FOUND") return rejected("SUBFLOW_PARENT_NOT_FOUND");
+  }
 
   // --- V3 expected freshness --------------------------------------------------------
   if (taskBearing && lookup?.status === "FOUND") {
@@ -144,6 +203,23 @@ function runValidation(
   }
   if (proposal.expected.compiled_profile_hash !== input.compiled_profile_hash) {
     return rejected("PROFILE_DRIFT");
+  }
+  // §9.2g V3 — F's tagged parent basis must equal the fresh view exactly; the Supervisor's
+  // observation of the parent's continuation point may not be stale.
+  if (materializationF !== undefined && fParentView?.status === "FOUND") {
+    const intent = materializationF.parent;
+    const stale =
+      intent.kind === "DISCOVERED_TASK"
+        ? intent.task_key !== fParentView.task_key ||
+          intent.task_ref !== fParentView.task_ref ||
+          intent.task_version !== fParentView.task_version ||
+          intent.task_definition_hash !== fParentView.task_definition_hash ||
+          fParentView.current_attempt_key !== null
+        : intent.task_key !== fParentView.task_key ||
+          intent.attempt_key !== fParentView.current_attempt_key ||
+          intent.task_contract_hash !== fParentView.current_task_contract_hash ||
+          intent.attempt_state !== fParentView.current_attempt_state;
+    if (stale) return rejected("SUBFLOW_PARENT_STALE");
   }
   // §9.2f V3 — the E parent stale guard: every proposed parent field must equal the fresh view
   // exactly. The Supervisor's observation of the parent's continuation point may not be stale.
@@ -190,6 +266,12 @@ function runValidation(
         return rejected("SUBFLOW_PIPELINE_INVALID");
       }
     }
+  }
+  // §9.2g V6 — F needs the batch-bound Compiled Profile v3's sole configured materializer; raw
+  // adapter installation is never the authority and there is no route to select between targets.
+  if (materializationF !== undefined) {
+    const capability = requireMaterializationCapability(input);
+    if (!capability.available) return rejected("SUBFLOW_MATERIALIZER_UNAVAILABLE");
   }
 
   // --- V7 Human Gate ----------------------------------------------------------------
@@ -249,7 +331,48 @@ function runValidation(
     }
   }
 
-  // --- V11 batch admission / concurrency --------------------------------------------
+  // --- V11 / §9.2g F reservation ----------------------------------------------------
+  if (materializationF !== undefined && fParentView?.status === "FOUND") {
+    const view = requireMaterializationBatch(input);
+    // §9.2g (review finding 5) — the F parent must be owned by this exact submission batch;
+    // a cross-batch (or cross-run) parent is a batch mismatch, never an accepted intent.
+    if (fParentView.batch_id !== view.batch_id) {
+      return rejected("SUBFLOW_PARENT_BATCH_MISMATCH");
+    }
+    // Parent rule: only a DISCOVERED whole-intent parent or a live ACTIVE attempt may decompose.
+    // §17.3 (D24) — on the resolved-gate path the parent is HELD by that exact gate; the tagged
+    // origin basis was already required exact by V3, and the intent commit re-checks the precise
+    // decision hold. The relaxation exists only for the one already-V1-passed gate copy.
+    const gatePath = authorizedGateProposal !== undefined;
+    const stateOk =
+      materializationF.parent.kind === "DISCOVERED_TASK"
+        ? fParentView.platform_state === "DISCOVERED" ||
+          (gatePath && fParentView.platform_state === "HELD")
+        : fParentView.platform_state === "ACTIVE" ||
+          (gatePath && fParentView.platform_state === "HELD");
+    const eligible =
+      materializationF.parent.kind === "DISCOVERED_TASK"
+        ? stateOk
+        : stateOk &&
+          fParentView.current_attempt_state !== null &&
+          ["READY", "IMPLEMENTING", "VERIFYING", "AUDITING", "REWORKING"].includes(
+            fParentView.current_attempt_state,
+          );
+    if (!eligible || fParentView.has_open_blocker || fParentView.has_recovery_conflict) {
+      return rejected("SUBFLOW_PARENT_INELIGIBLE");
+    }
+    // Reservation: external spam and later admission dead-ends are refused up front. Non-FAILED
+    // unadmitted materialisations and the unadmitted DISCOVERED parent all hold seats.
+    const limits = policy.batch_policy;
+    const reserved =
+      view.admitted_task_count +
+      view.unadmitted_materialized_child_count +
+      (view.parent_admitted ? 0 : 1);
+    if (view.admission_closed || reserved >= limits.max_tasks) {
+      return rejected("BATCH_MAX_TASKS_REACHED");
+    }
+  }
+
   if (selection !== undefined) {
     const batch = requireBatch(input);
     const limits = policy.batch_policy;
@@ -277,10 +400,32 @@ function runValidation(
       if (parentView.current_suspension_child_task_key !== null || child.has_parent_relation) {
         return rejected("SUBFLOW_RELATION_CONFLICT");
       }
+      // §9.2g — a materialised child is consumable only by an E naming the bound parent, over
+      // the exact bound body. Parent mismatch is a relation conflict; body drift is drift.
+      const binding = child.materialization_binding ?? null;
+      if (binding !== null) {
+        if (binding.parent_task_key !== parentView.task_key) {
+          return rejected("SUBFLOW_MATERIALIZATION_CONFLICT");
+        }
+        if (lookup?.status === "FOUND" && lookup.task.definition_hash !== binding.child_definition_hash) {
+          return rejected("SUBFLOW_MATERIALIZATION_DRIFT");
+        }
+      }
+    }
+
+    // §9.2g/§19.3a — a bound materialised child is never an ordinary top-level admission.
+    if (
+      selection.variant === "TASK_SELECTION" &&
+      (input.subflow_child?.materialization_binding ?? null) !== null
+    ) {
+      return rejected("SUBFLOW_MATERIALIZATION_CONFLICT");
     }
 
     // §9.2e — rule 1 is a *new admission* rule; a reselection re-uses the slot it already holds.
-    if (kind === "INITIAL_ADMISSION" && batch.admitted_task_count >= limits.max_tasks) {
+    // §9.2g (D24) — pending materialisations and their unadmitted parents hold seats an
+    // unrelated A/E may not steal; the exact reserved parent/bound child was already excluded.
+    const reservedSeats = input.materialization_reservation?.reserved_seats_excluding_target ?? 0;
+    if (kind === "INITIAL_ADMISSION" && batch.admitted_task_count + reservedSeats >= limits.max_tasks) {
       return rejected("BATCH_MAX_TASKS_REACHED");
     }
     // §9.2f P5 — E's admission is *projected*: parent ACTIVE→SUSPENDED and child
@@ -297,12 +442,57 @@ function runValidation(
     // compete for the writable slot. No new pipeline classification is introduced for this.
     const pipeline = project.pipelines[selection.pipeline_id];
     const writable = pipeline !== undefined && pipeline.steps.includes(WRITABLE_PIPELINE_STEP);
-    if (writable && batch.active_writable_candidate_count >= 1) {
-      return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+    if (writable) {
+      const slot = input.writable_slot ?? null;
+      if (slot === null) {
+        // Legacy batch, no D24 materialisation state: rule 3 stays the exact count judgement.
+        if (batch.active_writable_candidate_count >= 1) {
+          return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+        }
+      } else if (!writableSlotAdmits(slot, selection, parentView, input)) {
+        return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+      }
     }
   }
 
   return ACCEPTED;
+}
+
+/**
+ * D25 (§9.2e rule 3) — the owner-set judgement. An empty effective owner set admits the writable
+ * candidate outright. A non-empty set rejects every admission except the one exact transfer: an E
+ * over an OBSERVED bound D24 child (the binding is written only at OBSERVED, and the intent commit
+ * re-verifies the durable phase) whose bound parent is the *sole* effective owner, is ACTIVE with
+ * its current attempt in READY or REWORKING, and whose current writable phase has produced no
+ * dispatch evidence yet. Everything else — unrelated A/E, IMPLEMENTING parent, binding-null legacy
+ * E, second writer, a parent whose Actor dispatch already started — stays
+ * `WRITABLE_CONCURRENCY_CONFLICT`. Parent-identity and drift checks (§9.2f–g) already ran above;
+ * VERIFYING/AUDITING parents never hold a writable attempt state, so the D22 E path arrives here
+ * with an empty owner set and is untouched.
+ */
+function writableSlotAdmits(
+  slot: PendingMaterializedChildWritableSlotViewV1,
+  selection: SelectionProposalV1,
+  parentView: SubflowParentValidationView | undefined,
+  input: DecisionValidationInput,
+): boolean {
+  const owners = [
+    ...new Set([...slot.active_owner_task_keys, ...slot.transferred_owner_task_keys]),
+  ];
+  if (owners.length === 0) return true;
+  if (selection.variant !== "SUBFLOW_SELECTION" || parentView?.status !== "FOUND") return false;
+  if ((input.subflow_child?.materialization_binding ?? null) === null) return false;
+  return (
+    parentView.platform_state === "ACTIVE" &&
+    (parentView.current_attempt_state === "READY" ||
+      parentView.current_attempt_state === "REWORKING") &&
+    owners.length === 1 &&
+    owners[0] === parentView.task_key &&
+    parentView.current_attempt_key !== null &&
+    !slot.current_writable_phase_dispatch_started_attempt_keys.includes(
+      parentView.current_attempt_key,
+    )
+  );
 }
 
 /** Exact structural equality of two normalized Proposals (§17.3 step 5/13). */
@@ -419,6 +609,30 @@ function requireSubflowChild(input: DecisionValidationInput): SubflowChildContex
   const view = input.subflow_child;
   if (view === undefined) {
     throw inputInvalid("/subflow_child", "a subflow child context is required for E");
+  }
+  return view;
+}
+
+function requireMaterializationParent(input: DecisionValidationInput): ChildMaterializationParentViewV1 {
+  const view = input.materialization_parent;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_parent", "a materialisation parent view is required for F");
+  }
+  return view;
+}
+
+function requireMaterializationCapability(input: DecisionValidationInput): ChildMaterializationCapabilityViewV1 {
+  const view = input.materialization_capability;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_capability", "a materialisation capability view is required for F");
+  }
+  return view;
+}
+
+function requireMaterializationBatch(input: DecisionValidationInput): ChildMaterializationBatchViewV1 {
+  const view = input.materialization_batch;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_batch", "a materialisation batch view is required for F");
   }
   return view;
 }

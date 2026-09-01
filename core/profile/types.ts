@@ -148,6 +148,12 @@ export interface AdapterConfigured {
 
 export interface TaskSourceEntry extends AdapterConfigured {
   readonly id: string;
+  /**
+   * §7.1e (D24, prospective MVP 3) — the one TaskSource-bound child materializer. Present only in
+   * a v3 Project Profile; a project semantic declaration, never automation authority and never a
+   * Model-selectable field. Absent = the materialisation feature is unavailable.
+   */
+  readonly child_materializer?: AdapterConfigured;
 }
 
 export interface ContractSourceEntry {

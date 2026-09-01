@@ -260,6 +260,8 @@ export const inputFor = (
   proposal,
   compiled_profile: profile.body,
   compiled_profile_hash: profile.compiled_hash,
+  // D23 — the active turn's Platform allocation; the fixture Proposal echoes PROPOSAL_ID.
+  proposal_identity: { proposal_id: PROPOSAL_ID },
   task: found(),
   repository: { canonical_head: HEAD },
   manifests: manifests(),

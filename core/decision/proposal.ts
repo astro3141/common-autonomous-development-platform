@@ -10,6 +10,7 @@
  */
 
 import { isUlid } from "../schemas/identifiers.ts";
+import { normalizeTaskDefinitionBody } from "../tasksource/task-definition.ts";
 import { proposalInvalid } from "./errors.ts";
 import {
   DECISION_TYPES,
@@ -33,7 +34,12 @@ export function validateProposal(input: unknown): ProposalV1 {
   const raw = asObject(input, "");
 
   const decision = decisionOf(raw["decision"]);
-  const variant = PROPOSAL_VARIANT_BY_DECISION[decision];
+  // §9.2g (D24) — START_SUBFLOW carries two exact MVP 3 shapes. The presence of the `child`
+  // wrapper selects F; everything else about each shape stays an exact field set.
+  const variant =
+    decision === "START_SUBFLOW" && Object.hasOwn(raw, "child")
+      ? "SUBFLOW_CHILD_MATERIALIZATION"
+      : PROPOSAL_VARIANT_BY_DECISION[decision];
   exactKeys(raw, PROPOSAL_FIELDS[variant], "");
 
   const proposal_id = raw["proposal_id"];
@@ -49,6 +55,29 @@ export function validateProposal(input: unknown): ProposalV1 {
       variant,
       proposal_id,
       decision: "CLOSE_BATCH",
+      expected: { compiled_profile_hash: expected["compiled_profile_hash"] as string },
+      reason_refs,
+    };
+  }
+
+  if (variant === "SUBFLOW_CHILD_MATERIALIZATION") {
+    // §9.1 F — complete child semantics + explicit tagged parent, and nothing else. The child
+    // body passes the exact §8.1a validation here; no external identity or execution selection
+    // field exists to accept, so none can be filled in later.
+    const childWrapper = asObject(raw["child"], "/child");
+    exactKeys(childWrapper, ["task_definition_body"], "/child");
+    let body;
+    try {
+      body = normalizeTaskDefinitionBody(childWrapper["task_definition_body"], "/child/task_definition_body");
+    } catch {
+      throw proposalInvalid("/child/task_definition_body", "not a valid TaskDefinitionBodyV1");
+    }
+    return {
+      variant,
+      proposal_id,
+      decision: "START_SUBFLOW",
+      parent: validateMaterializationParent(raw["parent"]),
+      child: { task_definition_body: body as unknown as Readonly<Record<string, unknown>> },
       expected: { compiled_profile_hash: expected["compiled_profile_hash"] as string },
       reason_refs,
     };
@@ -115,6 +144,33 @@ export function validateProposal(input: unknown): ProposalV1 {
   }
 
   return { variant: "TASK_SELECTION", decision: "START_TASK", ...selection };
+}
+
+/** §9.1 F — the exact tagged parent union; each kind is an exact field set. */
+function validateMaterializationParent(value: unknown): import("./types.ts").MaterializationParentIntentV1 {
+  const parent = asObject(value, "/parent");
+  const kind = parent["kind"];
+  if (kind === "DISCOVERED_TASK") {
+    exactKeys(parent, ["kind", "task_key", "task_ref", "task_version", "task_definition_hash"], "/parent");
+    return {
+      kind,
+      task_key: nonEmptyString(parent["task_key"], "/parent/task_key"),
+      task_ref: nonEmptyString(parent["task_ref"], "/parent/task_ref"),
+      task_version: nonEmptyString(parent["task_version"], "/parent/task_version"),
+      task_definition_hash: nonEmptyString(parent["task_definition_hash"], "/parent/task_definition_hash"),
+    };
+  }
+  if (kind === "ACTIVE_ATTEMPT") {
+    exactKeys(parent, ["kind", "task_key", "attempt_key", "task_contract_hash", "attempt_state"], "/parent");
+    return {
+      kind,
+      task_key: nonEmptyString(parent["task_key"], "/parent/task_key"),
+      attempt_key: nonEmptyString(parent["attempt_key"], "/parent/attempt_key"),
+      task_contract_hash: nonEmptyString(parent["task_contract_hash"], "/parent/task_contract_hash"),
+      attempt_state: nonEmptyString(parent["attempt_state"], "/parent/attempt_state"),
+    };
+  }
+  throw proposalInvalid("/parent/kind", "expected DISCOVERED_TASK or ACTIVE_ATTEMPT");
 }
 
 /** §9.1 E — the exact four-field parent wrapper; unknown fields reject like every wrapper. */

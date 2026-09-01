@@ -104,7 +104,7 @@ test("S1 / S5 / S6: a usable session is reused, and the ordinal comes from durab
     const again = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(again, { kind: "REQUESTED", turn: 2, spawned: false });
@@ -161,7 +161,7 @@ test("S8: an indeterminate Supervisor turn is never resent", () => {
     const outcome = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(outcome, { kind: "INDETERMINATE", turn: 1 });
@@ -174,7 +174,7 @@ test("S8: an indeterminate Supervisor turn is never resent", () => {
     const again = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(again, { kind: "INDETERMINATE", turn: 1 });
@@ -375,12 +375,12 @@ test("B13-4 / B13-33 / B13-34 / B13-35: the Coordinator dispatches and never mer
   }
 });
 
-test("B13-39: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 8);
+test("B13-39: the schema is still v6 / 18 tables", () => {
+  assert.equal(MIGRATIONS.length, 9);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
   }
@@ -394,7 +394,7 @@ test("B13-39: the schema is still v6 / 17 tables", () => {
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of ["coordinator_state", "scheduler_state", "work_queue", "tick_cursor"]) {
         assert.equal(names.includes(forbidden), false, forbidden);
       }

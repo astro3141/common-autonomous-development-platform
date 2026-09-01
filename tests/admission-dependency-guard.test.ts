@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import {
   evaluateHardDependencies,
@@ -60,8 +61,9 @@ const soft = (ref = DEP): TaskDependency => ({
 const row = (state: TaskState, admitted: string | null): TaskRow =>
   ({ platform_state: state, admitted_at: admitted }) as TaskRow;
 
-const submit = (world: DomainWorld, authorities: AdmissionWorld, proposal: unknown) =>
-  submitProposal(authorities, {
+const submit = (world: DomainWorld, authorities: AdmissionWorld, proposal: unknown) => {
+  seedAllocationForProposal(world.store, BATCH_ID, proposal);
+  return submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,
     proposal,
@@ -69,6 +71,7 @@ const submit = (world: DomainWorld, authorities: AdmissionWorld, proposal: unkno
     decision_id: DECISION_ID,
     report_channel: REPORT_CHANNEL,
   });
+};
 
 // --- DG1 ~ DG13: the pure rule ------------------------------------------------------------
 

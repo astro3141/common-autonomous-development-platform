@@ -24,6 +24,7 @@ import { MIGRATIONS, type Migration } from "../core/store/migrations.ts";
 import { PlatformStore } from "../core/store/platform-store.ts";
 import { tempStore } from "./support/temp-store.ts";
 import {
+  PROPOSAL_ID,
   batchView,
   compiled,
   executionPolicy,
@@ -68,13 +69,13 @@ test("B5-M1 / B5-M4 ~ B5-M8: a fresh database reaches v6 with the two nullable c
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8, "B5-M4");
-    assert.equal(MIGRATIONS.length, 8);
+    assert.equal(store.schemaVersion, 9, "B5-M4");
+    assert.equal(MIGRATIONS.length, 9);
   } finally {
     store.close();
   }
   try {
-    assert.equal(tables(temp.path).length, 17, "B5-M5");
+    assert.equal(tables(temp.path).length, 18, "B5-M5");
     const task = columns(temp.path, "task");
     assert.equal(task.includes("repository_scope_id"), true, "B5-M6");
     assert.equal(task.includes("selection_binding_json"), true, "B5-M7");
@@ -87,13 +88,13 @@ test("B5-M1 / B5-M4 ~ B5-M8: a fresh database reaches v6 with the two nullable c
     }
     assert.deepEqual(
       MIGRATIONS.slice(3).map((migration) => migration.name),
-      ["selection-scope", "selection-binding", "audit-decision-category", "subflow-parent", "subflow-succeeded"],
+      ["selection-scope", "selection-binding", "audit-decision-category", "subflow-parent", "subflow-succeeded", "child-materialization"],
     );
     // M1-13 — v6 rebuilds one table to widen a CHECK vocabulary; the table set is unchanged.
     const v6 = MIGRATIONS[5] as Migration;
     assert.match(v6.statements, /DROP TABLE pending_human_decision/);
     assert.match(v6.statements, /RENAME TO pending_human_decision/);
-    assert.equal(tables(temp.path).length, 17);
+    assert.equal(tables(temp.path).length, 18);
 
     // Both columns are nullable — a DISCOVERED task legitimately has neither (§18.1e).
     const database = openDatabase(temp.path);
@@ -124,7 +125,7 @@ test("B5-M2 / B5-M3: v3 upgrades through v4/v5 to v6, and reopening applies noth
 
   // v3 → v4 → v5.
   const upgraded = temp.open();
-  assert.equal(upgraded.schemaVersion, 8);
+  assert.equal(upgraded.schemaVersion, 9);
   upgraded.close();
 
   // v4 → v5 alone.
@@ -133,19 +134,19 @@ test("B5-M2 / B5-M3: v3 upgrades through v4/v5 to v6, and reopening applies noth
   assert.equal(atFour.schemaVersion, 4);
   atFour.close();
   const toLatest = temp4.open();
-  assert.equal(toLatest.schemaVersion, 8, "B5-M2");
+  assert.equal(toLatest.schemaVersion, 9, "B5-M2");
   toLatest.close();
 
   try {
     // B5-M3 — reopening a migrated database is a no-op and never duplicates a column.
     for (const path of [temp, temp4]) {
       const reopened = path.open();
-      assert.equal(reopened.schemaVersion, 8);
+      assert.equal(reopened.schemaVersion, 9);
       reopened.close();
       const task = columns(path.path, "task");
       assert.equal(task.filter((name) => name === "repository_scope_id").length, 1);
       assert.equal(task.filter((name) => name === "selection_binding_json").length, 1);
-      assert.equal(tables(path.path).length, 17);
+      assert.equal(tables(path.path).length, 18);
     }
   } finally {
     temp.dispose();
@@ -274,6 +275,7 @@ test("B5-D4 / B5-D5: V6 validates the scope reference against the compiled profi
     proposal: selection({ profile, repository_scope_id }),
     compiled_profile: profile.body,
     compiled_profile_hash: profile.compiled_hash,
+    proposal_identity: { proposal_id: PROPOSAL_ID },
     task: found(),
     repository: { canonical_head: HEAD },
     manifests: manifests(),
@@ -292,7 +294,7 @@ test("B5-M4: PlatformStore reports the migrated version on a real file", () => {
   const temp = tempStore();
   const store = PlatformStore.open(temp.path);
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
     temp.dispose();

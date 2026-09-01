@@ -35,6 +35,8 @@ import {
   assertAdmissible,
   pipelineHasActor,
 } from "./admission.ts";
+import { materializationReservedSeats, requireExactBindingAuthority } from "../materialization/materialize-child.ts";
+import { effectiveWritableOwners, pendingWritableSlotView } from "../materialization/writable-slot.ts";
 import { nextAttemptOutcome } from "./attempt-transitions.ts";
 import { nextBatchOutcome, type BatchTaskCounts } from "./batch-transitions.ts";
 import type { BatchOutcome } from "./types.ts";
@@ -159,8 +161,56 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       }
     }
 
+    // §19.3a (D24) — the materialisation relation guard, in the same transaction. A bound
+    // materialised child is never an ordinary top-level admission, and an E may consume it only
+    // over the exact bound parent/body/snapshot.
+    const binding = task.materialization_binding;
+    if (!reselection && command.subflow_parent === undefined && binding !== null) {
+      throw illegal(`${task.task_key} carries a materialisation binding; only an E may admit it`);
+    }
+    if (command.subflow_parent !== undefined && binding !== null) {
+      if (binding.parent_task_key !== command.subflow_parent.task_key) {
+        throw illegal(`${task.task_key} is bound to ${binding.parent_task_key}, not the proposed parent`);
+      }
+      // Review 5496386527 finding 1 — the whole exact snapshot↔binding↔task↔DONE-receipt chain
+      // is re-verified inside this transaction; any inexact leg aborts the admission.
+      requireExactBindingAuthority(store, task);
+    }
+
     // Same durable recheck for both paths — Batch 7's V11 pass is not taken on trust.
     const compiled = store.batchView.compiledProfileFor(batch.batch_id);
+    const has_actor = pipelineHasActor(compiled, command.selection.pipeline_id);
+    // D25 (§19.3c) — rule 3 is judged as an owner set, recomputed from durable rows inside this
+    // very transaction; the validation pass leased nothing. A non-empty set admits exactly the
+    // parent→child transfer for an OBSERVED bound child E (the binding row exists only once the
+    // TaskSource round-trip observed the child) whose bound parent is the sole owner, ACTIVE
+    // with its current attempt in READY or REWORKING, and whose current writable phase shows no
+    // dispatch evidence. Everything else keeps the conflict.
+    const slot = pendingWritableSlotView(store, batch.batch_id);
+    let effective_writable_conflict: boolean | undefined;
+    if (slot !== null) {
+      const owners = effectiveWritableOwners(slot);
+      if (owners.length === 0) {
+        effective_writable_conflict = false;
+      } else {
+        const parentKey = command.subflow_parent?.task_key;
+        const parentAttempt = parentKey === undefined ? undefined : store.attempts.current(parentKey);
+        effective_writable_conflict = !(
+          command.subflow_parent !== undefined &&
+          binding !== null &&
+          binding.parent_task_key === command.subflow_parent.task_key &&
+          owners.length === 1 &&
+          owners[0] === command.subflow_parent.task_key &&
+          store.tasks.require(command.subflow_parent.task_key).platform_state === "ACTIVE" &&
+          parentAttempt !== undefined &&
+          parentAttempt.attempt_key === command.subflow_parent.attempt_key &&
+          (parentAttempt.state === "READY" || parentAttempt.state === "REWORKING") &&
+          !slot.current_writable_phase_dispatch_started_attempt_keys.includes(
+            parentAttempt.attempt_key,
+          )
+        );
+      }
+    }
     assertAdmissible({
       view: store.batchView.project(batch.batch_id),
       policy: compiled.effective.policy.batch_policy,
@@ -168,8 +218,16 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       // `admission_closed` is consumed again; concurrency and the writable slot still are.
       admission_closed: reselection ? false : batch.admission_closed,
       consumes_admission_slot: !reselection,
-      pipeline_has_actor: pipelineHasActor(compiled, command.selection.pipeline_id),
+      pipeline_has_actor: has_actor,
       hard_dependencies_clear: command.hard_dependencies_clear,
+      // §9.2g (D24) — pending materialisations keep their seats at commit time too; the exact
+      // reserved parent/bound child consumes its own seat via the exclusion.
+      reserved_materialization_seats: materializationReservedSeats(
+        store,
+        batch.batch_id,
+        command.task_key,
+      ),
+      ...(effective_writable_conflict === undefined ? {} : { effective_writable_conflict }),
     });
 
     const transition = appendTransition(store, {
@@ -210,6 +268,21 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
 
     if (command.subflow_parent !== undefined) {
       linkSubflowParent(store, task.task_key, command.subflow_parent);
+      // D25 — the transfer's post-state is verified in the same transaction: with the parent now
+      // SUSPENDED and the bound child SELECTED, the projected effective owner set must be exactly
+      // {child} for an ACTOR-pipeline child (∅ otherwise). Any other set means the exchange did
+      // not land atomically, and the whole admission rolls back.
+      if (binding !== null && slot !== null) {
+        const post = pendingWritableSlotView(store, batch.batch_id);
+        const postOwners = post === null ? [] : effectiveWritableOwners(post);
+        const expected = has_actor ? [task.task_key] : [];
+        if (postOwners.length !== expected.length || postOwners.some((k, i) => k !== expected[i])) {
+          throw illegal(
+            `writable owner transfer did not converge: expected [${expected.join(", ")}], ` +
+              `projected [${postOwners.join(", ")}]`,
+          );
+        }
+      }
     }
 
     return { transition, task: store.tasks.require(task.task_key), batch: currentBatch };
@@ -525,6 +598,28 @@ export function commitTaskAbandonment(
         reason: { code: reason, log_seq: transition.seq },
       }),
     };
+  });
+}
+
+/**
+ * §8.4b (D24) — the one-transaction DISCOVERED + immutable materialisation binding commit of a
+ * successfully round-tripped child. Ordinary discovery never writes a binding; nothing rewrites
+ * or clears it afterwards.
+ */
+export function commitMaterializedChildDiscovery(
+  store: PlatformStore,
+  command: DiscoverTaskCommand & {
+    readonly binding: import("../store/domain-types.ts").ChildMaterializationBindingV1;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "-", to: "DISCOVERED" },
+    });
+    store.tasks.discover(command);
+    const task = store.tasks.bindMaterialization(command.task_key, command.binding);
+    return { transition, task };
   });
 }
 

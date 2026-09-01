@@ -76,6 +76,7 @@ import {
 } from "../../adapters/local-verification/index.ts";
 import { FakeVerificationAdapter } from "../../testdoubles/fake-verification-adapter.ts";
 import { submitProposal } from "../../core/admission/submit-proposal.ts";
+import { seedAllocationForProposal } from "./coordinator-fixtures.ts";
 import type { ExecutionAuthorities } from "../../core/execution/start-implementation.ts";
 import { canonicalize, type CanonicalObject } from "../../core/schemas/canonical-json.ts";
 import type { ContractSourceInput } from "../../core/contract/types.ts";
@@ -491,6 +492,7 @@ export function activatedWorld(
   const repository = new RecordingRepository(admission.repository.head);
 
   discover(world);
+  seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile }));
   const submitted = submitProposal(admission, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,

@@ -23,6 +23,7 @@
  * and never as lifecycle authority.
  */
 
+import type { ChildTaskMaterializationAdapterV1 } from "../../adapters/interfaces/child-materialization-adapter.ts";
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import type { ReportAdapter } from "../../adapters/interfaces/report-adapter.ts";
 import type { RuntimeAdapter, RuntimePreflight } from "../../adapters/interfaces/runtime-adapter.ts";
@@ -53,10 +54,15 @@ import {
   requestSupervisorProposal,
   supervisorTurnsIssued,
 } from "../execution/supervisor-session.ts";
+import { assembleSupervisorDecisionContext } from "../execution/supervisor-decision-context.ts";
 import { mergeDecisionCause } from "../humandecision/merge-decision.ts";
 import type { ProfileSource } from "../profile/types.ts";
 import { commitBatchFact } from "../statemachine/transition-commit.ts";
 import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
+import {
+  advanceMaterializations,
+  pendingMaterializationsFor,
+} from "../materialization/materialize-child.ts";
 import { DECISION_VALIDATION_LOG_KIND } from "../decision/decision-log.ts";
 import type { TaskAttemptRow, TaskRow } from "../store/domain-types.ts";
 import { isTerminalTask } from "../store/domain-types.ts";
@@ -79,6 +85,8 @@ export interface ProductionCoordinatorDependencies {
   readonly contractSources: ContractSourceReader;
   readonly manifests: ManifestSetInput;
   readonly preflight: RuntimePreflight;
+  /** §8.1b (D24) — present only when the Compiled Profile v3 materialisation feature is composed. */
+  readonly materializer?: ChildTaskMaterializationAdapterV1;
   /** Caller-supplied identities and clock — Core allocates neither (TD §17.1, §18.1a). */
   readonly identities: CoordinatorIdentities;
 }
@@ -113,6 +121,11 @@ export type TickStep =
   | "AUTO_MERGE_COMPLETED"
   | "MERGE_OBSERVED"
   | "PARENT_RESUMED"
+  | "MATERIALIZATION_PUBLISHED"
+  | "MATERIALIZATION_OBSERVED"
+  | "MATERIALIZATION_FAILED"
+  | "MATERIALIZATION_UNKNOWN"
+  | "MATERIALIZATION_CONFLICT"
   | "DECISION_APPLIED"
   | "DECISION_APPLICATION_REFUSED"
   | "BATCH_WAITING"
@@ -140,6 +153,19 @@ export class ProductionCoordinator {
 
     for (const batch of store.batches.forRun(run_id)) {
       if (batch.status !== "RUNNING" && batch.status !== "WAITING") continue;
+
+      // §8.4b/§19.3e (D24) — an in-flight materialisation is an external operation that has
+      // already begun: publish, reconcile or round-trip it before any task advancement can start
+      // a new external effect on its parent.
+      const materialized = advanceMaterializations(
+        {
+          store,
+          taskSource: this.#deps.taskSource,
+          ...(this.#deps.materializer === undefined ? {} : { materializer: this.#deps.materializer }),
+        },
+        { run_id, batch_id: batch.batch_id, observed_at: this.#deps.identities.now() },
+      );
+      if (materialized !== undefined) return materialized;
 
       // Advance whatever is already in flight before asking for anything new.
       for (const task of store.tasks.inBatch(batch.batch_id)) {
@@ -214,6 +240,10 @@ export class ProductionCoordinator {
 
     switch (attempt.state) {
       case "READY":
+        // §19.3e (D24) — a pending materialised child (any non-FAILED unadmitted phase) blocks
+        // the parent's next Actor external INTENT: unfinished phases reconcile first, and an
+        // OBSERVED child asks the Supervisor for an E decision on a later turn.
+        if (pendingMaterializationsFor(this.#deps.store, task.task_key).length > 0) return undefined;
         return this.#step(startImplementation(this.#deps, { attempt_key: attempt.attempt_key }), {
           IMPLEMENTING: "IMPLEMENTATION_STARTED",
         });
@@ -226,6 +256,7 @@ export class ProductionCoordinator {
       case "AUDITING":
         return this.#completeAudit(attempt);
       case "REWORKING":
+        if (pendingMaterializationsFor(this.#deps.store, task.task_key).length > 0) return undefined;
         return this.#step(startRework(this.#deps, { attempt_key: attempt.attempt_key }), {
           IMPLEMENTING: "REWORK_STARTED",
         });
@@ -562,10 +593,34 @@ export class ProductionCoordinator {
         ? undefined
         : project.roles[project.supervisor_profile]?.runtime_profile;
     const configured = this.#deps.identities.supervisorRuntimeProfile;
+
+    // D23 — the proposal_id is allocated before the turn through the existing caller-supplied
+    // ULID seam, and the exact §13.4 context is assembled from fresh authoritative reads. An
+    // assembly failure (unreadable TaskSource, identity mismatch, partial projection) sends no
+    // turn at all — there is no repaired or truncated context.
+    let decision_context;
+    try {
+      decision_context = assembleSupervisorDecisionContext(
+        {
+          store,
+          taskSource: this.#deps.taskSource,
+          repository: this.#deps.repository,
+        },
+        {
+          run_id,
+          batch_id,
+          proposal_id: this.#deps.identities.nextUlid(),
+          observed_at: this.#deps.identities.now(),
+        },
+      );
+    } catch {
+      return "BLOCKED";
+    }
+
     const outcome = requestSupervisorProposal(this.#deps, {
       run_id,
       batch_id,
-      decision_context: this.#decisionContext(batch_id),
+      decision_context,
       runtime_profile: (boundProfile ?? configured) as typeof configured,
     });
     switch (outcome.kind) {
@@ -578,29 +633,6 @@ export class ProductionCoordinator {
     }
   }
 
-  /**
-   * §13.4 — the fresh read model one request is about. Platform-owned projections only: no adapter
-   * handle, no runtime identity, nothing a backend would recognise as its own.
-   */
-  #decisionContext(batch_id: string) {
-    const store = this.#deps.store;
-    const batch = store.batches.require(batch_id);
-    return {
-      batch_id,
-      compiled_profile_hash: batch.compiled_profile_hash,
-      candidates: store.tasks
-        .inBatch(batch_id)
-        .filter((task) => task.platform_state === "DISCOVERED")
-        .map((task) => ({
-          task_ref: task.external_task_ref,
-          external_state: task.external_snapshot.external_state,
-          version: task.external_snapshot.version,
-        })),
-      open_decisions: store.pendingDecisions
-        .openFor(batch_id)
-        .map((record) => record.body.category),
-    } as never;
-  }
 
   /** Maps a use-case outcome onto a tick step without interpreting it as lifecycle authority. */
   #step<Outcome extends { kind: string }>(

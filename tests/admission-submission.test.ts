@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { AdmissionError } from "../core/admission/errors.ts";
 import { assembleDecisionInput } from "../core/admission/fact-assembly.ts";
@@ -15,6 +16,7 @@ import { TransitionError } from "../core/statemachine/errors.ts";
 import { validateDecision } from "../core/decision/validator.ts";
 import { TaskSourceError } from "../core/tasksource/errors.ts";
 import {
+  TASK_REF,
   BATCH_ID,
   BINDING,
   RUN_ID,
@@ -40,14 +42,16 @@ const submit = (
   authorities: AdmissionWorld,
   proposal: unknown,
   overrides: { decision_id?: string; report_channel?: string } = {},
-) =>
-  submitProposal(authorities, {
+) => {
+  seedAllocationForProposal(world.store, BATCH_ID, proposal);
+  return submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,
     proposal,
     observed_at: OBSERVED_AT,
     ...overrides,
   });
+};
 
 /** Everything a rejection must leave exactly as it was. */
 const durable = (world: DomainWorld) => ({
@@ -356,7 +360,8 @@ test("M1B4-AC6 / §11: the Proposal, the fresh definition and the durable row mu
   withWorld((world) => {
     discover(world);
     // The source answers with a definition for a different task than the one asked for.
-    const source = new StubTaskSource(task({ task_ref: "T-202" }));
+    const source = new StubTaskSource();
+    source.definitions.set(TASK_REF, task({ task_ref: "T-202" }));
     const authorities = authoritiesFor(world, { taskSource: source });
 
     assert.throws(
@@ -459,6 +464,7 @@ test("M1B4-AC37 / §56: the state-machine guard is the final authority after ACC
       // Assemble and validate the second task while the batch still has room.
       const second = task({ task_ref: "T-2" });
       authorities.taskSource.definition = second;
+      seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile }));
       const assembled = assembleDecisionInput(authorities, {
         run_id: RUN_ID,
         batch_id: BATCH_ID,

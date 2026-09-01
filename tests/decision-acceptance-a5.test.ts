@@ -91,12 +91,14 @@ test("B7-AC32: the verdict is reproducible and reached without any execution sea
   assert.deepEqual(validateDecision(accepted), validateDecision(accepted), "deterministic");
 
   // The input carries authority projections only — no adapter, no session, no store handle.
+  // D23 adds exactly the active-turn proposal identity projection.
   assert.deepEqual(Object.keys(accepted).sort(), [
     "batch",
     "compiled_profile",
     "compiled_profile_hash",
     "manifests",
     "proposal",
+    "proposal_identity",
     "repository",
     "task",
   ]);

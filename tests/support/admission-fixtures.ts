@@ -56,6 +56,8 @@ export const manifestSetInput = (
 export class StubTaskSource implements TaskSourceV1 {
   readonly calls: string[] = [];
   definition: TaskDefinition;
+  /** Per-ref definitions for multi-task worlds (D23 context assembly reads every live ref). */
+  readonly definitions = new Map<string, TaskDefinition>();
   dependencies: readonly TaskDependency[] = [];
   /** Per-ref external state for dependency targets; unlisted refs answer `READY`. */
   readonly externalStates: Record<string, ExternalTaskState> = {};
@@ -76,7 +78,12 @@ export class StubTaskSource implements TaskSourceV1 {
   get_task(task_ref: string): TaskDefinition {
     this.calls.push(`get_task:${task_ref}`);
     if (this.failure !== undefined) throw this.failure;
-    return this.definition;
+    const registered = this.definitions.get(task_ref);
+    if (registered !== undefined) return registered;
+    if (this.definition.task_ref === task_ref) return this.definition;
+    // A deterministic per-ref definition, so a multi-task world stays coherent per ref. A test
+    // that needs an identity mismatch registers a poisoned entry for the exact ref instead.
+    return task({ task_ref });
   }
 
   get_dependencies(task_ref: string): readonly TaskDependency[] {

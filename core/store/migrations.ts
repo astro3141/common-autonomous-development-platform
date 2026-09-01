@@ -396,6 +396,71 @@ CREATE UNIQUE INDEX task_attempt_single_non_terminal
   WHERE state NOT IN ('MERGED', 'SUCCEEDED', 'INVALIDATED', 'FAILED');
 `;
 
+/**
+ * §18.1g (D24, prospective MVP 3) — the one immutable child-materialisation authority table and
+ * the task's nullable pre-admission binding column. The snapshot is the typed recovery authority
+ * for the validated semantic input (complete child body + parent/profile/source identity); the
+ * operation's status stays with the existing `idempotency` record and the audit trail with
+ * `decision_log`, so this is an index/association, never a parallel state machine. The task
+ * rebuild keeps every v8 column and adds `materialization_binding_json` (NULL for ordinary and
+ * pre-existing external tasks). Same FK-off rewrite discipline as v7/v8; tables +1.
+ */
+const MIGRATION_V9 = `
+CREATE TABLE child_materialization_snapshot (
+  materialization_id  TEXT PRIMARY KEY,
+  hash                TEXT NOT NULL UNIQUE,
+  batch_id            TEXT NOT NULL REFERENCES batch(batch_id),
+  parent_task_key     TEXT NOT NULL REFERENCES task(task_key),
+  envelope_json       TEXT NOT NULL,
+  created_at          TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE task_v9 (
+  task_key               TEXT PRIMARY KEY,
+  batch_id               TEXT NOT NULL REFERENCES batch(batch_id),
+  project_id             TEXT NOT NULL,
+  external_task_ref      TEXT NOT NULL,
+  platform_state         TEXT NOT NULL CHECK (platform_state IN
+                           ('DISCOVERED', 'SELECTED', 'ACTIVE', 'HELD', 'SUSPENDED',
+                            'DEFERRED', 'COMPLETED', 'FAILED')),
+  classification         TEXT,
+  pipeline_id            TEXT,
+  actor_profile          TEXT,
+  verification_profile   TEXT,
+  external_snapshot_json TEXT NOT NULL,
+  admitted_at            TEXT,
+  state_reason_code      TEXT,
+  state_reason_log_seq   INTEGER REFERENCES decision_log(seq),
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  repository_scope_id    TEXT,
+  selection_binding_json TEXT,
+  parent_task_key        TEXT REFERENCES task_v9(task_key),
+  materialization_binding_json TEXT,
+  UNIQUE (project_id, external_task_ref),
+  CHECK (platform_state NOT IN ('HELD', 'FAILED')
+         OR (state_reason_code IS NOT NULL AND state_reason_log_seq IS NOT NULL))
+) STRICT;
+
+INSERT INTO task_v9
+  (task_key, batch_id, project_id, external_task_ref, platform_state,
+   classification, pipeline_id, actor_profile, verification_profile,
+   external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+   created_at, updated_at, repository_scope_id, selection_binding_json, parent_task_key,
+   materialization_binding_json)
+SELECT
+  task_key, batch_id, project_id, external_task_ref, platform_state,
+  classification, pipeline_id, actor_profile, verification_profile,
+  external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+  created_at, updated_at, repository_scope_id, selection_binding_json, parent_task_key,
+  NULL
+FROM task;
+
+DROP TABLE task;
+
+ALTER TABLE task_v9 RENAME TO task;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "foundation", statements: MIGRATION_V1 },
   { version: 2, name: "domain", statements: MIGRATION_V2 },
@@ -405,6 +470,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 6, name: "audit-decision-category", statements: MIGRATION_V6 },
   { version: 7, name: "subflow-parent", statements: MIGRATION_V7, disable_foreign_keys: true },
   { version: 8, name: "subflow-succeeded", statements: MIGRATION_V8, disable_foreign_keys: true },
+  { version: 9, name: "child-materialization", statements: MIGRATION_V9, disable_foreign_keys: true },
 ];
 
 const BOOTSTRAP = `

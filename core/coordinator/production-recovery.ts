@@ -23,6 +23,7 @@ import { actorTurnMetadataKey, actorTurnOp } from "../execution/actor-operations
 import { startVerification } from "../execution/start-verification.ts";
 import { RUNTIME_ADAPTER } from "../execution/start-implementation.ts";
 import { deliverOneReport } from "./report-delivery.ts";
+import { advanceMaterializations } from "../materialization/materialize-child.ts";
 import { validateManifestSet } from "../capability/manifest-set.ts";
 import type { RequestedCapabilities } from "../capability/types.ts";
 import type { TaskContractV1Body } from "../contract/types.ts";
@@ -49,6 +50,8 @@ export interface RecoveryAction {
     | "TURN_LOSS_CAUGHT_UP"
     /** Spec §52 — an indeterminate canonical-mutation window stopped the batch. */
     | "CANONICAL_PAUSED"
+    /** §22.2 (D24) — an unfinished child materialisation converged one bounded step. */
+    | "MATERIALIZATION_RECONCILED"
     /** §22.3 — TaskSource says CLOSED while a decision was still open. */
     | "EXTERNAL_CLOSED_HELD";
   readonly subject: string;
@@ -72,6 +75,26 @@ export function recoverRun(
 
   // --- Platform-owned durable integrity first (§22.2 hash 검증; MVP 0 seam reused verbatim) ----
   const integrity = integrityClassification(store, command.run_id);
+
+  // §22.2 (D24) — unfinished child materialisations reconcile before anything else external:
+  // INTENT ops re-judge through the same op identity (CM1–CM3), COMMITTED receipts resume the
+  // exact TaskSource round-trip (CM4), and an UNKNOWN pauses safely with same-op provenance.
+  // Bounded: one pass per snapshot; a step that cannot be proven leaves durable state untouched.
+  for (const batch of store.batches.forRun(command.run_id)) {
+    const ops = store.materializations.forBatch(batch.batch_id).length;
+    for (let index = 0; index < ops; index += 1) {
+      const step = advanceMaterializations(
+        {
+          store,
+          taskSource: deps.taskSource,
+          ...(deps.materializer === undefined ? {} : { materializer: deps.materializer }),
+        },
+        { run_id: command.run_id, batch_id: batch.batch_id, observed_at: deps.identities.now() },
+      );
+      if (step === undefined) break;
+      actions.push({ kind: "MATERIALIZATION_RECONCILED", subject: `${batch.batch_id}:${step}` });
+    }
+  }
   if (integrity === "UNEXPLAINED") {
     // Spec §52 — durable state corruption is a safety stop, not a diagnosis to work around.
     for (const batch of store.batches.forRun(command.run_id)) {

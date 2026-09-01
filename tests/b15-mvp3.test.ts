@@ -46,7 +46,7 @@ import {
   RecordingRepository,
 } from "./support/execution-fixtures.ts";
 import { HEAD, selection, subflowSelection, task, taskControl } from "./support/decision-fixtures.ts";
-import { coordinatorWorld, type CoordinatorWorld } from "./support/coordinator-fixtures.ts";
+import { coordinatorWorld, seedAllocationForProposal, type CoordinatorWorld } from "./support/coordinator-fixtures.ts";
 
 const A_REF = "T-101";
 const B_REF = "T-202";
@@ -143,18 +143,20 @@ function submit(
     ...(options.classification === undefined ? {} : { classification: options.classification }),
     ...(options.pipeline_id === undefined ? {} : { pipeline_id: options.pipeline_id }),
   };
+  const body =
+    options.decision === "START_SUBFLOW"
+      ? subflowSelection({ ...shared, parent: options.parent! })
+      : options.decision === undefined || options.decision === "START_TASK"
+        ? selection({ ...shared, ...(options.decision === undefined ? {} : { decision: options.decision }) })
+        : taskControl({ profile: world.profile, definition, decision: options.decision });
+  seedAllocationForProposal(w.store, BATCH_ID, body);
   return submitProposal(
     { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
     {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
       observed_at: "2026-08-21T09:00:00Z",
-      proposal:
-        options.decision === "START_SUBFLOW"
-          ? subflowSelection({ ...shared, parent: options.parent! })
-          : options.decision === undefined || options.decision === "START_TASK"
-            ? selection({ ...shared, ...(options.decision === undefined ? {} : { decision: options.decision }) })
-            : taskControl({ profile: world.profile, definition, decision: options.decision }),
+      proposal: body,
     },
   );
 }

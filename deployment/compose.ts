@@ -72,6 +72,8 @@ export interface ComposeOverrides {
   readonly preflight?: RuntimePreflight;
   readonly manifests?: ManifestSetInput;
   readonly identities?: CoordinatorIdentities;
+  /** §8.1b (D24) — the configured child-materialisation backend, when the Profile declares one. */
+  readonly child_materializer?: import("../adapters/interfaces/child-materialization-adapter.ts").ChildTaskMaterializationAdapterV1;
 }
 
 export interface Composition {
@@ -209,6 +211,9 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
     contractSources,
     manifests,
     preflight,
+    ...(overrides.child_materializer === undefined
+      ? {}
+      : { materializer: overrides.child_materializer }),
     identities,
   };
 

@@ -70,9 +70,13 @@ test("B7-AC10 / B7-AC11: the result kinds and the reject vocabulary are exact", 
       "SUBFLOW_RELATION_CONFLICT",
       "SUBFLOW_CYCLE_DETECTED",
       "SUBFLOW_PIPELINE_INVALID",
+      // §9.2g (D24) — the three materialisation reasons; everything above stays sealed.
+      "SUBFLOW_MATERIALIZER_UNAVAILABLE",
+      "SUBFLOW_MATERIALIZATION_CONFLICT",
+      "SUBFLOW_MATERIALIZATION_DRIFT",
     ],
   );
-  assert.equal(DECISION_REJECT_REASONS.length, 19);
+  assert.equal(DECISION_REJECT_REASONS.length, 22);
 });
 
 // --- B7-AC8 read model ------------------------------------------------------------------

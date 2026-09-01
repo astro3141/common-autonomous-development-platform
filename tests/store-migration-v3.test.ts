@@ -60,7 +60,7 @@ const tables = (path: string): string[] =>
       .filter((name) => !name.startsWith("sqlite_")),
   );
 
-test("V3-M1 / M1B1-AC1 / AC3 / AC4: a fresh database reaches the current version with 17 tables", () => {
+test("V3-M1 / M1B1-AC1 / AC3 / AC4: a fresh database reaches the current version with 18 tables", () => {
   const temp = tempStore();
   const store = temp.open();
   try {
@@ -70,8 +70,13 @@ test("V3-M1 / M1B1-AC1 / AC3 / AC4: a fresh database reaches the current version
   }
   try {
     const present = tables(temp.path);
-    assert.equal(present.length, 17);
-    assert.deepEqual(present.sort(), [...FOUNDATION, ...DOMAIN_V2, ...ARTIFACTS_V3].sort());
+    assert.equal(present.length, 18);
+    // §18.1g (D24) — the current schema adds exactly the one materialisation authority table on
+    // top of the sealed v1/v2/v3 groups.
+    assert.deepEqual(
+      present.sort(),
+      [...FOUNDATION, ...DOMAIN_V2, ...ARTIFACTS_V3, "child_materialization_snapshot"].sort(),
+    );
   } finally {
     temp.dispose();
   }
@@ -109,6 +114,7 @@ test("V3-M2 / M1B1-AC5 / AC6: an existing v2 database gains only v3, keeping its
         { version: 6, name: "audit-decision-category" },
         { version: 7, name: "subflow-parent" },
       { version: 8, name: "subflow-succeeded" },
+      { version: 9, name: "child-materialization" },
       ],
     );
   } finally {

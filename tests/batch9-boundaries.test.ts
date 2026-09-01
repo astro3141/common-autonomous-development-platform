@@ -161,6 +161,7 @@ test("B9-AC4 / B9-AC22: no migration and no new table were added", () => {
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
       { version: 8, name: "subflow-succeeded" },
+      { version: 9, name: "child-materialization" },
     ],
   );
 
@@ -179,7 +180,7 @@ test("B9-AC4 / B9-AC22: no migration and no new table were added", () => {
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
 
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const absent of ["coordinator_state", "recovery_state"]) {
         assert.equal(names.includes(absent), false, `${absent} must not exist`);
       }
