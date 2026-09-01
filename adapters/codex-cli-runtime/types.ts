@@ -2,11 +2,21 @@
 
 export type CodexCliSandbox = "read-only" | "workspace-write";
 
+/** The measured `model_reasoning_effort` vocabulary of the inspected CLI (#51). */
+export type CodexCliReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface CodexCliRuntimeProfileBinding {
   /** The inspected CLI defaults to its built-in `openai` provider when user config is ignored. */
   readonly provider: "openai";
   /** Exact model request passed to `codex exec --model`; not an observed resolved model id. */
   readonly model: string;
+  /**
+   * #51 — explicit per-binding reasoning effort, passed as `-c model_reasoning_effort=<effort>`
+   * (the adapter ignores user-global config on purpose, so this is the only effort channel).
+   * Absent means UNSPECIFIED: no flag is sent and no hidden default is invented. Requested
+   * effort is never presented as observed actual effort.
+   */
+  readonly effort?: CodexCliReasoningEffort;
   /**
    * Fixed for the lifetime of the persisted CLI thread. `workspace-write` is lowered to the
    * inspected isolated-workspace commit profile, not to an approval or full-access mode.
