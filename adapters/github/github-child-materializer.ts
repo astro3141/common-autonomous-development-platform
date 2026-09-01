@@ -20,8 +20,10 @@
  *                        (state=all, every page answered) contains no marker for this op_key.
  *                        The issues REST list is the target's authoritative record — this is not
  *                        a search-index answer and is never emitted after a partial read.
- *   UNKNOWN              any transport failure, partial enumeration, malformed page, or an
- *                        op-marked issue whose marker cannot be read coherently.
+ *   UNKNOWN              any transport failure, partial enumeration, malformed page, or **any
+ *                        issue carrying a materialisation marker that cannot be decoded to a
+ *                        trustworthy identity** — a damaged marker may be this very op's child,
+ *                        so it is inconclusive evidence, never absence.
  */
 
 import {
@@ -34,7 +36,7 @@ import {
 import { normalizeTaskDefinitionBody } from "../../core/tasksource/task-definition.ts";
 import type { TaskDefinitionBodyV1 } from "../../core/tasksource/types.ts";
 import {
-  parseMaterializationMarker,
+  inspectMaterializationMarker,
   renderIssueBody,
   type MaterializationMarkerV1,
 } from "./representation.ts";
@@ -163,14 +165,25 @@ export class GitHubIssuesChildMaterializer implements ChildTaskMaterializationAd
         const record = entry as Record<string, unknown>;
         if (record["pull_request"] !== undefined) continue;
         const bodyText = typeof record["body"] === "string" ? record["body"] : "";
-        const marker = parseMaterializationMarker(bodyText);
-        if (marker === null || marker.op_key !== op_key) continue;
+        const observed = inspectMaterializationMarker(bodyText);
+        // Review finding (BLOCKING_EXTERNAL_EFFECT) — a malformed/unreadable materialisation
+        // marker is inconclusive external-effect evidence, never absence: the damaged issue may
+        // be exactly the child this op created, and its identity can no longer be safely
+        // excluded. The whole enumeration fails closed (reconcile → UNKNOWN; publish refuses to
+        // create over the unprovable state). No fuzzy recovery from title/body is attempted.
+        if (observed.kind === "MALFORMED") {
+          throw new Error(
+            `issue on page ${page} carries a malformed materialisation marker (${observed.detail}); ` +
+              "external-effect state is inconclusive",
+          );
+        }
+        if (observed.kind === "ABSENT" || observed.marker.op_key !== op_key) continue;
         if (typeof record["number"] !== "number") {
           throw new Error(`op-marked issue on page ${page} has no number`);
         }
         matches.push({
           number: record["number"],
-          marker,
+          marker: observed.marker,
           html_url: typeof record["html_url"] === "string" ? record["html_url"] : null,
         });
       }

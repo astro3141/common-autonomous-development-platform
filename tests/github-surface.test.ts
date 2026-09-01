@@ -205,6 +205,84 @@ test("GH70-3: an ambiguous create response leaves the INTENT reconcilable — no
   });
 });
 
+test("GH70-7: a malformed materialisation marker is inconclusive evidence — UNKNOWN, never absence", () => {
+  const { transport, issues } = issueBackedTransport();
+  const materializer = new GitHubIssuesChildMaterializer(transport, CONFIG);
+
+  // 1. Materialize the exact op successfully.
+  const committed = materializer.materialize_child(materializeRequest());
+  assert.equal(transport.posts(/\/issues$/u).length, 1);
+
+  // 2. Corrupt its correlation marker beneath the adapter: the frame survives, the payload no
+  //    longer permits trustworthy op-key discrimination.
+  const created = issues[0]!;
+  const pristineBody = String(created["body"]);
+  created["body"] = pristineBody.replace(
+    /adp:materialization:v1 b64:[A-Za-z0-9+/=]+/u,
+    "adp:materialization:v1 b64:%%%corrupt%%%",
+  );
+  assert.notEqual(created["body"], pristineBody, "the corruption plant took");
+
+  // 3–5. Reconciling the same op is UNKNOWN — the damaged issue may be exactly this op's child,
+  //      so a complete enumeration that sees it proves nothing. Never NO_EFFECT_CONFIRMED.
+  const reconciled = materializer.reconcile_child_materialization(materializeRequest().op_key);
+  assert.deepEqual(reconciled, { status: "UNKNOWN" });
+  assert.notEqual(reconciled.status, "NO_EFFECT_CONFIRMED");
+
+  // 6. The normal D24 retry path stays shut: only NO_EFFECT_CONFIRMED authorizes a same-op
+  //    retry, and even a direct publish call refuses to create over the unprovable state.
+  assert.throws(
+    () => materializer.materialize_child(materializeRequest()),
+    (error: unknown) => !(error instanceof MaterializationFailedError),
+    "an inconclusive scan is a retryable throw, never a definitive no-effect",
+  );
+  assert.equal(transport.posts(/\/issues$/u).length, 1, "no second POST / child creation");
+
+  // A decodable-but-not-JSON payload is the same inconclusive fact.
+  created["body"] = pristineBody.replace(
+    /adp:materialization:v1 b64:[A-Za-z0-9+/=]+/u,
+    `adp:materialization:v1 b64:${Buffer.from("not json at all").toString("base64")}`,
+  );
+  assert.deepEqual(materializer.reconcile_child_materialization(materializeRequest().op_key), {
+    status: "UNKNOWN",
+  });
+
+  // Restoring the exact marker restores the exact committed correlation.
+  created["body"] = pristineBody;
+  const restored = materializer.reconcile_child_materialization(materializeRequest().op_key);
+  assert.equal(restored.status, "COMMITTED");
+  assert.deepEqual((restored as { receipt: unknown }).receipt, committed.receipt);
+});
+
+test("GH70-8: malformed-marker ambiguity spans the scan; plain and unrelated markers do not block", () => {
+  const { transport, issues } = issueBackedTransport();
+  const materializer = new GitHubIssuesChildMaterializer(transport, CONFIG);
+  materializer.materialize_child(materializeRequest());
+
+  // A plain issue with no materialisation marker does not by itself force UNKNOWN…
+  issues.push({ number: 900, title: "plain", body: "just an ordinary issue", state: "open", updated_at: "t" });
+  // …and a well-formed *unrelated* op marker does not block an exact absence proof.
+  assert.deepEqual(materializer.reconcile_child_materialization("op:batch:1:materialize-child:M9"), {
+    status: "NO_EFFECT_CONFIRMED",
+  });
+
+  // But once any issue carries a malformed materialisation marker, ambiguity cannot be excluded:
+  // even an op with a valid exact marker elsewhere must not be arbitrarily selected.
+  issues.push({
+    number: 901,
+    title: "damaged",
+    body: "<!-- adp:materialization:v1 b64:@@@ -->",
+    state: "open",
+    updated_at: "t",
+  });
+  assert.deepEqual(materializer.reconcile_child_materialization(materializeRequest().op_key), {
+    status: "UNKNOWN",
+  });
+  assert.deepEqual(materializer.reconcile_child_materialization("op:batch:1:materialize-child:M9"), {
+    status: "UNKNOWN",
+  });
+});
+
 test("GH70-4: a duplicate op correlation is ambiguity (UNKNOWN), never a resolvable identity", () => {
   const { transport, issues } = issueBackedTransport();
   const materializer = new GitHubIssuesChildMaterializer(transport, CONFIG);

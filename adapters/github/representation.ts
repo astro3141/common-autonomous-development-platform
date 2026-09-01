@@ -61,27 +61,62 @@ export function parseDefinitionMarker(issueBody: string): TaskDefinitionBodyV1 |
   return normalizeTaskDefinitionBody(payload, "/github-issue/definition-marker") as TaskDefinitionBodyV1;
 }
 
-/** The D24 correlation marker, if present and well-formed; `null` otherwise. */
-export function parseMaterializationMarker(issueBody: string): MaterializationMarkerV1 | null {
+/**
+ * The three-state D24 correlation-marker observation (review finding: BLOCKING_EXTERNAL_EFFECT).
+ *
+ * `ABSENT` and `MALFORMED` are different external-effect facts and must never collapse: a body
+ * with no materialisation frame at all is ordinary non-correlation, while a body that *carries*
+ * the `adp:materialization:v1` frame but cannot be decoded to a trustworthy
+ * {op_key, materialization_id, materialization_hash} is **inconclusive external-effect
+ * evidence** — such an issue may be exactly the child a D24 op created. Callers proving absence
+ * must therefore treat `MALFORMED` as fail-closed (UNKNOWN), and no fuzzy recovery of op
+ * identity from titles, bodies or damaged payloads is ever attempted.
+ */
+export type MaterializationMarkerObservation =
+  | { readonly kind: "ABSENT" }
+  | { readonly kind: "VALID"; readonly marker: MaterializationMarkerV1 }
+  | { readonly kind: "MALFORMED"; readonly detail: string };
+
+export function inspectMaterializationMarker(issueBody: string): MaterializationMarkerObservation {
+  // Frame detection is deliberately broader than the strict parse: any occurrence of the marker
+  // name means a correlation marker was written here, however damaged its framing now is.
+  if (!issueBody.includes(MATERIALIZATION_MARKER)) return { kind: "ABSENT" };
   let payload: unknown;
   try {
     payload = readMarker(issueBody, MATERIALIZATION_MARKER);
-  } catch {
-    return null; // a mangled correlation marker is an inconclusive correlation, not a crash
+  } catch (error) {
+    return {
+      kind: "MALFORMED",
+      detail: `marker payload cannot be decoded: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (payload === null) {
+    return { kind: "MALFORMED", detail: "marker frame is present but not readable" };
+  }
+  if (typeof payload !== "object" || Array.isArray(payload)) {
+    return { kind: "MALFORMED", detail: "marker payload is not an object" };
+  }
   const record = payload as Record<string, unknown>;
   const op_key = record["op_key"];
   const materialization_id = record["materialization_id"];
   const materialization_hash = record["materialization_hash"];
   if (
     typeof op_key !== "string" ||
+    op_key.length === 0 ||
     typeof materialization_id !== "string" ||
-    typeof materialization_hash !== "string"
+    materialization_id.length === 0 ||
+    typeof materialization_hash !== "string" ||
+    materialization_hash.length === 0
   ) {
-    return null;
+    return { kind: "MALFORMED", detail: "marker payload misses a required identity field" };
   }
-  return { op_key, materialization_id, materialization_hash };
+  return { kind: "VALID", marker: { op_key, materialization_id, materialization_hash } };
+}
+
+/** The valid D24 correlation marker, or `null`. Never used to prove absence — see the tri-state. */
+export function parseMaterializationMarker(issueBody: string): MaterializationMarkerV1 | null {
+  const observed = inspectMaterializationMarker(issueBody);
+  return observed.kind === "VALID" ? observed.marker : null;
 }
 
 /** §8.1a derivation for a plain hand-written issue: title/body verbatim, empty arrays. */
