@@ -1544,7 +1544,7 @@ materialize_child(request: ChildTaskMaterializationRequestV1)
   -> { status: COMMITTED, receipt: ChildTaskMaterializationReceiptV1 }
 
 reconcile_child_materialization(op_key)
-  -> NOT_FOUND | COMMITTED(receipt) | UNKNOWN
+  -> NO_EFFECT_CONFIRMED | COMMITTED(receipt) | UNKNOWN
 ```
 
 ```text
@@ -1566,6 +1566,12 @@ ChildTaskMaterializationReceiptV1 {
 exact field set이며 unknown field는 reject다. `external_task_ref`를 request/Model이 공급하지 않는다.
 adapter는 같은 `op_key + materialization_hash`에 항상 같은 committed external ref를 반환하거나 exact
 COMMITTED receipt를 reconcile해야 한다. 같은 op_key에 다른 hash/request는 fail-closed conflict다.
+
+`NO_EFFECT_CONFIRMED`는 ordinary lookup miss가 아니라 **그 op_key의 external effect가 존재하지 않는다는
+target-authoritative proof**다. transient 404/empty result, eventual-consistency visibility delay, unavailable
+read, 또는 op_key를 external identity와 확정적으로 correlate할 수 없는 경우는 반드시 `UNKNOWN`이며
+`NO_EFFECT_CONFIRMED`로 반환하면 안 된다. 오직 `NO_EFFECT_CONFIRMED`만 same-op retry를 허용하고,
+`UNKNOWN`은 새 materialization id와 same-op retry 모두 금지한다(§21/§22).
 
 mutation reach는 **configured source에 새 task representation 하나 생성**으로 한정한다. existing task
 update/upsert/delete, issue close/label mutation, dependency graph rewrite, Project Profile/Platform lifecycle,
@@ -1976,8 +1982,8 @@ ordinary external/pre-existing task는 binding이 null인 것이 정상이다.
 `batch_policy.max_tasks`를 넘는 snapshot/INTENT조차 만들지 않는다. 여러 child는 여러 exact Proposal이며
 graph/priority/scheduler inference가 없다.
 
-**Failure.** validation/Human Gate 전에는 side effect 0. adapter가 definitive NOT_FOUND/no-effect를
-authoritative하게 증명한 실패만 idempotency FAILED로 끝내고 reservation을 해제할 수 있으며, parent는
+**Failure.** validation/Human Gate 전에는 side effect 0. adapter가 `NO_EFFECT_CONFIRMED`로 definitive
+no-effect를 authoritative하게 증명한 실패만 idempotency FAILED로 끝내고 reservation을 해제할 수 있으며, parent는
 `HELD(TASK_MATERIALIZATION_FAILED)`로 전이해 whole intent 실행이 child 필요성을 조용히 무시하지 않게 한다. COMMITTED 뒤
 TaskSource visibility 지연은 DONE receipt를 보존한 채 같은 ref를 재관측한다. exact body mismatch,
 duplicate/conflicting ref, unreadable snapshot/source는 task row를 만들지 않고 batch를 기존
@@ -2269,6 +2275,9 @@ V5는 **Execution Policy와 effective classification disposition이 이 Proposal
 
 - **`allow_auto_subflow=false`를 human gate 하나로 우회하지 않는다** — Execution Policy를 사람 approval로
   암묵 override하는 경로를 만들지 않는다.
+- `effective.policy.allow_auto_subflow=true`는 (a) F child materialisation external effect와 (b) 이후 E
+  `START_SUBFLOW` admission을 **각각** authorize한다. 둘은 별도 Proposal occurrence이므로 F authorization/
+  Human Gate resolution은 E authorization/Human Gate resolution을 내포하거나 재사용하지 않는다.
 - F가 classification을 미리 선택하지 않는 것은 policy bypass가 아니다. external child를 exact하게
   re-observe한 뒤 E가 새 Proposal로 classification/disposition/profile을 선택·검증하며, F acceptance를 E
   acceptance로 재사용하지 않는다.
@@ -2480,16 +2489,38 @@ ChildMaterializationCapabilityViewV1 =
   | { available: true, task_source_id, materializer_adapter }
 
 ChildMaterializationBatchViewV1 {
-  admitted_task_count
-  unadmitted_materialized_child_count
-  parent_admitted
-  admission_closed
+  run_status: RUNNING | PAUSED_SAFELY | COMPLETED
+  batch_status: BatchState
+  has_unresolved_unknown_materialization: boolean
+  admitted_task_count: integer >= 0
+  unadmitted_materialized_child_count: integer >= 0
+  parent_admitted: boolean
+  admission_closed: boolean
 }
 ```
 
 capability view는 batch-bound Compiled Profile v3에서만 만들며 raw adapter installation/config probe를
 authority로 쓰지 않는다. `materializer_adapter`는 diagnostic/reference용 declared id이고 Model 선택값이
 아니다.
+
+F의 local recovery guard는 capability/parent/reservation 판정보다 먼저 적용한다:
+
+```text
+run_status == PAUSED_SAFELY
+OR batch_status == PAUSED_SAFELY
+OR has_unresolved_unknown_materialization == true
+  → POLICY_REJECTED(DECISION_NOT_ALLOWED)
+  → new snapshot / idempotency INTENT / adapter call = 0
+```
+
+`UNKNOWN` reconciliation은 같은 transaction에서 batch `PAUSED_SAFELY` transition과
+`decision_log(kind=materialization_reconcile_unknown, ref_key=<op_key>)`를 기록한다. 별도 status/table은
+추가하지 않는다. `has_unresolved_unknown_materialization`은 같은 batch snapshot의 idempotency가 아직
+`INTENT`이고 그 op_key의 위 decision log가 존재할 때만 true다. raw adapter absence나 Model 진술로 false로
+만들지 않는다. 따라서 pause가 Human/recovery 오류로 먼저 해제되더라도 unresolved `UNKNOWN` 하나가 있는 동안
+새 F identity/INTENT를 만들 수 없다. read-only reconcile은 계속 허용하며, authoritative
+`NO_EFFECT_CONFIRMED` 또는 `COMMITTED` 처리로 INTENT가 terminal idempotency state를 얻은 뒤에만 이 guard가
+해소된다.
 
 F parent rule:
 
@@ -5429,6 +5460,13 @@ tables                     unchanged
 restart 뒤 재구성해야 하므로 별도 additive migration으로 정확히 한 immutable table과 task column 하나를
 추가한다:
 
+existing `decision_log`는 transition/provenance 기록이지 complete child body와 parent/profile/source-bound
+external request의 recovery authority가 아니고, `idempotency` INTENT에는 operation state만 있어 receipt 전
+crash에서 exact request semantics를 복원할 수 없다. content-addressed `blob`만으로도 bytes는 보존할 수 있지만
+materialization/batch/parent identity와 reservation/reconciliation lookup을 제공하지 않으므로 log scan이나
+raw Model output에서 authority를 재구성하게 된다. 아래 immutable row는 그 typed association/index이며,
+status/retry authority는 계속 existing idempotency record가 소유하므로 parallel state machine이 아니다.
+
 ```text
 child_materialization_snapshot                                  # immutable
   materialization_id  TEXT PK       # accepted Proposal.proposal_id ULID
@@ -6395,9 +6433,10 @@ incoming transition을 갖지 않는다.** 기존 failure/safety taxonomy(§24)�
   CM1 snapshot/INTENT 전 crash             external effect 0
   CM2 INTENT durable, adapter 호출 전       same-op 호출 허용
   CM3 external create, receipt persist 전    reconcile_child_materialization(same op_key)
-      NOT_FOUND                             same-op 호출 허용
+      NO_EFFECT_CONFIRMED                    same-op 호출 허용
       COMMITTED(exact receipt)              DONE 승격, duplicate 0
-      UNKNOWN                               blind retry 금지, batch PAUSED_SAFELY/recovery
+      UNKNOWN                               blind retry 금지; batch PAUSED_SAFELY +
+                                            decision_log(materialization_reconcile_unknown) atomic commit
   CM4 DONE, TaskSource round-trip 전 crash   stored exact ref로 fresh read 재개
   CM5 round-trip/task binding committed      두 번째 create/read-materialization 없음
   ```
@@ -6523,9 +6562,10 @@ Model conversation → authority 없음 (항상)
 ```text
 startup → active run/batch/attempt 로드
 → unfinished child materialisation 처리 (#59): immutable snapshot마다 stable op_key를 재구성하고
-    idempotency INTENT/DONE/FAILED를 §21 CM1–CM5로 판정한다. INTENT는 adapter reconcile이 NOT_FOUND를
-    authoritative하게 증명할 때만 same-op 재호출, COMMITTED면 exact receipt로 DONE 승격, UNKNOWN이면
-    duplicate를 만들지 않고 batch PAUSED_SAFELY. DONE인데 task binding이 없으면 stored external ref로
+    idempotency INTENT/DONE/FAILED를 §21 CM1–CM5로 판정한다. INTENT는 adapter reconcile이
+    NO_EFFECT_CONFIRMED를 authoritative하게 증명할 때만 same-op 재호출, COMMITTED면 exact receipt로 DONE 승격,
+    UNKNOWN이면 duplicate를 만들지 않고 batch PAUSED_SAFELY + 같은 op_key의
+    `materialization_reconcile_unknown` decision log를 atomic commit한다. DONE인데 task binding이 없으면 stored external ref로
     같은 TaskSource fresh round-trip을 다시 수행한다. exact body/hash면 DISCOVERED row+binding을 commit하고,
     mismatch/collision/unreadable source면 parent state를 바꾸지 않은 채 PAUSED_SAFELY. FAILED definitive
     no-effect snapshot만 reservation에서 제외한다.
@@ -7110,7 +7150,10 @@ D24 (v1.5 Issue #59 Human-authorized Spec/TD amendment) Supervisor는 F START_SU
     OBSERVED child만 existing E/D22 admission path로 들어가며 F는 admission/suspension/Task Contract authority가
     아니다. child external identity는 adapter, 이후 definition은 TaskSource, executable relation은 §19.5
     transaction이 소유한다. one immutable table + task binding column은 prospective MVP3 additive state이며
-    MVP0/1 seal 비소급. #7 C-03 미채택; dynamic pipeline/workflow/model topology 및 generic planner/graph/DSL 없음.
+    MVP0/1 seal 비소급. `allow_auto_subflow`는 F effect/E admission을 각각 authorize하며, reconcile의
+    NO_EFFECT_CONFIRMED는 authoritative no-effect proof만 뜻하고 transient absence는 UNKNOWN이다. paused/UNKNOWN
+    batch에서는 새 F INTENT가 불가능하다. #7 C-03 미채택; dynamic pipeline/workflow/model topology 및 generic
+    planner/graph/DSL 없음.
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
