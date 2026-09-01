@@ -27,8 +27,10 @@ import type { RuntimeAdapter, RuntimePreflight } from "../../adapters/interfaces
 import type { CapabilityGrantV1Body } from "../capability/types.ts";
 import { validateEnforcementReceipt } from "../capability/receipt.ts";
 import { validateManifestSet, type ManifestSetInput } from "../capability/manifest-set.ts";
+import { SUPERVISOR_PROPOSAL_ALLOCATION_KIND } from "../decision/decision-log.ts";
 import type { CanonicalObject, CanonicalValue } from "../schemas/canonical-json.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
+import type { SupervisorDecisionContextV1 } from "./supervisor-decision-context.ts";
 import { ExecutionStartError, RUNTIME_ADAPTER } from "./start-implementation.ts";
 import {
   supervisorSpawnOp,
@@ -50,8 +52,12 @@ export interface SupervisorAuthorities {
 export interface SupervisorRequestCommand {
   readonly run_id: string;
   readonly batch_id: string;
-  /** The Platform-owned read model this request is about. Never adapter-native metadata. */
-  readonly decision_context: CanonicalObject;
+  /**
+   * D23 — the exact §13.4 model-facing projection for this turn, assembled by the caller from
+   * authoritative reads *before* this request. Never adapter-native metadata, never a second
+   * authority. `decision_context.proposal_id` is the pre-turn Platform allocation.
+   */
+  readonly decision_context: SupervisorDecisionContextV1;
   /** How the Supervisor is asked to run. Resolved by the caller from durable authority. */
   readonly runtime_profile: RuntimeProfile;
 }
@@ -92,6 +98,18 @@ export function requestSupervisorProposal(
   const op_key = supervisorTurnOp(command.batch_id, turn);
   store.withTransaction(() => {
     store.idempotency.beginIntent(op_key);
+    // D23 — the turn's proposal_id allocation is durable with the turn's own write-ahead INTENT,
+    // so a restart correlates the active allocation from durable state alone. Never re-allocated
+    // or replaced after model output.
+    store.decisions.append({
+      kind: SUPERVISOR_PROPOSAL_ALLOCATION_KIND,
+      refKey: command.batch_id,
+      payload: {
+        batch_id: command.batch_id,
+        turn,
+        proposal_id: command.decision_context.proposal_id,
+      } as never,
+    });
   });
 
   let handle: RuntimeTurnHandle;
@@ -255,6 +273,8 @@ function supervisorInstruction(command: SupervisorRequestCommand): string {
     `Review the current state of ${command.batch_id} and propose the next decision.`,
     JSON.stringify(command.decision_context),
     "Submit exactly one Proposal through the Platform API, naming this run and batch.",
+    "Echo proposal_id unchanged; select semantic fields only from the declared compiled_profile",
+    "choices; bind expected.* to the exact freshness basis shown in this context.",
     "Your reply in this turn is not a decision: only a submitted Proposal is acted on.",
   ].join("\n");
 }

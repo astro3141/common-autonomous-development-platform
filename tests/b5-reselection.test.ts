@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { activateSelectedTask } from "../core/admission/activate-task.ts";
 import { resolveHumanGateAndAdmit, submitProposal } from "../core/admission/submit-proposal.ts";
@@ -47,14 +48,18 @@ const submit = (
   overrides: Record<string, unknown> = {},
   observed_at = OBSERVED_AT,
 ) =>
-  submitProposal(authorities, {
-    run_id: RUN_ID,
-    batch_id: BATCH_ID,
-    proposal: { ...selection({ profile: world.profile }), ...overrides },
-    observed_at,
-    decision_id: DECISION_ID,
-    report_channel: REPORT_CHANNEL,
-  });
+  {
+    const proposal = { ...selection({ profile: world.profile }), ...overrides };
+    seedAllocationForProposal(world.store, BATCH_ID, proposal);
+    return submitProposal(authorities, {
+      run_id: RUN_ID,
+      batch_id: BATCH_ID,
+      proposal,
+      observed_at,
+      decision_id: DECISION_ID,
+      report_channel: REPORT_CHANNEL,
+    });
+  }
 
 /** Drives a task all the way to `HELD(SELECTION_STALE)` through a real activation. */
 const stale = (world: DomainWorld): AdmissionWorld => {
@@ -108,6 +113,7 @@ test("B5-R2: another HELD reason is not a reselection escape hatch", () => {
     const authorities = authoritiesFor(world);
     assert.equal(world.store.tasks.require(held).state_reason?.code, "RECOVERY_CONFLICT");
 
+    seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile }));
     assert.throws(
       () =>
         submitProposal(authorities, {

@@ -46,6 +46,7 @@ import {
   type SelectionAdmissionKind,
   type SelectionProposalV1,
   type SubflowChildContextV1,
+  type SupervisorProposalIdentityView,
   type SubflowParentValidationView,
   type TaskBearingProposalV1,
   type TaskLookupView,
@@ -71,6 +72,12 @@ export interface DecisionValidationInput {
    * is still re-judged.
    */
   readonly admission_kind?: SelectionAdmissionKind;
+  /**
+   * D23 — the active turn's Platform allocation. V1 requires the Proposal's `proposal_id` to be
+   * this exact value; a missing view means no active turn context exists and every Proposal is
+   * rejected at `/proposal_id`.
+   */
+  readonly proposal_identity?: SupervisorProposalIdentityView;
   /** §9.2f — required for variant E (V2/V3/V11 P1–P4). Built by the caller from durable owners. */
   readonly subflow_parent?: SubflowParentValidationView;
   /** §9.2f — the child-side durable facts P1/P3/P4 compare against. Required for variant E. */
@@ -115,6 +122,16 @@ function runValidation(
       return rejected("PROPOSAL_SCHEMA_INVALID");
     }
     throw error;
+  }
+
+  // D23 — active-turn identity binding, still V1 (`/proposal_id`): the id is Platform-assigned
+  // identity, not a semantic choice, and a Proposal no active turn asked for is schema-invalid.
+  // ULID grammar was already enforced by the parser above.
+  if (
+    input.proposal_identity === undefined ||
+    proposal.proposal_id !== input.proposal_identity.proposal_id
+  ) {
+    return rejected("PROPOSAL_SCHEMA_INVALID");
   }
 
   const project = input.compiled_profile.effective.project;

@@ -17,6 +17,7 @@
  */
 
 import { validateManifestSet, type ManifestSetInput } from "../capability/manifest-set.ts";
+import { activeSupervisorProposalAllocation } from "../decision/decision-log.ts";
 import { validateProposal } from "../decision/proposal.ts";
 import { DecisionError } from "../decision/errors.ts";
 import type { DecisionValidationInput } from "../decision/validator.ts";
@@ -148,12 +149,19 @@ export function assembleDecisionInput(
     : null;
   const admission_kind = admissionKindFor(durable_task);
 
+  // D23 — the active turn's durable Platform allocation. Absent → V1 rejects at /proposal_id:
+  // a Proposal that no active Supervisor turn asked for is not repaired into acceptance.
+  const allocation = activeSupervisorProposalAllocation(store.decisions, batch.batch_id);
+
   const input: DecisionValidationInput = {
     proposal: context.proposal,
     compiled_profile,
     compiled_profile_hash,
     manifests,
     admission_kind,
+    ...(allocation === undefined
+      ? {}
+      : { proposal_identity: { proposal_id: allocation.proposal_id } }),
     ...(task === undefined ? {} : { task }),
     ...(canonical_head === null ? {} : { repository: { canonical_head } }),
     ...(proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"

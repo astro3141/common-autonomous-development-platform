@@ -19,6 +19,40 @@ import type { DecisionValidationResult } from "./types.ts";
 
 export const DECISION_VALIDATION_LOG_KIND = "decision_validation";
 
+/**
+ * D23 — the durable record of one Supervisor turn's pre-turn `proposal_id` allocation. Written in
+ * the same transaction as the turn operation's write-ahead INTENT (§13.4), so a restart can
+ * correlate the active turn's allocation from durable state alone. This is journal provenance on
+ * the existing `decision_log` — not a proposal store, snapshot table or identity registry.
+ */
+export const SUPERVISOR_PROPOSAL_ALLOCATION_KIND = "supervisor_proposal_allocation";
+
+export interface SupervisorProposalAllocation {
+  readonly batch_id: string;
+  readonly turn: number;
+  readonly proposal_id: string;
+}
+
+/**
+ * The active turn's Platform allocation for a batch: the most recently journaled allocation.
+ * `undefined` means no Supervisor turn context is active — V1 then rejects any Proposal
+ * (`PROPOSAL_SCHEMA_INVALID` at `/proposal_id`), which is D23's fail-closed answer to a Proposal
+ * that no active turn asked for. No replacement id is ever fabricated around a returned output.
+ */
+export function activeSupervisorProposalAllocation(
+  log: { read(): readonly DecisionLogEntry[] },
+  batch_id: string,
+): SupervisorProposalAllocation | undefined {
+  let latest: SupervisorProposalAllocation | undefined;
+  for (const entry of log.read()) {
+    if (entry.kind !== SUPERVISOR_PROPOSAL_ALLOCATION_KIND) continue;
+    const payload = entry.payload as unknown as SupervisorProposalAllocation;
+    if (payload.batch_id !== batch_id) continue;
+    if (latest === undefined || payload.turn >= latest.turn) latest = payload;
+  }
+  return latest;
+}
+
 /** The Batch 2 journal, narrowed to the one operation this seam needs. */
 export interface DecisionLogAppender {
   append(entry: DecisionLogAppend): DecisionLogEntry;

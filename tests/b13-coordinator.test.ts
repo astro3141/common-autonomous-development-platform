@@ -104,7 +104,7 @@ test("S1 / S5 / S6: a usable session is reused, and the ordinal comes from durab
     const again = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(again, { kind: "REQUESTED", turn: 2, spawned: false });
@@ -161,7 +161,7 @@ test("S8: an indeterminate Supervisor turn is never resent", () => {
     const outcome = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(outcome, { kind: "INDETERMINATE", turn: 1 });
@@ -174,7 +174,7 @@ test("S8: an indeterminate Supervisor turn is never resent", () => {
     const again = requestSupervisorProposal(w, {
       run_id: RUN_ID,
       batch_id: BATCH_ID,
-      decision_context: {} as never,
+      decision_context: { proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0PID" } as never,
       runtime_profile: w.identities.supervisorRuntimeProfile,
     });
     assert.deepEqual(again, { kind: "INDETERMINATE", turn: 1 });

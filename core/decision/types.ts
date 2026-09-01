@@ -241,6 +241,15 @@ export type SubflowParentValidationView =
       readonly has_recovery_conflict: boolean;
     };
 
+/**
+ * D23 — the active §13.4 turn's Platform `proposal_id` allocation. Ordinary submission sources it
+ * from the active `SupervisorDecisionContextV1`; §17.3 post-gate revalidation reconstructs it from
+ * the terminal record's bound `gate_proposal.proposal_id` without allocating a new id.
+ */
+export interface SupervisorProposalIdentityView {
+  readonly proposal_id: string;
+}
+
 /** §9.2f P1/P3/P4 — the child-side durable facts the parent checks compare against. */
 export interface SubflowChildContextV1 {
   readonly task_key: string;

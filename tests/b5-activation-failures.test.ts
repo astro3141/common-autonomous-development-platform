@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { activateSelectedTask } from "../core/admission/activate-task.ts";
 import { submitProposal } from "../core/admission/submit-proposal.ts";
@@ -65,6 +66,7 @@ const selected = (
 ): AdmissionWorld => {
   discover(domain);
   const authorities = authoritiesFor(domain, overrides);
+  seedAllocationForProposal(domain.store, BATCH_ID, selection({ profile: domain.profile }));
   const result = submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,

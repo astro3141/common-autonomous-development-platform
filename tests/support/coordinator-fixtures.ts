@@ -22,6 +22,11 @@ import {
   type TickStep,
 } from "../../core/coordinator/production-coordinator.ts";
 import { submitProposal } from "../../core/admission/submit-proposal.ts";
+import type { PlatformStore } from "../../core/store/platform-store.ts";
+import {
+  activeSupervisorProposalAllocation,
+  SUPERVISOR_PROPOSAL_ALLOCATION_KIND,
+} from "../../core/decision/decision-log.ts";
 import { actorTurnMetadataKey } from "../../core/execution/actor-operations.ts";
 import { DocumentProfileSource, FileContractSourceReader } from "../../adapters/local-drift-source/index.ts";
 import { FakeReportAdapter } from "../../testdoubles/fake-report-adapter.ts";
@@ -29,7 +34,7 @@ import { FakeVerificationAdapter } from "../../testdoubles/fake-verification-ada
 import type { CanonicalObject } from "../../core/schemas/canonical-json.ts";
 import type { ContractSourceInput } from "../../core/contract/types.ts";
 import { manifestSetInput, StubTaskSource } from "./admission-fixtures.ts";
-import { HEAD, selection } from "./decision-fixtures.ts";
+import { HEAD, PROPOSAL_ID, selection } from "./decision-fixtures.ts";
 import { BATCH_ID, discover, RUN_ID, TASK_KEY, type DomainWorld } from "./domain-fixtures.ts";
 import {
   CurrentSources,
@@ -152,10 +157,45 @@ export function coordinatorWorld(
 }
 
 /**
+ * D23 — the platform's pre-turn `proposal_id` allocation, as the test-side platform caller. Where
+ * a real Supervisor turn already allocated one, a fixture Proposal that uses its own id gets a
+ * newer allocation seeded so the submission still binds to "the active turn".
+ */
+export function seedProposalAllocation(
+  store: PlatformStore,
+  batch_id: string,
+  proposal_id: string,
+): void {
+  const active = activeSupervisorProposalAllocation(store.decisions, batch_id);
+  if (active?.proposal_id === proposal_id) return;
+  store.decisions.append({
+    kind: SUPERVISOR_PROPOSAL_ALLOCATION_KIND,
+    refKey: batch_id,
+    payload: { batch_id, turn: (active?.turn ?? 0) + 1, proposal_id } as never,
+  });
+}
+
+/** Seeds the allocation for whatever id the fixture Proposal carries (test-side platform caller). */
+export function seedAllocationForProposal(
+  store: PlatformStore,
+  batch_id: string,
+  proposal: unknown,
+): void {
+  const id = (proposal as { proposal_id?: unknown } | null)?.proposal_id;
+  seedProposalAllocation(store, batch_id, typeof id === "string" && id.length > 0 ? id : PROPOSAL_ID);
+}
+
+/** The active turn's Platform-allocated proposal_id, read back from durable state (D23). */
+export function activeProposalId(store: PlatformStore, batch_id: string): string | undefined {
+  return activeSupervisorProposalAllocation(store.decisions, batch_id)?.proposal_id;
+}
+
+/**
  * The MCP / Platform API ingress: the Supervisor submits a structured Proposal naming this run and
  * batch. This is the *only* thing that can select a task — a Runtime turn body cannot (§13.4).
  */
 export function submitSupervisorProposal(w: CoordinatorWorld, world: DomainWorld): void {
+  seedProposalAllocation(w.store, BATCH_ID, PROPOSAL_ID);
   const submitted = submitProposal(
     {
       store: w.store,

@@ -24,6 +24,7 @@ import { MIGRATIONS, type Migration } from "../core/store/migrations.ts";
 import { PlatformStore } from "../core/store/platform-store.ts";
 import { tempStore } from "./support/temp-store.ts";
 import {
+  PROPOSAL_ID,
   batchView,
   compiled,
   executionPolicy,
@@ -274,6 +275,7 @@ test("B5-D4 / B5-D5: V6 validates the scope reference against the compiled profi
     proposal: selection({ profile, repository_scope_id }),
     compiled_profile: profile.body,
     compiled_profile_hash: profile.compiled_hash,
+    proposal_identity: { proposal_id: PROPOSAL_ID },
     task: found(),
     repository: { canonical_head: HEAD },
     manifests: manifests(),

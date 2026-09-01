@@ -147,6 +147,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // §17.4 (D22) — the RECOVERY_DECISION mapping row re-observes "candidate still not canonical"
     // fresh at application time. A canonical read; the merge primitives stay unreachable.
     "core/execution/apply-resolved-decision.ts",
+    // §13.4 (D23) — the Supervisor decision context carries the fresh canonical head as the
+    // turn's freshness basis. A model-facing projection read; still not merging.
+    "core/execution/supervisor-decision-context.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge

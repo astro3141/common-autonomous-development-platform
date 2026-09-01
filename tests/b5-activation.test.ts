@@ -6,6 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { activateSelectedTask, type ActivationOutcome } from "../core/admission/activate-task.ts";
 import { submitProposal } from "../core/admission/submit-proposal.ts";
@@ -46,13 +47,15 @@ const sources = (text = "spec bytes\n"): ContractSourceInput[] => [
   { path: "SPEC.md", bytes: encoder.encode(text) },
 ];
 
-const admit = (world: DomainWorld, authorities: AdmissionWorld) =>
-  submitProposal(authorities, {
+const admit = (world: DomainWorld, authorities: AdmissionWorld) => {
+  seedAllocationForProposal(world.store, BATCH_ID, selection({ profile: world.profile }));
+  return submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,
     proposal: selection({ profile: world.profile }),
     observed_at: OBSERVED_AT,
   });
+};
 
 const activate = (
   authorities: AdmissionWorld,

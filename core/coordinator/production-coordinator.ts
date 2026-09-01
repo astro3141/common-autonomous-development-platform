@@ -53,6 +53,7 @@ import {
   requestSupervisorProposal,
   supervisorTurnsIssued,
 } from "../execution/supervisor-session.ts";
+import { assembleSupervisorDecisionContext } from "../execution/supervisor-decision-context.ts";
 import { mergeDecisionCause } from "../humandecision/merge-decision.ts";
 import type { ProfileSource } from "../profile/types.ts";
 import { commitBatchFact } from "../statemachine/transition-commit.ts";
@@ -562,10 +563,34 @@ export class ProductionCoordinator {
         ? undefined
         : project.roles[project.supervisor_profile]?.runtime_profile;
     const configured = this.#deps.identities.supervisorRuntimeProfile;
+
+    // D23 — the proposal_id is allocated before the turn through the existing caller-supplied
+    // ULID seam, and the exact §13.4 context is assembled from fresh authoritative reads. An
+    // assembly failure (unreadable TaskSource, identity mismatch, partial projection) sends no
+    // turn at all — there is no repaired or truncated context.
+    let decision_context;
+    try {
+      decision_context = assembleSupervisorDecisionContext(
+        {
+          store,
+          taskSource: this.#deps.taskSource,
+          repository: this.#deps.repository,
+        },
+        {
+          run_id,
+          batch_id,
+          proposal_id: this.#deps.identities.nextUlid(),
+          observed_at: this.#deps.identities.now(),
+        },
+      );
+    } catch {
+      return "BLOCKED";
+    }
+
     const outcome = requestSupervisorProposal(this.#deps, {
       run_id,
       batch_id,
-      decision_context: this.#decisionContext(batch_id),
+      decision_context,
       runtime_profile: (boundProfile ?? configured) as typeof configured,
     });
     switch (outcome.kind) {
@@ -578,29 +603,6 @@ export class ProductionCoordinator {
     }
   }
 
-  /**
-   * §13.4 — the fresh read model one request is about. Platform-owned projections only: no adapter
-   * handle, no runtime identity, nothing a backend would recognise as its own.
-   */
-  #decisionContext(batch_id: string) {
-    const store = this.#deps.store;
-    const batch = store.batches.require(batch_id);
-    return {
-      batch_id,
-      compiled_profile_hash: batch.compiled_profile_hash,
-      candidates: store.tasks
-        .inBatch(batch_id)
-        .filter((task) => task.platform_state === "DISCOVERED")
-        .map((task) => ({
-          task_ref: task.external_task_ref,
-          external_state: task.external_snapshot.external_state,
-          version: task.external_snapshot.version,
-        })),
-      open_decisions: store.pendingDecisions
-        .openFor(batch_id)
-        .map((record) => record.body.category),
-    } as never;
-  }
 
   /** Maps a use-case outcome onto a tick step without interpreting it as lifecycle authority. */
   #step<Outcome extends { kind: string }>(
