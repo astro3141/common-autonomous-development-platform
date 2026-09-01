@@ -31,10 +31,13 @@ function interfaceMethods(source: string, name: string): string[] {
   return [...body.matchAll(/^\s{2}([a-z_][a-z0-9_]*)\s*\(/gim)].map((match) => match[1] as string);
 }
 
-test("B3-AC1: exactly five adapter interfaces exist", () => {
+test("B3-AC1: the five sealed adapter interfaces plus the D24 materialisation contract exist", () => {
   const files = readdirSync(INTERFACES).filter((name) => name.endsWith(".ts")).sort();
   assert.deepEqual(files, [
     "capability.ts",
+    // §8.1b (D24, prospective MVP 3) — the one bounded child-creation mutation contract; the
+    // five MVP 0 adapter interfaces stay sealed and unchanged.
+    "child-materialization-adapter.ts",
     "handles.ts",
     "index.ts",
     "report-adapter.ts",

@@ -76,12 +76,13 @@ export interface DomainWorld {
 /** A store with a persisted Compiled Profile, one run and one batch. */
 export function world(
   policyOverrides: Record<string, unknown> = {},
-  options: { readonly now?: () => string } = {},
+  options: { readonly now?: () => string; readonly projectOverrides?: Record<string, unknown> } = {},
 ): DomainWorld {
   const temp = tempStore();
   const store = temp.open(options.now === undefined ? {} : { now: options.now });
-  const inputs = { project: projectProfile(), policy: executionPolicy(policyOverrides) };
-  const profile = compiled(policyOverrides);
+  const projectOverrides = options.projectOverrides ?? {};
+  const inputs = { project: projectProfile(projectOverrides), policy: executionPolicy(policyOverrides) };
+  const profile = compiled(policyOverrides, projectOverrides);
 
   store.withTransaction(() => {
     store.compiledProfiles.put(profile);
@@ -113,7 +114,7 @@ export function world(
 export const withWorld = <T>(
   run: (world: DomainWorld) => T,
   policyOverrides: Record<string, unknown> = {},
-  options: { readonly now?: () => string } = {},
+  options: { readonly now?: () => string; readonly projectOverrides?: Record<string, unknown> } = {},
 ): T => {
   const created = world(policyOverrides, options);
   try {

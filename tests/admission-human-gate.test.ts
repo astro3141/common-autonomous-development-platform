@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { resolveHumanGateAndAdmit, submitProposal } from "../core/admission/submit-proposal.ts";
 import { DECISION_VALIDATION_LOG_KIND } from "../core/decision/decision-log.ts";
@@ -36,15 +37,18 @@ const RESOLVED_AT = "2026-08-11T15:00:00Z";
 const gated = (world: DomainWorld) =>
   selection({ profile: world.profile, classification: "LARGE_SCOPE" });
 
-const submitGated = (world: DomainWorld, authorities: AdmissionWorld, proposal?: unknown) =>
-  submitProposal(authorities, {
+const submitGated = (world: DomainWorld, authorities: AdmissionWorld, proposal?: unknown) => {
+  const body = proposal ?? gated(world);
+  seedAllocationForProposal(world.store, BATCH_ID, body);
+  return submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,
-    proposal: proposal ?? gated(world),
+    proposal: body,
     observed_at: OBSERVED_AT,
     decision_id: DECISION_ID,
     report_channel: REPORT_CHANNEL,
   });
+};
 
 const approve = (world: DomainWorld): void => {
   const resolution: PendingDecisionResolution = {

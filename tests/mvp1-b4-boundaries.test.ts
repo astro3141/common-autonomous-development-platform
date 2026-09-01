@@ -245,6 +245,7 @@ test("M1B4-AC41 ~ AC44: the schema and the B1/B2/B3 surfaces are untouched", () 
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
       { version: 8, name: "subflow-succeeded" },
+      { version: 9, name: "child-materialization" },
     ],
   );
   assert.deepEqual(
@@ -268,7 +269,7 @@ test("M1B4-AC41 ~ AC44: the schema and the B1/B2/B3 surfaces are untouched", () 
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of ["current_batch", "decision_event", "fact_cache", "task_dependency"]) {
         assert.equal(names.includes(forbidden), false);
       }

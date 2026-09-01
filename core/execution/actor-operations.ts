@@ -29,6 +29,10 @@ export const actorTurnOp = (attemptKey: string, n: number): string =>
 /** TD §18.1c — the durable turn projection, per turn for the same reason. */
 export const actorTurnMetadataKey = (n: number): string => `actor_turn:${n}`;
 
+/** §19.3c (D25) — the prefixes a provenance *enumeration* scans; same grammar as above. */
+export const actorTurnOpPrefix = (attemptKey: string): string => `op:${attemptKey}:actor-turn:`;
+export const ACTOR_TURN_METADATA_PREFIX = "actor_turn:";
+
 /**
  * The turn ordinal for an attempt whose `REWORK_STARTED` has **already committed**. Called with
  * the pre-transition count it would be off by one, which is exactly the mistake this function

@@ -644,11 +644,11 @@ test("B11-47 / B11-49 / B11-50: Core settles through the adapter and invents no 
 });
 
 test("B11-48 / B11-51: no backend identifier and no schema change", () => {
-  assert.equal(MIGRATIONS.length, 8);
+  assert.equal(MIGRATIONS.length, 9);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
   }
@@ -662,7 +662,7 @@ test("B11-48 / B11-51: no backend identifier and no schema change", () => {
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of ["audit_cycle", "audit_attempt", "invalid_audit_record"]) {
         assert.equal(names.includes(forbidden), false, forbidden);
       }

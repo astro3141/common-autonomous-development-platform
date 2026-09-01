@@ -17,12 +17,17 @@
  */
 
 import { validateManifestSet, type ManifestSetInput } from "../capability/manifest-set.ts";
+import { activeSupervisorProposalAllocation } from "../decision/decision-log.ts";
 import { validateProposal } from "../decision/proposal.ts";
 import { DecisionError } from "../decision/errors.ts";
 import type { DecisionValidationInput } from "../decision/validator.ts";
 import type {
+  ChildMaterializationBatchViewV1,
+  ChildMaterializationCapabilityViewV1,
+  ChildMaterializationParentViewV1,
   ProposalV1,
   SelectionAdmissionKind,
+  SubflowChildMaterializationProposalV1,
   SubflowParentValidationView,
   SubflowSelectionProposalV1,
   TaskBearingProposalV1,
@@ -42,6 +47,12 @@ import { normalizeTaskDefinition } from "../tasksource/task-definition.ts";
 import type { TaskDefinition, TaskDependency, TaskSourceV1 } from "../tasksource/types.ts";
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import { AdmissionError } from "./errors.ts";
+import {
+  materializationBatchFacts,
+  materializationReservedSeats,
+  requireExactBindingAuthority,
+} from "../materialization/materialize-child.ts";
+import { pendingWritableSlotView } from "../materialization/writable-slot.ts";
 
 /** The authoritative owners one submission reads from. Every one is an interface, not a class. */
 export interface DecisionAuthorities {
@@ -104,11 +115,19 @@ export function assembleDecisionInput(
   const compiled_profile = store.batchView.compiledProfileFor(batch.batch_id);
   const compiled_profile_hash = batch.compiled_profile_hash;
 
+  // D23 (review 5493739663 R1) — the active ordinary allocation is resolved *before* parsing
+  // untrusted output, so a structurally malformed answer still carries the identity its
+  // validation outcome consumes. One issued turn yields exactly one ordinary outcome.
+  const allocation = activeSupervisorProposalAllocation(store.decisions, batch.batch_id);
+  const proposal_identity =
+    allocation === undefined ? {} : { proposal_identity: { proposal_id: allocation.proposal_id } };
+
   const proposal = parseProposal(context.proposal);
   if (proposal === null) {
-    // Nothing else can be assembled without a task_ref; V1 rejects and the run stops there.
+    // Nothing else can be assembled without a task_ref; V1 rejects and the run stops there —
+    // but the malformed answer was still this turn's answer, so the identity travels with it.
     return {
-      input: { proposal: context.proposal, compiled_profile, compiled_profile_hash },
+      input: { proposal: context.proposal, compiled_profile, compiled_profile_hash, ...proposal_identity },
       proposal: null,
       run,
       batch,
@@ -148,16 +167,40 @@ export function assembleDecisionInput(
     : null;
   const admission_kind = admissionKindFor(durable_task);
 
+  // Review 5496386527 finding 1 — a selection target carrying a materialisation binding is
+  // checked against the whole exact snapshot↔binding↔task↔receipt chain *before* any validator
+  // input exists; an inexact durable row is a fail-closed assembly failure, never a view.
+  if (
+    (proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION") &&
+    durable_task !== null &&
+    durable_task.materialization_binding !== null
+  ) {
+    requireExactBindingAuthority(store, durable_task);
+  }
+
   const input: DecisionValidationInput = {
     proposal: context.proposal,
     compiled_profile,
     compiled_profile_hash,
     manifests,
     admission_kind,
+    ...proposal_identity,
     ...(task === undefined ? {} : { task }),
     ...(canonical_head === null ? {} : { repository: { canonical_head } }),
     ...(proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"
-      ? { batch: store.batchView.project(batch.batch_id) }
+      ? {
+          batch: store.batchView.project(batch.batch_id),
+          materialization_reservation: {
+            reserved_seats_excluding_target: materializationReservedSeats(
+              store,
+              batch.batch_id,
+              task_key ?? undefined,
+            ),
+          },
+          // D25 — the §19.3c owner-set projection; a projection that cannot be computed exactly
+          // throws here, before the validator ever runs (fail-closed assembly).
+          writable_slot: pendingWritableSlotView(store, batch.batch_id),
+        }
       : {}),
     // §9.2f — the fresh parent/child read-models an E submission carries into V2/V3/V11.
     ...(proposal.variant === "SUBFLOW_SELECTION" && task_key !== null && durable_task !== null
@@ -167,6 +210,43 @@ export function assembleDecisionInput(
             task_key,
             batch_id: durable_task.batch_id,
             has_parent_relation: durable_task.parent_task_key !== null,
+            materialization_binding:
+              durable_task.materialization_binding === null
+                ? null
+                : {
+                    parent_task_key: durable_task.materialization_binding.parent_task_key,
+                    child_definition_hash: durable_task.materialization_binding.child_definition_hash,
+                  },
+          },
+        }
+      : {}),
+    // §9.2g — an A selection over a bound materialised child must be refused; the binding fact
+    // travels with the same child context shape.
+    ...(proposal.variant === "TASK_SELECTION" && task_key !== null && durable_task !== null
+      ? {
+          subflow_child: {
+            task_key,
+            batch_id: durable_task.batch_id,
+            has_parent_relation: durable_task.parent_task_key !== null,
+            materialization_binding:
+              durable_task.materialization_binding === null
+                ? null
+                : {
+                    parent_task_key: durable_task.materialization_binding.parent_task_key,
+                    child_definition_hash: durable_task.materialization_binding.child_definition_hash,
+                  },
+          },
+        }
+      : {}),
+    // §9.2g (D24) — the F read models: fresh parent basis, v3 capability, recovery/reservation.
+    ...(proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION"
+      ? {
+          materialization_parent: materializationParentView(authorities, proposal),
+          materialization_capability: materializationCapability(compiled_profile),
+          materialization_batch: {
+            ...materializationBatchView(store, run, batch.batch_id),
+            parent_admitted:
+              store.tasks.get(proposal.parent.task_key)?.admitted_at != null,
           },
         }
       : {}),
@@ -245,6 +325,104 @@ function subflowParentView(
 }
 
 /**
+ * §9.2g (D24) — the F Proposal's fresh parent view: durable row + current Attempt/Contract from
+ * the Store, and (for a DISCOVERED parent) the fresh normalized TaskSource basis. A missing row
+ * is a real NOT_FOUND; an unreadable source stays an operational failure of the submission.
+ */
+function materializationParentView(
+  authorities: DecisionAuthorities,
+  proposal: SubflowChildMaterializationProposalV1,
+): ChildMaterializationParentViewV1 {
+  const { store } = authorities;
+  const parent = store.tasks.get(proposal.parent.task_key);
+  if (parent === undefined) return { status: "NOT_FOUND" };
+  const attempt = store.attempts.current(parent.task_key);
+
+  // One coherent fresh TaskSource basis for the parent's external identity (D23 discipline).
+  let raw;
+  try {
+    raw = authorities.taskSource.get_task(parent.external_task_ref);
+  } catch (error) {
+    if (error instanceof TaskSourceError && error.reason === "TASK_NOT_FOUND") {
+      return { status: "NOT_FOUND" };
+    }
+    throw error;
+  }
+  const definition = normalizeTaskDefinition(
+    {
+      task_ref: raw.task_ref,
+      version: raw.version,
+      ...(raw.definition_hash === undefined ? {} : { definition_hash: raw.definition_hash }),
+      body: raw.body,
+    },
+    "/materialization_parent",
+  );
+  if (definition.task_ref !== parent.external_task_ref) {
+    throw new AdmissionError(
+      "TASK_IDENTITY_MISMATCH",
+      "/materialization_parent",
+      `the source returned ${definition.task_ref} for ${parent.external_task_ref}`,
+    );
+  }
+
+  return {
+    status: "FOUND",
+    task_key: parent.task_key,
+    batch_id: parent.batch_id,
+    platform_state: parent.platform_state,
+    task_ref: parent.external_task_ref,
+    task_version: definition.version,
+    task_definition_hash: definition.definition_hash,
+    current_attempt_key: attempt?.attempt_key ?? null,
+    current_attempt_state: attempt?.state ?? null,
+    current_task_contract_hash:
+      attempt === undefined ? null : (store.contracts.hashOf(attempt.contract_snapshot_id) as string),
+    has_open_blocker: store.pendingDecisions.openFor(parent.task_key).length > 0,
+    has_recovery_conflict:
+      parent.state_reason?.code === "RECOVERY_CONFLICT" ||
+      attempt?.state_reason?.code === "RECOVERY_CONFLICT",
+  };
+}
+
+/** §9.2g — the batch-bound Compiled Profile v3 capability; never a raw adapter probe. */
+function materializationCapability(
+  compiled_profile: ReturnType<PlatformStore["batchView"]["compiledProfileFor"]>,
+): ChildMaterializationCapabilityViewV1 {
+  const entries = compiled_profile.effective.project.task_sources.filter(
+    (entry) => entry.child_materializer !== undefined,
+  );
+  if (entries.length !== 1 || compiled_profile.effective.project.task_sources.length !== 1) {
+    return { available: false };
+  }
+  const entry = entries[0]!;
+  return {
+    available: true,
+    task_source_id: entry.id,
+    materializer_adapter: entry.child_materializer!.adapter,
+  };
+}
+
+/** §9.2g — recovery/reservation facts from durable exact state, never adapter absence. */
+function materializationBatchView(
+  store: PlatformStore,
+  run: PlatformRunRow,
+  batch_id: string,
+): ChildMaterializationBatchViewV1 {
+  const batch = store.batches.require(batch_id);
+  const facts = materializationBatchFacts(store, batch_id);
+  return {
+    batch_id,
+    run_status: store.runs.require(run.run_id).status,
+    batch_status: batch.status,
+    has_unresolved_unknown_materialization: facts.has_unresolved_unknown_materialization,
+    admitted_task_count: store.batchView.project(batch_id).admitted_task_count,
+    unadmitted_materialized_child_count: facts.unadmitted_materialized_child_count,
+    parent_admitted: false, // refined by the caller-context below
+    admission_closed: batch.admission_closed,
+  };
+}
+
+/**
  * §9.2e (M1-7) + §17.4 — a task held by `SELECTION_STALE` or `REATTEMPT_REQUIRED:<decision_id>`
  * with an admission marker and no live attempt is reselecting; anything else is an initial
  * admission. Read off durable state, never proposed.
@@ -304,7 +482,7 @@ function parseProposal(proposal: unknown): ProposalV1 | null {
 }
 
 const isTaskBearing = (proposal: ProposalV1): proposal is TaskBearingProposalV1 =>
-  proposal.variant !== "BATCH_CONTROL";
+  proposal.variant !== "BATCH_CONTROL" && proposal.variant !== "SUBFLOW_CHILD_MATERIALIZATION";
 
 /**
  * §8.4 — a Proposal may only act on a task this batch already materialized. Materializing one

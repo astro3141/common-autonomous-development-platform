@@ -18,12 +18,12 @@ const VERIFICATION = join(ROOT, "core/execution/start-verification.ts");
 const stripComments = (source: string): string =>
   source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 
-test("B7-29: the schema is still v5 / 17 tables and no workflow table was added", () => {
-  assert.equal(MIGRATIONS.length, 8);
+test("B7-29: the schema is still v5 / 18 tables and no workflow table was added", () => {
+  assert.equal(MIGRATIONS.length, 9);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
   }
@@ -37,7 +37,7 @@ test("B7-29: the schema is still v5 / 17 tables and no workflow table was added"
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       // TD §18.1c names these as forbidden; a verification request is not a reason to add one.
       for (const forbidden of [
         "workflow",

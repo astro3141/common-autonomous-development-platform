@@ -39,6 +39,19 @@ import {
   PILOT_VERIFICATION_PROFILE,
 } from "./support/deployment-fixtures.ts";
 
+/** D23 — the active turn's Platform-allocated proposal_id, read from the durable journal. */
+function allocatedProposalId(store: { decisions: { read(): readonly { kind: string; payload: unknown }[] } }, batch_id: string): string {
+  let latest: { turn: number; proposal_id: string } | undefined;
+  for (const entry of store.decisions.read()) {
+    if (entry.kind !== "supervisor_proposal_allocation") continue;
+    const payload = entry.payload as { batch_id: string; turn: number; proposal_id: string };
+    if (payload.batch_id !== batch_id) continue;
+    if (latest === undefined || payload.turn >= latest.turn) latest = payload;
+  }
+  if (latest === undefined) throw new Error(`no active proposal allocation for ${batch_id}`);
+  return latest.proposal_id;
+}
+
 const TASK_KEY = `task:pilot:${PILOT_TASK_REF}`;
 
 async function post(base: string, path: string, body: unknown): Promise<unknown> {
@@ -90,7 +103,7 @@ test("ALIVE-1: one task crosses the full lifecycle through the production compos
       run_id: opened.run_id,
       batch_id: opened.batch_id,
       proposal: {
-        proposal_id: ulid(),
+        proposal_id: allocatedProposalId(store, opened.batch_id),
         decision: "START_TASK",
         task_ref: PILOT_TASK_REF,
         classification: PILOT_CLASSIFICATION,
@@ -299,7 +312,7 @@ test("ALIVE-2: with a compliant backend and auto_merge policy, the Gate performs
         batch_id: opened.batch_id,
         observed_at: new Date().toISOString(),
         proposal: {
-          proposal_id: ulid(),
+          proposal_id: allocatedProposalId(store, opened.batch_id),
           decision: "START_TASK",
           task_ref: PILOT_TASK_REF,
           classification: PILOT_CLASSIFICATION,
@@ -424,7 +437,7 @@ test("ALIVE-3: a platform restart mid-implementation resumes from durable state 
         batch_id: opened.batch_id,
         observed_at: new Date().toISOString(),
         proposal: {
-          proposal_id: ulid(),
+          proposal_id: allocatedProposalId(first.store, opened.batch_id),
           decision: "START_TASK",
           task_ref: PILOT_TASK_REF,
           classification: PILOT_CLASSIFICATION,
@@ -578,7 +591,7 @@ test("ALIVE-4: total backend loss across a restart — no duplicate turn, honest
         batch_id: opened.batch_id,
         observed_at: new Date().toISOString(),
         proposal: {
-          proposal_id: ulid(),
+          proposal_id: allocatedProposalId(first.store, opened.batch_id),
           decision: "START_TASK",
           task_ref: PILOT_TASK_REF,
           classification: PILOT_CLASSIFICATION,

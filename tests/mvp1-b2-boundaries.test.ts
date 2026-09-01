@@ -55,6 +55,7 @@ test("M1B2-AC1 / AC2 / AC48: no migration was added and the v3 foundation is unt
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
       { version: 8, name: "subflow-succeeded" },
+      { version: 9, name: "child-materialization" },
     ],
   );
   assert.deepEqual(
@@ -82,7 +83,7 @@ test("M1B2-AC1 / AC2 / AC48: no migration was added and the v3 foundation is unt
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
 
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of [
         "task_dependency",
         "task_observation",
@@ -130,7 +131,22 @@ test("M1B2-AC26 / §55: TaskStore exposes no generic patch and no external-state
     Object.getOwnPropertyNames(TaskStore.prototype)
       .filter((name) => name !== "constructor")
       .sort(),
-    ["childrenOf", "discover", "get", "inBatch", "observe", "require", "write"],
+    // §18.1g (D24) — `bindMaterialization` is the one write-once NULL→binding setter of the
+    // materialisation provenance column; it patches nothing else and never clears.
+    // §18.1g (review 5496784502) — `materializationClaims` is a read-only cross-batch sweep of
+    // binding-claiming rows, added so a wrong-id/cross-batch/duplicate claim is detectable as
+    // corruption instead of hiding as absence. It writes nothing.
+    [
+      "bindMaterialization",
+      "childrenOf",
+      "discover",
+      "get",
+      "inBatch",
+      "materializationClaims",
+      "observe",
+      "require",
+      "write",
+    ],
   );
   for (const forbidden of [
     "patch",

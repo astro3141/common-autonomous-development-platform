@@ -61,7 +61,16 @@ export function validateDecisionAfterResolvedHumanGate(
     );
   }
 
-  return validateDecisionWithSatisfiedGate(input, authorization.normalized_gate_proposal);
+  // D23 — post-gate revalidation never allocates a new id. The identity view is reconstructed
+  // from the exact Proposal copy the terminal record hash bound; this narrow rule applies to the
+  // one already-V1-passed Proposal and is not a generic bypass of the active-turn binding.
+  return validateDecisionWithSatisfiedGate(
+    {
+      ...input,
+      proposal_identity: { proposal_id: authorization.normalized_gate_proposal.proposal_id },
+    },
+    authorization.normalized_gate_proposal,
+  );
 }
 
 function assertAuthorizationShape(authorization: ResolvedHumanGateAuthorization): void {

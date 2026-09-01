@@ -40,6 +40,19 @@ import { createRequire } from "node:module";
 
 const createRequireForTest = createRequire;
 
+/** D23 — the active turn's Platform-allocated proposal_id, read from the durable journal. */
+function allocatedProposalId(store: { decisions: { read(): readonly { kind: string; payload: unknown }[] } }, batch_id: string): string {
+  let latest: { turn: number; proposal_id: string } | undefined;
+  for (const entry of store.decisions.read()) {
+    if (entry.kind !== "supervisor_proposal_allocation") continue;
+    const payload = entry.payload as { batch_id: string; turn: number; proposal_id: string };
+    if (payload.batch_id !== batch_id) continue;
+    if (latest === undefined || payload.turn >= latest.turn) latest = payload;
+  }
+  if (latest === undefined) throw new Error(`no active proposal allocation for ${batch_id}`);
+  return latest.proposal_id;
+}
+
 const CANDIDATE = "9a8b7c6d5e4f30211203344556677889900aabbc";
 const SINGLE = { batch_policy: { max_tasks: 1, max_rework: 2, concurrency: 1 } };
 
@@ -624,7 +637,7 @@ test("F3: bootRun reconciles a persisted mid-flight run before any tick can star
         batch_id: opened.batch_id,
         observed_at: new Date().toISOString(),
         proposal: {
-          proposal_id: ulid(),
+          proposal_id: allocatedProposalId(first.store, opened.batch_id),
           decision: "START_TASK",
           task_ref: PILOT_TASK_REF,
           classification: PILOT_CLASSIFICATION,

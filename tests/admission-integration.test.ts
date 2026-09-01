@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { bootstrapRun } from "../core/admission/bootstrap.ts";
 import { submitProposal } from "../core/admission/submit-proposal.ts";
@@ -103,6 +104,7 @@ const currentHash = (taskSource: ProjectDocumentTaskSource): string =>
 test("M1B4-AC8 / AC9 / §51: a live document and repository admit the task end to end", () => {
   withLiveWorld(({ store, taskSource, repository, base }) => {
     const profile = compiled();
+    seedAllocationForProposal(store, BATCH_ID, null);
     const result = submitProposal(
       { store, taskSource, repository, manifests: manifestSetInput() },
       {
@@ -151,6 +153,7 @@ test("M1B4-AC9 / §50: a canonical head that really advanced is caught by V8, no
       "the durable snapshot still describes the old observation",
     );
 
+    seedAllocationForProposal(store, BATCH_ID, null);
     const result = submitProposal(
       { store, taskSource, repository, manifests: manifestSetInput() },
       { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: OBSERVED_AT, proposal },
@@ -183,6 +186,7 @@ test("M1B4-AC6 / §50: a document that really changed is caught by V3, not by th
       dependencies: [],
     });
 
+    seedAllocationForProposal(store, BATCH_ID, null);
     const result = submitProposal(
       { store, taskSource, repository, manifests: manifestSetInput() },
       { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: OBSERVED_AT, proposal },
@@ -199,6 +203,7 @@ test("M1B4-AC34: the durable materialization is untouched by a rejected submissi
     const before = store.tasks.require(TASK_KEY);
     repo.commit({ path: "other.txt", content: "moved\n", message: "B" });
 
+    seedAllocationForProposal(store, BATCH_ID, null);
     submitProposal(
       { store, taskSource, repository, manifests: manifestSetInput() },
       {

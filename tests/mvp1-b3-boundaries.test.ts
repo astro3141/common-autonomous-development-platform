@@ -147,6 +147,9 @@ test("M1B3-AC32 ~ AC35 / §55: no Gate, no automatic merge and no merge INTENT e
     // §17.4 (D22) — the RECOVERY_DECISION mapping row re-observes "candidate still not canonical"
     // fresh at application time. A canonical read; the merge primitives stay unreachable.
     "core/execution/apply-resolved-decision.ts",
+    // §13.4 (D23) — the Supervisor decision context carries the fresh canonical head as the
+    // turn's freshness basis. A model-facing projection read; still not merging.
+    "core/execution/supervisor-decision-context.ts",
   ];
   // MVP1-B6 — creating the feature workspace is the one repository *mutation* Core may now reach,
   // and only from the module that owns READY→IMPLEMENTING. It is not a Gate primitive: the merge
@@ -240,6 +243,9 @@ test("M1B3-AC33: no production Repository Gate module was added", () => {
     "discovery",
     "execution",
     "humandecision",
+    // §5.3a (D24) — the bounded child-materialisation boundary: snapshot sealing + publish/
+    // round-trip orchestration. It reaches no merge, candidate or verification primitive.
+    "materialization",
     // v1.5 §5.11–§5.14 — read-only derivations (diagnostics, measurement, findings, routing).
     // None of them is a Gate: the Repository Gate lives in `execution/automatic-merge.ts` and is
     // held to its own guards (B14).
@@ -318,6 +324,7 @@ test("M1B3-AC36 ~ AC39: the schema and the MVP1-B1/B2 surfaces are untouched", (
       { version: 6, name: "audit-decision-category" },
       { version: 7, name: "subflow-parent" },
       { version: 8, name: "subflow-succeeded" },
+      { version: 9, name: "child-materialization" },
     ],
   );
   assert.deepEqual(
@@ -341,7 +348,7 @@ test("M1B3-AC36 ~ AC39: the schema and the MVP1-B1/B2 surfaces are untouched", (
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of ["workspace", "repository_state", "merge_intent"]) {
         assert.equal(names.includes(forbidden), false);
       }

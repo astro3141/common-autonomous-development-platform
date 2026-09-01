@@ -30,6 +30,9 @@ import {
   commitTaskDeferral,
 } from "../statemachine/transition-commit.ts";
 import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
+import { commitMaterializationIntent } from "../materialization/materialize-child.ts";
+import { sealMaterializationSnapshot } from "../materialization/snapshot.ts";
+import { hashTaskDefinitionBody } from "../tasksource/task-definition.ts";
 import type { TaskDependency } from "../tasksource/types.ts";
 import { AdmissionError } from "./errors.ts";
 import { evaluateHardDependencies } from "./dependency-admission.ts";
@@ -75,9 +78,13 @@ export function submitProposal(
   command: SubmitProposalCommand,
 ): ProposalSubmissionResult {
   const assembled = assembleDecisionInput(authorities, command);
+  // D23 — this ordinary submission consumes the active turn allocation atomically with its own
+  // validation journal entry, whatever the verdict: the turn is answered exactly once.
+  const consumed = assembled.input.proposal_identity?.proposal_id;
   const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input, {
     run_id: command.run_id,
     batch_id: command.batch_id,
+    ...(consumed === undefined ? {} : { consumed_allocation: consumed }),
   });
 
   return act(authorities, command, assembled, recorded.result, recorded.entry.seq);
@@ -181,10 +188,15 @@ function act(
 
     // §17.2 — the existing dedup key is deterministic over (subject, category, created_from), so
     // resubmitting the same Proposal finds the OPEN record instead of opening a second one.
+    // §9.2b (D24) — an F gate's subject is the exact parent the materialisation intent names.
     const decision = buildHumanGateDecision({
       decision_id: command.decision_id,
       proposal,
-      ...(assembled.task_key === null ? {} : { task_key: assembled.task_key }),
+      ...(proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION"
+        ? { task_key: proposal.parent.task_key }
+        : assembled.task_key === null
+          ? {}
+          : { task_key: assembled.task_key }),
       ...(proposal.variant === "BATCH_CONTROL" ? { batch_id: assembled.batch.batch_id } : {}),
     });
     const existing = authorities.store.pendingDecisions.byDedupKey(decision.dedup_key);
@@ -196,6 +208,9 @@ function act(
       decision,
       channel: command.report_channel,
     });
+    // §17.3 (D24) — the gate's TASK subject is the F parent, so `commitPendingDecision` above
+    // already parked it HELD(BLOCKED_BY_DECISION:<id>), freezing the tagged origin the approval
+    // must later restore. Zero snapshot/INTENT/external effect exists yet.
     return { ...base, pending_decision_id: opened.decision_id };
   }
 
@@ -227,6 +242,39 @@ function act(
       payload: { reason: outcome.reason } as never,
     });
     return base;
+  }
+
+  // §8.4b (D24) — an accepted F freezes the validated semantics and the write-ahead INTENT in
+  // one transaction. The adapter call is the Coordinator's next bounded step, never this one; F
+  // acceptance is not admission and no state transition happens here.
+  if (proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION") {
+    const compiled = authorities.store.batchView.compiledProfileFor(assembled.batch.batch_id);
+    const sourceEntry = compiled.effective.project.task_sources.find(
+      (entry) => entry.child_materializer !== undefined,
+    );
+    if (sourceEntry === undefined) return base;
+    const body = proposal.child.task_definition_body;
+    const sealed = sealMaterializationSnapshot({
+      materialization_id: proposal.proposal_id,
+      batch_id: assembled.batch.batch_id,
+      compiled_profile_hash: assembled.batch.compiled_profile_hash,
+      task_source_id: sourceEntry.id,
+      parent_intent: proposal.parent,
+      child_definition_body: body as never,
+      child_definition_hash: hashTaskDefinitionBody(body as never),
+      reason_refs: proposal.reason_refs,
+    });
+    const committed = commitMaterializationIntent(authorities.store, {
+      sealed,
+      ...(resolvedDecisionId === undefined
+        ? {}
+        : {
+            resolved_decision_id: resolvedDecisionId,
+            restore_parent_origin:
+              proposal.parent.kind === "DISCOVERED_TASK" ? ("DISCOVERED" as const) : ("ACTIVE" as const),
+          }),
+    });
+    return { ...base, transition_seq: committed.transition.seq };
   }
 
   if (proposal.variant !== "TASK_SELECTION" && proposal.variant !== "SUBFLOW_SELECTION") return base;

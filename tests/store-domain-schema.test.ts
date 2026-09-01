@@ -133,6 +133,8 @@ test("B8-AC7 / B8-AC8: the domain columns are exactly TD §18.1a", () => {
     "repository_scope_id",
     "selection_binding_json",
     "parent_task_key",
+    // §18.1g (D24) — the nullable pre-admission materialisation provenance binding.
+    "materialization_binding_json",
   ]);
   assert.deepEqual(columns("task_attempt"), [
     "attempt_key",

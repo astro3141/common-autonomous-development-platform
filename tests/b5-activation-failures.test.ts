@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { seedAllocationForProposal } from "./support/coordinator-fixtures.ts";
 
 import { activateSelectedTask } from "../core/admission/activate-task.ts";
 import { submitProposal } from "../core/admission/submit-proposal.ts";
@@ -65,6 +66,7 @@ const selected = (
 ): AdmissionWorld => {
   discover(domain);
   const authorities = authoritiesFor(domain, overrides);
+  seedAllocationForProposal(domain.store, BATCH_ID, selection({ profile: domain.profile }));
   const result = submitProposal(authorities, {
     run_id: RUN_ID,
     batch_id: BATCH_ID,
@@ -203,6 +205,7 @@ test("FC2 / §10: the hold is durable — no retry, no decision, no reselection 
       assert.equal(domain.store.outbox.count(), 0);
 
       // §18 — a backend hold is not a SELECTION_STALE hold, so START_TASK does not reselect it.
+      seedAllocationForProposal(domain.store, BATCH_ID, selection({ profile: domain.profile }));
       assert.throws(() =>
         submitProposal(authorities, {
           run_id: RUN_ID,
@@ -276,8 +279,8 @@ test("§6: a TaskSource read failure stays operational and never becomes CONTRAC
 
 test("FC5 / FC6: the schema and the success path are unchanged by this patch", () => {
   withWorld((domain) => {
-    assert.equal(domain.store.schemaVersion, 8, "FC5");
-    assert.equal(MIGRATIONS.length, 8);
+    assert.equal(domain.store.schemaVersion, 9, "FC5");
+    assert.equal(MIGRATIONS.length, 9);
 
     const authorities = selected(domain);
     const outcome = activate(authorities);

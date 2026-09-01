@@ -15,6 +15,7 @@ import {
 } from "./artifact-stores.ts";
 import { BlobStore } from "./blob-store.ts";
 import { DecisionLog } from "./decision-log.ts";
+import { ChildMaterializationSnapshotStore } from "./materialization-store.ts";
 import { IdempotencyStore } from "./idempotency-store.ts";
 import { AttemptStore, BatchStore, RunStore, TaskStore } from "./lifecycle-stores.ts";
 import { migrate, type Migration } from "./migrations.ts";
@@ -46,6 +47,7 @@ export class PlatformStore {
 
   // Batch 8 domain stores (TD §18.1a).
   readonly compiledProfiles: CompiledProfileStore;
+  readonly materializations: ChildMaterializationSnapshotStore;
   readonly runs: RunStore;
   readonly batches: BatchStore;
   readonly tasks: TaskStore;
@@ -72,6 +74,7 @@ export class PlatformStore {
     this.idempotency = new IdempotencyStore(database, now);
 
     this.compiledProfiles = new CompiledProfileStore(database, now);
+    this.materializations = new ChildMaterializationSnapshotStore(database, now);
     this.runs = new RunStore(database, now);
     this.batches = new BatchStore(database, now);
     this.tasks = new TaskStore(database, now);

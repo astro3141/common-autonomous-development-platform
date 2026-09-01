@@ -55,7 +55,32 @@ export function compileProfile(input: CompileInput): CompileResult {
   const overrides = validateApprovedOverrides(input.approvedOverrides);
 
   // TD §7.1d/§7.7a — a v2 Project Profile compiles to a v2 Compiled Profile; merge rules stay v1.
-  const profileVersion = project.supervisor_profile === undefined ? 1 : 2;
+  // TD §7.1e/§7.7b (D24) — a `child_materializer` declaration selects v3, which contains the v2
+  // shape and freezes the validated materializer binding. v1/v2 are never silently reinterpreted.
+  const materializerEntries = project.task_sources.filter(
+    (entry) => entry.child_materializer !== undefined,
+  );
+  // S13 — the MVP 3 v1 materialisation boundary: exactly one task source, and exactly one
+  // materializer bound to that source. Zero materializers = feature unavailable, still valid.
+  // Any shape that would force Core to *choose* a source/target is a deterministic compile error.
+  if (materializerEntries.length > 0) {
+    if (project.supervisor_profile === undefined) {
+      throw new ProfileCompileError(
+        "EFFECTIVE_INVALID",
+        "/task_sources/child_materializer",
+        "child materialisation requires the declared supervisor_profile binding",
+      );
+    }
+    if (project.task_sources.length !== 1 || materializerEntries.length !== 1) {
+      throw new ProfileCompileError(
+        "EFFECTIVE_INVALID",
+        "/task_sources/child_materializer",
+        "materialisation requires exactly one task source with exactly one bound materializer; Core never routes between sources",
+      );
+    }
+  }
+  const profileVersion =
+    materializerEntries.length > 0 ? 3 : project.supervisor_profile === undefined ? 1 : 2;
   const projectHash = hashEnvelope(
     makeEnvelope(PROJECT_PROFILE_SCHEMA, profileVersion, project as unknown as CanonicalObject),
   );
@@ -75,7 +100,7 @@ export function compileProfile(input: CompileInput): CompileResult {
     project_profile: { id: project.id, version: project.version, hash: projectHash },
     execution_policy: { id: policy.id, version: policy.version, hash: policyHash },
     approved_overrides: { hash: overridesHash },
-    compiled_version: profileVersion === 2 ? 2 : COMPILED_VERSION,
+    compiled_version: profileVersion === 1 ? COMPILED_VERSION : profileVersion,
     merge_rules_version: MERGE_RULES_VERSION,
     effective: { project, policy: effectivePolicy },
   };
@@ -83,7 +108,7 @@ export function compileProfile(input: CompileInput): CompileResult {
   // compiled_hash is the hash of this envelope; it is deliberately not a member of the body.
   const envelope = makeEnvelope(
     COMPILED_PROFILE_SCHEMA,
-    profileVersion === 2 ? 2 : 1,
+    profileVersion === 1 ? 1 : profileVersion,
     body as unknown as CanonicalObject,
   );
   return { envelope, compiled_hash: hashEnvelope(envelope), body };

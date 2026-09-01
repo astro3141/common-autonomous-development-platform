@@ -63,6 +63,12 @@ export const TRANSITION_REASON_CODES = [
    * the old Attempt may not continue, and the successor is a fresh `START_TASK` Proposal.
    */
   "REATTEMPT_REQUESTED",
+  /** §8.4b/§24 (D24) — definitive no-effect adapter failure; the snapshot stays as audit. */
+  "TASK_MATERIALIZATION_FAILED",
+  /** §8.4b/§21/§22 (D24) — effect or exact round-trip could not be established; no guessing. */
+  "TASK_MATERIALIZATION_UNOBSERVABLE",
+  /** §8.4b/§24 (D24) — same identity/ref with a different snapshot/body/parent binding. */
+  "TASK_MATERIALIZATION_CONFLICT",
 ] as const;
 
 export type TransitionReasonCode = (typeof TRANSITION_REASON_CODES)[number];
@@ -93,6 +99,11 @@ export const ABANDONED_BY_DECISION = "ABANDONED_BY_DECISION";
 export const abandonedByDecision = (decisionId: string): string =>
   `${ABANDONED_BY_DECISION}:${decisionId}`;
 
+/** §17.3/§24 (D24) — `MATERIALIZATION_REJECTED:<decision_id>`: a human refused the exact F publish. */
+export const MATERIALIZATION_REJECTED = "MATERIALIZATION_REJECTED";
+export const materializationRejected = (decisionId: string): string =>
+  `${MATERIALIZATION_REJECTED}:${decisionId}`;
+
 /** TD §18.1f/§19.5 — `SUBFLOW_CHILD:<child_task_key>`: the parent SUSPENDED row's exact cause. */
 export const SUBFLOW_CHILD = "SUBFLOW_CHILD";
 export const subflowChild = (childTaskKey: string): string => `${SUBFLOW_CHILD}:${childTaskKey}`;
@@ -109,7 +120,7 @@ export function subflowChildOf(reason: string | undefined): string | undefined {
  */
 export function isReasonCode(value: string): boolean {
   if ((TRANSITION_REASON_CODES as readonly string[]).includes(value)) return true;
-  for (const prefix of [BLOCKED_BY_DECISION, REATTEMPT_REQUIRED, ABANDONED_BY_DECISION, SUBFLOW_CHILD]) {
+  for (const prefix of [BLOCKED_BY_DECISION, REATTEMPT_REQUIRED, ABANDONED_BY_DECISION, SUBFLOW_CHILD, MATERIALIZATION_REJECTED]) {
     if (value.startsWith(`${prefix}:`) && value.slice(prefix.length + 1).length > 0) return true;
   }
   return false;

@@ -9,6 +9,7 @@
 import { canonicalize } from "../schemas/canonical-json.ts";
 import type { DatabaseSync } from "./database.ts";
 import {
+  type ChildMaterializationBindingV1,
   ATTEMPT_STATES,
   BATCH_STATES,
   EXTERNAL_SNAPSHOT_FIELDS,
@@ -333,6 +334,25 @@ export class TaskStore {
     return this.require(taskKey);
   }
 
+  /**
+   * §8.4b/§18.1g (D24) — sets the immutable materialisation binding exactly once, in the exact
+   * TaskSource round-trip transaction. NULL→binding only; a second write with the same exact
+   * binding is idempotent, anything else refuses. Nothing ever clears it.
+   */
+  bindMaterialization(taskKey: string, binding: ChildMaterializationBindingV1): TaskRow {
+    const current = this.require(taskKey);
+    if (current.materialization_binding !== null) {
+      if (canonicalize(current.materialization_binding as never) === canonicalize(binding as never)) {
+        return current;
+      }
+      throw invalid(`${taskKey} already carries a different materialisation binding`);
+    }
+    this.#database
+      .prepare("UPDATE task SET materialization_binding_json = ?, updated_at = ? WHERE task_key = ?")
+      .run(canonicalize(binding as never), this.#now(), taskKey);
+    return this.require(taskKey);
+  }
+
   get(taskKey: string): TaskRow | undefined {
     const row = this.#database
       .prepare(
@@ -340,7 +360,7 @@ export class TaskStore {
                 classification, pipeline_id, actor_profile, verification_profile,
                 repository_scope_id, selection_binding_json,
                 external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
-                parent_task_key, created_at, updated_at
+                parent_task_key, materialization_binding_json, created_at, updated_at
            FROM task WHERE task_key = ?`,
       )
       .get(taskKey) as TaskDbRow | undefined;
@@ -361,7 +381,7 @@ export class TaskStore {
                 classification, pipeline_id, actor_profile, verification_profile,
                 repository_scope_id, selection_binding_json,
                 external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
-                parent_task_key, created_at, updated_at
+                parent_task_key, materialization_binding_json, created_at, updated_at
            FROM task WHERE parent_task_key = ? ORDER BY task_key ASC`,
       )
       .all(parentTaskKey) as unknown as TaskDbRow[];
@@ -375,10 +395,30 @@ export class TaskStore {
                 classification, pipeline_id, actor_profile, verification_profile,
                 repository_scope_id, selection_binding_json,
                 external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
-                parent_task_key, created_at, updated_at
+                parent_task_key, materialization_binding_json, created_at, updated_at
            FROM task WHERE batch_id = ? ORDER BY task_key ASC`,
       )
       .all(batchId) as unknown as TaskDbRow[];
+    return rows.map(toTaskRow);
+  }
+
+  /**
+   * §18.1g (review 5496784502) — every task claiming *any* materialisation binding, across all
+   * batches, in stable key order. The corruption sweep behind child resolution: a wrong-id,
+   * cross-batch or duplicate binding claim must be observable, never filtered out by a narrower
+   * same-batch/same-id lookup.
+   */
+  materializationClaims(): readonly TaskRow[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT task_key, batch_id, project_id, external_task_ref, platform_state,
+                classification, pipeline_id, actor_profile, verification_profile,
+                repository_scope_id, selection_binding_json,
+                external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+                parent_task_key, materialization_binding_json, created_at, updated_at
+           FROM task WHERE materialization_binding_json IS NOT NULL ORDER BY task_key ASC`,
+      )
+      .all() as unknown as TaskDbRow[];
     return rows.map(toTaskRow);
   }
 }
@@ -528,6 +568,7 @@ interface TaskDbRow {
   state_reason_code: string | null;
   state_reason_log_seq: number | null;
   parent_task_key: string | null;
+  materialization_binding_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -566,6 +607,10 @@ function toTaskRow(row: TaskDbRow): TaskRow {
     external_snapshot: JSON.parse(row.external_snapshot_json) as ExternalTaskSnapshotV1,
     admitted_at: row.admitted_at,
     parent_task_key: row.parent_task_key,
+    materialization_binding:
+      row.materialization_binding_json === null
+        ? null
+        : (JSON.parse(row.materialization_binding_json) as ChildMaterializationBindingV1),
     state_reason: toReason(row.state_reason_code, row.state_reason_log_seq),
     created_at: row.created_at,
     updated_at: row.updated_at,
