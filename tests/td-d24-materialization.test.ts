@@ -1266,10 +1266,11 @@ test("HB2: a binding naming never-F-authorized semantics under a real snapshot i
     const parent = w.store.tasks.require(TASK_KEY);
     assert.equal(parent.platform_state, "ACTIVE", "the parent was never suspended");
 
-    // The CM5 existing-row recovery lane converges on nothing either: a rebuilt Coordinator
-    // fails closed rather than re-accepting the inexact row.
+    // The CM5 recovery lane converges on the module's safe conflict/pause with durable
+    // provenance rather than re-accepting the inexact row (review 5496784502).
     const rebuilt = new ProductionCoordinator({ ...w, materializer });
-    assert.throws(() => rebuilt.tickOnce(RUN_ID));
+    assert.equal(rebuilt.tickOnce(RUN_ID), "MATERIALIZATION_CONFLICT");
+    assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
   }, POLICY, V3_OPTIONS);
 });
 
@@ -1379,5 +1380,114 @@ test("HB4: a current dispatch INTENT landing between validation and commit is re
     assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
     assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE");
     assert.equal(w.store.tasks.require(childKey).parent_task_key, null, "no partial relation");
+  }, POLICY, V3_OPTIONS);
+});
+
+// --- review 5496784502: wrong-id/cross-batch/duplicate binding claims are never absence ----------
+
+/** The shared fail-closed battery for a planted binding-chain corruption (review 5496784502). */
+function assertBindingCorruptionContained(
+  w: CoordinatorWorld,
+  world: World,
+  materializer: FakeChildMaterializer,
+  childKey: string,
+): void {
+  const opPrefix = `op:${BATCH_ID}:materialize-child:`;
+  const before = {
+    ...effectCounts(w, materializer),
+    intents: w.store.idempotency.keysWithPrefix(opPrefix).length,
+  };
+
+  // A reopened Store projects no ordinary absence: the materialisation facts are unavailable.
+  const reopened = world.temp.open();
+  try {
+    assert.throws(() => materializationOperations(reopened, BATCH_ID));
+  } finally {
+    reopened.close();
+  }
+  assert.throws(() => materializationOperations(w.store, BATCH_ID));
+  assert.throws(() =>
+    assembleSupervisorDecisionContext(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never },
+      { run_id: RUN_ID, batch_id: BATCH_ID, proposal_id: ULID_F2, observed_at: "2026-09-02T12:00:00Z" },
+    ),
+  );
+
+  // A fresh valid F is refused before any snapshot exists: zero snapshot, zero INTENT, zero
+  // external materializer effect over the unresolved corrupt chain.
+  assert.throws(() => submitF(w, fProposal(w, { proposal_id: ULID_F2 })));
+  const after = {
+    ...effectCounts(w, materializer),
+    intents: w.store.idempotency.keysWithPrefix(opPrefix).length,
+  };
+  assert.deepEqual(after, before, "no new snapshot, INTENT or external effect");
+
+  // Zero identity/transfer/admission/relation/suspension anywhere.
+  const child = w.store.tasks.require(childKey);
+  assert.equal(child.platform_state, "DISCOVERED");
+  assert.equal(child.parent_task_key, null);
+  const parent = w.store.tasks.require(TASK_KEY);
+  assert.notEqual(parent.platform_state, "SUSPENDED");
+
+  // CM5 recovery converges to the safe conflict/pause with durable provenance.
+  assert.equal(w.tick(), "MATERIALIZATION_CONFLICT");
+  assert.equal(w.store.batches.require(BATCH_ID).status, "PAUSED_SAFELY");
+  assert.equal(
+    w.store.decisions.read().some((entry) => entry.kind === "materialization_conflict"),
+    true,
+    "the conflict is journaled",
+  );
+}
+
+test("HB5-a: a corrupt binding.materialization_id is corruption, never COMMITTED_NOT_OBSERVED", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+
+    corruptBinding(world, childKey, { materialization_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0BAD" });
+    assertBindingCorruptionContained(w, world, materializer, childKey);
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB5-b: a bound child moved out of the snapshot batch is corruption, never absence", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+
+    world.store.withTransaction(() => {
+      world.store.batches.create({
+        batch_id: "batch:other:1",
+        run_id: RUN_ID,
+        ordinal: 2,
+        compiled_profile_hash: w.store.batches.require(BATCH_ID).compiled_profile_hash,
+      });
+    });
+    const raw = new DatabaseSync(world.temp.path);
+    raw.prepare("UPDATE task SET batch_id = ? WHERE task_key = ?").run("batch:other:1", childKey);
+    raw.close();
+
+    assertBindingCorruptionContained(w, world, materializer, childKey);
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB5-c: a duplicate binding claim is ambiguity, never a resolvable child", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+
+    discover(world, "DUP-1");
+    const raw = new DatabaseSync(world.temp.path);
+    const row = raw
+      .prepare("SELECT materialization_binding_json AS json FROM task WHERE task_key = ?")
+      .get(childKey) as { json: string };
+    raw
+      .prepare("UPDATE task SET materialization_binding_json = ? WHERE task_key = ?")
+      .run(row.json, `task:${PROJECT}:DUP-1`);
+    raw.close();
+
+    assertBindingCorruptionContained(w, world, materializer, childKey);
   }, POLICY, V3_OPTIONS);
 });

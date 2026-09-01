@@ -173,14 +173,63 @@ function view(
   };
 }
 
+/**
+ * Review 5496784502 — durable binding corruption discovered while resolving a snapshot's child.
+ * A dedicated type so the Coordinator's advance loop can converge it to the module's safe
+ * conflict/pause, while every read-model and admission consumer stays a plain fail-closed throw.
+ */
+export class MaterializationBindingCorruptionError extends Error {}
+
+/**
+ * Resolves the one exactly-bound child of a snapshot, or `undefined` for genuine absence.
+ *
+ * Review 5496784502 — absence must be *proven*, not assumed: the sweep runs over every binding
+ * claim in the Store (any batch), so a corrupt `materialization_id`, a bound row moved out of the
+ * snapshot's batch, or a duplicate claim surfaces as corruption instead of downgrading to
+ * `COMMITTED_NOT_OBSERVED`. When no claim names this snapshot, the DONE receipt's external ref is
+ * used **only as a corruption-detection lookup hint** for the deterministic expected row — never
+ * as child or admission authority (R4b): an unbound row at that ref stays ordinary absence, while
+ * a non-null binding there that does not name this snapshot is an inconsistent durable chain.
+ */
 function boundChild(store: PlatformStore, snapshot: StoredMaterializationSnapshot) {
-  const bound = store.tasks
-    .inBatch(snapshot.batch_id)
-    .find((task) => task.materialization_binding?.materialization_id === snapshot.materialization_id);
-  // Review 5496386527 finding 1 — a bound row is OBSERVED authority only when it is *exact*; an
-  // inexact durable binding fails the projection closed instead of downgrading to a phase.
-  if (bound !== undefined) requireExactBindingAuthority(store, bound);
-  return bound;
+  const corrupt = (detail: string): never => {
+    throw new MaterializationBindingCorruptionError(
+      `materialisation ${snapshot.materialization_id} cannot resolve its child: ${detail}; ` +
+        "the durable chain must be repaired before this projection is available",
+    );
+  };
+  const claims = store.tasks
+    .materializationClaims()
+    .filter((task) => task.materialization_binding?.materialization_id === snapshot.materialization_id);
+  if (claims.length > 1) {
+    return corrupt(`duplicate binding claims (${claims.map((task) => task.task_key).join(", ")})`);
+  }
+  if (claims.length === 1) {
+    const bound = claims[0]!;
+    // The exact guard covers every leg, cross-batch included; an inexact claim fails closed.
+    requireExactBindingAuthority(store, bound);
+    return bound;
+  }
+  // Zero claims. Before declaring absence, check the deterministic expected row via the DONE
+  // receipt ref — detection only, never authority.
+  const record = store.idempotency.get(
+    materializeChildOp(snapshot.batch_id, snapshot.materialization_id),
+  );
+  if (record?.state === "DONE") {
+    const receipt = record.result as { external_task_ref?: unknown } | null | undefined;
+    const ref = receipt?.external_task_ref;
+    if (typeof ref === "string" && ref.length > 0) {
+      const run = store.runs.require(store.batches.require(snapshot.batch_id).run_id);
+      const expected = store.tasks.get(buildTaskKey(run.project_id, ref));
+      if (expected !== undefined && expected.materialization_binding !== null) {
+        return corrupt(
+          `the expected child row ${expected.task_key} carries a binding that does not name this snapshot`,
+        );
+      }
+      // Unbound row at the ref (or no row at all): the R4b boundary — ordinary absence.
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -198,7 +247,7 @@ export function requireExactBindingAuthority(
 ): StoredMaterializationSnapshot {
   const binding = task.materialization_binding;
   const fail = (leg: string): never => {
-    throw new Error(
+    throw new MaterializationBindingCorruptionError(
       `materialisation binding of ${task.task_key} is not the exact F authority (${leg}); ` +
         "the durable chain must be repaired before any admission may consume it",
     );
@@ -337,11 +386,26 @@ export function advanceMaterializations(
   command: { readonly run_id: string; readonly batch_id: string; readonly observed_at: string },
 ): MaterializationStep | undefined {
   const { store } = authorities;
-  for (const operation of materializationOperations(store, command.batch_id)) {
+  for (const snapshot of store.materializations.forBatch(command.batch_id)) {
+    // Review 5496784502 — a binding chain that cannot be resolved exactly is not an operation to
+    // advance: recovery converges it to the module's safe conflict/pause with durable provenance,
+    // never a re-published/re-observed step and never a silent skip.
+    let operation: MaterializationOperationView;
+    try {
+      operation = operationView(store, snapshot);
+    } catch (error) {
+      if (error instanceof MaterializationBindingCorruptionError) {
+        return pauseConflict(
+          store,
+          snapshot,
+          materializeChildOp(snapshot.batch_id, snapshot.materialization_id),
+          error.message,
+        );
+      }
+      throw error;
+    }
     if (operation.phase === "FAILED" || (operation.phase === "OBSERVED" && operation.admitted)) continue;
     if (operation.phase === "OBSERVED") continue; // awaiting the Supervisor's E decision
-
-    const snapshot = store.materializations.require(operation.materialization_id);
 
     if (operation.phase === "INTENT") {
       const unknown = store.decisions

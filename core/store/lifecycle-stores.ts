@@ -401,6 +401,26 @@ export class TaskStore {
       .all(batchId) as unknown as TaskDbRow[];
     return rows.map(toTaskRow);
   }
+
+  /**
+   * §18.1g (review 5496784502) — every task claiming *any* materialisation binding, across all
+   * batches, in stable key order. The corruption sweep behind child resolution: a wrong-id,
+   * cross-batch or duplicate binding claim must be observable, never filtered out by a narrower
+   * same-batch/same-id lookup.
+   */
+  materializationClaims(): readonly TaskRow[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT task_key, batch_id, project_id, external_task_ref, platform_state,
+                classification, pipeline_id, actor_profile, verification_profile,
+                repository_scope_id, selection_binding_json,
+                external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+                parent_task_key, materialization_binding_json, created_at, updated_at
+           FROM task WHERE materialization_binding_json IS NOT NULL ORDER BY task_key ASC`,
+      )
+      .all() as unknown as TaskDbRow[];
+    return rows.map(toTaskRow);
+  }
 }
 
 // --- task_attempt ---------------------------------------------------------------------------

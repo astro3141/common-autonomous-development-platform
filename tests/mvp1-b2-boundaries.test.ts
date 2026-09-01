@@ -133,7 +133,20 @@ test("M1B2-AC26 / §55: TaskStore exposes no generic patch and no external-state
       .sort(),
     // §18.1g (D24) — `bindMaterialization` is the one write-once NULL→binding setter of the
     // materialisation provenance column; it patches nothing else and never clears.
-    ["bindMaterialization", "childrenOf", "discover", "get", "inBatch", "observe", "require", "write"],
+    // §18.1g (review 5496784502) — `materializationClaims` is a read-only cross-batch sweep of
+    // binding-claiming rows, added so a wrong-id/cross-batch/duplicate claim is detectable as
+    // corruption instead of hiding as absence. It writes nothing.
+    [
+      "bindMaterialization",
+      "childrenOf",
+      "discover",
+      "get",
+      "inBatch",
+      "materializationClaims",
+      "observe",
+      "require",
+      "write",
+    ],
   );
   for (const forbidden of [
     "patch",
