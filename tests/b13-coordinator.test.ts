@@ -347,7 +347,9 @@ test("B13-4 / B13-33 / B13-34 / B13-35: the Coordinator dispatches and never mer
     /prepare_merge|commit_merge/,
     /nextAttemptOutcome|commitAttemptFact|nextBatchOutcome/,
     /validateProposal|validateDecision|assertAdmissible/,
-    /auto_?merge|RepositoryGate|MergeGate/i,
+    // MVP 2 — the Coordinator may *read* the frozen `auto_merge` flag to pick which sealed
+    // use-case owns READY_TO_MERGE; it still contains no Gate logic of its own.
+    /RepositoryGate|MergeGate/i,
     /reconcil|recovery_framework|turn_ledger/i,
     /AUTO_SUBFLOW|parent_relation|dependency_graph|subtree/i,
   ]) {
@@ -364,6 +366,8 @@ test("B13-4 / B13-33 / B13-34 / B13-35: the Coordinator dispatches and never mer
     /requestMergeApproval\(/,
     /applyResolvedMergeApproval\(/,
     /observeHumanMerge\(/,
+    /startAutomaticMerge\(/,
+    /completeAutomaticMerge\(/,
     /requestSupervisorProposal\(/,
     /deliverOneReport\(/,
   ]) {
@@ -372,11 +376,11 @@ test("B13-4 / B13-33 / B13-34 / B13-35: the Coordinator dispatches and never mer
 });
 
 test("B13-39: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 8);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 8);
   } finally {
     store.close();
   }

@@ -24,7 +24,12 @@ import type { DecisionValidationResult, ProposalV1 } from "../decision/types.ts"
 import { validateAndRecordDecision } from "../decision/decision-log.ts";
 import { buildHumanGateDecision } from "../humandecision/gate-request.ts";
 import { resolvedHumanGateAuthorization } from "../humandecision/gate-authorization.ts";
-import { commitAdmission, commitPendingDecision } from "../statemachine/transition-commit.ts";
+import {
+  commitAdmission,
+  commitPendingDecision,
+  commitTaskDeferral,
+} from "../statemachine/transition-commit.ts";
+import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
 import type { TaskDependency } from "../tasksource/types.ts";
 import { AdmissionError } from "./errors.ts";
 import { evaluateHardDependencies } from "./dependency-admission.ts";
@@ -70,7 +75,10 @@ export function submitProposal(
   command: SubmitProposalCommand,
 ): ProposalSubmissionResult {
   const assembled = assembleDecisionInput(authorities, command);
-  const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input);
+  const recorded = validateAndRecordDecision(authorities.store.decisions, assembled.input, {
+    run_id: command.run_id,
+    batch_id: command.batch_id,
+  });
 
   return act(authorities, command, assembled, recorded.result, recorded.entry.seq);
 }
@@ -108,7 +116,10 @@ export function resolveHumanGateAndAdmit(
   const entry = authorities.store.decisions.append({
     kind: DECISION_VALIDATION_LOG_KIND,
     refKey: authorization.normalized_gate_proposal.proposal_id,
-    payload: decisionPayload(assembled.input.proposal, result),
+    payload: decisionPayload(assembled.input.proposal, result, {
+      run_id: command.run_id,
+      batch_id: command.batch_id,
+    }),
   });
 
   return act(
@@ -188,10 +199,38 @@ function act(
     return { ...base, pending_decision_id: opened.decision_id };
   }
 
-  // ACCEPTED. The one transition this batch performs is task admission; START_SUBFLOW and every
-  // control decision are reported as accepted without a lifecycle change (MVP 3 / later batches).
-  if (proposal === null || proposal.variant !== "TASK_SELECTION") return base;
-  if (proposal.decision !== "START_TASK" || assembled.task_key === null) return base;
+  // ACCEPTED. Selection decisions admit; MVP 3 also applies DEFER_TASK and RESUME_PARENT.
+  // HOLD_TASK and CLOSE_BATCH-adjacent control remain reported-without-lifecycle: the TD defines
+  // no held-reason vocabulary for a Supervisor-initiated hold, and inventing one is not this
+  // module's authority.
+  if (proposal === null) return base;
+
+  if (proposal.decision === "DEFER_TASK" && assembled.task_key !== null) {
+    // TD §19.3 — DEFERRED is entered only before selection, from a validated DEFER_TASK.
+    const deferred = commitTaskDeferral(authorities.store, assembled.task_key);
+    return { ...base, transition_seq: deferred.transition.seq };
+  }
+
+  if (proposal.decision === "RESUME_PARENT" && assembled.task_key !== null) {
+    // §19.5.3 (D22) — the Proposal's V5 PASS is *not* resume authority. Normal resume is owned by
+    // the deterministic eligibility predicate; this validated request only causes it to be
+    // re-observed now. When the predicate does not hold, nothing moves and the refusal is a
+    // durable observation — bypassing it takes a §17.4-mapped RECOVERY_DECISION or an approved
+    // operator action, never a Supervisor Proposal.
+    const outcome = resumeParentIfEligible(authorities.store, assembled.task_key);
+    if (outcome.kind === "RESUMED") {
+      return { ...base, transition_seq: outcome.transition_seq };
+    }
+    authorities.store.decisions.append({
+      kind: "resume_predicate_not_met",
+      refKey: assembled.task_key,
+      payload: { reason: outcome.reason } as never,
+    });
+    return base;
+  }
+
+  if (proposal.variant !== "TASK_SELECTION" && proposal.variant !== "SUBFLOW_SELECTION") return base;
+  if (assembled.task_key === null) return base;
 
   // TD §8.4a — computed as late as possible, from this invocation's own fresh observations, and
   // recomputed on the resolved-gate path too: a human approval does not carry a dependency fact.
@@ -210,6 +249,9 @@ function act(
     );
   }
 
+  // §19.5.1 — an E admission carries the Proposal's exact parent observation into the commit,
+  // where the transaction re-reads and re-checks it against current durable rows. Child
+  // selection, parent suspension and the relation land together or not at all.
   const admitted = commitAdmission(authorities.store, {
     task_key: assembled.task_key,
     hard_dependencies_clear,
@@ -223,6 +265,7 @@ function act(
     },
     admitted_at: command.observed_at,
     ...(resolvedDecisionId === undefined ? {} : { resolved_decision_id: resolvedDecisionId }),
+    ...(proposal.variant === "SUBFLOW_SELECTION" ? { subflow_parent: proposal.parent } : {}),
   });
 
   return { ...base, admitted: true, transition_seq: admitted.transition.seq };

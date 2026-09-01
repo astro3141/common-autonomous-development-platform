@@ -13,9 +13,9 @@ back from the repository.
 ```text
 MVP 0   FORMAL COMPLETE
 MVP 1   FORMAL COMPLETE
-MVP 2   NOT STARTED        (Safe Automatic Merge)
-MVP 3   NOT STARTED        (Subflow / Hold-next / Batch)
-MVP 4   NOT STARTED        (Long-running Unattended / reconciliation)
+MVP 2   IMPLEMENTED (this branch — Safe Automatic Merge; see STATUS_integration_adp_fixed_point.md)
+MVP 3   IMPLEMENTED (this branch — Subflow / Hold-next / Batch)
+MVP 4   IMPLEMENTED (this branch — recovery / circuit breaker / read-only monitoring)
 ```
 
 ## Status — read this before reading anything else
@@ -27,14 +27,14 @@ production Coordinator, and proven by executable tests. Every Runtime session, r
 verification run and report delivery proven in this repository is a deterministic test double.
 
 ```text
-tests      1034 / 1034 PASS
+tests      1099 / 1099 PASS
 typecheck  PASS
-schema     v6 / 17 tables
+schema     v7 / 17 tables
 
-production composition root   absent
-live backend READY proof      absent
-automatic merge               absent
-RA-4 live preflight           BLOCKED (C2, C3, C4, C5)
+production composition root   present (deployment/ — runnable entrypoint)
+live backend READY proof      absent  (RA-4 BLOCKED in this environment; fail-closed proven)
+automatic merge               implemented (Repository Gate, strategy A; refused on Backend v1)
+RA-4 live preflight           BLOCKED (C1..C5 here — no backend install)
 ```
 
 The repository also carries its own failures in the open. `STATUS_common_platform_mvp1.md` §3
@@ -118,8 +118,15 @@ npm test        # 1034 deterministic tests
 npm run typecheck
 ```
 
-There is no `start` script, because there is no production composition root yet. See
-`PREFLIGHT_composition_root.md` for what building one requires.
+The production composition root exists on this branch:
+
+```sh
+node deployment/main.ts --config <deployment.json> [--once]
+```
+
+It opens (or resumes) a run, reports the RA-4 verdict, starts the HTTP ingress and ticks. In an
+environment where the Backend v1 install is absent the preflight is BLOCKED and no Runtime
+external effect ever starts — that boundary is proven live and by test.
 
 ## Safety boundary
 

@@ -1,0 +1,205 @@
+/**
+ * RoutingRecommendationV1 — read-only operability output (TD §5.14, D20; PR #43 finding 16).
+ *
+ * The evaluation unit is exactly the §5.14 tuple —
+ * `role × task/corpus class × runtime binding × assurance context × input-completeness cohort` —
+ * never one global best-model score, and samples whose assurance context or input completeness
+ * differ are **separate strata**, never silently pooled. Each recommendation carries the refs the
+ * TD requires: the per-category sample references into the Measurement Projection, so quality,
+ * failure, latency, usage and cost claims are each traceable to their attempt-level sources
+ * (UNKNOWN where the source is empty — no composite leaderboard number exists).
+ *
+ * The output is evidence for a *human* Profile change or a Supervisor's ordinary `actor_profile`
+ * proposal — never a policy input the Coordinator, RuntimeAdapter or Profile Compiler consumes
+ * (I-TD10). Automatic evidence-based routing stays unadopted; nothing here reduces the Execution
+ * Policy revision it would require.
+ */
+
+import type { PlatformStore } from "../store/platform-store.ts";
+import { evaluationInputContext } from "./measurement.ts";
+import { measurementPacket, type Availability, UNKNOWN } from "./measurement.ts";
+
+export interface RoutingRecommendationV1 {
+  readonly role: "ACTOR";
+  readonly task_or_corpus_class: string;
+  readonly candidate_runtime_profile: string;
+  /** The frozen verification-assurance context these samples ran under (§5.14 unit axis). */
+  readonly assurance_context: string;
+  /** The §5.14 input-completeness cohort these samples share (never pooled across values). */
+  readonly input_completeness: "COMPLETE" | "PARTIAL" | "UNKNOWN";
+  readonly observed_provider: Availability<string>;
+  readonly observed_model: Availability<string>;
+  readonly observed_binding_ref: Availability<string>;
+  readonly sample_size: number;
+  readonly first_pass_acceptance_rate: Availability<number>;
+  readonly rework_rate: Availability<number>;
+  readonly completed_rate: Availability<number>;
+  /** §5.14 required refs — per-category attempt references into the Measurement Projection. */
+  readonly quality_refs: readonly string[];
+  readonly failure_refs: readonly string[];
+  readonly latency_refs: readonly string[];
+  readonly usage_refs: readonly string[];
+  readonly cost_refs: readonly string[];
+  readonly exclusions: readonly string[];
+  readonly limitations: readonly string[];
+  readonly generated_at: string;
+}
+
+export interface RoutingQuery {
+  readonly run_id: string;
+  /** Project classification the samples are grouped under (Profile-owned vocabulary). */
+  readonly task_class?: string;
+  readonly generated_at: string;
+}
+
+/** Derives per-unit recommendations over one run's terminal attempts. Read-only. */
+export function buildRoutingRecommendations(
+  store: PlatformStore,
+  query: RoutingQuery,
+): readonly RoutingRecommendationV1[] {
+  const exclusions: string[] = [];
+  interface Sample {
+    readonly attempt_key: string;
+    readonly completed: boolean;
+    readonly rework_count: number;
+    readonly provider: Availability<string>;
+    readonly model: Availability<string>;
+    readonly binding_ref: Availability<string>;
+    readonly has_latency: boolean;
+    readonly has_usage: boolean;
+    readonly has_cost: boolean;
+    readonly failed: boolean;
+  }
+  interface Group {
+    readonly profile: string;
+    readonly klass: string;
+    readonly assurance: string;
+    readonly completeness: "COMPLETE" | "PARTIAL" | "UNKNOWN";
+    readonly samples: Sample[];
+  }
+  const groups = new Map<string, Group>();
+
+  for (const batch of store.batches.forRun(query.run_id)) {
+    const compiled = store.batchView.compiledProfileFor(batch.batch_id);
+    // The frozen assurance context of this batch's policy: the accepted-assurance sets of every
+    // required check, in a canonical order. Two policies with different accepted sets are
+    // different benchmark conditions and never pool (§5.14).
+    const required = compiled.effective.policy.verification_policy.required_verification;
+    const assurance =
+      Object.keys(required).length === 0
+        ? "UNKNOWN"
+        : Object.keys(required)
+            .sort()
+            .map((check) => `${check}:[${[...(required[check]?.accepted_assurance ?? [])].sort().join(",")}]`)
+            .join(" ");
+
+    for (const task of store.tasks.inBatch(batch.batch_id)) {
+      if (query.task_class !== undefined && task.classification !== query.task_class) continue;
+      if (task.actor_profile === null || task.classification === null) continue;
+      const attempts = store.attempts.forTask(task.task_key);
+      if (attempts.length === 0) continue;
+
+      const runtimeProfile =
+        compiled.effective.project.roles[task.actor_profile]?.runtime_profile ?? "";
+      if (runtimeProfile === "") {
+        exclusions.push(`${task.task_key}: actor profile resolves to no runtime profile`);
+        continue;
+      }
+
+      for (const attempt of attempts) {
+        if (
+          attempt.state !== "MERGED" &&
+          attempt.state !== "FAILED" &&
+          attempt.state !== "INVALIDATED"
+        ) {
+          continue; // only terminal attempts are comparable samples
+        }
+        const packet = measurementPacket(store, attempt.attempt_key);
+        const context = evaluationInputContext(store, attempt.attempt_key);
+        const key = [task.classification, runtimeProfile, assurance, context.input_completeness].join(
+          " | ",
+        );
+        const group: Group = groups.get(key) ?? {
+          profile: runtimeProfile,
+          klass: task.classification,
+          assurance,
+          completeness: context.input_completeness,
+          samples: [],
+        };
+        group.samples.push({
+          attempt_key: attempt.attempt_key,
+          completed: attempt.state === "MERGED",
+          rework_count: attempt.rework_count,
+          provider: packet.actual_provider,
+          model: packet.actual_model,
+          binding_ref: packet.actual_binding_ref,
+          has_latency: packet.stage_durations_ms.kind === "REPORTED",
+          has_usage: packet.usage.kind === "REPORTED",
+          has_cost: packet.cost.kind === "REPORTED",
+          failed: packet.failure_attribution !== null,
+        });
+        groups.set(key, group);
+      }
+    }
+  }
+
+  const recommendations: RoutingRecommendationV1[] = [];
+  for (const group of groups.values()) {
+    const n = group.samples.length;
+    const single = (
+      pick: (sample: Sample) => Availability<string>,
+    ): Availability<string> => {
+      const values = new Set(
+        group.samples
+          .map((sample) => {
+            const field = pick(sample);
+            return field.kind === "REPORTED" ? field.value : undefined;
+          })
+          .filter((value): value is string => value !== undefined),
+      );
+      return values.size === 1 ? { kind: "REPORTED", value: [...values][0]! } : UNKNOWN;
+    };
+    recommendations.push({
+      role: "ACTOR",
+      task_or_corpus_class: group.klass,
+      candidate_runtime_profile: group.profile,
+      assurance_context: group.assurance,
+      input_completeness: group.completeness,
+      observed_provider: single((sample) => sample.provider),
+      observed_model: single((sample) => sample.model),
+      observed_binding_ref: single((sample) => sample.binding_ref),
+      sample_size: n,
+      first_pass_acceptance_rate:
+        n === 0
+          ? UNKNOWN
+          : {
+              kind: "REPORTED",
+              value: group.samples.filter((s) => s.completed && s.rework_count === 0).length / n,
+            },
+      rework_rate:
+        n === 0
+          ? UNKNOWN
+          : { kind: "REPORTED", value: group.samples.filter((s) => s.rework_count > 0).length / n },
+      completed_rate:
+        n === 0
+          ? UNKNOWN
+          : { kind: "REPORTED", value: group.samples.filter((s) => s.completed).length / n },
+      quality_refs: group.samples.map((s) => `measurement:${s.attempt_key}`),
+      failure_refs: group.samples.filter((s) => s.failed).map((s) => `measurement:${s.attempt_key}`),
+      latency_refs: group.samples
+        .filter((s) => s.has_latency)
+        .map((s) => `measurement:${s.attempt_key}`),
+      usage_refs: group.samples.filter((s) => s.has_usage).map((s) => `measurement:${s.attempt_key}`),
+      cost_refs: group.samples.filter((s) => s.has_cost).map((s) => `measurement:${s.attempt_key}`),
+      exclusions,
+      limitations: [
+        "provider/model/binding identity is UNKNOWN unless a backend reported it (§13.2a); nothing is inferred from profile names",
+        "usage/cost are UNKNOWN — no estimator is applied; empty usage/cost refs mean no source series exists",
+        "samples with a different assurance context or input completeness are separate strata (§5.14) — this row never pools across them",
+        "recommendation is read-only evidence; it is not a policy input (I-TD10) and automatic routing is not adopted (§5.14)",
+      ],
+      generated_at: query.generated_at,
+    });
+  }
+  return recommendations;
+}

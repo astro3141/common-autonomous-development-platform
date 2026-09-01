@@ -18,7 +18,7 @@ import type { BlobStore } from "../store/blob-store.ts";
 import { captureContractSources } from "./contract-source.ts";
 import { contractError } from "./errors.ts";
 import { sealTaskContract, type TaskContractResult } from "./task-contract.ts";
-import type { ContractSourceInput, ContractSourceRef, RepositoryScopeV1 } from "./types.ts";
+import type { ContractSourceInput, ContractSourceRef, RepositoryScopeV1, SubflowBindingV1 } from "./types.ts";
 
 export interface TaskContractBuildInput {
   readonly snapshot_id: string;
@@ -38,6 +38,11 @@ export interface TaskContractBuildInput {
   readonly actor_grant_id: string;
   readonly auditor_grant_id: string;
   readonly blobs: BlobStore;
+  /**
+   * §10.1a — present exactly for a subflow child. The builder freezes this already-committed
+   * relation verbatim; it never selects or derives a parent.
+   */
+  readonly subflow_binding?: SubflowBindingV1;
 }
 
 export interface TaskContractBuildResult {
@@ -49,6 +54,15 @@ export interface TaskContractBuildResult {
 
 export function buildTaskContract(input: TaskContractBuildInput): TaskContractBuildResult {
   const profileBody = input.compiled_profile.body;
+
+  // §10.1a — a subflow child's frozen pipeline must terminate in RESUME_PARENT: its completion is
+  // the parent's resumption predicate (§19.5.2), never a canonical merge.
+  if (input.subflow_binding !== undefined) {
+    const steps = profileBody.effective.project.pipelines[input.pipeline_id]?.steps ?? [];
+    if (steps.length === 0 || steps[steps.length - 1] !== "RESUME_PARENT") {
+      throw contractError("/pipeline_id", "a subflow child pipeline must terminate in RESUME_PARENT");
+    }
+  }
 
   // Declared order is the authority; the caller's input order never is (§10.2).
   const declaredPaths = profileBody.effective.project.contract_sources.map((entry) => entry.path);
@@ -102,6 +116,7 @@ export function buildTaskContract(input: TaskContractBuildInput): TaskContractBu
         backend_instance_id: runtimeBody.backend_instance_id,
       },
     },
+    ...(input.subflow_binding === undefined ? {} : { subflow_binding: input.subflow_binding }),
     capability_grants: {
       actor: { grant_id: actor_grant.body.grant_id, grant_hash: actor_grant.grant_hash },
       auditor: { grant_id: auditor_grant.body.grant_id, grant_hash: auditor_grant.grant_hash },

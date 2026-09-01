@@ -644,11 +644,11 @@ test("B11-47 / B11-49 / B11-50: Core settles through the adapter and invents no 
 });
 
 test("B11-48 / B11-51: no backend identifier and no schema change", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 8);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 8);
   } finally {
     store.close();
   }

@@ -34,6 +34,8 @@ export type TaskState =
   | "SELECTED"
   | "ACTIVE"
   | "HELD"
+  /** TD §19.1 / §27 — MVP 3 extension state, held only by a subflow parent. */
+  | "SUSPENDED"
   | "DEFERRED"
   | "COMPLETED"
   | "FAILED";
@@ -42,6 +44,7 @@ export const TASK_STATES: readonly TaskState[] = [
   "SELECTED",
   "ACTIVE",
   "HELD",
+  "SUSPENDED",
   "DEFERRED",
   "COMPLETED",
   "FAILED",
@@ -60,6 +63,7 @@ export type AttemptState =
   | "APPROVED_FOR_MANUAL_MERGE"
   | "MERGING"
   | "MERGED"
+  | "SUCCEEDED"
   | "INVALIDATED"
   | "FAILED";
 export const ATTEMPT_STATES: readonly AttemptState[] = [
@@ -72,12 +76,16 @@ export const ATTEMPT_STATES: readonly AttemptState[] = [
   "APPROVED_FOR_MANUAL_MERGE",
   "MERGING",
   "MERGED",
+  // §19.5.2 (D22, MVP 3) — frozen-pipeline terminal-success for a RESUME_PARENT terminal step.
+  // Not a repository/publication fact and never interchangeable with MERGED.
+  "SUCCEEDED",
   "INVALIDATED",
   "FAILED",
 ];
 
 export const TERMINAL_ATTEMPT_STATES: readonly AttemptState[] = [
   "MERGED",
+  "SUCCEEDED",
   "INVALIDATED",
   "FAILED",
 ];
@@ -179,6 +187,8 @@ export interface TaskRow {
   readonly external_snapshot: ExternalTaskSnapshotV1;
   /** Monotonic admission marker: once set it is never cleared (TD §18.1a). */
   readonly admitted_at: string | null;
+  /** MVP 3 (TD §27) — the parent this task is a subflow child of, or null. */
+  readonly parent_task_key: string | null;
   readonly state_reason: StateReason | null;
   readonly created_at: string;
   readonly updated_at: string;

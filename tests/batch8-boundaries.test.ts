@@ -114,12 +114,10 @@ test("B8-AC39: no backend or project vocabulary, and no MVP 3 state", () => {
     }
   }
 
-  // MVP 3 lifecycle is absent from the code; explaining its absence in a comment is fine.
-  scan(BATCH8_SOURCES, "an MVP 3 state", [
-    new RegExp(fragment("SUS", "PENDED")),
-    new RegExp(fragment("sub", "flow"), "i"),
-    new RegExp(fragment("parent", "_relation")),
-  ]);
+  // MVP 3 is implemented: SUSPENDED and the subflow linkage are Core vocabulary now, owned by
+  // the state machine and store modules this guard scans. What must still never appear is the
+  // never-adopted `parent_relation` spelling (TD §27 fixed `parent_task_key`).
+  scan(BATCH8_SOURCES, "a rejected MVP 3 spelling", [new RegExp(fragment("parent", "_relation"))]);
 });
 
 test("B8-AC39: no credential-bearing identifier reaches the domain schema", () => {

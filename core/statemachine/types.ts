@@ -58,6 +58,11 @@ export const TRANSITION_REASON_CODES = [
   "EXTERNAL_CLOSED",
   "MERGE_REJECTED",
   "POLICY_BACKEND_INCOMPATIBLE",
+  /**
+   * TD §17.4/§24 — the causal fact on an Attempt a person's fresh-snapshot choice invalidated:
+   * the old Attempt may not continue, and the successor is a fresh `START_TASK` Proposal.
+   */
+  "REATTEMPT_REQUESTED",
 ] as const;
 
 export type TransitionReasonCode = (typeof TRANSITION_REASON_CODES)[number];
@@ -68,14 +73,46 @@ export const BLOCKED_BY_DECISION = "BLOCKED_BY_DECISION";
 export const blockedByDecision = (decisionId: string): string =>
   `${BLOCKED_BY_DECISION}:${decisionId}`;
 
-/** True for a fixed §24 code or the parameterized blocking form. Nothing else is a reason. */
 /** TD §19.3a (M1-7) — the pre-Attempt staleness hold reason. */
 export const SELECTION_STALE = "SELECTION_STALE";
 
+/**
+ * TD §17.4/§24 — `REATTEMPT_REQUIRED:<decision_id>`: a next-owner/re-entry reason, never execution
+ * authority. It is resolved by a fresh `START_TASK` Proposal handled as a `RESELECTION` (§9.2e).
+ */
+export const REATTEMPT_REQUIRED = "REATTEMPT_REQUIRED";
+export const reattemptRequired = (decisionId: string): string =>
+  `${REATTEMPT_REQUIRED}:${decisionId}`;
+export function isReattemptRequired(value: string | undefined): boolean {
+  if (value === undefined || !value.startsWith(`${REATTEMPT_REQUIRED}:`)) return false;
+  return value.slice(REATTEMPT_REQUIRED.length + 1).length > 0;
+}
+
+/** TD §17.4/§24 — `ABANDONED_BY_DECISION:<decision_id>`: the exact resolved ABANDON's terminal reason. */
+export const ABANDONED_BY_DECISION = "ABANDONED_BY_DECISION";
+export const abandonedByDecision = (decisionId: string): string =>
+  `${ABANDONED_BY_DECISION}:${decisionId}`;
+
+/** TD §18.1f/§19.5 — `SUBFLOW_CHILD:<child_task_key>`: the parent SUSPENDED row's exact cause. */
+export const SUBFLOW_CHILD = "SUBFLOW_CHILD";
+export const subflowChild = (childTaskKey: string): string => `${SUBFLOW_CHILD}:${childTaskKey}`;
+export function subflowChildOf(reason: string | undefined): string | undefined {
+  if (reason === undefined || !reason.startsWith(`${SUBFLOW_CHILD}:`)) return undefined;
+  const child = reason.slice(SUBFLOW_CHILD.length + 1);
+  return child.length === 0 ? undefined : child;
+}
+
+/**
+ * True for a fixed §24 code or one of the three parameterized forms
+ * (`BLOCKED_BY_DECISION:`, `REATTEMPT_REQUIRED:`, `ABANDONED_BY_DECISION:`, `SUBFLOW_CHILD:`).
+ * Nothing else is a reason.
+ */
 export function isReasonCode(value: string): boolean {
   if ((TRANSITION_REASON_CODES as readonly string[]).includes(value)) return true;
-  if (!value.startsWith(`${BLOCKED_BY_DECISION}:`)) return false;
-  return value.slice(BLOCKED_BY_DECISION.length + 1).length > 0;
+  for (const prefix of [BLOCKED_BY_DECISION, REATTEMPT_REQUIRED, ABANDONED_BY_DECISION, SUBFLOW_CHILD]) {
+    if (value.startsWith(`${prefix}:`) && value.slice(prefix.length + 1).length > 0) return true;
+  }
+  return false;
 }
 
 // --- attempt facts ------------------------------------------------------------------
@@ -115,6 +152,21 @@ export type AttemptFact =
       readonly verdict: "AUDIT_PASS" | "FIX_REQUIRED" | "HUMAN_REQUIRED";
       readonly drift_clear: boolean;
     }
+  /**
+   * §19.5.2 (D22, MVP 3) — the frozen RESUME_PARENT terminal-success predicate held: the child
+   * Contract is subflow v2 with a current binding, every required verification evidence is PASS
+   * and bound to this exact candidate/Contract, the audit settled AUDIT_PASS for the same cycle,
+   * and no blocker/drift/recovery/circuit condition stands. Booleans are the caller's *observed*
+   * predicate legs — a false one is rejected, never reinterpreted. No repository operation exists
+   * on this path at all.
+   */
+  | {
+      readonly kind: "FOUNDATION_SUCCEEDED";
+      readonly subflow_binding_current: boolean;
+      readonly required_checks_bound: boolean;
+      readonly settlement_is_pass: boolean;
+      readonly blockers_clear: boolean;
+    }
   /** §19.3 REWORKING→IMPLEMENTING. */
   | { readonly kind: "REWORK_STARTED"; readonly snapshot_valid: boolean }
   /** §19.4 — a human APPROVE. Explicitly not a merge. */
@@ -129,11 +181,42 @@ export type AttemptFact =
   /** §11.1 INVALIDATE_AT_BOUNDARY, or an explicit human decision. */
   | { readonly kind: "CONTRACT_DRIFT_INVALIDATED" }
   /** Any §24 hold that leaves the attempt where it is and parks the task. */
+  /**
+   * TD §17.4 — a resolved non-merge decision's deterministic lifecycle application. The caller has
+   * already validated the record, re-read every named authority and matched the exact
+   * category × origin × option mapping row; the guard owns only the source-state legality and the
+   * resulting states. Resolution itself is never a lifecycle effect — this fact is.
+   */
+  | { readonly kind: "RESOLVED_DECISION_APPLIED"; readonly application: ResolvedDecisionApplication }
   | { readonly kind: "EXECUTION_HELD"; readonly reason_code: TransitionReasonCode }
   /** Unrecoverable: the attempt terminates and the task fails with it (§19.2 I4). */
   | { readonly kind: "ATTEMPT_FAILED"; readonly reason_code: TransitionReasonCode };
 
 /** What one attempt fact resolves to. The commit function writes exactly this. */
+/**
+ * TD §17.4 — the five deterministic applications of the current v1 category × origin × option
+ * mapping. Each names its exact effect; there is deliberately no generic "resolve any decision"
+ * shape, and an unmapped combination has no representation here at all.
+ */
+export type ResolvedDecisionApplication =
+  /** `AUDIT_DECISION` × `REQUEST_REWORK`: AUDITING→REWORKING + task HELD→ACTIVE. */
+  | { readonly kind: "AUDIT_REWORK" }
+  /** Any mapped `ABANDON`: the non-terminal source Attempt and its Task both FAIL. */
+  | { readonly kind: "ABANDON"; readonly decision_id: string }
+  /**
+   * `REATTEMPT_WITH_NEW_SNAPSHOT` over a non-terminal source: the source is INVALIDATED with the
+   * category's §17.4 causal reason and the task re-enters via `REATTEMPT_REQUIRED:<id>`.
+   */
+  | {
+      readonly kind: "REATTEMPT";
+      readonly decision_id: string;
+      readonly attempt_reason: "REATTEMPT_REQUESTED" | "RECOVERY_CONFLICT";
+    }
+  /** `CONTRACT_DECISION` × `ALLOW_FROZEN_SNAPSHOT_TO_COMPLETE`: task HELD→ACTIVE, Attempt untouched. */
+  | { readonly kind: "ALLOW_FROZEN" }
+  /** `CONTRACT_DECISION` × `INVALIDATE_ATTEMPT`: INVALIDATED(CONTRACT_DRIFT) + re-entry reason. */
+  | { readonly kind: "INVALIDATE_CONTRACT_DRIFT"; readonly decision_id: string };
+
 export interface AttemptOutcome {
   readonly attempt_state: AttemptState;
   readonly candidate_commit?: string;

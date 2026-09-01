@@ -23,6 +23,10 @@ import {
   manifests,
   repositoryControl,
   selection,
+  subflowChildContext,
+  subflowParentView,
+  SUBFLOW_PARENT_INTENT,
+  subflowSelection,
   taskControl,
   HEAD,
 } from "./support/decision-fixtures.ts";
@@ -161,7 +165,24 @@ test("B7-AC25: START_TASK and START_SUBFLOW check actor_execution then auditor_e
     const classification = decision === "START_TASK" ? "IMPLEMENTABLE" : "SPLIT_NEEDED";
     const run = (used: ReturnType<typeof compiled>): DecisionValidationResult =>
       validateDecision(
-        inputFor(selection({ profile: used, decision, classification }), used, { manifests: weak }),
+        inputFor(
+          decision === "START_SUBFLOW"
+            ? subflowSelection({
+                profile: used,
+                classification,
+                pipeline_id: "foundation",
+                parent: SUBFLOW_PARENT_INTENT,
+              })
+            : selection({ profile: used, decision, classification }),
+          used,
+          decision === "START_SUBFLOW"
+            ? {
+                manifests: weak,
+                subflow_parent: subflowParentView() as never,
+                subflow_child: subflowChildContext() as never,
+              }
+            : { manifests: weak },
+        ),
       );
 
     assert.equal(

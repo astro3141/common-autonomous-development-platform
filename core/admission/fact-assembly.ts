@@ -23,10 +23,12 @@ import type { DecisionValidationInput } from "../decision/validator.ts";
 import type {
   ProposalV1,
   SelectionAdmissionKind,
+  SubflowParentValidationView,
+  SubflowSelectionProposalV1,
   TaskBearingProposalV1,
   TaskLookupView,
 } from "../decision/types.ts";
-import { SELECTION_STALE } from "../statemachine/types.ts";
+import { isReattemptRequired, SELECTION_STALE, subflowChildOf } from "../statemachine/types.ts";
 import { taskKey as buildTaskKey } from "../schemas/identifiers.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
 import type {
@@ -86,6 +88,7 @@ export interface AssembledDecision {
 /** Variants whose `expected` carries a `base_head`, so V8 applies (§9.1). */
 const REPOSITORY_SENSITIVE: readonly ProposalV1["variant"][] = [
   "TASK_SELECTION",
+  "SUBFLOW_SELECTION",
   "REPOSITORY_SENSITIVE_TASK_CONTROL",
 ];
 
@@ -153,8 +156,19 @@ export function assembleDecisionInput(
     admission_kind,
     ...(task === undefined ? {} : { task }),
     ...(canonical_head === null ? {} : { repository: { canonical_head } }),
-    ...(proposal.variant === "TASK_SELECTION"
+    ...(proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"
       ? { batch: store.batchView.project(batch.batch_id) }
+      : {}),
+    // §9.2f — the fresh parent/child read-models an E submission carries into V2/V3/V11.
+    ...(proposal.variant === "SUBFLOW_SELECTION" && task_key !== null && durable_task !== null
+      ? {
+          subflow_parent: subflowParentView(store, proposal),
+          subflow_child: {
+            task_key,
+            batch_id: durable_task.batch_id,
+            has_parent_relation: durable_task.parent_task_key !== null,
+          },
+        }
       : {}),
   };
 
@@ -181,13 +195,66 @@ export function assembleDecisionInput(
 }
 
 /**
- * §9.2e (M1-7) — a task held by `SELECTION_STALE` with an admission marker and no live attempt is
- * reselecting; anything else is an initial admission. Read off durable state, never proposed.
+ * §9.2f — the exact fresh parent read-model, from durable owners only. A missing parent row is a
+ * real `NOT_FOUND`; a *corrupt* relation (a cycle in the durable `parent_task_key` chain) is an
+ * operational failure before the validator runs, with zero side effects.
+ */
+function subflowParentView(
+  store: PlatformStore,
+  proposal: SubflowSelectionProposalV1,
+): SubflowParentValidationView {
+  const parent = store.tasks.get(proposal.parent.task_key);
+  if (parent === undefined) return { status: "NOT_FOUND" };
+
+  const attempt = store.attempts.current(parent.task_key);
+  const ancestors: string[] = [];
+  for (
+    let cursor = parent.parent_task_key;
+    cursor !== null;
+    cursor = store.tasks.require(cursor).parent_task_key
+  ) {
+    if (cursor === parent.task_key || ancestors.includes(cursor)) {
+      throw new AdmissionError(
+        "SUBMISSION_CONTEXT_INVALID",
+        "/parent/task_key",
+        `${parent.task_key} sits on a cyclic durable parent chain; refusing to validate against it`,
+      );
+    }
+    ancestors.push(cursor);
+  }
+
+  return {
+    status: "FOUND",
+    task_key: parent.task_key,
+    batch_id: parent.batch_id,
+    platform_state: parent.platform_state,
+    current_attempt_key: attempt?.attempt_key ?? null,
+    current_attempt_state: attempt?.state ?? null,
+    current_task_contract_hash:
+      attempt === undefined ? null : (store.contracts.hashOf(attempt.contract_snapshot_id) as string),
+    ancestor_task_keys: ancestors,
+    current_suspension_child_task_key:
+      parent.platform_state === "SUSPENDED"
+        ? (subflowChildOf(parent.state_reason?.code) ?? null)
+        : null,
+    has_open_blocker: store.pendingDecisions.openFor(parent.task_key).length > 0,
+    has_recovery_conflict:
+      parent.state_reason?.code === "RECOVERY_CONFLICT" ||
+      attempt?.state_reason?.code === "RECOVERY_CONFLICT",
+  };
+}
+
+/**
+ * §9.2e (M1-7) + §17.4 — a task held by `SELECTION_STALE` or `REATTEMPT_REQUIRED:<decision_id>`
+ * with an admission marker and no live attempt is reselecting; anything else is an initial
+ * admission. Read off durable state, never proposed.
  */
 function admissionKindFor(task: TaskRow | null): SelectionAdmissionKind {
   if (task === null) return "INITIAL_ADMISSION";
-  const stale = task.platform_state === "HELD" && task.state_reason?.code === SELECTION_STALE;
-  return stale && task.admitted_at !== null ? "RESELECTION" : "INITIAL_ADMISSION";
+  const reentry =
+    task.platform_state === "HELD" &&
+    (task.state_reason?.code === SELECTION_STALE || isReattemptRequired(task.state_reason?.code));
+  return reentry && task.admitted_at !== null ? "RESELECTION" : "INITIAL_ADMISSION";
 }
 
 // --- context ------------------------------------------------------------------------

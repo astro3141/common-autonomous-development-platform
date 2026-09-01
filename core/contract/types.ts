@@ -73,7 +73,42 @@ export interface TaskContractGrantsV1 {
   readonly auditor: CapabilityGrantRefV1;
 }
 
-/** TD §10.1 — exactly twelve top-level fields, all required. */
+/**
+ * §10.1a (D22, MVP 3) — the committed parent relation a subflow child Contract freezes. Built by
+ * the activation builder from authoritative rows *after* the §19.5.1 admission committed — the
+ * Contract build never selects a parent.
+ */
+export interface SubflowBindingV1 {
+  readonly parent_task_key: string;
+  readonly parent_attempt_key: string;
+  readonly parent_task_contract_hash: string;
+  readonly parent_attempt_state_at_suspend: string;
+  /** `transition:<decision_log.seq>` of the parent's suspension transition. */
+  readonly suspension_transition_ref: string;
+}
+
+export const SUBFLOW_BINDING_FIELDS: readonly (keyof SubflowBindingV1)[] = [
+  "parent_task_key",
+  "parent_attempt_key",
+  "parent_task_contract_hash",
+  "parent_attempt_state_at_suspend",
+  "suspension_transition_ref",
+];
+
+/** §10.1a — the parent Attempt states a suspension can freeze as the continuation point. */
+export const SUBFLOW_PARENT_SUSPEND_STATES: readonly string[] = [
+  "READY",
+  "IMPLEMENTING",
+  "VERIFYING",
+  "AUDITING",
+  "REWORKING",
+];
+
+/**
+ * TD §10.1 — exactly twelve top-level fields, all required. §10.1a's subflow v2 adds exactly one
+ * required 13th field (`subflow_binding`) for children admitted through a SubflowSelectionProposal;
+ * the ordinary v1 body never carries it, not even as null.
+ */
 export interface TaskContractV1Body {
   readonly snapshot_id: string;
   readonly task: TaskContractTaskV1;
@@ -88,6 +123,8 @@ export interface TaskContractV1Body {
   readonly capability_grants: TaskContractGrantsV1;
   /** Immutable copy of `task.body_copy.acceptance_notes` — no independent authority (§10.1). */
   readonly completion_conditions: readonly string[];
+  /** §10.1a — present exactly when this is a subflow child Contract (schema v2). */
+  readonly subflow_binding?: SubflowBindingV1;
 }
 
 export const TASK_CONTRACT_BODY_FIELDS: readonly string[] = [

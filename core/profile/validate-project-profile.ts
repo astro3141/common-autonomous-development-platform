@@ -23,6 +23,7 @@ import {
   EXECUTION_DISPOSITIONS,
   PIPELINE_STEPS,
   PROJECT_PROFILE_TOP_LEVEL,
+  PROJECT_PROFILE_TOP_LEVEL_V2,
   type AdapterConfigured,
   type ClassificationEntry,
   type ContractSourceEntry,
@@ -36,7 +37,14 @@ import {
 
 export function validateProjectProfile(input: unknown): ProjectProfileV1Body {
   const body = asObject(input, "");
-  exactKeys(body, "", PROJECT_PROFILE_TOP_LEVEL as readonly string[]);
+  // TD §7.1d — the presence of `supervisor_profile` selects the v2 shape; everything else about
+  // the body is byte-for-byte the v1 contract. No inference, no default, no roles-first-entry.
+  const isV2 = Object.hasOwn(body, "supervisor_profile");
+  exactKeys(
+    body,
+    "",
+    (isV2 ? PROJECT_PROFILE_TOP_LEVEL_V2 : PROJECT_PROFILE_TOP_LEVEL) as readonly string[],
+  );
 
   const id = asNonEmptyString(body["id"], "/id");
   if (id.includes(":")) {
@@ -59,7 +67,22 @@ export function validateProjectProfile(input: unknown): ProjectProfileV1Body {
     ),
     repository_scopes: repositoryScopes(body["repository_scopes"]),
     hooks: adapterConfiguredMap(body["hooks"], "/hooks"),
+    ...(isV2
+      ? { supervisor_profile: supervisorProfile(body["supervisor_profile"], roles(body["roles"])) }
+      : {}),
   };
+}
+
+/** TD §7.1d — non-empty and declared in `roles`; missing or unknown references never resolve. */
+function supervisorProfile(
+  value: unknown,
+  declaredRoles: Readonly<Record<string, RoleEntry>>,
+): string {
+  const reference = asNonEmptyString(value, "/supervisor_profile");
+  if (!Object.hasOwn(declaredRoles, reference)) {
+    throw schemaError("/supervisor_profile", `references undeclared role ${JSON.stringify(reference)}`);
+  }
+  return reference;
 }
 
 /**

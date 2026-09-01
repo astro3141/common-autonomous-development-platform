@@ -78,6 +78,19 @@ export class RunStore {
     return this.require(runId);
   }
 
+  /** Non-COMPLETED runs of one project, oldest first. The durable run-discovery read (§53). */
+  activeForProject(projectId: string): readonly PlatformRunRow[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT run_id, project_id, compiled_profile_hash, status, created_at, updated_at
+           FROM platform_run
+          WHERE project_id = ? AND status <> 'COMPLETED'
+          ORDER BY run_id ASC`,
+      )
+      .all(projectId) as unknown as PlatformRunRow[];
+    return rows;
+  }
+
   get(runId: string): PlatformRunRow | undefined {
     const row = this.#database
       .prepare(
@@ -208,6 +221,8 @@ export interface TaskStateWrite {
   readonly admitted_at?: string;
   /** Clears `state_reason_*`, e.g. when a reselection resolves a SELECTION_STALE hold. */
   readonly clear_reason?: boolean;
+  /** MVP 3 — links a subflow child to its parent. Written once at subflow admission. */
+  readonly parent_task_key?: string;
 }
 
 export class TaskStore {
@@ -296,6 +311,7 @@ export class TaskStore {
                          repository_scope_id = ?, selection_binding_json = ?,
                          admitted_at = COALESCE(admitted_at, ?),
                          state_reason_code = ?, state_reason_log_seq = ?,
+                         parent_task_key = COALESCE(?, parent_task_key),
                          updated_at = ?
            WHERE task_key = ?`,
       )
@@ -310,6 +326,7 @@ export class TaskStore {
         write.admitted_at ?? null,
         write.clear_reason === true ? null : (write.reason?.code ?? null),
         write.clear_reason === true ? null : (write.reason?.log_seq ?? null),
+        write.parent_task_key ?? null,
         this.#now(),
         taskKey,
       );
@@ -323,7 +340,7 @@ export class TaskStore {
                 classification, pipeline_id, actor_profile, verification_profile,
                 repository_scope_id, selection_binding_json,
                 external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
-                created_at, updated_at
+                parent_task_key, created_at, updated_at
            FROM task WHERE task_key = ?`,
       )
       .get(taskKey) as TaskDbRow | undefined;
@@ -336,6 +353,21 @@ export class TaskStore {
     return row;
   }
 
+  /** MVP 3 — the subflow children linked to one parent, in stable key order. */
+  childrenOf(parentTaskKey: string): readonly TaskRow[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT task_key, batch_id, project_id, external_task_ref, platform_state,
+                classification, pipeline_id, actor_profile, verification_profile,
+                repository_scope_id, selection_binding_json,
+                external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
+                parent_task_key, created_at, updated_at
+           FROM task WHERE parent_task_key = ? ORDER BY task_key ASC`,
+      )
+      .all(parentTaskKey) as unknown as TaskDbRow[];
+    return rows.map(toTaskRow);
+  }
+
   inBatch(batchId: string): readonly TaskRow[] {
     const rows = this.#database
       .prepare(
@@ -343,7 +375,7 @@ export class TaskStore {
                 classification, pipeline_id, actor_profile, verification_profile,
                 repository_scope_id, selection_binding_json,
                 external_snapshot_json, admitted_at, state_reason_code, state_reason_log_seq,
-                created_at, updated_at
+                parent_task_key, created_at, updated_at
            FROM task WHERE batch_id = ? ORDER BY task_key ASC`,
       )
       .all(batchId) as unknown as TaskDbRow[];
@@ -459,7 +491,7 @@ export class AttemptStore {
     const row = this.#database
       .prepare(
         `${ATTEMPT_COLUMNS} WHERE task_key = ?
-            AND state NOT IN ('MERGED', 'INVALIDATED', 'FAILED')`,
+            AND state NOT IN ('MERGED', 'SUCCEEDED', 'INVALIDATED', 'FAILED')`,
       )
       .get(taskKey) as AttemptDbRow | undefined;
     return row === undefined ? undefined : toAttemptRow(row);
@@ -495,6 +527,7 @@ interface TaskDbRow {
   admitted_at: string | null;
   state_reason_code: string | null;
   state_reason_log_seq: number | null;
+  parent_task_key: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -532,6 +565,7 @@ function toTaskRow(row: TaskDbRow): TaskRow {
         : (JSON.parse(row.selection_binding_json) as SelectionBindingV1),
     external_snapshot: JSON.parse(row.external_snapshot_json) as ExternalTaskSnapshotV1,
     admitted_at: row.admitted_at,
+    parent_task_key: row.parent_task_key,
     state_reason: toReason(row.state_reason_code, row.state_reason_log_seq),
     created_at: row.created_at,
     updated_at: row.updated_at,

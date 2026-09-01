@@ -64,11 +64,15 @@ export class DocumentProfileSource implements ProfileSource {
 /** Exactly how the Compiled Profile derives its own refs, so the two are comparable. */
 function componentRef(
   schema: string,
-  body: { readonly id: string; readonly version: number },
+  body: { readonly id: string; readonly version: number; readonly supervisor_profile?: string },
 ): { id: string; version: number; hash: string } {
+  // TD §7.1d — a v2 Project Profile hashes under schema_version 2, exactly as the compiler does,
+  // so a drift comparison of the same document yields the same component hash.
+  const schemaVersion =
+    schema === PROJECT_PROFILE_SCHEMA && body.supervisor_profile !== undefined ? 2 : 1;
   return {
     id: body.id,
     version: body.version,
-    hash: hashEnvelope(makeEnvelope(schema, 1, body as unknown as CanonicalObject)),
+    hash: hashEnvelope(makeEnvelope(schema, schemaVersion, body as unknown as CanonicalObject)),
   };
 }

@@ -53,6 +53,8 @@ test("M1B2-AC1 / AC2 / AC48: no migration was added and the v3 foundation is unt
       { version: 4, name: "selection-scope" },
       { version: 5, name: "selection-binding" },
       { version: 6, name: "audit-decision-category" },
+      { version: 7, name: "subflow-parent" },
+      { version: 8, name: "subflow-succeeded" },
     ],
   );
   assert.deepEqual(
@@ -128,7 +130,7 @@ test("M1B2-AC26 / §55: TaskStore exposes no generic patch and no external-state
     Object.getOwnPropertyNames(TaskStore.prototype)
       .filter((name) => name !== "constructor")
       .sort(),
-    ["discover", "get", "inBatch", "observe", "require", "write"],
+    ["childrenOf", "discover", "get", "inBatch", "observe", "require", "write"],
   );
   for (const forbidden of [
     "patch",

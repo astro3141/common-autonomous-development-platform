@@ -502,6 +502,7 @@ function decide(
     attempt_key,
     verdict_value: verdict,
     envelope: input.verdict,
+    contract: input.contract,
   });
 }
 
@@ -517,6 +518,7 @@ function commitDecision(
     readonly decision_op: string;
     readonly verdict_value: PlatformAuditVerdict;
     readonly envelope: AuditorVerdictV1;
+    readonly contract: TaskContractV1Body;
   },
 ): CompleteAuditingOutcome {
   const { store } = authorities;
@@ -547,11 +549,33 @@ function commitDecision(
     }
   }
 
+  // §19.5.2 (D22, MVP 3) — the frozen pipeline owns the terminal-success shape. A RESUME_PARENT
+  // terminal makes AUDIT_PASS the foundation predicate's last leg: the settled pass produces
+  // `SUCCEEDED` + `COMPLETED` with zero repository operations, never `READY_TO_MERGE`. The
+  // predicate legs are all authoritative at this point — the verification gate crossed at
+  // VERIFYING→AUDITING and rebinds through the review's evidence ids, the settlement above is
+  // the exact settled AUDIT_PASS, drift crossed CONTINUE, and the subflow v2 binding is re-read
+  // from the frozen Contract this cycle judged.
+  const compiledPipeline = store.batchView.compiledProfileFor(input.task.batch_id).effective
+    .project.pipelines[input.contract.pipeline_id];
+  const foundationTerminal =
+    input.verdict_value === "AUDIT_PASS" &&
+    compiledPipeline !== undefined &&
+    compiledPipeline.steps[compiledPipeline.steps.length - 1] === "RESUME_PARENT";
+
   const committed = commitAttemptFact(store, {
     attempt_key: input.attempt_key,
     // §19.2 — the sealed guard owns every branch. `drift_clear` is true because `AUDIT_PASS`
     // reached here only through a `CONTINUE` boundary, and the other two do not cross one.
-    fact: { kind: "AUDIT_DECIDED", verdict: input.verdict_value, drift_clear: true },
+    fact: foundationTerminal
+      ? {
+          kind: "FOUNDATION_SUCCEEDED",
+          subflow_binding_current: input.contract.subflow_binding !== undefined,
+          required_checks_bound: true,
+          settlement_is_pass: true,
+          blockers_clear: true,
+        }
+      : { kind: "AUDIT_DECIDED", verdict: input.verdict_value, drift_clear: true },
     ...(decision === undefined ? {} : { decision }),
     within: () => {
       store.auditRecords.put({

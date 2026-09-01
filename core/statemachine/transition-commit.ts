@@ -18,7 +18,7 @@ import type { PendingDecisionV1 } from "../humandecision/types.ts";
 import { subjectKey } from "../humandecision/pending-decision.ts";
 import type { CanonicalObject } from "../schemas/canonical-json.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
-import { SELECTION_STALE } from "./types.ts";
+import { abandonedByDecision, reattemptRequired, isReattemptRequired, SELECTION_STALE, subflowChild } from "./types.ts";
 import {
   isTerminalTask,
   type AttemptState,
@@ -106,6 +106,18 @@ export interface AdmissionCommand {
    * decision, and the transition ref is written back into its resolution.
    */
   readonly resolved_decision_id?: string;
+  /**
+   * §9.2f/§19.5.1 (MVP 3) — present for a `START_SUBFLOW` admission: the E Proposal's exact
+   * parent observation. The transaction re-reads the parent's current rows and requires exact
+   * equality on all four fields before it links the child and suspends the parent — validation
+   * never leases authority across the gap (§9.2f "P1–P5는 … lease가 아니다").
+   */
+  readonly subflow_parent?: {
+    readonly task_key: string;
+    readonly attempt_key: string;
+    readonly task_contract_hash: string;
+    readonly attempt_state: string;
+  };
 }
 
 /**
@@ -117,12 +129,15 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
     const task = store.tasks.require(command.task_key);
     const batch = store.batches.require(task.batch_id);
 
-    // §9.2e/§19.3a (M1-7) — a HELD(SELECTION_STALE) task is reselecting, not being admitted.
+    // §9.2e/§19.3a (M1-7) + §17.4 — a task held by `SELECTION_STALE` or by
+    // `REATTEMPT_REQUIRED:<decision_id>` is reselecting, not being admitted anew.
     const reselection =
-      task.platform_state === "HELD" && task.state_reason?.code === SELECTION_STALE;
+      task.platform_state === "HELD" &&
+      (task.state_reason?.code === SELECTION_STALE ||
+        isReattemptRequired(task.state_reason?.code));
     if (reselection) {
       if (task.admitted_at === null) {
-        throw illegal(`${task.task_key} is SELECTION_STALE without an admission marker`);
+        throw illegal(`${task.task_key} is reselecting without an admission marker`);
       }
       if (store.attempts.current(task.task_key) !== undefined) {
         throw illegal(`${task.task_key} still has a non-terminal attempt`);
@@ -193,7 +208,107 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       store.pendingDecisions.recordAppliedTransition(command.resolved_decision_id, transition.seq);
     }
 
-    return { transition, task: updated, batch: currentBatch };
+    if (command.subflow_parent !== undefined) {
+      linkSubflowParent(store, task.task_key, command.subflow_parent);
+    }
+
+    return { transition, task: store.tasks.require(task.task_key), batch: currentBatch };
+  });
+}
+
+/** §9.2f P2 — the parent Attempt states a subflow may interrupt. */
+const SUBFLOW_PARENT_ATTEMPT_STATES: readonly string[] = [
+  "READY",
+  "IMPLEMENTING",
+  "VERIFYING",
+  "AUDITING",
+  "REWORKING",
+];
+
+/**
+ * §19.5.1 (MVP 3) — links an admitted subflow child to its explicit parent and suspends the
+ * ACTIVE parent, inside the admission transaction. Everything E claimed about the parent is
+ * re-read and re-checked here against current durable rows — child link, parent suspension,
+ * relation provenance and admission all commit together or not at all. A parent that is HELD,
+ * SUSPENDED, terminal or in a merge stage is not a normal-subflow parent.
+ */
+function linkSubflowParent(
+  store: PlatformStore,
+  childKey: string,
+  intent: {
+    readonly task_key: string;
+    readonly attempt_key: string;
+    readonly task_contract_hash: string;
+    readonly attempt_state: string;
+  },
+): void {
+  const parentKey = intent.task_key;
+  if (childKey === parentKey) throw illegal(`${childKey} cannot be its own subflow parent`);
+  const child = store.tasks.require(childKey);
+  const parent = store.tasks.require(parentKey);
+  if (parent.batch_id !== child.batch_id) {
+    throw illegal(`subflow parent ${parentKey} is not in ${child.batch_id}`);
+  }
+  if (parent.platform_state !== "ACTIVE") {
+    throw illegal(`a normal subflow parent must be ACTIVE, not ${parent.platform_state}`);
+  }
+  if (child.parent_task_key !== null) {
+    throw illegal(`${childKey} already has a parent relation`);
+  }
+  // No cycle through the durable chain (P3) and no competing current relation (P4).
+  let cursor = parent.parent_task_key;
+  while (cursor !== null) {
+    if (cursor === childKey || cursor === parentKey) {
+      throw illegal(`linking ${childKey} under ${parentKey} would close a parent cycle`);
+    }
+    cursor = store.tasks.require(cursor).parent_task_key;
+  }
+  for (const sibling of store.tasks.childrenOf(parentKey)) {
+    if (!isTerminalTask(sibling.platform_state)) {
+      throw illegal(`${parentKey} already has a non-terminal child relation (${sibling.task_key})`);
+    }
+  }
+  // E's exact parent observation must still be true of the current rows (§19.5.1).
+  const attempt = store.attempts.current(parentKey);
+  if (attempt === undefined || attempt.attempt_key !== intent.attempt_key) {
+    throw illegal(`${parentKey} no longer runs the Attempt the Proposal observed`);
+  }
+  if (attempt.state !== intent.attempt_state || !SUBFLOW_PARENT_ATTEMPT_STATES.includes(attempt.state)) {
+    throw illegal(`${parentKey}'s Attempt is ${attempt.state}; the observed continuation point is stale`);
+  }
+  if (store.contracts.hashOf(attempt.contract_snapshot_id) !== intent.task_contract_hash) {
+    throw illegal(`${parentKey}'s frozen Task Contract is not the one the Proposal observed`);
+  }
+
+  store.tasks.write(childKey, { platform_state: child.platform_state, parent_task_key: parentKey });
+  // §18.1f — the parent SUSPENDED row must carry the exact relation/cause and its transition ref.
+  const suspension = appendTransition(store, {
+    primary_entity_key: parentKey,
+    task: { from: "ACTIVE", to: "SUSPENDED" },
+    reason_code: subflowChild(childKey),
+  });
+  store.tasks.write(parentKey, {
+    platform_state: "SUSPENDED",
+    reason: { code: subflowChild(childKey), log_seq: suspension.seq },
+  });
+}
+
+/**
+ * MVP 3 — `SUSPENDED → ACTIVE`. Explicitly by a validated `RESUME_PARENT` Proposal, or by the
+ * Coordinator when every subflow child has COMPLETED (Spec §47: Child PASS → Parent RESUME).
+ * The parent's Attempt was never touched by the suspension, so nothing else changes.
+ */
+export function commitParentResume(store: PlatformStore, parentTaskKey: string): TransitionResult {
+  return store.withTransaction(() => {
+    const parent = store.tasks.require(parentTaskKey);
+    if (parent.platform_state !== "SUSPENDED") {
+      throw illegal(`resume requires SUSPENDED, not ${parent.platform_state}`);
+    }
+    const transition = appendTransition(store, {
+      primary_entity_key: parentTaskKey,
+      task: { from: "SUSPENDED", to: "ACTIVE" },
+    });
+    return { transition, task: store.tasks.write(parentTaskKey, { platform_state: "ACTIVE" }) };
   });
 }
 
@@ -330,6 +445,86 @@ export function commitTaskDeferral(store: PlatformStore, taskKey: string): Trans
     });
     // admitted_at is not touched: a deferral never gives back consumed admission.
     return { transition, task: store.tasks.write(taskKey, { platform_state: "DEFERRED" }) };
+  });
+}
+
+/**
+ * TD §17.4 — the `HELD→HELD` re-entry transition for a resolved `REATTEMPT_WITH_NEW_SNAPSHOT`
+ * whose source Attempt is *already terminal* (the drift path invalidated it before the question
+ * was answered). Only the task's reason changes — to `REATTEMPT_REQUIRED:<decision_id>` — so the
+ * next-owner becomes the fresh `START_TASK` re-entry (§9.2e RESELECTION). The old Attempt is not
+ * touched: terminal rows are immutable and continuation is forbidden either way.
+ */
+export function commitTaskReattemptReentry(
+  store: PlatformStore,
+  command: {
+    readonly task_key: string;
+    readonly decision_id: string;
+    readonly within?: (transition: TransitionRecord) => void;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const task = store.tasks.require(command.task_key);
+    if (task.platform_state !== "HELD") {
+      throw illegal(`a reattempt re-entry requires HELD, not ${task.platform_state}`);
+    }
+    if (store.attempts.current(command.task_key) !== undefined) {
+      throw illegal(`${command.task_key} still has a non-terminal Attempt`);
+    }
+    const reason = reattemptRequired(command.decision_id);
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "HELD", to: "HELD" },
+      reason_code: reason,
+      pending_decision_id: command.decision_id,
+    });
+    command.within?.(transition);
+    return {
+      transition,
+      task: store.tasks.write(command.task_key, {
+        platform_state: "HELD",
+        reason: { code: reason, log_seq: transition.seq },
+      }),
+    };
+  });
+}
+
+/**
+ * TD §17.4 — the terminal application of a resolved `ABANDON` whose source Attempt is *already
+ * terminal* (drift already invalidated it). The task alone fails, with the exact resolved
+ * decision as its §24 reason; the terminal Attempt row stays exactly as it is.
+ */
+export function commitTaskAbandonment(
+  store: PlatformStore,
+  command: {
+    readonly task_key: string;
+    readonly decision_id: string;
+    readonly within?: (transition: TransitionRecord) => void;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const task = store.tasks.require(command.task_key);
+    if (task.platform_state !== "HELD") {
+      throw illegal(`an abandonment application requires HELD, not ${task.platform_state}`);
+    }
+    if (store.attempts.current(command.task_key) !== undefined) {
+      throw illegal(`${command.task_key} still has a non-terminal Attempt`);
+    }
+    const reason = abandonedByDecision(command.decision_id);
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "HELD", to: "FAILED" },
+      reason_code: reason,
+      pending_decision_id: command.decision_id,
+    });
+    command.within?.(transition);
+    return {
+      transition,
+      task: store.tasks.write(command.task_key, {
+        platform_state: "FAILED",
+        reason: { code: reason, log_seq: transition.seq },
+      }),
+    };
   });
 }
 
@@ -619,6 +814,34 @@ export interface BatchCommand {
    * status follow in the same breath — neither should be able to survive a rolled-back completion.
    */
   readonly within?: (transition: TransitionRecord, outcome: BatchOutcome) => void;
+}
+
+/**
+ * MVP 4 (TD §20/§22.2) — the explicit, human-initiated exit from PAUSED_SAFELY.
+ *
+ * Spec §52 forbids automatic recovery; the caller must be an operator surface, and the caller must
+ * have re-run the §22.2 reconciliation and obtained CONSISTENT before asking. This function trusts
+ * neither: it re-checks the states and refuses anything but the exact PAUSED_SAFELY → RUNNING
+ * step. It never touches tasks or attempts — whatever fail-closed states they hold, they keep.
+ */
+export function commitBatchResumeFromPause(
+  store: PlatformStore,
+  command: { readonly batch_id: string },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const batch = store.batches.require(command.batch_id);
+    if (batch.status !== "PAUSED_SAFELY") {
+      throw illegal(`resume-from-pause requires PAUSED_SAFELY, not ${batch.status}`);
+    }
+    const transition = appendTransition(store, {
+      primary_entity_key: batch.batch_id,
+      batch: { from: "PAUSED_SAFELY", to: "RUNNING" },
+    });
+    const updated = store.batches.setStatus(batch.batch_id, "RUNNING");
+    const run = store.runs.require(batch.run_id);
+    if (run.status === "PAUSED_SAFELY") store.runs.setStatus(batch.run_id, "RUNNING");
+    return { transition, batch: updated };
+  });
 }
 
 export function commitBatchFact(store: PlatformStore, command: BatchCommand): TransitionResult {

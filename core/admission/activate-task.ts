@@ -18,6 +18,7 @@
  */
 
 import { buildTaskContract, type TaskContractBuildResult } from "../contract/builder.ts";
+import { SUBFLOW_PARENT_SUSPEND_STATES, type SubflowBindingV1 } from "../contract/types.ts";
 import type { ContractSourceInput } from "../contract/types.ts";
 import { evaluateCapabilityRequirements } from "../capability/compatibility.ts";
 import { deriveRequestedCapabilities } from "../capability/derive.ts";
@@ -37,6 +38,7 @@ import {
   commitContractBuildFailure,
   commitSelectionStale,
 } from "../statemachine/transition-commit.ts";
+import { subflowChildOf } from "../statemachine/types.ts";
 import { normalizeTaskDefinition } from "../tasksource/task-definition.ts";
 import type { TaskDefinition } from "../tasksource/types.ts";
 import { AdmissionError } from "./errors.ts";
@@ -141,6 +143,10 @@ export function activateSelectedTask(
       // snapshot, the attempt and the task state all commit or roll back together (§10.2, §18.2).
       build: (): TaskContractBuildResult =>
         buildTaskContract({
+          // §10.1a — the child freezes the committed relation only; nothing is selected here.
+          ...(task.parent_task_key === null
+            ? {}
+            : { subflow_binding: frozenSubflowBinding(store, task) }),
           snapshot_id: command.snapshot_id,
           task: definition,
           attempt: n,
@@ -169,6 +175,50 @@ export function activateSelectedTask(
   }
 
   return { kind: "ACTIVATED", attempt_key, transition_seq: result.transition.seq };
+}
+
+/**
+ * §10.1a — the relation freeze, from authoritative rows only: the child's durable
+ * `parent_task_key`, the parent's SUSPENDED row with its exact `SUBFLOW_CHILD:<this child>`
+ * cause/ref, and the parent's untouched current Attempt/Contract. Any mismatch is a build
+ * failure — the already-committed relation is never rewritten or re-derived.
+ */
+function frozenSubflowBinding(
+  store: DecisionAuthorities["store"],
+  child: TaskRow,
+): SubflowBindingV1 {
+  const parentKey = child.parent_task_key as string;
+  const parent = store.tasks.require(parentKey);
+  if (parent.platform_state !== "SUSPENDED") {
+    throw new AdmissionError(
+      "SUBMISSION_CONTEXT_INVALID",
+      "/parent/platform_state",
+      `${parentKey} is ${parent.platform_state}; the committed suspension is gone`,
+    );
+  }
+  const reason = parent.state_reason;
+  if (reason === null || reason === undefined || subflowChildOf(reason.code) !== child.task_key) {
+    throw new AdmissionError(
+      "SUBMISSION_CONTEXT_INVALID",
+      "/parent/state_reason",
+      `${parentKey} is not suspended for ${child.task_key}`,
+    );
+  }
+  const attempt = store.attempts.current(parentKey);
+  if (attempt === undefined || !SUBFLOW_PARENT_SUSPEND_STATES.includes(attempt.state)) {
+    throw new AdmissionError(
+      "SUBMISSION_CONTEXT_INVALID",
+      "/parent/attempt",
+      `${parentKey} has no frozen continuation Attempt`,
+    );
+  }
+  return {
+    parent_task_key: parentKey,
+    parent_attempt_key: attempt.attempt_key,
+    parent_task_contract_hash: store.contracts.hashOf(attempt.contract_snapshot_id) as string,
+    parent_attempt_state_at_suspend: attempt.state,
+    suspension_transition_ref: `transition:${reason.log_seq}`,
+  };
 }
 
 // --- preconditions --------------------------------------------------------------------

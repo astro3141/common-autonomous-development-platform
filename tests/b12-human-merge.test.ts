@@ -673,7 +673,8 @@ test("B12-61 / B12-64 ~ B12-66: the Platform merges nothing and reaches no backe
     assert.equal(pattern.test(code), false, `human-merge matches ${pattern}`);
   }
 
-  // And no Core module gained a merge primitive.
+  // And no Core module gained a merge primitive — except the MVP 2 Repository Gate, which is the
+  // one module whose job it is (TD §14.4). The human path itself still merges nothing.
   const coreFiles = readdirSync(join(ROOT, "core"), { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .flatMap((entry) =>
@@ -682,6 +683,7 @@ test("B12-61 / B12-64 ~ B12-66: the Platform merges nothing and reaches no backe
         .map((name) => join(ROOT, "core", entry.name, name)),
     );
   for (const file of coreFiles) {
+    if (relative(ROOT, file) === "core/execution/automatic-merge.ts") continue;
     assert.equal(
       /prepare_merge|commit_merge/.test(stripped(file)),
       false,
@@ -691,11 +693,11 @@ test("B12-61 / B12-64 ~ B12-66: the Platform merges nothing and reaches no backe
 });
 
 test("B12-63: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 8);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 8);
   } finally {
     store.close();
   }

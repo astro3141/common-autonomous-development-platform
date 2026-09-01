@@ -19,6 +19,8 @@ import {
   compiled,
   repositoryControl,
   selection,
+  SUBFLOW_PARENT_INTENT,
+  subflowSelection,
   task,
   taskControl,
   PROPOSAL_ID,
@@ -67,10 +69,10 @@ test("B7-AC1: an unknown decision is rejected", () => {
 
 // --- B7-AC2 the four variants ---------------------------------------------------------
 
-test("B7-AC2: all eight decisions parse through exactly four structural variants", () => {
+test("B7-AC2: all eight decisions parse through the four sealed variants plus subflow E", () => {
   const parsed = [
     validateProposal(selection({ profile, decision: "START_TASK" })),
-    validateProposal(selection({ profile, decision: "START_SUBFLOW" })),
+    validateProposal(subflowSelection({ profile, parent: SUBFLOW_PARENT_INTENT })),
     validateProposal(repositoryControl({ profile, decision: "REQUEST_REWORK" })),
     validateProposal(repositoryControl({ profile, decision: "PROPOSE_MERGE" })),
     validateProposal(taskControl({ profile, decision: "HOLD_TASK" })),
@@ -86,7 +88,13 @@ test("B7-AC2: all eight decisions parse through exactly four structural variants
   );
   assert.deepEqual(
     [...new Set(parsed.map((proposal) => proposal.variant))].sort(),
-    ["BATCH_CONTROL", "REPOSITORY_SENSITIVE_TASK_CONTROL", "TASK_CONTROL", "TASK_SELECTION"],
+    [
+      "BATCH_CONTROL",
+      "REPOSITORY_SENSITIVE_TASK_CONTROL",
+      "SUBFLOW_SELECTION",
+      "TASK_CONTROL",
+      "TASK_SELECTION",
+    ],
   );
 });
 

@@ -16,9 +16,11 @@ import {
   EXPECTED_FIELDS,
   PROPOSAL_FIELDS,
   PROPOSAL_VARIANT_BY_DECISION,
+  SUBFLOW_PARENT_FIELDS,
   type DecisionType,
   type ProposalV1,
   type ProposalVariant,
+  type SubflowParentIntentV1,
 } from "./types.ts";
 
 /**
@@ -88,10 +90,8 @@ export function validateProposal(input: unknown): ProposalV1 {
     };
   }
 
-  return {
-    variant,
+  const selection = {
     proposal_id,
-    decision: decision as "START_TASK" | "START_SUBFLOW",
     task_ref,
     classification: nonEmptyString(raw["classification"], "/classification"),
     pipeline_id: nonEmptyString(raw["pipeline_id"], "/pipeline_id"),
@@ -100,6 +100,32 @@ export function validateProposal(input: unknown): ProposalV1 {
     repository_scope_id: nonEmptyString(raw["repository_scope_id"], "/repository_scope_id"),
     expected: repositorySensitive,
     reason_refs,
+  };
+
+  if (variant === "SUBFLOW_SELECTION") {
+    // §9.2f — `parent` is the Supervisor's explicit relationship intent, exact four fields. A
+    // parentless START_SUBFLOW simply is not an E and fails V1; there is no acceptance path that
+    // picks a parent later.
+    return {
+      variant,
+      decision: "START_SUBFLOW",
+      parent: validateParentIntent(raw["parent"]),
+      ...selection,
+    };
+  }
+
+  return { variant: "TASK_SELECTION", decision: "START_TASK", ...selection };
+}
+
+/** §9.1 E — the exact four-field parent wrapper; unknown fields reject like every wrapper. */
+function validateParentIntent(value: unknown): SubflowParentIntentV1 {
+  const parent = asObject(value, "/parent");
+  exactKeys(parent, SUBFLOW_PARENT_FIELDS, "/parent");
+  return {
+    task_key: nonEmptyString(parent["task_key"], "/parent/task_key"),
+    attempt_key: nonEmptyString(parent["attempt_key"], "/parent/attempt_key"),
+    task_contract_hash: nonEmptyString(parent["task_contract_hash"], "/parent/task_contract_hash"),
+    attempt_state: nonEmptyString(parent["attempt_state"], "/parent/attempt_state"),
   };
 }
 

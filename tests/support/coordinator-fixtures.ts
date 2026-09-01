@@ -84,8 +84,11 @@ export interface CoordinatorWorld extends ProductionCoordinatorDependencies {
  * A run and batch with a compiled profile, a run-scoped SUPERVISOR grant, one discovered task and
  * a production Coordinator over all of it. Nothing has been executed yet.
  */
-export function coordinatorWorld(world: DomainWorld): CoordinatorWorld {
-  const manifests = receiptFreeManifests();
+export function coordinatorWorld(
+  world: DomainWorld,
+  overrides: Partial<{ repository: RecordingRepository; manifests: ReturnType<typeof receiptFreeManifests> }> = {},
+): CoordinatorWorld {
+  const manifests = overrides.manifests ?? receiptFreeManifests();
 
   // §13.4 — the run-scoped SUPERVISOR grant is issued before the first Supervisor session exists,
   // through the Core use-case that owns it. The fixture supplies only the caller-owned ULID.
@@ -102,7 +105,7 @@ export function coordinatorWorld(world: DomainWorld): CoordinatorWorld {
   current.put(PROFILE_DOCUMENTS.execution_policy_path, world.inputs.policy);
   for (const source of sources()) current.bytes.set(source.path, source.bytes);
 
-  const repository = new RecordingRepository(HEAD);
+  const repository = overrides.repository ?? new RecordingRepository(HEAD);
   const runtime = new RecordingRuntime();
   const identities: CoordinatorIdentities = {
     nextUlid: ulidAllocator(),

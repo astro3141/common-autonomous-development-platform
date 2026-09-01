@@ -61,7 +61,7 @@ test("A1 / A2 / A4: a full generic lifecycle runs on Core alone with neutral voc
       "LARGE_SCOPE",
       "SPLIT_NEEDED",
     ]);
-    assert.deepEqual(Object.keys(project.pipelines).sort(), ["review_only", "standard"]);
+    assert.deepEqual(Object.keys(project.pipelines).sort(), ["foundation", "review_only", "standard"]);
 
     const key = discover(world);
     const raw = selection({ profile: world.profile });

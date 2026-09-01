@@ -53,12 +53,80 @@ export interface ModelDeclaredOutcome {
 }
 
 /**
- * TD §13.2 — schema `platform/runtime-turn-result` v1.
+ * TD §13.2a (v1.5, PROSPECTIVE) — the measurement observation a v2 turn result carries.
+ *
+ * Everything is availability-honest: a backend that does not report provider/model/usage/cost
+ * yields `UNKNOWN`, and nothing is inferred from profile names, elapsed time or price tables.
+ * This is a measurement/evidence source only — never Task success, Verification PASS, retry or
+ * transition authority.
+ */
+export interface RuntimeExecutionObservationV1 {
+  readonly op_key: string;
+  /**
+   * TD §13.2a — the subject of this operation. The adapter cannot know the Platform's attempt
+   * identity, so it emits `UNKNOWN`; Core stamps the real subject from the frozen chain when it
+   * persists the observation (§13.5 — "Core가 공급").
+   */
+  readonly subject:
+    | { readonly run_id: string }
+    | { readonly attempt_key: string }
+    | { readonly kind: "UNKNOWN" };
+  readonly role: string;
+  /** The Project-Profile role id behind this operation — Core-supplied, `""` until stamped. */
+  readonly role_profile_id: string;
+  readonly runtime_profile: string;
+  /** Displayable adapter-resolved requested binding, when one exists (I-TD7 safe). */
+  readonly requested_binding_ref?: string;
+  readonly actual: {
+    readonly provider:
+      | { readonly availability: "REPORTED"; readonly value: string }
+      | { readonly availability: "UNKNOWN" };
+    readonly model:
+      | { readonly availability: "REPORTED"; readonly value: string }
+      | { readonly availability: "UNKNOWN" };
+    /** Displayable stable fingerprint of the actual binding, when the backend reports one (I-TD7 safe). */
+    readonly binding_ref:
+      | { readonly availability: "REPORTED"; readonly value: string }
+      | { readonly availability: "UNKNOWN" };
+  };
+  readonly timing: { readonly started_at: string; readonly completed_at: string };
+  readonly usage:
+    | {
+        readonly kind: "REPORTED";
+        readonly quantities: Readonly<Record<string, { readonly value: number; readonly unit: string }>>;
+      }
+    | { readonly kind: "UNKNOWN" };
+  readonly cost:
+    | { readonly kind: "REPORTED"; readonly value: string; readonly currency: string }
+    | { readonly kind: "UNKNOWN" };
+  /**
+   * TD §24.1 — diagnostic attribution for a failed operation, or null when the turn completed.
+   * Structurally the same shape `core/operability/measurement.ts` consumes; declared inline here
+   * because an adapter interface must not import Core modules.
+   */
+  readonly failure_attribution: {
+    readonly domain: string;
+    readonly detail_code: string;
+    readonly source_ref: string;
+    readonly reporter: "BACKEND" | "PLATFORM" | "VERIFIER" | "AUDITOR" | "HUMAN";
+    readonly retryable:
+      | { readonly kind: "REPORTED"; readonly value: boolean }
+      | { readonly kind: "UNKNOWN" };
+  } | null;
+}
+
+/**
+ * TD §13.2 — schema `platform/runtime-turn-result` v1 (v2 adds `execution_observation`).
  *
  * `model_declared_outcome` is always non-authoritative; `structured_output` is absent when the
  * adapter could not collect a structured result, in which case `result_channel` is `TURN_TEXT`.
  */
 export interface RuntimeTurnResult {
+  /**
+   * TD §13.2a — `platform/runtime-turn-result` schema version. Version 2 requires
+   * `execution_observation`; absent means v1. Never a hash-bearing artifact either way.
+   */
+  readonly schema_version?: 1 | 2;
   readonly session_handle: RuntimeSessionHandle;
   readonly turn_handle: RuntimeTurnHandle;
   readonly backend_status: RuntimeBackendStatus;
@@ -71,6 +139,8 @@ export interface RuntimeTurnResult {
   readonly model_declared_outcome?: ModelDeclaredOutcome;
   /** Backend references admissible under I-TD7; stored only as adapter metadata (TD §6.1). */
   readonly backend_native_refs?: CanonicalObject;
+  /** TD §13.2a — present when the adapter speaks v2. Measurement source, never authority. */
+  readonly execution_observation?: RuntimeExecutionObservationV1;
 }
 
 /**

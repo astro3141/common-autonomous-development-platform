@@ -11,7 +11,7 @@
 
 import { isTerminalAttempt, type TaskAttemptRow } from "../store/domain-types.ts";
 import { illegal, precondition, TransitionError } from "./errors.ts";
-import type { AttemptFact, AttemptOutcome } from "./types.ts";
+import { abandonedByDecision, reattemptRequired, type AttemptFact, type AttemptOutcome } from "./types.ts";
 
 export interface AttemptLimits {
   /** `effective.policy.batch_policy.max_rework` of the batch that froze the profile. */
@@ -118,6 +118,17 @@ export function nextAttemptOutcome(
       break;
     }
 
+    case "FOUNDATION_SUCCEEDED": {
+      expect(from === "AUDITING", `foundation terminal-success requires AUDITING, not ${from}`);
+      if (!fact.subflow_binding_current) throw precondition("the subflow v2 binding is not current");
+      if (!fact.required_checks_bound) throw precondition("the verification gate did not pass for this candidate");
+      if (!fact.settlement_is_pass) throw precondition("no settled AUDIT_PASS binds to this cycle");
+      if (!fact.blockers_clear) throw precondition("a blocker/drift/recovery condition stands");
+      // Completion ≠ merge: SUCCEEDED is the frozen pipeline's terminal-success, `MERGED` is the
+      // MERGE_GATE path's repository fact, and neither aliases the other (§19.5.2).
+      return { attempt_state: "SUCCEEDED", task_state: "COMPLETED" };
+    }
+
     case "REWORK_STARTED": {
       expect(from === "REWORKING", `rework requires REWORKING, not ${from}`);
       if (!fact.snapshot_valid) throw precondition("the frozen contract snapshot is no longer valid");
@@ -188,6 +199,56 @@ export function nextAttemptOutcome(
         // A new Attempt is always an explicit human decision — never a silent restart (§19.2).
         needs_human_decision: true,
       };
+    }
+
+    case "RESOLVED_DECISION_APPLIED": {
+      // §17.4 — the caller matched the exact mapping row and re-read every authority; this guard
+      // owns source-state legality and the resulting states, nothing else.
+      const application = fact.application;
+      switch (application.kind) {
+        case "AUDIT_REWORK": {
+          expect(from === "AUDITING", `a resolved audit rework requires AUDITING, not ${from}`);
+          if (attempt.rework_count >= limits.max_rework) {
+            throw precondition("the rework budget is spent; the mapping row required remaining rework");
+          }
+          // Same Attempt, same Contract continues; applying the answer is what unblocks the task.
+          return { attempt_state: "REWORKING", task_state: "ACTIVE" };
+        }
+        case "ABANDON": {
+          return {
+            attempt_state: "FAILED",
+            attempt_reason_code: abandonedByDecision(application.decision_id),
+            task_state: "FAILED",
+            task_reason_code: abandonedByDecision(application.decision_id),
+          };
+        }
+        case "REATTEMPT": {
+          expect(
+            from === "READY_TO_MERGE" || from === "APPROVED_FOR_MANUAL_MERGE",
+            `a resolved reattempt over a live Attempt requires a merge-pending source, not ${from}`,
+          );
+          // Old-Attempt continuation is forbidden; the successor is a fresh START_TASK Proposal.
+          return {
+            attempt_state: "INVALIDATED",
+            attempt_reason_code: application.attempt_reason,
+            task_state: "HELD",
+            task_reason_code: reattemptRequired(application.decision_id),
+          };
+        }
+        case "ALLOW_FROZEN": {
+          // The frozen snapshot may finish: Attempt state and Contract are untouched.
+          return { attempt_state: from, task_state: "ACTIVE" };
+        }
+        case "INVALIDATE_CONTRACT_DRIFT": {
+          return {
+            attempt_state: "INVALIDATED",
+            attempt_reason_code: "CONTRACT_DRIFT",
+            task_state: "HELD",
+            task_reason_code: reattemptRequired(application.decision_id),
+          };
+        }
+      }
+      break;
     }
 
     case "EXECUTION_HELD": {

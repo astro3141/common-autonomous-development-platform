@@ -40,11 +40,11 @@ import { commitAttemptFact } from "../statemachine/transition-commit.ts";
 import type { TaskAttemptRow } from "../store/domain-types.ts";
 import { StoreError } from "../store/errors.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
+import { actorTurnMetadataKey } from "./actor-operations.ts";
 import {
   ExecutionStartError,
   REPOSITORY_ADAPTER,
   RUNTIME_ADAPTER,
-  TURN_METADATA_KEY,
   WORKSPACE_METADATA_KEY,
 } from "./start-implementation.ts";
 
@@ -73,6 +73,15 @@ export interface VerificationAuthorities {
 
 export interface StartVerificationCommand {
   readonly attempt_key: string;
+  /**
+   * TD §22.3 (R-1) — set only by the recovery pass, after the RuntimeAdapter itself reported the
+   * session/turn as lost (`SESSION_LOST`/`RUNTIME_ERROR`). It lets the candidate the repository
+   * actually holds be judged on its own facts ("검증이 model 무관하게 판정") instead of waiting
+   * forever for a turn that will never complete. It never bypasses the repository checks, and a
+   * merely-unobservable turn (no terminal projection) is *not* a loss — the caller must have an
+   * authoritative terminal answer in hand.
+   */
+  readonly recovered_turn_loss?: boolean;
 }
 
 export type StartVerificationOutcome =
@@ -118,13 +127,61 @@ export function startVerification(
   const contract = requireContract(store, attempt);
 
   // --- step 1–2 — the Runtime's only contribution: the turn is over --------------------
-  const turn_handle = requireMetadata(store, attempt_key, RUNTIME_ADAPTER, TURN_METADATA_KEY);
+  // The *current* turn, not the first one: after a rework the attempt's live turn is
+  // `actor-turn:<rework_count + 1>` (M1-15), and consulting an earlier, already-terminal turn
+  // would advance the lifecycle while the real work is still running (§19.3 — the trigger is
+  // this turn's terminal observation).
+  const turn_handle = requireMetadata(
+    store,
+    attempt_key,
+    RUNTIME_ADAPTER,
+    actorTurnMetadataKey(attempt.rework_count + 1),
+  );
   const result = authorities.runtime.get_turn_result(turn_handle as unknown as RuntimeTurnHandle);
   if (result.backend_status !== "COMPLETED") {
-    // §7 — the other terminal states belong to the existing failure/recovery rules, and §22.3's
-    // catch-up is a recovery pass, not this transition. Nothing is written either way.
-    return { kind: "TURN_NOT_COMPLETED", backend_status: result.backend_status };
+    const recoverable_loss =
+      command.recovered_turn_loss === true &&
+      (result.backend_status === "SESSION_LOST" || result.backend_status === "RUNTIME_ERROR");
+    if (!recoverable_loss) {
+      // §7 — the other terminal states belong to the existing failure/recovery rules, and §22.3's
+      // catch-up is a recovery pass, not this transition. Nothing is written either way.
+      return { kind: "TURN_NOT_COMPLETED", backend_status: result.backend_status };
+    }
+    // §22.3 R-1 — the turn is treated as failed; what was actually produced is the repository's
+    // question from here on, exactly as in the ordinary path below.
   }
+  // §5.12 (durable source minimum) — the completed turn's redacted envelope is preserved as a
+  // durable measurement source when the transition that consumes it commits. Structured bodies,
+  // backend-native refs and anything I-TD7 restricts are deliberately not part of the projection.
+  const turn_ordinal = attempt.rework_count + 1;
+  // §13.2a / §13.5 — role, role_profile_id, subject and the resolved runtime_profile are supplied
+  // by Core from the *frozen* authority chain, never by the adapter and never inferred from
+  // provider output: the selection is durable on the task row and the chain is resolved from the
+  // batch-bound Compiled Profile. Adapter-observed fields (provider/model/binding/usage/cost/
+  // timing/attribution) pass through untouched.
+  const adapter_observation = (result as { execution_observation?: CanonicalObject })
+    .execution_observation;
+  const frozen_chain = {
+    subject: { attempt_key },
+    role: "ACTOR",
+    role_profile_id: task.actor_profile ?? "",
+    runtime_profile: resolveFrozenActorRuntimeProfile(store, attempt, task.actor_profile),
+  };
+  const redacted_turn: CanonicalValue = {
+    backend_status: result.backend_status,
+    termination_reason: result.termination_reason,
+    started_at: result.started_at,
+    completed_at: result.completed_at,
+    schema_version: (result as { schema_version?: number }).schema_version ?? 1,
+    ...(adapter_observation === undefined
+      ? {}
+      : {
+          execution_observation: {
+            ...(adapter_observation as Record<string, unknown>),
+            ...frozen_chain,
+          } as unknown as CanonicalObject,
+        }),
+  } as unknown as CanonicalValue;
 
   // --- steps 3–5 — the repository decides what exists ----------------------------------
   const workspace = requireWorkspace(store, attempt_key);
@@ -160,6 +217,7 @@ export function startVerification(
       attempt_key,
       op_key,
       candidate,
+      turn_projection: { key: `actor_turn_result:${turn_ordinal}`, value: redacted_turn },
       run_value: requireStoredRun(stored, record?.result, op_key),
       already_stored: stored !== undefined,
     });
@@ -193,6 +251,7 @@ export function startVerification(
     candidate,
     run_value: started.run_handle as unknown as CanonicalValue,
     already_stored: false,
+    turn_projection: { key: `actor_turn_result:${turn_ordinal}`, value: redacted_turn },
   });
 }
 
@@ -206,6 +265,7 @@ function commitVerifying(
     readonly candidate: string;
     readonly run_value: CanonicalValue;
     readonly already_stored: boolean;
+    readonly turn_projection?: { readonly key: string; readonly value: CanonicalValue };
   },
 ): StartVerificationOutcome {
   const result = commitAttemptFact(store, {
@@ -229,6 +289,18 @@ function commitVerifying(
       }
       if (store.idempotency.get(input.op_key)?.state !== "DONE") {
         store.idempotency.markDone(input.op_key, input.run_value);
+      }
+      if (
+        input.turn_projection !== undefined &&
+        store.adapterMetadata.get(input.attempt_key, RUNTIME_ADAPTER, input.turn_projection.key) ===
+          undefined
+      ) {
+        store.adapterMetadata.put({
+          entity_key: input.attempt_key,
+          adapter_id: RUNTIME_ADAPTER,
+          key: input.turn_projection.key,
+          value: input.turn_projection.value,
+        });
       }
     },
   });
@@ -339,4 +411,24 @@ function requireStoredRun(
     throw new StoreError("DOMAIN_ROW_INVALID", `${op_key} completed without a run reference`);
   }
   return value;
+}
+
+/**
+ * §13.5 — the frozen Actor runtime-profile chain: `task.actor_profile` (validated selection) →
+ * batch-bound Compiled Profile `roles[...].runtime_profile`. Never the current registry, never a
+ * default; an unresolvable chain is honestly empty rather than guessed.
+ */
+function resolveFrozenActorRuntimeProfile(
+  store: PlatformStore,
+  attempt: TaskAttemptRow,
+  actor_profile: string | null,
+): string {
+  if (actor_profile === null) return "";
+  try {
+    const task = store.tasks.require(attempt.task_key);
+    const compiled = store.batchView.compiledProfileFor(task.batch_id);
+    return compiled.effective.project.roles[actor_profile]?.runtime_profile ?? "";
+  } catch {
+    return "";
+  }
 }

@@ -35,7 +35,7 @@ const coreSources = (): string[] =>
 // --- area V: the schema is untouched -----------------------------------------------------------
 
 test("B6-29 (V): the schema is still v5 with the same 17 tables and no new migration", () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 8);
   assert.deepEqual(
     MIGRATIONS.map((migration) => migration.name),
     [
@@ -46,13 +46,16 @@ test("B6-29 (V): the schema is still v5 with the same 17 tables and no new migra
       "selection-binding",
       // M1-13 — the AUDIT_DECISION category; a CHECK rebuild, not a new table.
       "audit-decision-category",
+      // MVP 3 — SUSPENDED + parent_task_key; a CHECK rebuild, not a new table.
+      "subflow-parent",
+      "subflow-succeeded",
     ],
   );
 
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 6);
+    assert.equal(store.schemaVersion, 8);
   } finally {
     store.close();
   }

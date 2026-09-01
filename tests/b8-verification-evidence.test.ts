@@ -361,11 +361,18 @@ test("§24 / §25 + B9 §25/§26: evidence work is one module, and no module doe
     "core/execution/complete-auditing.ts",
     // MVP1-B12 reads the settled audit record the merge approval is bound to. Reads only.
     "core/execution/human-merge.ts",
+    // MVP 2 — the Repository Gate recomputes the verification gate from the immutable rows
+    // (§14.4 precondition). Reads only, writes none.
+    "core/execution/automatic-merge.ts",
   ];
-  /** MVP1-B11 writes them; MVP1-B12 reads the one its merge approval is bound to. */
+  /** MVP1-B11 writes them; MVP1-B12 and the MVP 2 Gate read the one their merge is bound to. */
   const AUDIT_RECORD_READERS = [
     "core/execution/complete-auditing.ts",
     "core/execution/human-merge.ts",
+    "core/execution/automatic-merge.ts",
+    // §17.4 (D22) — the AUDIT_DECISION mapping row re-reads the settled record its question was
+    // opened on ("the audit evidence still binds to this exact cycle"). Reads only, writes none.
+    "core/execution/apply-resolved-decision.ts",
   ];
   const execution = readdirSync(join(ROOT, "core/execution"))
     .filter((name) => name.endsWith(".ts"))
@@ -402,6 +409,10 @@ test("§24 / §25 + B9 §25/§26: evidence work is one module, and no module doe
       "core/execution/drift-observation.ts",
       "core/execution/assemble-drift-observation.ts",
       "core/execution/stage-boundary-drift.ts",
+      // §17.4 (D22) — the resolved-decision application names AUDITING only as the exact allowed
+      // source state of the AUDIT_DECISION mapping row. It launches nothing and reads no verdict;
+      // the decision surface below stays forbidden to it like everyone else.
+      "core/execution/apply-resolved-decision.ts",
     ];
     const namesAuditorStage = AUDITOR_STAGE_MODULES.includes(relative(ROOT, file));
     for (const forbidden of [/AUDITING/, /"AUDITOR"/]) {

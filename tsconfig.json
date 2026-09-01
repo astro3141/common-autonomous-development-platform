@@ -11,5 +11,11 @@
     "noUncheckedIndexedAccess": true,
     "noEmit": true
   },
-  "include": ["core/**/*.ts", "adapters/**/*.ts", "testdoubles/**/*.ts", "tests/**/*.ts"]
+  "include": [
+    "core/**/*.ts",
+    "adapters/**/*.ts",
+    "deployment/**/*.ts",
+    "testdoubles/**/*.ts",
+    "tests/**/*.ts"
+  ]
 }

@@ -64,6 +64,8 @@ export const projectProfile = (overrides: Record<string, unknown> = {}): Record<
     // M1-10 — an auditing pipeline declares which role its Auditor runs under.
     standard: { steps: ["ACTOR", "VERIFY", "AUDITOR", "MERGE_GATE"], auditor_profile: "review" },
     review_only: { steps: ["VERIFY", "AUDITOR"], auditor_profile: "review" },
+    // §19.5.2 — the foundation shape: terminal-success is RESUME_PARENT, never a merge.
+    foundation: { steps: ["ACTOR", "VERIFY", "AUDITOR", "RESUME_PARENT"], auditor_profile: "review" },
   },
   verification_profiles: { full: { adapter: "example-verifier", config: {} } },
   // M1-6 — the Project Profile is the declaration authority for repository mutation scope.
@@ -168,6 +170,30 @@ export const selection = (options: ProposalOptions): Record<string, unknown> => 
   reason_refs: [],
 });
 
+/** §9.1 E — a subflow selection with an explicit parent intent (D22). */
+export const subflowSelection = (
+  options: ProposalOptions & {
+    readonly parent: {
+      readonly task_key: string;
+      readonly attempt_key: string;
+      readonly task_contract_hash: string;
+      readonly attempt_state: string;
+    };
+  },
+): Record<string, unknown> => ({
+  proposal_id: PROPOSAL_ID,
+  decision: "START_SUBFLOW",
+  task_ref: (options.definition ?? task()).task_ref,
+  classification: options.classification ?? "IMPLEMENTABLE",
+  pipeline_id: options.pipeline_id ?? "standard",
+  actor_profile: "implementation",
+  verification_profile: "full",
+  repository_scope_id: options.repository_scope_id ?? "collector",
+  parent: options.parent,
+  expected: { ...freshness(options), base_head: options.base_head ?? HEAD },
+  reason_refs: [],
+});
+
 export const repositoryControl = (options: ProposalOptions): Record<string, unknown> => ({
   proposal_id: PROPOSAL_ID,
   decision: options.decision ?? "PROPOSE_MERGE",
@@ -192,6 +218,40 @@ export const batchControl = (options: ProposalOptions): Record<string, unknown> 
 });
 
 /** A complete, passing input; individual tests replace one part at a time. */
+/** A coherent §9.2f parent intent + fresh view pair for validator-level E tests. */
+export const SUBFLOW_PARENT_INTENT = {
+  task_key: "task:alpha:P-1",
+  attempt_key: "attempt:task:alpha:P-1:1",
+  task_contract_hash: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  attempt_state: "VERIFYING",
+} as const;
+
+export const subflowParentView = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  status: "FOUND",
+  task_key: SUBFLOW_PARENT_INTENT.task_key,
+  batch_id: "batch:alpha:1",
+  platform_state: "ACTIVE",
+  current_attempt_key: SUBFLOW_PARENT_INTENT.attempt_key,
+  current_attempt_state: SUBFLOW_PARENT_INTENT.attempt_state,
+  current_task_contract_hash: SUBFLOW_PARENT_INTENT.task_contract_hash,
+  ancestor_task_keys: [],
+  current_suspension_child_task_key: null,
+  has_open_blocker: false,
+  has_recovery_conflict: false,
+  ...overrides,
+});
+
+export const subflowChildContext = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  task_key: "task:alpha:C-1",
+  batch_id: "batch:alpha:1",
+  has_parent_relation: false,
+  ...overrides,
+});
+
 export const inputFor = (
   proposal: unknown,
   profile: CompileResult,
