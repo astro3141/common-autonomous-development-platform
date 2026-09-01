@@ -475,7 +475,7 @@ test("B5-I1 / B5-I2 / B5-I3: SELECTED and ACTIVE both survive a reopen", () => {
 
     // B5-I1 — the binding is durable, with no Proposal anywhere in memory.
     const reopened = owner.temp.open();
-    assert.equal(reopened.schemaVersion, 8);
+    assert.equal(reopened.schemaVersion, 9);
     assert.deepEqual(reopened.tasks.require(TASK_KEY).selection_binding, binding);
 
     // B5-I2 — activation resumes from durable state alone.

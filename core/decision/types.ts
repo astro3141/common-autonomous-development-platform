@@ -23,14 +23,17 @@ export type { DecisionType };
 export type ProposalVariant =
   | "TASK_SELECTION"
   | "SUBFLOW_SELECTION"
+  | "SUBFLOW_CHILD_MATERIALIZATION"
   | "REPOSITORY_SENSITIVE_TASK_CONTROL"
   | "TASK_CONTROL"
   | "BATCH_CONTROL";
 
 export const PROPOSAL_VARIANT_BY_DECISION: Readonly<Record<DecisionType, ProposalVariant>> = {
   START_TASK: "TASK_SELECTION",
-  // §9.2f — applying START_SUBFLOW requires the explicit-parent shape E; the legacy parentless
-  // form is not a valid Proposal at all (V1 PROPOSAL_SCHEMA_INVALID), never a deferred acceptance.
+  // §9.2f/§9.2g — START_SUBFLOW carries two exact MVP 3 shapes: E (child admission, explicit
+  // parent) and F (child definition materialisation, D24). The parser disambiguates by exact
+  // shape; the legacy parentless selection form is not a valid Proposal at all, and F is never an
+  // escape hatch that lets the Platform complete a missing task_ref later.
   START_SUBFLOW: "SUBFLOW_SELECTION",
   REQUEST_REWORK: "REPOSITORY_SENSITIVE_TASK_CONTROL",
   PROPOSE_MERGE: "REPOSITORY_SENSITIVE_TASK_CONTROL",
@@ -103,6 +106,39 @@ export interface SubflowSelectionProposalV1 {
   readonly reason_refs: readonly string[];
 }
 
+/** §9.1 F — the exact tagged parent basis of a child-materialisation Proposal (D24). */
+export type MaterializationParentIntentV1 =
+  | {
+      readonly kind: "DISCOVERED_TASK";
+      readonly task_key: string;
+      readonly task_ref: string;
+      readonly task_version: string;
+      readonly task_definition_hash: string;
+    }
+  | {
+      readonly kind: "ACTIVE_ATTEMPT";
+      readonly task_key: string;
+      readonly attempt_key: string;
+      readonly task_contract_hash: string;
+      readonly attempt_state: string;
+    };
+
+/**
+ * §9.1 F (D24) — `SubflowChildMaterializationProposalV1`: the Supervisor's complete child
+ * semantics + explicit parent intent, and nothing else. No external identity, no classification/
+ * pipeline/profile/scope, no base_head — those belong to the adapter, the TaskSource round-trip
+ * and the later E Proposal respectively.
+ */
+export interface SubflowChildMaterializationProposalV1 {
+  readonly variant: "SUBFLOW_CHILD_MATERIALIZATION";
+  readonly proposal_id: string;
+  readonly decision: "START_SUBFLOW";
+  readonly parent: MaterializationParentIntentV1;
+  readonly child: { readonly task_definition_body: Readonly<Record<string, unknown>> };
+  readonly expected: ProfileFreshnessExpectation;
+  readonly reason_refs: readonly string[];
+}
+
 export interface RepositorySensitiveTaskControlProposalV1 {
   readonly variant: "REPOSITORY_SENSITIVE_TASK_CONTROL";
   readonly proposal_id: string;
@@ -132,6 +168,7 @@ export interface BatchControlProposalV1 {
 export type ProposalV1 =
   | TaskSelectionProposalV1
   | SubflowSelectionProposalV1
+  | SubflowChildMaterializationProposalV1
   | RepositorySensitiveTaskControlProposalV1
   | TaskControlProposalV1
   | BatchControlProposalV1;
@@ -173,6 +210,7 @@ export const PROPOSAL_FIELDS: Readonly<Record<ProposalVariant, readonly string[]
     "expected",
     "reason_refs",
   ],
+  SUBFLOW_CHILD_MATERIALIZATION: ["proposal_id", "decision", "parent", "child", "expected", "reason_refs"],
   REPOSITORY_SENSITIVE_TASK_CONTROL: [
     "proposal_id",
     "decision",
@@ -194,6 +232,7 @@ export const SUBFLOW_PARENT_FIELDS: readonly (keyof SubflowParentIntentV1)[] = [
 export const EXPECTED_FIELDS: Readonly<Record<ProposalVariant, readonly string[]>> = {
   TASK_SELECTION: ["task_version", "task_definition_hash", "base_head", "compiled_profile_hash"],
   SUBFLOW_SELECTION: ["task_version", "task_definition_hash", "base_head", "compiled_profile_hash"],
+  SUBFLOW_CHILD_MATERIALIZATION: ["compiled_profile_hash"],
   REPOSITORY_SENSITIVE_TASK_CONTROL: [
     "task_version",
     "task_definition_hash",
@@ -255,6 +294,45 @@ export interface SubflowChildContextV1 {
   readonly task_key: string;
   readonly batch_id: string;
   readonly has_parent_relation: boolean;
+  /** §9.2g (D24) — the target task's pre-admission materialisation binding, when one exists. */
+  readonly materialization_binding?: {
+    readonly parent_task_key: string;
+    readonly child_definition_hash: string;
+  } | null;
+}
+
+/** §9.2g (D24) — the F Proposal's fresh parent view, from durable owners + fresh TaskSource. */
+export type ChildMaterializationParentViewV1 =
+  | { readonly status: "NOT_FOUND" }
+  | {
+      readonly status: "FOUND";
+      readonly task_key: string;
+      readonly batch_id: string;
+      readonly platform_state: string;
+      readonly task_ref: string;
+      readonly task_version: string;
+      readonly task_definition_hash: string;
+      readonly current_attempt_key: string | null;
+      readonly current_attempt_state: string | null;
+      readonly current_task_contract_hash: string | null;
+      readonly has_open_blocker: boolean;
+      readonly has_recovery_conflict: boolean;
+    };
+
+/** §9.2g — the batch-bound Compiled Profile v3 materialisation capability projection. */
+export type ChildMaterializationCapabilityViewV1 =
+  | { readonly available: false }
+  | { readonly available: true; readonly task_source_id: string; readonly materializer_adapter: string };
+
+/** §9.2g — the reservation/recovery facts of the F local guard. */
+export interface ChildMaterializationBatchViewV1 {
+  readonly run_status: string;
+  readonly batch_status: string;
+  readonly has_unresolved_unknown_materialization: boolean;
+  readonly admitted_task_count: number;
+  readonly unadmitted_materialized_child_count: number;
+  readonly parent_admitted: boolean;
+  readonly admission_closed: boolean;
 }
 
 /** Exactly three counts; the queries that produce them belong to the domain-store batch. */
@@ -309,7 +387,10 @@ export type DecisionRejectReason =
   | "SUBFLOW_PARENT_BATCH_MISMATCH"
   | "SUBFLOW_RELATION_CONFLICT"
   | "SUBFLOW_CYCLE_DETECTED"
-  | "SUBFLOW_PIPELINE_INVALID";
+  | "SUBFLOW_PIPELINE_INVALID"
+  | "SUBFLOW_MATERIALIZER_UNAVAILABLE"
+  | "SUBFLOW_MATERIALIZATION_CONFLICT"
+  | "SUBFLOW_MATERIALIZATION_DRIFT";
 
 export const DECISION_REJECT_REASONS: readonly DecisionRejectReason[] = [
   "PROPOSAL_SCHEMA_INVALID",
@@ -331,6 +412,9 @@ export const DECISION_REJECT_REASONS: readonly DecisionRejectReason[] = [
   "SUBFLOW_RELATION_CONFLICT",
   "SUBFLOW_CYCLE_DETECTED",
   "SUBFLOW_PIPELINE_INVALID",
+  "SUBFLOW_MATERIALIZER_UNAVAILABLE",
+  "SUBFLOW_MATERIALIZATION_CONFLICT",
+  "SUBFLOW_MATERIALIZATION_DRIFT",
 ];
 
 /** The B5 compatibility failure representation is reused verbatim — no second failure schema. */

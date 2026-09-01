@@ -42,6 +42,7 @@ import type {
   TaskSourceV1,
 } from "../tasksource/types.ts";
 import { ExecutionStartError } from "./start-implementation.ts";
+import { materializationOperations } from "../materialization/materialize-child.ts";
 
 export interface SupervisorCompiledProfileDecisionViewV1 {
   readonly hash: string;
@@ -273,7 +274,37 @@ export function assembleSupervisorDecisionContext(
   for (const task of durableTasks) collect(task.task_key);
 
   const effective = compiled.effective;
+
+  // §13.4 MVP 3 (D24) — a Compiled Profile v3 turn carries context v2's one additive field: the
+  // read-only materialisation projection. `phase` and `remaining_task_capacity` are projections
+  // of the immutable snapshots + idempotency + task binding, never authority.
+  const materializerEntries = effective.project.task_sources.filter(
+    (entry) => entry.child_materializer !== undefined,
+  );
+  const v3 = materializerEntries.length === 1 && effective.project.task_sources.length === 1;
+  let subflow_materialization: SupervisorSubflowMaterializationViewV1 | undefined;
+  if (v3) {
+    const operations = materializationOperations(store, command.batch_id);
+    const unadmitted = operations.filter((op) => op.phase !== "FAILED" && !op.admitted).length;
+    const view = store.batchView.project(command.batch_id);
+    const maxTasks = effective.policy.batch_policy.max_tasks;
+    subflow_materialization = {
+      available: true,
+      remaining_task_capacity: Math.max(0, maxTasks - view.admitted_task_count - unadmitted),
+      operations: operations
+        .filter((op) => op.phase !== "FAILED" && !op.admitted)
+        .map((op) => ({
+          materialization_id: op.materialization_id,
+          parent_task_key: op.parent_task_key,
+          child_definition_hash: op.child_definition_hash,
+          phase: op.phase as "INTENT" | "COMMITTED_NOT_OBSERVED" | "OBSERVED",
+          task_ref: op.task_ref,
+        })),
+    };
+  }
+
   return {
+    ...(subflow_materialization === undefined ? {} : { subflow_materialization }),
     run_id: command.run_id,
     batch_id: command.batch_id,
     proposal_id: command.proposal_id,

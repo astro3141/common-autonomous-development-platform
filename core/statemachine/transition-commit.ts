@@ -159,6 +159,26 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       }
     }
 
+    // §19.3a (D24) — the materialisation relation guard, in the same transaction. A bound
+    // materialised child is never an ordinary top-level admission, and an E may consume it only
+    // over the exact bound parent/body/snapshot.
+    const binding = task.materialization_binding;
+    if (!reselection && command.subflow_parent === undefined && binding !== null) {
+      throw illegal(`${task.task_key} carries a materialisation binding; only an E may admit it`);
+    }
+    if (command.subflow_parent !== undefined && binding !== null) {
+      if (binding.parent_task_key !== command.subflow_parent.task_key) {
+        throw illegal(`${task.task_key} is bound to ${binding.parent_task_key}, not the proposed parent`);
+      }
+      if (task.external_snapshot.definition_hash !== binding.child_definition_hash) {
+        throw illegal(`${task.task_key}'s fresh definition drifted from its materialisation binding`);
+      }
+      const snapshot = store.materializations.get(binding.materialization_id);
+      if (snapshot === undefined || snapshot.hash !== binding.materialization_hash) {
+        throw illegal(`${task.task_key}'s materialisation snapshot does not verify against its binding`);
+      }
+    }
+
     // Same durable recheck for both paths — Batch 7's V11 pass is not taken on trust.
     const compiled = store.batchView.compiledProfileFor(batch.batch_id);
     assertAdmissible({
@@ -525,6 +545,28 @@ export function commitTaskAbandonment(
         reason: { code: reason, log_seq: transition.seq },
       }),
     };
+  });
+}
+
+/**
+ * §8.4b (D24) — the one-transaction DISCOVERED + immutable materialisation binding commit of a
+ * successfully round-tripped child. Ordinary discovery never writes a binding; nothing rewrites
+ * or clears it afterwards.
+ */
+export function commitMaterializedChildDiscovery(
+  store: PlatformStore,
+  command: DiscoverTaskCommand & {
+    readonly binding: import("../store/domain-types.ts").ChildMaterializationBindingV1;
+  },
+): TransitionResult {
+  return store.withTransaction(() => {
+    const transition = appendTransition(store, {
+      primary_entity_key: command.task_key,
+      task: { from: "-", to: "DISCOVERED" },
+    });
+    store.tasks.discover(command);
+    const task = store.tasks.bindMaterialization(command.task_key, command.binding);
+    return { transition, task };
   });
 }
 

@@ -44,6 +44,9 @@ import {
   type ProposalV1,
   type RepositoryValidationView,
   type SelectionAdmissionKind,
+  type ChildMaterializationBatchViewV1,
+  type ChildMaterializationCapabilityViewV1,
+  type ChildMaterializationParentViewV1,
   type SelectionProposalV1,
   type SubflowChildContextV1,
   type SupervisorProposalIdentityView,
@@ -82,6 +85,10 @@ export interface DecisionValidationInput {
   readonly subflow_parent?: SubflowParentValidationView;
   /** §9.2f — the child-side durable facts P1/P3/P4 compare against. Required for variant E. */
   readonly subflow_child?: SubflowChildContextV1;
+  /** §9.2g (D24) — required for variant F. */
+  readonly materialization_parent?: ChildMaterializationParentViewV1;
+  readonly materialization_capability?: ChildMaterializationCapabilityViewV1;
+  readonly materialization_batch?: ChildMaterializationBatchViewV1;
 }
 
 const ACCEPTED: DecisionValidationResult = { kind: "ACCEPTED" };
@@ -136,7 +143,24 @@ function runValidation(
 
   const project = input.compiled_profile.effective.project;
   const policy = input.compiled_profile.effective.policy;
-  const taskBearing = proposal.variant !== "BATCH_CONTROL";
+  const taskBearing =
+    proposal.variant !== "BATCH_CONTROL" && proposal.variant !== "SUBFLOW_CHILD_MATERIALIZATION";
+  const materializationF =
+    proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION" ? proposal : undefined;
+
+  // §9.2g (D24) — the F local recovery guard applies before any capability/parent/reservation
+  // judgement: a paused run/batch or one unresolved UNKNOWN materialisation admits no new F
+  // occurrence, so no snapshot, no INTENT and no adapter call can follow this validation.
+  if (materializationF !== undefined) {
+    const recovery = requireMaterializationBatch(input);
+    if (
+      recovery.run_status === "PAUSED_SAFELY" ||
+      recovery.batch_status === "PAUSED_SAFELY" ||
+      recovery.has_unresolved_unknown_materialization
+    ) {
+      return rejected("DECISION_NOT_ALLOWED");
+    }
+  }
 
   // --- V2 task existence (A/B/C/E) --------------------------------------------------
   let lookup: TaskLookupView | undefined;
@@ -150,6 +174,12 @@ function runValidation(
     parentView = requireSubflowParent(input);
     if (parentView.status === "NOT_FOUND") return rejected("SUBFLOW_PARENT_NOT_FOUND");
   }
+  // §9.2g — F's child lookup is N/A; its explicit parent must exist as a durable row.
+  let fParentView: ChildMaterializationParentViewV1 | undefined;
+  if (materializationF !== undefined) {
+    fParentView = requireMaterializationParent(input);
+    if (fParentView.status === "NOT_FOUND") return rejected("SUBFLOW_PARENT_NOT_FOUND");
+  }
 
   // --- V3 expected freshness --------------------------------------------------------
   if (taskBearing && lookup?.status === "FOUND") {
@@ -161,6 +191,23 @@ function runValidation(
   }
   if (proposal.expected.compiled_profile_hash !== input.compiled_profile_hash) {
     return rejected("PROFILE_DRIFT");
+  }
+  // §9.2g V3 — F's tagged parent basis must equal the fresh view exactly; the Supervisor's
+  // observation of the parent's continuation point may not be stale.
+  if (materializationF !== undefined && fParentView?.status === "FOUND") {
+    const intent = materializationF.parent;
+    const stale =
+      intent.kind === "DISCOVERED_TASK"
+        ? intent.task_key !== fParentView.task_key ||
+          intent.task_ref !== fParentView.task_ref ||
+          intent.task_version !== fParentView.task_version ||
+          intent.task_definition_hash !== fParentView.task_definition_hash ||
+          fParentView.current_attempt_key !== null
+        : intent.task_key !== fParentView.task_key ||
+          intent.attempt_key !== fParentView.current_attempt_key ||
+          intent.task_contract_hash !== fParentView.current_task_contract_hash ||
+          intent.attempt_state !== fParentView.current_attempt_state;
+    if (stale) return rejected("SUBFLOW_PARENT_STALE");
   }
   // §9.2f V3 — the E parent stale guard: every proposed parent field must equal the fresh view
   // exactly. The Supervisor's observation of the parent's continuation point may not be stale.
@@ -207,6 +254,12 @@ function runValidation(
         return rejected("SUBFLOW_PIPELINE_INVALID");
       }
     }
+  }
+  // §9.2g V6 — F needs the batch-bound Compiled Profile v3's sole configured materializer; raw
+  // adapter installation is never the authority and there is no route to select between targets.
+  if (materializationF !== undefined) {
+    const capability = requireMaterializationCapability(input);
+    if (!capability.available) return rejected("SUBFLOW_MATERIALIZER_UNAVAILABLE");
   }
 
   // --- V7 Human Gate ----------------------------------------------------------------
@@ -266,7 +319,43 @@ function runValidation(
     }
   }
 
-  // --- V11 batch admission / concurrency --------------------------------------------
+  // --- V11 / §9.2g F reservation ----------------------------------------------------
+  if (materializationF !== undefined && fParentView?.status === "FOUND") {
+    const view = requireMaterializationBatch(input);
+    // Parent rule: only a DISCOVERED whole-intent parent or a live ACTIVE attempt may decompose.
+    // §17.3 (D24) — on the resolved-gate path the parent is HELD by that exact gate; the tagged
+    // origin basis was already required exact by V3, and the intent commit re-checks the precise
+    // decision hold. The relaxation exists only for the one already-V1-passed gate copy.
+    const gatePath = authorizedGateProposal !== undefined;
+    const stateOk =
+      materializationF.parent.kind === "DISCOVERED_TASK"
+        ? fParentView.platform_state === "DISCOVERED" ||
+          (gatePath && fParentView.platform_state === "HELD")
+        : fParentView.platform_state === "ACTIVE" ||
+          (gatePath && fParentView.platform_state === "HELD");
+    const eligible =
+      materializationF.parent.kind === "DISCOVERED_TASK"
+        ? stateOk
+        : stateOk &&
+          fParentView.current_attempt_state !== null &&
+          ["READY", "IMPLEMENTING", "VERIFYING", "AUDITING", "REWORKING"].includes(
+            fParentView.current_attempt_state,
+          );
+    if (!eligible || fParentView.has_open_blocker || fParentView.has_recovery_conflict) {
+      return rejected("SUBFLOW_PARENT_INELIGIBLE");
+    }
+    // Reservation: external spam and later admission dead-ends are refused up front. Non-FAILED
+    // unadmitted materialisations and the unadmitted DISCOVERED parent all hold seats.
+    const limits = policy.batch_policy;
+    const reserved =
+      view.admitted_task_count +
+      view.unadmitted_materialized_child_count +
+      (view.parent_admitted ? 0 : 1);
+    if (view.admission_closed || reserved >= limits.max_tasks) {
+      return rejected("BATCH_MAX_TASKS_REACHED");
+    }
+  }
+
   if (selection !== undefined) {
     const batch = requireBatch(input);
     const limits = policy.batch_policy;
@@ -294,6 +383,25 @@ function runValidation(
       if (parentView.current_suspension_child_task_key !== null || child.has_parent_relation) {
         return rejected("SUBFLOW_RELATION_CONFLICT");
       }
+      // §9.2g — a materialised child is consumable only by an E naming the bound parent, over
+      // the exact bound body. Parent mismatch is a relation conflict; body drift is drift.
+      const binding = child.materialization_binding ?? null;
+      if (binding !== null) {
+        if (binding.parent_task_key !== parentView.task_key) {
+          return rejected("SUBFLOW_MATERIALIZATION_CONFLICT");
+        }
+        if (lookup?.status === "FOUND" && lookup.task.definition_hash !== binding.child_definition_hash) {
+          return rejected("SUBFLOW_MATERIALIZATION_DRIFT");
+        }
+      }
+    }
+
+    // §9.2g/§19.3a — a bound materialised child is never an ordinary top-level admission.
+    if (
+      selection.variant === "TASK_SELECTION" &&
+      (input.subflow_child?.materialization_binding ?? null) !== null
+    ) {
+      return rejected("SUBFLOW_MATERIALIZATION_CONFLICT");
     }
 
     // §9.2e — rule 1 is a *new admission* rule; a reselection re-uses the slot it already holds.
@@ -436,6 +544,30 @@ function requireSubflowChild(input: DecisionValidationInput): SubflowChildContex
   const view = input.subflow_child;
   if (view === undefined) {
     throw inputInvalid("/subflow_child", "a subflow child context is required for E");
+  }
+  return view;
+}
+
+function requireMaterializationParent(input: DecisionValidationInput): ChildMaterializationParentViewV1 {
+  const view = input.materialization_parent;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_parent", "a materialisation parent view is required for F");
+  }
+  return view;
+}
+
+function requireMaterializationCapability(input: DecisionValidationInput): ChildMaterializationCapabilityViewV1 {
+  const view = input.materialization_capability;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_capability", "a materialisation capability view is required for F");
+  }
+  return view;
+}
+
+function requireMaterializationBatch(input: DecisionValidationInput): ChildMaterializationBatchViewV1 {
+  const view = input.materialization_batch;
+  if (view === undefined) {
+    throw inputInvalid("/materialization_batch", "a materialisation batch view is required for F");
   }
   return view;
 }

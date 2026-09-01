@@ -1,7 +1,7 @@
 /**
  * MVP1-B6 areas U, V and §3/§31/§32/§36/§38 — what this batch must *not* have introduced.
  *
- * The schema stays v5/17 tables, no new durable vocabulary appears, the Coordinator stays the
+ * The schema stays v5/18 tables, no new durable vocabulary appears, the Coordinator stays the
  * MVP 0 shell, and RA-2 / RA-3 remain untouched.
  */
 
@@ -34,8 +34,8 @@ const coreSources = (): string[] =>
 
 // --- area V: the schema is untouched -----------------------------------------------------------
 
-test("B6-29 (V): the schema is still v5 with the same 17 tables and no new migration", () => {
-  assert.equal(MIGRATIONS.length, 8);
+test("B6-29 (V): the schema is still v5 with the same 18 tables and no new migration", () => {
+  assert.equal(MIGRATIONS.length, 9);
   assert.deepEqual(
     MIGRATIONS.map((migration) => migration.name),
     [
@@ -49,13 +49,14 @@ test("B6-29 (V): the schema is still v5 with the same 17 tables and no new migra
       // MVP 3 — SUSPENDED + parent_task_key; a CHECK rebuild, not a new table.
       "subflow-parent",
       "subflow-succeeded",
+      "child-materialization",
     ],
   );
 
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
   }
@@ -69,7 +70,7 @@ test("B6-29 (V): the schema is still v5 with the same 17 tables and no new migra
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       // §3 — none of the durable tables this batch was forbidden to invent exists.
       for (const forbidden of [
         "runtime_session",

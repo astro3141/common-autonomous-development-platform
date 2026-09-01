@@ -145,11 +145,21 @@ function taskSources(value: unknown): readonly TaskSourceEntry[] {
   const result = entries.map((entry, index) => {
     const path = `/task_sources/${index}`;
     const object = asObject(entry, path);
-    exactKeys(object, path, ["id", "adapter", "config"]);
+    const hasMaterializer = Object.hasOwn(object, "child_materializer");
+    exactKeys(
+      object,
+      path,
+      hasMaterializer ? ["id", "adapter", "config", "child_materializer"] : ["id", "adapter", "config"],
+    );
     return {
       id: asNonEmptyString(object["id"], `${path}/id`),
       adapter: asNonEmptyString(object["adapter"], `${path}/adapter`),
       config: asOpaqueConfig(object["config"], `${path}/config`),
+      // §7.1e (D24) — exact { adapter, config } wrapper; the S13 single-source boundary is the
+      // compiler's rule, not this shape check's.
+      ...(hasMaterializer
+        ? { child_materializer: childMaterializer(object["child_materializer"], `${path}/child_materializer`) }
+        : {}),
     };
   });
   assertUnique(
@@ -158,6 +168,16 @@ function taskSources(value: unknown): readonly TaskSourceEntry[] {
     "task source id",
   );
   return result;
+}
+
+/** §7.1e (D24) — the exact v3 materializer wrapper. */
+function childMaterializer(value: unknown, path: string): TaskSourceEntry["child_materializer"] {
+  const object = asObject(value, path);
+  exactKeys(object, path, ["adapter", "config"]);
+  return {
+    adapter: asNonEmptyString(object["adapter"], `${path}/adapter`),
+    config: asOpaqueConfig(object["config"], `${path}/config`),
+  };
 }
 
 function contractSources(value: unknown): readonly ContractSourceEntry[] {

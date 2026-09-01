@@ -251,7 +251,7 @@ test("C9 / C10: v5 rows survive the v6 rebuild, and the table count is unchanged
     old.close();
 
     const upgraded = temp.open();
-    assert.equal(upgraded.schemaVersion, 8);
+    assert.equal(upgraded.schemaVersion, 9);
     upgraded.close();
 
     const database = openDatabase(temp.path);
@@ -270,7 +270,7 @@ test("C9 / C10: v5 rows survive the v6 rebuild, and the table count is unchanged
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       assert.equal(names.includes("pending_human_decision"), true);
       assert.equal(names.includes("pending_human_decision_v6"), false);
 

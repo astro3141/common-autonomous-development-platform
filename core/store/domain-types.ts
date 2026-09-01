@@ -170,6 +170,28 @@ export const SELECTION_BINDING_FIELDS: readonly (keyof SelectionBindingV1)[] = [
   "base_head",
 ];
 
+/**
+ * §8.4b/§18.1g (D24) — the immutable pre-admission relation provenance a materialised child's
+ * task row carries after the exact TaskSource round-trip. Never rewritten or cleared; ordinary
+ * and pre-existing external tasks keep null. Distinct from `parent_task_key`, which stays the
+ * D22 executable relation set only at E admission.
+ */
+export interface ChildMaterializationBindingV1 {
+  readonly materialization_id: string;
+  readonly materialization_hash: string;
+  readonly task_source_id: string;
+  readonly parent_task_key: string;
+  readonly child_definition_hash: string;
+}
+
+export const CHILD_MATERIALIZATION_BINDING_FIELDS: readonly (keyof ChildMaterializationBindingV1)[] = [
+  "materialization_id",
+  "materialization_hash",
+  "task_source_id",
+  "parent_task_key",
+  "child_definition_hash",
+];
+
 export interface TaskRow {
   readonly task_key: string;
   readonly batch_id: string;
@@ -189,6 +211,8 @@ export interface TaskRow {
   readonly admitted_at: string | null;
   /** MVP 3 (TD §27) — the parent this task is a subflow child of, or null. */
   readonly parent_task_key: string | null;
+  /** §18.1g (D24) — pre-admission materialisation provenance, or null. */
+  readonly materialization_binding: ChildMaterializationBindingV1 | null;
   readonly state_reason: StateReason | null;
   readonly created_at: string;
   readonly updated_at: string;

@@ -278,8 +278,8 @@ test("§6: a TaskSource read failure stays operational and never becomes CONTRAC
 
 test("FC5 / FC6: the schema and the success path are unchanged by this patch", () => {
   withWorld((domain) => {
-    assert.equal(domain.store.schemaVersion, 8, "FC5");
-    assert.equal(MIGRATIONS.length, 8);
+    assert.equal(domain.store.schemaVersion, 9, "FC5");
+    assert.equal(MIGRATIONS.length, 9);
 
     const authorities = selected(domain);
     const outcome = activate(authorities);

@@ -692,12 +692,12 @@ test("B12-61 / B12-64 ~ B12-66: the Platform merges nothing and reaches no backe
   }
 });
 
-test("B12-63: the schema is still v6 / 17 tables", () => {
-  assert.equal(MIGRATIONS.length, 8);
+test("B12-63: the schema is still v6 / 18 tables", () => {
+  assert.equal(MIGRATIONS.length, 9);
   const temp = tempStore();
   const store = temp.open();
   try {
-    assert.equal(store.schemaVersion, 8);
+    assert.equal(store.schemaVersion, 9);
   } finally {
     store.close();
   }
@@ -711,7 +711,7 @@ test("B12-63: the schema is still v6 / 17 tables", () => {
       )
         .map((row) => row.name)
         .filter((name) => !name.startsWith("sqlite_"));
-      assert.equal(names.length, 17);
+      assert.equal(names.length, 18);
       for (const forbidden of [
         "merge_approval",
         "merge_cycle",

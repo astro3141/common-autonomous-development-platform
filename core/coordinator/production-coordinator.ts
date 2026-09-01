@@ -23,6 +23,7 @@
  * and never as lifecycle authority.
  */
 
+import type { ChildTaskMaterializationAdapterV1 } from "../../adapters/interfaces/child-materialization-adapter.ts";
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import type { ReportAdapter } from "../../adapters/interfaces/report-adapter.ts";
 import type { RuntimeAdapter, RuntimePreflight } from "../../adapters/interfaces/runtime-adapter.ts";
@@ -58,6 +59,10 @@ import { mergeDecisionCause } from "../humandecision/merge-decision.ts";
 import type { ProfileSource } from "../profile/types.ts";
 import { commitBatchFact } from "../statemachine/transition-commit.ts";
 import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
+import {
+  advanceMaterializations,
+  pendingMaterializationsFor,
+} from "../materialization/materialize-child.ts";
 import { DECISION_VALIDATION_LOG_KIND } from "../decision/decision-log.ts";
 import type { TaskAttemptRow, TaskRow } from "../store/domain-types.ts";
 import { isTerminalTask } from "../store/domain-types.ts";
@@ -80,6 +85,8 @@ export interface ProductionCoordinatorDependencies {
   readonly contractSources: ContractSourceReader;
   readonly manifests: ManifestSetInput;
   readonly preflight: RuntimePreflight;
+  /** §8.1b (D24) — present only when the Compiled Profile v3 materialisation feature is composed. */
+  readonly materializer?: ChildTaskMaterializationAdapterV1;
   /** Caller-supplied identities and clock — Core allocates neither (TD §17.1, §18.1a). */
   readonly identities: CoordinatorIdentities;
 }
@@ -114,6 +121,11 @@ export type TickStep =
   | "AUTO_MERGE_COMPLETED"
   | "MERGE_OBSERVED"
   | "PARENT_RESUMED"
+  | "MATERIALIZATION_PUBLISHED"
+  | "MATERIALIZATION_OBSERVED"
+  | "MATERIALIZATION_FAILED"
+  | "MATERIALIZATION_UNKNOWN"
+  | "MATERIALIZATION_CONFLICT"
   | "DECISION_APPLIED"
   | "DECISION_APPLICATION_REFUSED"
   | "BATCH_WAITING"
@@ -141,6 +153,19 @@ export class ProductionCoordinator {
 
     for (const batch of store.batches.forRun(run_id)) {
       if (batch.status !== "RUNNING" && batch.status !== "WAITING") continue;
+
+      // §8.4b/§19.3e (D24) — an in-flight materialisation is an external operation that has
+      // already begun: publish, reconcile or round-trip it before any task advancement can start
+      // a new external effect on its parent.
+      const materialized = advanceMaterializations(
+        {
+          store,
+          taskSource: this.#deps.taskSource,
+          ...(this.#deps.materializer === undefined ? {} : { materializer: this.#deps.materializer }),
+        },
+        { run_id, batch_id: batch.batch_id, observed_at: this.#deps.identities.now() },
+      );
+      if (materialized !== undefined) return materialized;
 
       // Advance whatever is already in flight before asking for anything new.
       for (const task of store.tasks.inBatch(batch.batch_id)) {
@@ -215,6 +240,10 @@ export class ProductionCoordinator {
 
     switch (attempt.state) {
       case "READY":
+        // §19.3e (D24) — a pending materialised child (any non-FAILED unadmitted phase) blocks
+        // the parent's next Actor external INTENT: unfinished phases reconcile first, and an
+        // OBSERVED child asks the Supervisor for an E decision on a later turn.
+        if (pendingMaterializationsFor(this.#deps.store, task.task_key).length > 0) return undefined;
         return this.#step(startImplementation(this.#deps, { attempt_key: attempt.attempt_key }), {
           IMPLEMENTING: "IMPLEMENTATION_STARTED",
         });
@@ -227,6 +256,7 @@ export class ProductionCoordinator {
       case "AUDITING":
         return this.#completeAudit(attempt);
       case "REWORKING":
+        if (pendingMaterializationsFor(this.#deps.store, task.task_key).length > 0) return undefined;
         return this.#step(startRework(this.#deps, { attempt_key: attempt.attempt_key }), {
           IMPLEMENTING: "REWORK_STARTED",
         });
