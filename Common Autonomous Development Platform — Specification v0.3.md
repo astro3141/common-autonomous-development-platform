@@ -1,5 +1,11 @@
 Common Autonomous Development Platform — Specification v0.3
 Status: SPECIFICATION BASELINE Supersedes: v0.2 Scope: 장기 아키텍처, 책임 경계, 신뢰 모델, 공통 계약, MVP 범위 Non-scope: Technical Design, 구체 클래스/파일 구조, 구현 언어, 데이터베이스 선택, 특정 Runtime 설정
+Amendment — ADP #59 Human architecture decision:
+Supervisor는 실행 중 whole intent를 bounded child task로 decomposition하고, 완전한 child TaskDefinition
+semantics와 explicit parent-child intent를 structured Proposal로 제안할 수 있다. Platform만 Compiled
+Profile/Execution Policy/authority boundary를 검증하고 authoritative materialisation을 수행한다. Supervisor는
+TaskSource/backend를 직접 mutate하지 않는다. 이 권한은 Profile-declared pipeline/role/verification profile의
+선택까지이며 dynamic pipeline/workflow/model topology synthesis를 포함하지 않는다.
 이 Specification의 목표는 “또 하나의 coding-agent 제품”을 만드는 것이 아니다.
 기존 Runtime·Workflow·Git·CI·Workspace 기능은 가능한 한 재사용하고, 프로젝트 의미·자동화 권한·실행 계약·검증 증거·사람 판단을 deterministic하게 통제하는 공통 Control Plane만 자체 자산으로 만든다.
 
@@ -141,6 +147,8 @@ Compiled Profile Snapshot
 Decision Validator
 
 TaskSource Contract
+
+Child Task Materialisation Contract
 
 Immutable Task Contract Snapshot
 
@@ -460,6 +468,12 @@ JiraTaskSource
 
 StaticTaskSource
 
+TaskSource의 discovery/read authority와 별도로 Platform은 configured TaskSource가 다시 관측할 수 있는 외부
+task representation을 만드는 **Child Task Materialisation Contract**를 가질 수 있다. 이것은 generic
+TaskSource write API가 아니며 Supervisor에게 direct mutation authority를 주지 않는다. materialisation은
+Platform-owned validation과 idempotent actuation 경계를 거쳐야 하고, 성공한 publish 결과도 fresh
+TaskSource observation 전에는 executable task admission authority가 아니다.
+
 15. TaskSource와 Durable State의 분리
     TaskSource는 task discovery/input의 authoritative source일 수 있다.
     하지만:
@@ -479,6 +493,8 @@ Platform은 필요하면 외부 상태를 projection한다.
     Supervisor는 판단 모델이다.
     Supervisor 책임:
     Task 후보 평가
+
+bounded child TaskDefinition 및 explicit parent-child intent 제안
 
 Project classification 수행
 
@@ -509,6 +525,10 @@ Backend identity 주장
 
 Human Gate 제거
 
+Supervisor는 child의 external identity를 할당하거나 TaskSource/backend mutation을 직접 수행하지 않는다.
+child Proposal에서도 pipeline, Actor profile, Verification profile은 Project Profile에 선언된 선택지만 사용할
+수 있으며, 새 pipeline/workflow/model topology를 생성할 수 없다.
+
 17. Supervisor Decision = Proposal
     Supervisor의 모든 의미 있는 action은 구조화된 Proposal이다.
     예:
@@ -522,6 +542,41 @@ Human Gate 제거
     "reason_refs": [...]
     }
     Platform이 실제 실행 전에 deterministic validation을 한다.
+
+17A. Supervisor Decomposition / Child Task Materialisation
+     Supervisor는 한 번의 structured Proposal에서 child 하나의 완전한 task semantics와 explicit parent
+     intent를 제안할 수 있다. 여러 child decomposition은 batch/task limit 안에서 이 bounded Proposal을
+     반복한다. 한 Proposal이 임의 graph나 dynamic workflow를 생성하지 않는다.
+
+     authority chain:
+
+     Supervisor structured child Proposal
+     → Platform schema / Compiled Profile / Execution Policy / parent / batch validation
+     → 필요한 Human Gate
+     → Platform-owned materialisation operation
+     → configured TaskSource-visible representation publish
+     → fresh TaskSource re-observation
+     → normal discovery / admission / Task Contract / execution path
+
+     child body의 semantic source는 validated Supervisor Proposal이다. Platform/Harness는 Proposal 수신 뒤
+     title, description, references, acceptance, parent 또는 Profile 선택을 임의 생성·보완하지 않는다.
+     external task identity/version은 materialisation target의 authoritative adapter가 할당하며 Model이
+     발명하지 않는다.
+
+     materialisation은 admission이 아니다. publish만으로 parent를 suspend하거나 child를 SELECTED/ACTIVE로
+     만들거나 Task Contract를 freeze하지 않는다. TaskSource가 published body를 exact하게 재관측한 뒤에만
+     child는 기존 discovery path로 DISCOVERED가 될 수 있고, 기존 START_SUBFLOW validation/admission이
+     fresh parent relation과 Profile-declared execution choices를 별도로 검증한다.
+
+     모든 materialisation side effect는 durable validated intent와 stable idempotency identity가 먼저
+     기록되어야 한다. restart에서 exact published task를 authoritative하게 재획득할 수 없으면 duplicate를
+     만들지 않고 fail-closed한다. title/body 유사성은 identity나 duplicate 판단 authority가 아니다.
+
+     Execution Policy가 materialisation/subflow를 허용하지 않으면 side effect는 0이다. Human Gate가
+     요구되면 publish 전에 적용하며, approval은 invalid Proposal이나 stale parent를 우회하지 않는다.
+
+     Dynamic pipeline synthesis, workflow graph language, runtime/model topology creation은 이 authority에
+     포함되지 않는다. 그런 기능은 별도 future Spec decision이다.
 
 18. Decision Validation
     최소 검증:
@@ -546,6 +601,21 @@ Human Gate 여부
 Repository expected state 일치
 
 Backend capability 요구 충족
+
+Child materialisation Proposal에는 추가로:
+
+완전한 child definition body
+
+explicit parent identity / freshness
+
+configured materialisation boundary 존재
+
+subflow policy 허용
+
+batch/task materialisation bound
+
+동일 materialisation identity의 content 일치
+
 실패하면 side effect를 수행하지 않는다.
 
 19. Generic Lifecycle
@@ -1117,6 +1187,11 @@ merge 이후 canonical SHA reconcile
     → AUTO_SUBFLOW
     로 compile될 수 있다.
     Generic flow:
+    whole intent / active Parent
+    → Supervisor bounded child Proposal
+    → Platform validate + materialise
+    → TaskSource re-observe
+
     Parent Task
     → SUSPENDED
 
@@ -1281,6 +1356,8 @@ Backend raw identifiers은 Adapter-owned metadata로 격리한다.
 
 Task Contract hash
 
+Child materialisation intent / receipt / TaskSource round-trip
+
 CapabilityGrant version
 
 TaskSource external state
@@ -1308,6 +1385,18 @@ PendingHumanDecision state
 
 Task external definition
 → TaskSource
+
+Child decomposition semantics
+→ validated Supervisor Proposal을 동결한 Platform materialisation record
+
+Child external identity / published representation
+→ configured Child Task Materialisation Adapter, 이후 definition authority는 TaskSource fresh observation
+
+Parent-child materialisation intent
+→ Platform materialisation record
+
+Parent suspension / executable relation
+→ Platform durable state의 validated START_SUBFLOW transition
 
 Platform transition
 → Platform durable state
@@ -1582,6 +1671,12 @@ Protected remote merge
     MVP 2 +
     AUTO_SUBFLOW
 
+bounded Supervisor child TaskDefinition Proposal
+
+Platform-owned idempotent child materialisation
+
+fresh TaskSource re-observation before admission
+
 Parent suspend/resume
 
 Task dependency graph
@@ -1643,6 +1738,13 @@ Generic contract는 유지하되 구현체 수는 최소화한다.
 1. Core state가 OpenClaw ACP identifier에 의존하지 않는다.
 
 1. Supervisor Decision은 실행 authority가 아니라 Proposal이다.
+
+1. Supervisor-authored child semantics는 structured validation과 Platform-owned materialisation을 거치며,
+   Supervisor가 TaskSource/backend를 직접 mutate하지 않는다.
+
+1. materialised child는 fresh TaskSource observation 전에는 admission/Task Contract authority가 아니다.
+
+1. child materialisation은 Profile 밖 pipeline/workflow/model topology를 생성하지 않는다.
 
 1. Profile 범위 밖 Proposal은 deterministic하게 거부된다.
 
