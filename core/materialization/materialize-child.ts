@@ -514,33 +514,6 @@ function pauseConflict(
 
 // --- §17.3 gate integration ----------------------------------------------------------------------
 
-/** Parks the F parent on the exact open gate decision (Rule A), freezing its tagged origin. */
-export function holdParentForMaterializationGate(
-  store: PlatformStore,
-  command: { readonly parent_task_key: string; readonly decision_id: string },
-): void {
-  store.withTransaction(() => {
-    const parent = store.tasks.require(command.parent_task_key);
-    if (parent.platform_state !== "DISCOVERED" && parent.platform_state !== "ACTIVE") {
-      throw new MaterializationFailedError(
-        `${parent.task_key} is ${parent.platform_state}; only a DISCOVERED or ACTIVE parent gates an F`,
-      );
-    }
-    const entry = store.decisions.append({
-      kind: "state_transition",
-      refKey: parent.task_key,
-      payload: {
-        primary_entity_key: parent.task_key,
-        task: { from: parent.platform_state, to: "HELD" },
-        reason_code: blockedByDecision(command.decision_id),
-      } as never,
-    });
-    store.tasks.write(parent.task_key, {
-      platform_state: "HELD",
-      reason: { code: blockedByDecision(command.decision_id), log_seq: entry.seq },
-    });
-  });
-}
 
 /** REJECT — zero external effect; the parent asks for a replan under the exact refused decision. */
 export function applyRejectedMaterializationGate(

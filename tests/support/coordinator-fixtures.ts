@@ -91,7 +91,11 @@ export interface CoordinatorWorld extends ProductionCoordinatorDependencies {
  */
 export function coordinatorWorld(
   world: DomainWorld,
-  overrides: Partial<{ repository: RecordingRepository; manifests: ReturnType<typeof receiptFreeManifests> }> = {},
+  overrides: Partial<{
+    repository: RecordingRepository;
+    manifests: ReturnType<typeof receiptFreeManifests>;
+    materializer: import("../../adapters/interfaces/child-materialization-adapter.ts").ChildTaskMaterializationAdapterV1;
+  }> = {},
 ): CoordinatorWorld {
   const manifests = overrides.manifests ?? receiptFreeManifests();
 
@@ -130,6 +134,7 @@ export function coordinatorWorld(
     contractSources: new FileContractSourceReader("", current.readContractSource),
     manifests,
     preflight: readyPreflight,
+    ...(overrides.materializer === undefined ? {} : { materializer: overrides.materializer }),
     identities,
   };
 

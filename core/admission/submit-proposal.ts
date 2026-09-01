@@ -30,10 +30,7 @@ import {
   commitTaskDeferral,
 } from "../statemachine/transition-commit.ts";
 import { resumeParentIfEligible } from "../execution/subflow-resume.ts";
-import {
-  commitMaterializationIntent,
-  holdParentForMaterializationGate,
-} from "../materialization/materialize-child.ts";
+import { commitMaterializationIntent } from "../materialization/materialize-child.ts";
 import { sealMaterializationSnapshot } from "../materialization/snapshot.ts";
 import { hashTaskDefinitionBody } from "../tasksource/task-definition.ts";
 import type { TaskDependency } from "../tasksource/types.ts";
@@ -207,14 +204,9 @@ function act(
       decision,
       channel: command.report_channel,
     });
-    // §17.3 (D24) — a gated F parks its exact parent on this decision, freezing the tagged
-    // origin the approval must later restore. Zero snapshot/INTENT/external effect exists yet.
-    if (proposal.variant === "SUBFLOW_CHILD_MATERIALIZATION") {
-      holdParentForMaterializationGate(authorities.store, {
-        parent_task_key: proposal.parent.task_key,
-        decision_id: opened.decision_id,
-      });
-    }
+    // §17.3 (D24) — the gate's TASK subject is the F parent, so `commitPendingDecision` above
+    // already parked it HELD(BLOCKED_BY_DECISION:<id>), freezing the tagged origin the approval
+    // must later restore. Zero snapshot/INTENT/external effect exists yet.
     return { ...base, pending_decision_id: opened.decision_id };
   }
 
