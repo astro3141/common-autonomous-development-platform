@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,8 @@ import {
   type CodexCliRuntimeAdapterConfig,
 } from "../adapters/codex-cli-runtime/index.ts";
 import { validateManifestSet } from "../core/capability/manifest-set.ts";
+import { validateProposal } from "../core/decision/proposal.ts";
+import { DECISION_TYPES } from "../core/profile/types.ts";
 import type { CanonicalObject } from "../core/schemas/canonical-json.ts";
 
 const NOW = "2026-09-01T00:00:00.000Z";
@@ -130,6 +132,17 @@ function spawnActor(adapter: CodexCliRuntimeAdapter): RuntimeSessionHandle {
   ).session_handle;
 }
 
+function spawnSupervisor(adapter: CodexCliRuntimeAdapter): RuntimeSessionHandle {
+  return adapter.spawn_session(
+    { op_key: "op:supervisor:spawn" },
+    "SUPERVISOR",
+    "supervisor-agent" as unknown as RuntimeProfile,
+    "/workspace",
+    { run_id: "run-1" },
+    {} as CapabilityGrant,
+  ).session_handle;
+}
+
 test("Codex CLI adapter advertises only inspected/configured capability and preflights auth", () => {
   const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
   try {
@@ -210,6 +223,112 @@ test("spawn uses a bounded real initialization turn and send uses explicit threa
       assert.equal(result.execution_observation.usage.quantities["input"]?.value, 11);
       assert.equal(result.execution_observation.usage.quantities["input"]?.unit, "token");
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SUPERVISOR schema exposes the complete Core vocabulary and exact subflow parent intent", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    const proposal = {
+      proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0G01",
+      decision: "START_SUBFLOW",
+      task_ref: "child-task",
+      classification: "feature",
+      pipeline_id: "standard",
+      actor_profile: "actor",
+      verification_profile: "verify",
+      repository_scope_id: "repo",
+      parent: {
+        task_key: "parent-task",
+        attempt_key: "parent-attempt",
+        task_contract_hash: "contract-hash",
+        attempt_state: "ACTIVE",
+      },
+      expected: {
+        task_version: "1",
+        task_definition_hash: "definition-hash",
+        base_head: "abc123",
+        compiled_profile_hash: "profile-hash",
+      },
+      reason_refs: ["reason-1"],
+    };
+    runner.turns.push(
+      completedTurn("thread-supervisor", { ready: true }),
+      completedTurn("thread-supervisor", {
+        proposal,
+        declared_status: "DONE",
+        summary: "selected subflow",
+        refs: [],
+      }),
+    );
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    const session = spawnSupervisor(adapter);
+    const turn = adapter.send_turn({ op_key: "op:supervisor:turn:1" }, session, "select");
+
+    const invocation = runner.invocations.filter((entry) => entry.args[0] === "exec")[1];
+    const schemaAt = invocation?.args.indexOf("--output-schema") ?? -1;
+    const schema = JSON.parse(readFileSync(invocation!.args[schemaAt + 1]!, "utf8")) as any;
+    const variants = schema.properties.proposal.anyOf as any[];
+    assert.deepEqual(
+      [...new Set(variants.flatMap((variant) => variant.properties.decision.enum))].toSorted(),
+      DECISION_TYPES.toSorted(),
+    );
+    for (const variant of variants) {
+      assert.deepEqual(variant.required.toSorted(), Object.keys(variant.properties).toSorted());
+      const expected = variant.properties.expected;
+      assert.deepEqual(expected.required.toSorted(), Object.keys(expected.properties).toSorted());
+    }
+    const subflow = variants.find(
+      (variant) =>
+        variant.properties.decision.enum.includes("START_SUBFLOW") &&
+        Object.hasOwn(variant.properties, "parent"),
+    );
+    assert.deepEqual(
+      Object.keys(subflow.properties.parent.properties).sort(),
+      ["attempt_key", "attempt_state", "task_contract_hash", "task_key"],
+    );
+    assert.equal(subflow.properties.parent.type, "object");
+    assert.equal(subflow.required.includes("parent"), true);
+    assert.deepEqual(validateProposal(proposal), {
+      ...proposal,
+      variant: "SUBFLOW_SELECTION",
+      decision: "START_SUBFLOW",
+    });
+    const parentlessSubflow = variants.find(
+      (variant) =>
+        variant.properties.decision.enum.includes("START_SUBFLOW") &&
+        !Object.hasOwn(variant.properties, "parent"),
+    );
+    assert.notEqual(parentlessSubflow, undefined, "the schema must not pre-empt Core V1");
+    const { parent: _parent, ...parentless } = proposal;
+    void _parent;
+    assert.throws(() => validateProposal(parentless));
+    assert.deepEqual(adapter.get_turn_result(turn).structured_output?.body, proposal);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SUPERVISOR adapter parsing fails closed when proposal is malformed", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-codex-cli-unit-"));
+  try {
+    const runner = new ScriptedRunner();
+    runner.turns.push(
+      completedTurn("thread-supervisor-malformed", { ready: true }),
+      completedTurn("thread-supervisor-malformed", {
+        proposal: "not-an-object",
+        declared_status: "DONE",
+        summary: "malformed",
+        refs: [],
+      }),
+    );
+    const adapter = new CodexCliRuntimeAdapter(config(root), runner);
+    const session = spawnSupervisor(adapter);
+    const turn = adapter.send_turn({ op_key: "op:supervisor:malformed" }, session, "select");
+    assert.equal(adapter.get_turn_result(turn).structured_output, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

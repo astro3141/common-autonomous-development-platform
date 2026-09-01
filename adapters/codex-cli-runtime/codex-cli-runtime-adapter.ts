@@ -695,16 +695,7 @@ function roleSchema(role: string): CanonicalObject {
     return {
       type: "object",
       properties: {
-        proposal: {
-          type: "object",
-          properties: {
-            decision: { type: "string", enum: ["START_TASK", "NO_ACTION"] },
-            task_ref: { type: ["string", "null"] },
-            reason_refs: { type: "array", items: { type: "string" } },
-          },
-          required: ["decision", "task_ref", "reason_refs"],
-          additionalProperties: false,
-        },
+        proposal: supervisorProposalSchema(),
         ...outcome,
       },
       required: ["proposal", "declared_status", "summary", "refs"],
@@ -716,6 +707,81 @@ function roleSchema(role: string): CanonicalObject {
     properties: outcome,
     required: ["declared_status", "summary", "refs"],
     additionalProperties: false,
+  } as unknown as CanonicalObject;
+}
+
+function supervisorProposalSchema(): CanonicalObject {
+  const string = { type: "string" };
+  const reason_refs = { type: "array", items: string };
+  const expected = (fields: readonly string[]) => ({
+    type: "object",
+    properties: Object.fromEntries(fields.map((field) => [field, string])),
+    required: fields,
+    additionalProperties: false,
+  });
+  const proposal = (
+    decisions: readonly string[],
+    properties: Readonly<Record<string, unknown>>,
+  ) => ({
+    type: "object",
+    properties: {
+      proposal_id: string,
+      decision: { type: "string", enum: decisions },
+      ...properties,
+      reason_refs,
+    },
+    required: ["proposal_id", "decision", ...Object.keys(properties), "reason_refs"],
+    additionalProperties: false,
+  });
+  const taskFreshness = ["task_version", "task_definition_hash", "compiled_profile_hash"];
+  const repositoryFreshness = [...taskFreshness, "base_head"];
+  const selection = {
+    task_ref: string,
+    classification: string,
+    pipeline_id: string,
+    actor_profile: string,
+    verification_profile: string,
+    repository_scope_id: string,
+  };
+  return {
+    anyOf: [
+      proposal(["START_TASK"], {
+        ...selection,
+        expected: expected(repositoryFreshness),
+      }),
+      proposal(["START_SUBFLOW"], {
+        ...selection,
+        parent: {
+          type: "object",
+          properties: {
+            task_key: string,
+            attempt_key: string,
+            task_contract_hash: string,
+            attempt_state: string,
+          },
+          required: ["task_key", "attempt_key", "task_contract_hash", "attempt_state"],
+          additionalProperties: false,
+        },
+        expected: expected(repositoryFreshness),
+      }),
+      // Deliberately expressible but not a Core proposal variant: V1 rejects this parentless
+      // START_SUBFLOW. Keeping it in the transport schema preserves Core as the policy authority.
+      proposal(["START_SUBFLOW"], {
+        ...selection,
+        expected: expected(repositoryFreshness),
+      }),
+      proposal(["REQUEST_REWORK", "PROPOSE_MERGE"], {
+        task_ref: string,
+        expected: expected(repositoryFreshness),
+      }),
+      proposal(["HOLD_TASK", "DEFER_TASK", "RESUME_PARENT"], {
+        task_ref: string,
+        expected: expected(taskFreshness),
+      }),
+      proposal(["CLOSE_BATCH"], {
+        expected: expected(["compiled_profile_hash"]),
+      }),
+    ],
   } as unknown as CanonicalObject;
 }
 
