@@ -40,6 +40,10 @@ test("B3-AC1: the five sealed adapter interfaces plus the D24 materialisation co
     "child-materialization-adapter.ts",
     "handles.ts",
     "index.ts",
+    // #52 — the candidate-PR delivery projection contract: push one exact SHA, open one PR,
+    // reconcile truthfully. Delivery only; it holds no lifecycle authority and the five MVP 0
+    // adapter interfaces stay sealed and unchanged.
+    "pull-request-projection.ts",
     "report-adapter.ts",
     "repository-adapter.ts",
     "runtime-adapter.ts",
