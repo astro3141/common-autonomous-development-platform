@@ -47,7 +47,11 @@ import { normalizeTaskDefinition } from "../tasksource/task-definition.ts";
 import type { TaskDefinition, TaskDependency, TaskSourceV1 } from "../tasksource/types.ts";
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import { AdmissionError } from "./errors.ts";
-import { materializationBatchFacts, materializationReservedSeats } from "../materialization/materialize-child.ts";
+import {
+  materializationBatchFacts,
+  materializationReservedSeats,
+  requireExactBindingAuthority,
+} from "../materialization/materialize-child.ts";
 import { pendingWritableSlotView } from "../materialization/writable-slot.ts";
 
 /** The authoritative owners one submission reads from. Every one is an interface, not a class. */
@@ -162,6 +166,17 @@ export function assembleDecisionInput(
     ? authorities.repository.snapshot_canonical().head
     : null;
   const admission_kind = admissionKindFor(durable_task);
+
+  // Review 5496386527 finding 1 — a selection target carrying a materialisation binding is
+  // checked against the whole exact snapshot↔binding↔task↔receipt chain *before* any validator
+  // input exists; an inexact durable row is a fail-closed assembly failure, never a view.
+  if (
+    (proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION") &&
+    durable_task !== null &&
+    durable_task.materialization_binding !== null
+  ) {
+    requireExactBindingAuthority(store, durable_task);
+  }
 
   const input: DecisionValidationInput = {
     proposal: context.proposal,

@@ -31,6 +31,7 @@ import {
 } from "../statemachine/transition-commit.ts";
 import { blockedByDecision, materializationRejected, subflowChildOf } from "../statemachine/types.ts";
 import type { PlatformStore } from "../store/platform-store.ts";
+import type { TaskRow } from "../store/domain-types.ts";
 import type { StoredMaterializationSnapshot } from "../store/materialization-store.ts";
 import { TaskSourceError } from "../tasksource/errors.ts";
 import { normalizeTaskDefinition } from "../tasksource/task-definition.ts";
@@ -173,9 +174,64 @@ function view(
 }
 
 function boundChild(store: PlatformStore, snapshot: StoredMaterializationSnapshot) {
-  return store.tasks
+  const bound = store.tasks
     .inBatch(snapshot.batch_id)
     .find((task) => task.materialization_binding?.materialization_id === snapshot.materialization_id);
+  // Review 5496386527 finding 1 — a bound row is OBSERVED authority only when it is *exact*; an
+  // inexact durable binding fails the projection closed instead of downgrading to a phase.
+  if (bound !== undefined) requireExactBindingAuthority(store, bound);
+  return bound;
+}
+
+/**
+ * §8.4b/§9.2g/§19.3c/§19.5 (review 5496386527 finding 1) — the one exact
+ * snapshot ↔ binding ↔ task ↔ DONE-receipt equality check. A task's materialisation binding is
+ * child identity, reservation exemption and D25 transfer authority *only* when every leg of the
+ * chain agrees: the immutable snapshot the binding names (re-hashed on load), the binding's own
+ * hash/source/parent/child-definition fields, the task's current body identity and external ref,
+ * and the durable DONE receipt of the publish operation. Any missing, malformed or mismatched leg
+ * throws — assembly and commit fail closed; nothing downgrades to INTENT, absence or OBSERVED.
+ */
+export function requireExactBindingAuthority(
+  store: PlatformStore,
+  task: TaskRow,
+): StoredMaterializationSnapshot {
+  const binding = task.materialization_binding;
+  const fail = (leg: string): never => {
+    throw new Error(
+      `materialisation binding of ${task.task_key} is not the exact F authority (${leg}); ` +
+        "the durable chain must be repaired before any admission may consume it",
+    );
+  };
+  if (binding === null) return fail("binding missing");
+  const snapshot = store.materializations.get(binding.materialization_id);
+  if (snapshot === undefined) return fail("snapshot missing");
+  if (snapshot.hash !== binding.materialization_hash) return fail("materialization_hash");
+  if (snapshot.batch_id !== task.batch_id) return fail("batch");
+  if (snapshot.body.task_source_id !== binding.task_source_id) return fail("task_source_id");
+  if (snapshot.parent_task_key !== binding.parent_task_key) return fail("parent_task_key");
+  if (snapshot.body.parent_intent.task_key !== binding.parent_task_key) return fail("parent intent");
+  if (snapshot.body.child_definition_hash !== binding.child_definition_hash) {
+    return fail("child_definition_hash");
+  }
+  if (task.external_snapshot.definition_hash !== binding.child_definition_hash) {
+    return fail("task body identity");
+  }
+  const record = store.idempotency.get(
+    materializeChildOp(snapshot.batch_id, snapshot.materialization_id),
+  );
+  if (record?.state !== "DONE") return fail("DONE receipt missing");
+  const receipt = record.result as { materialization_id?: unknown; materialization_hash?: unknown; external_task_ref?: unknown } | null | undefined;
+  if (
+    receipt === null ||
+    receipt === undefined ||
+    receipt.materialization_id !== snapshot.materialization_id ||
+    receipt.materialization_hash !== snapshot.hash ||
+    receipt.external_task_ref !== task.external_task_ref
+  ) {
+    return fail("DONE receipt identity");
+  }
+  return snapshot;
 }
 
 /**
@@ -530,7 +586,19 @@ function roundTrip(
     if (binding === null || binding.materialization_id !== snapshot.materialization_id) {
       return pauseConflict(store, snapshot, op_key, `${task_key} exists without this exact binding`);
     }
-    return undefined; // CM5 — already observed and bound; nothing to do twice
+    // CM5 (review 5496386527 finding 1) — a same-id row converges only when the whole durable
+    // chain is exact; an inexact persisted binding is a conflict, never silent convergence.
+    try {
+      requireExactBindingAuthority(store, existing);
+    } catch (error) {
+      return pauseConflict(
+        store,
+        snapshot,
+        op_key,
+        error instanceof Error ? error.message : `${task_key} carries an inexact binding`,
+      );
+    }
+    return undefined; // CM5 — already observed and exactly bound; nothing to do twice
   }
 
   const external_state = taskSource.get_task_state(receipt.external_task_ref);

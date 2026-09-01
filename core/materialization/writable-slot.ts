@@ -21,11 +21,12 @@
 
 import type { PendingMaterializedChildWritableSlotViewV1 } from "../decision/types.ts";
 import {
+  ACTOR_TURN_METADATA_PREFIX,
   actorSpawnOp,
-  actorTurnMetadataKey,
-  actorTurnOp,
+  actorTurnOpPrefix,
   actorWorkspaceOp,
 } from "../execution/actor-operations.ts";
+import { requireExactBindingAuthority } from "./materialize-child.ts";
 import {
   REPOSITORY_ADAPTER,
   RUNTIME_ADAPTER,
@@ -78,41 +79,49 @@ export function pendingWritableSlotView(
     }
 
     // --- transferred owners: post-E SELECTED bound children (§19.3c D24 set) ----------------
+    // Review 5496386527 finding 1 — every bound row this projection touches must be the exact
+    // F authority; an inexact durable binding makes the projection unavailable (throws).
+    if (task.materialization_binding !== null) requireExactBindingAuthority(store, task);
     if (
       task.platform_state === "SELECTED" &&
       pipelineHasActor(task.pipeline_id) &&
       task.materialization_binding !== null &&
       task.parent_task_key !== null
     ) {
-      const snapshot = store.materializations.get(task.materialization_binding.materialization_id);
       const parent = store.tasks.get(task.parent_task_key);
       const suspendedForThisChild =
         parent !== undefined &&
         parent.platform_state === "SUSPENDED" &&
         subflowChildOf(parent.state_reason?.code) === task.task_key;
-      if (
-        snapshot !== undefined &&
-        snapshot.hash === task.materialization_binding.materialization_hash &&
-        suspendedForThisChild
-      ) {
-        transferred.push(task.task_key);
-      }
+      if (suspendedForThisChild) transferred.push(task.task_key);
     }
 
     // --- phase-aware dispatch-started attempts ----------------------------------------------
+    // Review 5496386527 finding 2 — provenance is *enumerated and strictly parsed*, never point-
+    // read: an ordinal beyond the phase's one possible next turn contradicts the durable Attempt
+    // counter and fails the projection closed. Legitimate completed ordinals below the next turn
+    // are history and never block; the exact next ordinal is dispatch-started.
     if (attempt !== undefined && (attempt.state === "READY" || attempt.state === "REWORKING")) {
       const key = attempt.attempt_key;
+      const next_turn = attempt.state === "READY" ? 1 : attempt.rework_count + 2;
+      const ordinals = actorTurnProvenance(store, key);
+      for (const ordinal of ordinals) {
+        if (ordinal > next_turn) {
+          throw new Error(
+            `actor-turn:${ordinal} provenance on ${key} contradicts ${attempt.state} ` +
+              `(rework_count ${attempt.rework_count}, next turn ${next_turn}); ` +
+              "the writable projection is unavailable",
+          );
+        }
+      }
       const started =
-        attempt.state === "READY"
-          ? [actorWorkspaceOp(key), actorSpawnOp(key), actorTurnOp(key, 1)].some(
-              (op) => store.idempotency.get(op) !== undefined,
-            ) ||
+        ordinals.includes(next_turn) ||
+        (attempt.state === "READY" &&
+          ([actorWorkspaceOp(key), actorSpawnOp(key)].some(
+            (op) => store.idempotency.get(op) !== undefined,
+          ) ||
             store.adapterMetadata.get(key, REPOSITORY_ADAPTER, WORKSPACE_METADATA_KEY) !== undefined ||
-            store.adapterMetadata.get(key, RUNTIME_ADAPTER, SESSION_METADATA_KEY) !== undefined ||
-            store.adapterMetadata.get(key, RUNTIME_ADAPTER, actorTurnMetadataKey(1)) !== undefined
-          : store.idempotency.get(actorTurnOp(key, attempt.rework_count + 2)) !== undefined ||
-            store.adapterMetadata.get(key, RUNTIME_ADAPTER, actorTurnMetadataKey(attempt.rework_count + 2)) !==
-              undefined;
+            store.adapterMetadata.get(key, RUNTIME_ADAPTER, SESSION_METADATA_KEY) !== undefined));
       if (started) dispatchStarted.push(key);
     }
   }
@@ -131,6 +140,36 @@ export function pendingWritableSlotView(
     transferred_owner_task_keys: [...new Set(transferred)].sort(),
     current_writable_phase_dispatch_started_attempt_keys: [...new Set(dispatchStarted)].sort(),
   };
+}
+
+const TURN_ORDINAL = /^[1-9][0-9]*$/;
+
+/**
+ * Every durable Actor-turn ordinal recorded for one Attempt — idempotency rows and adapter turn
+ * metadata alike. A suffix that is not a canonical positive integer is malformed provenance and
+ * throws; it is a contradiction to resolve, never absence.
+ */
+function actorTurnProvenance(store: PlatformStore, attempt_key: string): readonly number[] {
+  const ordinals = new Set<number>();
+  const parse = (source: string, suffix: string): void => {
+    if (!TURN_ORDINAL.test(suffix)) {
+      throw new Error(
+        `malformed actor-turn provenance ${JSON.stringify(source)} on ${attempt_key}; ` +
+          "the writable projection is unavailable",
+      );
+    }
+    ordinals.add(Number(suffix));
+  };
+  const opPrefix = actorTurnOpPrefix(attempt_key);
+  for (const op_key of store.idempotency.keysWithPrefix(opPrefix)) {
+    parse(op_key, op_key.slice(opPrefix.length));
+  }
+  for (const row of store.adapterMetadata.forEntity(attempt_key)) {
+    if (row.key.startsWith(ACTOR_TURN_METADATA_PREFIX)) {
+      parse(row.key, row.key.slice(ACTOR_TURN_METADATA_PREFIX.length));
+    }
+  }
+  return [...ordinals].sort((a, b) => a - b);
 }
 
 /** The union the §9.2e rule judges. Sorted set semantics. */

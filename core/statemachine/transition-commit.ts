@@ -35,7 +35,7 @@ import {
   assertAdmissible,
   pipelineHasActor,
 } from "./admission.ts";
-import { materializationReservedSeats } from "../materialization/materialize-child.ts";
+import { materializationReservedSeats, requireExactBindingAuthority } from "../materialization/materialize-child.ts";
 import { effectiveWritableOwners, pendingWritableSlotView } from "../materialization/writable-slot.ts";
 import { nextAttemptOutcome } from "./attempt-transitions.ts";
 import { nextBatchOutcome, type BatchTaskCounts } from "./batch-transitions.ts";
@@ -172,13 +172,9 @@ export function commitAdmission(store: PlatformStore, command: AdmissionCommand)
       if (binding.parent_task_key !== command.subflow_parent.task_key) {
         throw illegal(`${task.task_key} is bound to ${binding.parent_task_key}, not the proposed parent`);
       }
-      if (task.external_snapshot.definition_hash !== binding.child_definition_hash) {
-        throw illegal(`${task.task_key}'s fresh definition drifted from its materialisation binding`);
-      }
-      const snapshot = store.materializations.get(binding.materialization_id);
-      if (snapshot === undefined || snapshot.hash !== binding.materialization_hash) {
-        throw illegal(`${task.task_key}'s materialisation snapshot does not verify against its binding`);
-      }
+      // Review 5496386527 finding 1 — the whole exact snapshot↔binding↔task↔DONE-receipt chain
+      // is re-verified inside this transaction; any inexact leg aborts the admission.
+      requireExactBindingAuthority(store, task);
     }
 
     // Same durable recheck for both paths — Batch 7's V11 pass is not taken on trust.

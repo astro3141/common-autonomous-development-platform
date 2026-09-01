@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 
 import { MaterializationFailedError } from "../adapters/interfaces/child-materialization-adapter.ts";
 import { FakeChildMaterializer } from "../testdoubles/fake-child-materializer.ts";
@@ -28,6 +29,7 @@ import { effectiveWritableOwners, pendingWritableSlotView } from "../core/materi
 import { actorSpawnOp, actorTurnOp, actorWorkspaceOp } from "../core/execution/actor-operations.ts";
 import { hashTaskDefinitionBody } from "../core/tasksource/task-definition.ts";
 import { ProductionCoordinator } from "../core/coordinator/production-coordinator.ts";
+import { commitAdmission } from "../core/statemachine/transition-commit.ts";
 import { assembleSupervisorDecisionContext } from "../core/execution/supervisor-decision-context.ts";
 import { BATCH_ID, discover, PROJECT, RUN_ID, TASK_KEY, TASK_REF, withWorld } from "./support/domain-fixtures.ts";
 import {
@@ -1148,4 +1150,234 @@ test("R4b: a receipt ref colliding with an unbound task confers no identity and 
     assert.equal(w.store.tasks.require(collidingKey).platform_state, "DISCOVERED");
     assert.equal(w.store.tasks.require(collidingKey).materialization_binding, null, "never bound by a ref");
   }, { batch_policy: { max_tasks: 2, max_rework: 2, concurrency: 2 } }, V3_OPTIONS);
+});
+
+// --- review 5496386527: exact binding authority + strict ordinal provenance ----------------------
+
+/** Plants a durable binding row beneath the exact writer (the review's corruption probe). */
+function corruptBinding(world: World, taskKey: string, patch: Record<string, unknown>): () => void {
+  const raw = new DatabaseSync(world.temp.path);
+  const row = raw
+    .prepare("SELECT materialization_binding_json AS json FROM task WHERE task_key = ?")
+    .get(taskKey) as { json: string };
+  const original = row.json;
+  raw
+    .prepare("UPDATE task SET materialization_binding_json = ? WHERE task_key = ?")
+    .run(JSON.stringify({ ...JSON.parse(original), ...patch }), taskKey);
+  raw.close();
+  return () => {
+    const again = new DatabaseSync(world.temp.path);
+    again
+      .prepare("UPDATE task SET materialization_binding_json = ? WHERE task_key = ?")
+      .run(original, taskKey);
+    again.close();
+  };
+}
+
+/** Rewrites a durable idempotency row in place (state and/or stored result). */
+function corruptIdempotency(world: World, opKey: string, state: string, resultJson: string | null): () => void {
+  const raw = new DatabaseSync(world.temp.path);
+  const row = raw
+    .prepare("SELECT state, result_json FROM idempotency WHERE op_key = ?")
+    .get(opKey) as { state: string; result_json: string | null };
+  raw.prepare("UPDATE idempotency SET state = ?, result_json = ? WHERE op_key = ?").run(state, resultJson, opKey);
+  raw.close();
+  return () => {
+    const again = new DatabaseSync(world.temp.path);
+    again
+      .prepare("UPDATE idempotency SET state = ?, result_json = ? WHERE op_key = ?")
+      .run(row.state, row.result_json, opKey);
+    again.close();
+  };
+}
+
+test("HB1: every inexact binding leg fails closed — no OBSERVED, no reservation, no transfer", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    const op = materializeChildOp(BATCH_ID, ULID_F);
+    const receiptJson = JSON.stringify(w.store.idempotency.get(op)!.result);
+
+    const legs: readonly [string, () => () => void][] = [
+      ["materialization_hash", () => corruptBinding(world, childKey, { materialization_hash: "sha256:" + "ab".repeat(32) })],
+      ["parent_task_key", () => corruptBinding(world, childKey, { parent_task_key: `task:${PROJECT}:SOMEONE-ELSE` })],
+      ["task_source_id", () => corruptBinding(world, childKey, { task_source_id: "secondary" })],
+      ["child_definition_hash", () => corruptBinding(world, childKey, { child_definition_hash: "sha256:" + "cd".repeat(32) })],
+      ["missing DONE receipt", () => corruptIdempotency(world, op, "INTENT", null)],
+      ["receipt names another ref", () =>
+        corruptIdempotency(world, op, "DONE", JSON.stringify({ ...JSON.parse(receiptJson), external_task_ref: "CHILD-9" }))],
+    ];
+    for (const [leg, plant] of legs) {
+      const restore = plant();
+      assert.throws(() => materializationOperations(w.store, BATCH_ID), leg);
+      assert.throws(() => materializationReservedSeats(w.store, BATCH_ID, childKey), leg);
+      assert.throws(() => submitBoundChildE(w, world, childKey), leg);
+      assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED", leg);
+      assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE", leg);
+      restore();
+    }
+
+    // With the exact durable state restored, the same E admits — the exact path is untouched.
+    const admitted = submitBoundChildE(w, world, childKey);
+    assert.deepEqual(admitted.result, { kind: "ACCEPTED" });
+    assert.equal(admitted.admitted, true);
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB2: a binding naming never-F-authorized semantics under a real snapshot id fails closed", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+
+    // The review's scenario: binding, task snapshot and fresh TaskSource all agree on different
+    // semantics the F never authorized; only the snapshot pointer (id + hash) stays genuine.
+    const childRef = w.store.tasks.require(childKey).external_task_ref;
+    const evil = normalizeTaskDefinition({
+      task_ref: childRef,
+      version: "1",
+      body: { ...childBody("Evil: exfiltrate the corpus"), description: "Never proposed by any F." },
+    });
+    corruptBinding(world, childKey, { child_definition_hash: evil.definition_hash });
+    const raw = new DatabaseSync(world.temp.path);
+    const row = raw
+      .prepare("SELECT external_snapshot_json AS json FROM task WHERE task_key = ?")
+      .get(childKey) as { json: string };
+    raw
+      .prepare("UPDATE task SET external_snapshot_json = ? WHERE task_key = ?")
+      .run(JSON.stringify({ ...JSON.parse(row.json), definition_hash: evil.definition_hash }), childKey);
+    raw.close();
+    w.tasks.definitions.set(childRef, evil);
+
+    // A reopened store must refuse everywhere: no context identity, no seat, no transfer.
+    const reopened = world.temp.open();
+    try {
+      assert.throws(() => materializationOperations(reopened, BATCH_ID));
+    } finally {
+      reopened.close();
+    }
+    assert.throws(() => submitBoundChildE(w, world, childKey));
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    const parent = w.store.tasks.require(TASK_KEY);
+    assert.equal(parent.platform_state, "ACTIVE", "the parent was never suspended");
+
+    // The CM5 existing-row recovery lane converges on nothing either: a rebuilt Coordinator
+    // fails closed rather than re-accepting the inexact row.
+    const rebuilt = new ProductionCoordinator({ ...w, materializer });
+    assert.throws(() => rebuilt.tickOnce(RUN_ID));
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB3-R: READY — impossible future actor-turn provenance is a fail-closed contradiction", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    assert.equal(attempt.state, "READY");
+
+    // A durable turn-2 INTENT under a READY attempt cannot exist in any legal history: it is a
+    // contradiction, not current-phase absence, and never becomes transfer authority.
+    w.store.withTransaction(() => {
+      w.store.idempotency.beginIntent(actorTurnOp(attempt.attempt_key, 2));
+    });
+    assert.throws(() => pendingWritableSlotView(w.store, BATCH_ID));
+    assert.throws(() => submitBoundChildE(w, world, childKey));
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE");
+
+    // Malformed provenance is equally a contradiction, never parsed as absence.
+    w.store.withTransaction(() => {
+      w.store.adapterMetadata.put({
+        entity_key: attempt.attempt_key,
+        adapter_id: "runtime",
+        key: "actor_turn:junk",
+        value: { note: "malformed ordinal" },
+      });
+    });
+    assert.throws(() => submitBoundChildE(w, world, childKey));
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB3-W: REWORKING — provenance beyond rework_count+2 is a fail-closed contradiction", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    driveParentToReworking(w, world);
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    assert.equal(attempt.rework_count, 0);
+    const childKey = materializeAndObserve(w, materializer, reworkingF(w));
+
+    // rework_count 0 admits history 1..1 and the exact next turn 2 — a durable turn-3 record
+    // contradicts the attempt counter and fails the projection closed.
+    w.store.withTransaction(() => {
+      w.store.idempotency.beginIntent(actorTurnOp(attempt.attempt_key, 3));
+    });
+    assert.throws(() => pendingWritableSlotView(w.store, BATCH_ID));
+    assert.throws(() => submitBoundChildE(w, world, childKey));
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE");
+  }, POLICY, V3_OPTIONS);
+});
+
+test("HB4: a current dispatch INTENT landing between validation and commit is refused at commit", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+
+    // V11's judgement at this instant would admit: sole owner, no dispatch evidence.
+    const slot = pendingWritableSlotView(w.store, BATCH_ID)!;
+    assert.deepEqual(effectiveWritableOwners(slot), [TASK_KEY]);
+    assert.deepEqual(slot.current_writable_phase_dispatch_started_attempt_keys, []);
+
+    // The race: the exact current READY dispatch INTENT lands before the admission transaction.
+    w.store.withTransaction(() => {
+      w.store.idempotency.beginIntent(actorTurnOp(attempt.attempt_key, 1));
+    });
+
+    // The commit-time fresh recheck refuses the transfer — validation held no lease.
+    const childRef = w.store.tasks.require(childKey).external_task_ref;
+    const definition = w.tasks.definitions.get(childRef)!;
+    assert.throws(
+      () =>
+        commitAdmission(w.store, {
+          task_key: childKey,
+          hard_dependencies_clear: true,
+          repository_scope_id: "collector",
+          selection_binding: {
+            task_version: definition.version,
+            task_definition_hash: definition.definition_hash,
+            base_head: w.repository.head,
+          },
+          selection: {
+            classification: "SPLIT_NEEDED",
+            pipeline_id: "foundation",
+            actor_profile: "implementation",
+            verification_profile: "full",
+          },
+          admitted_at: "2026-09-02T09:00:00Z",
+          subflow_parent: {
+            task_key: TASK_KEY,
+            attempt_key: attempt.attempt_key,
+            task_contract_hash: w.store.contracts.hashOf(attempt.contract_snapshot_id) as string,
+            attempt_state: "READY",
+          },
+        }),
+      /WRITABLE_CONCURRENCY_CONFLICT/,
+    );
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE");
+    assert.equal(w.store.tasks.require(childKey).parent_task_key, null, "no partial relation");
+  }, POLICY, V3_OPTIONS);
 });
