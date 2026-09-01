@@ -348,3 +348,49 @@ test("D23-9: Human-Gate revalidation reuses the bound proposal id and cannot sub
     void discover;
   }, SINGLE);
 });
+
+// --- review 5493739663 R1 regression: malformed output also answers the turn ---------------------
+
+test("D23-R1b: structurally malformed ordinary output consumes the active allocation at first outcome", () => {
+  withWorld((world) => {
+    const w = coordinatorWorld(world);
+    assert.equal(w.tick(), "SUPERVISOR_REQUESTED");
+
+    // Each malformed shape is one turn's whole answer: the validation row closes the allocation,
+    // so the originally allocated id is dead immediately afterwards — replay has zero effect.
+    const malformed: readonly unknown[] = [
+      {},
+      { ...selection({ profile: world.profile }), proposal_id: undefined },
+      { ...selection({ profile: world.profile }), proposal_id: "not-a-ulid" },
+      { ...selection({ profile: world.profile }), smuggled_field: true },
+    ];
+    for (const shape of malformed) {
+      const active = activeProposalId(w.store, BATCH_ID) ?? seedNext(w);
+      const refused = submit(w, world, shape);
+      assert.deepEqual(
+        refused.result,
+        { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" },
+        JSON.stringify(shape),
+      );
+      assert.equal(refused.admitted, false);
+      assert.equal(activeProposalId(w.store, BATCH_ID), undefined, "the allocation is closed");
+      const replay = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: active });
+      assert.deepEqual(replay.result, { kind: "POLICY_REJECTED", reason_code: "PROPOSAL_SCHEMA_INVALID" });
+      assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "DISCOVERED", "zero effect");
+    }
+
+    // A fresh turn's allocation still admits normally — nothing was leaked or double-consumed.
+    const fresh = seedNext(w);
+    const exact = submit(w, world, { ...selection({ profile: world.profile }), proposal_id: fresh });
+    assert.deepEqual(exact.result, { kind: "ACCEPTED" });
+    assert.equal(exact.admitted, true);
+  }, SINGLE);
+});
+
+/** Seeds a new turn allocation with a fresh ULID and returns it (the test-side platform caller). */
+function seedNext(w: CoordinatorWorld): string {
+  const id = `01JQ8ZK5T7RC9V2W4X6Y8Z0R${String(seedNext.n++).padStart(2, "0")}`;
+  seedProposalAllocation(w.store, BATCH_ID, id);
+  return id;
+}
+seedNext.n = 10;

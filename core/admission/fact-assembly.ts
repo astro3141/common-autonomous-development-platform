@@ -48,6 +48,7 @@ import type { TaskDefinition, TaskDependency, TaskSourceV1 } from "../tasksource
 import type { RepositoryAdapter } from "../../adapters/interfaces/repository-adapter.ts";
 import { AdmissionError } from "./errors.ts";
 import { materializationBatchFacts, materializationReservedSeats } from "../materialization/materialize-child.ts";
+import { pendingWritableSlotView } from "../materialization/writable-slot.ts";
 
 /** The authoritative owners one submission reads from. Every one is an interface, not a class. */
 export interface DecisionAuthorities {
@@ -110,11 +111,19 @@ export function assembleDecisionInput(
   const compiled_profile = store.batchView.compiledProfileFor(batch.batch_id);
   const compiled_profile_hash = batch.compiled_profile_hash;
 
+  // D23 (review 5493739663 R1) — the active ordinary allocation is resolved *before* parsing
+  // untrusted output, so a structurally malformed answer still carries the identity its
+  // validation outcome consumes. One issued turn yields exactly one ordinary outcome.
+  const allocation = activeSupervisorProposalAllocation(store.decisions, batch.batch_id);
+  const proposal_identity =
+    allocation === undefined ? {} : { proposal_identity: { proposal_id: allocation.proposal_id } };
+
   const proposal = parseProposal(context.proposal);
   if (proposal === null) {
-    // Nothing else can be assembled without a task_ref; V1 rejects and the run stops there.
+    // Nothing else can be assembled without a task_ref; V1 rejects and the run stops there —
+    // but the malformed answer was still this turn's answer, so the identity travels with it.
     return {
-      input: { proposal: context.proposal, compiled_profile, compiled_profile_hash },
+      input: { proposal: context.proposal, compiled_profile, compiled_profile_hash, ...proposal_identity },
       proposal: null,
       run,
       batch,
@@ -154,19 +163,13 @@ export function assembleDecisionInput(
     : null;
   const admission_kind = admissionKindFor(durable_task);
 
-  // D23 — the active turn's durable Platform allocation. Absent → V1 rejects at /proposal_id:
-  // a Proposal that no active Supervisor turn asked for is not repaired into acceptance.
-  const allocation = activeSupervisorProposalAllocation(store.decisions, batch.batch_id);
-
   const input: DecisionValidationInput = {
     proposal: context.proposal,
     compiled_profile,
     compiled_profile_hash,
     manifests,
     admission_kind,
-    ...(allocation === undefined
-      ? {}
-      : { proposal_identity: { proposal_id: allocation.proposal_id } }),
+    ...proposal_identity,
     ...(task === undefined ? {} : { task }),
     ...(canonical_head === null ? {} : { repository: { canonical_head } }),
     ...(proposal.variant === "TASK_SELECTION" || proposal.variant === "SUBFLOW_SELECTION"
@@ -179,6 +182,9 @@ export function assembleDecisionInput(
               task_key ?? undefined,
             ),
           },
+          // D25 — the §19.3c owner-set projection; a projection that cannot be computed exactly
+          // throws here, before the validator ever runs (fail-closed assembly).
+          writable_slot: pendingWritableSlotView(store, batch.batch_id),
         }
       : {}),
     // §9.2f — the fresh parent/child read-models an E submission carries into V2/V3/V11.

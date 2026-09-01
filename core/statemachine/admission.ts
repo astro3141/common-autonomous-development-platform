@@ -42,6 +42,13 @@ export interface AdmissionCheck {
    * already excluding the admission target itself. Defaults to 0 in pre-D24 worlds.
    */
   readonly reserved_materialization_seats?: number;
+  /**
+   * D25 (§19.3c) — when the batch carries D24 materialisation state, the committing caller judges
+   * rule 3 against the durable writable owner *set* (including the one exact parent→child
+   * transfer) and supplies the verdict here; the bare count comparison is then not consulted.
+   * Absent in legacy batches, where the count is the whole truth.
+   */
+  readonly effective_writable_conflict?: boolean;
 }
 
 /** Returns the rejection, or `undefined` when the admission may proceed. */
@@ -55,7 +62,9 @@ export function evaluateAdmission(check: AdmissionCheck): AdmissionRejection | u
     return "BATCH_MAX_TASKS_REACHED";
   }
   if (check.view.active_task_count >= check.policy.concurrency) return "CONCURRENCY_LIMIT_REACHED";
-  if (check.pipeline_has_actor && check.view.active_writable_candidate_count >= 1) {
+  const writable_conflict =
+    check.effective_writable_conflict ?? check.view.active_writable_candidate_count >= 1;
+  if (check.pipeline_has_actor && writable_conflict) {
     return "WRITABLE_CONCURRENCY_CONFLICT";
   }
   // Evaluated last so the existing rejection precedence is unchanged.

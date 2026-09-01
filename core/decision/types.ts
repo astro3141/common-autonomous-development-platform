@@ -337,6 +337,22 @@ export interface ChildMaterializationBatchViewV1 {
   readonly admission_closed: boolean;
 }
 
+/**
+ * D25 (§19.3c) — the writable slot judged as an owner *set*, derived on every read from durable
+ * rows; never a durable row itself. `active_owner_task_keys` are the exact keys behind
+ * `active_writable_candidate_count` (the count definition is unchanged), the transferred set is
+ * the D24 SELECTED bound children holding a slot, and the dispatch-started set names attempts
+ * whose *current* writable phase already produced dispatch evidence — the phase-aware fence that
+ * decides whether a parent→child transfer is still permitted. All three are sorted, deduplicated
+ * sets. `null` (view absent) means a legacy batch with no D24 materialisation state, where rule 3
+ * stays exactly the count-only judgement.
+ */
+export interface PendingMaterializedChildWritableSlotViewV1 {
+  readonly active_owner_task_keys: readonly string[];
+  readonly transferred_owner_task_keys: readonly string[];
+  readonly current_writable_phase_dispatch_started_attempt_keys: readonly string[];
+}
+
 /** Exactly three counts; the queries that produce them belong to the domain-store batch. */
 export interface DecisionValidationBatchView {
   readonly admitted_task_count: number;

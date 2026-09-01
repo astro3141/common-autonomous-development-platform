@@ -44,6 +44,7 @@ import {
   type ProposalV1,
   type RepositoryValidationView,
   type SelectionAdmissionKind,
+  type PendingMaterializedChildWritableSlotViewV1,
   type ChildMaterializationBatchViewV1,
   type ChildMaterializationCapabilityViewV1,
   type ChildMaterializationParentViewV1,
@@ -94,6 +95,12 @@ export interface DecisionValidationInput {
    * already excluding the admission target. Absent in pre-D24 worlds (treated as 0).
    */
   readonly materialization_reservation?: { readonly reserved_seats_excluding_target: number };
+  /**
+   * D25 (§19.3c/§9.2e rule 3) — the writable owner-set projection for a selection admission.
+   * `null`/absent means a legacy batch with no D24 materialisation state; rule 3 then judges the
+   * bare `active_writable_candidate_count` exactly as before.
+   */
+  readonly writable_slot?: PendingMaterializedChildWritableSlotViewV1 | null;
 }
 
 const ACCEPTED: DecisionValidationResult = { kind: "ACCEPTED" };
@@ -435,12 +442,57 @@ function runValidation(
     // compete for the writable slot. No new pipeline classification is introduced for this.
     const pipeline = project.pipelines[selection.pipeline_id];
     const writable = pipeline !== undefined && pipeline.steps.includes(WRITABLE_PIPELINE_STEP);
-    if (writable && batch.active_writable_candidate_count >= 1) {
-      return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+    if (writable) {
+      const slot = input.writable_slot ?? null;
+      if (slot === null) {
+        // Legacy batch, no D24 materialisation state: rule 3 stays the exact count judgement.
+        if (batch.active_writable_candidate_count >= 1) {
+          return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+        }
+      } else if (!writableSlotAdmits(slot, selection, parentView, input)) {
+        return rejected("WRITABLE_CONCURRENCY_CONFLICT");
+      }
     }
   }
 
   return ACCEPTED;
+}
+
+/**
+ * D25 (§9.2e rule 3) — the owner-set judgement. An empty effective owner set admits the writable
+ * candidate outright. A non-empty set rejects every admission except the one exact transfer: an E
+ * over an OBSERVED bound D24 child (the binding is written only at OBSERVED, and the intent commit
+ * re-verifies the durable phase) whose bound parent is the *sole* effective owner, is ACTIVE with
+ * its current attempt in READY or REWORKING, and whose current writable phase has produced no
+ * dispatch evidence yet. Everything else — unrelated A/E, IMPLEMENTING parent, binding-null legacy
+ * E, second writer, a parent whose Actor dispatch already started — stays
+ * `WRITABLE_CONCURRENCY_CONFLICT`. Parent-identity and drift checks (§9.2f–g) already ran above;
+ * VERIFYING/AUDITING parents never hold a writable attempt state, so the D22 E path arrives here
+ * with an empty owner set and is untouched.
+ */
+function writableSlotAdmits(
+  slot: PendingMaterializedChildWritableSlotViewV1,
+  selection: SelectionProposalV1,
+  parentView: SubflowParentValidationView | undefined,
+  input: DecisionValidationInput,
+): boolean {
+  const owners = [
+    ...new Set([...slot.active_owner_task_keys, ...slot.transferred_owner_task_keys]),
+  ];
+  if (owners.length === 0) return true;
+  if (selection.variant !== "SUBFLOW_SELECTION" || parentView?.status !== "FOUND") return false;
+  if ((input.subflow_child?.materialization_binding ?? null) === null) return false;
+  return (
+    parentView.platform_state === "ACTIVE" &&
+    (parentView.current_attempt_state === "READY" ||
+      parentView.current_attempt_state === "REWORKING") &&
+    owners.length === 1 &&
+    owners[0] === parentView.task_key &&
+    parentView.current_attempt_key !== null &&
+    !slot.current_writable_phase_dispatch_started_attempt_keys.includes(
+      parentView.current_attempt_key,
+    )
+  );
 }
 
 /** Exact structural equality of two normalized Proposals (§17.3 step 5/13). */

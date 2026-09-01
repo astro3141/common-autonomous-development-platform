@@ -146,8 +146,10 @@ function operationView(
     return view(snapshot, op_key, "OBSERVED", bound.external_task_ref, bound.admitted_at !== null);
   }
   if (record?.state === "DONE") {
-    const receipt = record.result as unknown as ChildTaskMaterializationReceiptV1 | undefined;
-    return view(snapshot, op_key, "COMMITTED_NOT_OBSERVED", receipt?.external_task_ref ?? null, false);
+    // §13.4 context v2 / §8.4b (review 5493739663 R4) — a COMMITTED receipt ref is publication
+    // provenance, not child identity: `task_ref` stays null until the exact TaskSource
+    // round-trip commits the durable binding (OBSERVED).
+    return view(snapshot, op_key, "COMMITTED_NOT_OBSERVED", null, false);
   }
   return view(snapshot, op_key, "INTENT", null, false);
 }
@@ -221,15 +223,16 @@ export function materializationReservedSeats(
   batch_id: string,
   exclude_task_key?: string,
 ): number {
-  const operations = materializationOperations(store, batch_id).filter(
-    (operation) => operation.phase !== "FAILED" && !operation.admitted,
-  );
   let childSeats = 0;
   const parentSeats = new Set<string>();
-  for (const operation of operations) {
-    const boundKey =
-      operation.task_ref === null ? undefined : buildTaskKey(runProject(store, batch_id), operation.task_ref);
-    if (boundKey !== undefined && boundKey === exclude_task_key) {
+  for (const snapshot of store.materializations.forBatch(batch_id)) {
+    const operation = operationView(store, snapshot);
+    if (operation.phase === "FAILED" || operation.admitted) continue;
+    // §8.4b/§9.2g (review 5493739663 R4) — only the exact OBSERVED durable binding names the
+    // child that may consume this seat. A COMMITTED receipt ref that happens to collide with a
+    // pre-existing unbound task is publication provenance, never binding authority.
+    const bound = operation.phase === "OBSERVED" ? boundChild(store, snapshot) : undefined;
+    if (bound !== undefined && bound.task_key === exclude_task_key) {
       // The exact bound child consumes its own reserved seat.
     } else {
       childSeats += 1;
@@ -240,10 +243,6 @@ export function materializationReservedSeats(
     }
   }
   return childSeats + parentSeats.size;
-}
-
-function runProject(store: PlatformStore, batch_id: string): string {
-  return store.runs.require(store.batches.require(batch_id).run_id).project_id;
 }
 
 /** §9.2g — the F local-guard/reservation facts, derived from durable exact state only. */

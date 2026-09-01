@@ -24,6 +24,8 @@ import {
   pendingMaterializationsFor,
 } from "../core/materialization/materialize-child.ts";
 import { sealMaterializationSnapshot, materializeChildOp } from "../core/materialization/snapshot.ts";
+import { effectiveWritableOwners, pendingWritableSlotView } from "../core/materialization/writable-slot.ts";
+import { actorSpawnOp, actorTurnOp, actorWorkspaceOp } from "../core/execution/actor-operations.ts";
 import { hashTaskDefinitionBody } from "../core/tasksource/task-definition.ts";
 import { ProductionCoordinator } from "../core/coordinator/production-coordinator.ts";
 import { assembleSupervisorDecisionContext } from "../core/execution/supervisor-decision-context.ts";
@@ -44,11 +46,19 @@ import { validateDecision } from "../core/decision/validator.ts";
 import { normalizeTaskDefinition } from "../core/tasksource/task-definition.ts";
 import {
   activeProposalId,
+  actorProduced,
   coordinatorWorld,
   seedProposalAllocation,
   submitSupervisorProposal,
   type CoordinatorWorld,
 } from "./support/coordinator-fixtures.ts";
+import {
+  AUDITOR_VERDICT_PROTOCOL,
+  auditorTurnResult,
+  auditorVerdict,
+  evidenceItem,
+  REQUIRED_CHECK,
+} from "./support/execution-fixtures.ts";
 
 const ULID_F = "01JQ8ZK5T7RC9V2W4X6Y8Z0FM1";
 const ULID_F2 = "01JQ8ZK5T7RC9V2W4X6Y8Z0FM2";
@@ -845,4 +855,297 @@ test("R5: a cross-batch F parent fails closed everywhere, and a legacy row still
     });
     assert.equal(pendingMaterializationsFor(w.store, OTHER_KEY).length, 1, "the fence sees it");
   }, { batch_policy: { max_tasks: 5, max_rework: 2, concurrency: 2 } }, V3_OPTIONS);
+});
+
+// --- D25 (#71): phase-aware writable-owner transfer ----------------------------------------------
+
+/** F1–F7: accept F, publish, play the TaskSource side, observe — returns the bound child's key. */
+function materializeAndObserve(w: CoordinatorWorld, materializer: FakeChildMaterializer, f?: Record<string, unknown>): string {
+  const proposal = f ?? fProposal(w);
+  const outcome = submitF(w, proposal);
+  assert.deepEqual(outcome.result, { kind: "ACCEPTED" });
+  const id = proposal["proposal_id"] as string;
+  assert.equal(w.tick(), "MATERIALIZATION_PUBLISHED");
+  const receipt = materializer.committedReceipt(materializeChildOp(BATCH_ID, id))!;
+  const snapshot = w.store.materializations.require(id);
+  w.tasks.definitions.set(
+    receipt.external_task_ref,
+    normalizeTaskDefinition({ task_ref: receipt.external_task_ref, version: "1", body: snapshot.body.child_definition_body }),
+  );
+  assert.equal(w.tick(), "MATERIALIZATION_OBSERVED");
+  return `task:${PROJECT}:${receipt.external_task_ref}`;
+}
+
+/** The exact bound-child E over the current parent attempt, through the production ingress. */
+function submitBoundChildE(w: CoordinatorWorld, world: World, childKey: string) {
+  const parentAttempt = w.store.attempts.current(TASK_KEY)!;
+  const childRef = w.store.tasks.require(childKey).external_task_ref;
+  const proposal = subflowSelection({
+    profile: world.profile,
+    definition: w.tasks.definitions.get(childRef)!,
+    classification: "SPLIT_NEEDED",
+    pipeline_id: "foundation",
+    parent: {
+      task_key: TASK_KEY,
+      attempt_key: parentAttempt.attempt_key,
+      task_contract_hash: w.store.contracts.hashOf(parentAttempt.contract_snapshot_id) as string,
+      attempt_state: parentAttempt.state,
+    },
+  });
+  seedProposalAllocation(w.store, BATCH_ID, proposal["proposal_id"] as string);
+  return submitProposal(
+    { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+    { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T10:00:00Z", proposal },
+  );
+}
+
+/** An unrelated ordinary A over a seeded second task, expecting rule 3 to refuse it. */
+function submitSecondWriter(w: CoordinatorWorld, world: World, ref: string) {
+  const proposal = selection({ profile: world.profile, definition: task({ task_ref: ref }) });
+  seedProposalAllocation(w.store, BATCH_ID, proposal["proposal_id"] as string);
+  return submitProposal(
+    { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+    { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T10:01:00Z", proposal },
+  );
+}
+
+const owners = (w: CoordinatorWorld): readonly string[] => {
+  const slot = pendingWritableSlotView(w.store, BATCH_ID);
+  return slot === null ? [] : effectiveWritableOwners(slot);
+};
+
+test("D25-R: READY — the bound child E transfers the writable slot atomically; no dispatch ever started", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    discover(world, "T-2");
+    w.tasks.definitions.set("T-2", task({ task_ref: "T-2" }));
+
+    // F1–F7 on the DISCOVERED parent, then F8: the parent itself is admitted and activated.
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    const parentAttempt = w.store.attempts.current(TASK_KEY)!;
+    assert.equal(parentAttempt.state, "READY");
+
+    // F10 — the pending bound child gates the Actor protocol: zero external side effects.
+    assert.notEqual(w.tick(), "IMPLEMENTATION_STARTED");
+    assert.equal(w.store.idempotency.get(actorWorkspaceOp(parentAttempt.attempt_key)), undefined);
+    assert.equal(w.store.idempotency.get(actorSpawnOp(parentAttempt.attempt_key)), undefined);
+    assert.equal(w.store.idempotency.get(actorTurnOp(parentAttempt.attempt_key, 1)), undefined);
+    assert.equal(w.store.adapterMetadata.forEntity(parentAttempt.attempt_key).length, 0);
+    assert.deepEqual(owners(w), [TASK_KEY], "the READY parent holds the slot");
+
+    // Restart pre-E: a rebuilt Coordinator converges — still gated, no Actor dispatch evidence.
+    const rebuilt = new ProductionCoordinator({ ...w, materializer });
+    assert.notEqual(rebuilt.tickOnce(RUN_ID), "IMPLEMENTATION_STARTED");
+    assert.equal(w.store.idempotency.get(actorWorkspaceOp(parentAttempt.attempt_key)), undefined);
+    assert.deepEqual(owners(w), [TASK_KEY]);
+
+    // A second writer cannot take the occupied slot (D25 is not a general exemption).
+    const second = submitSecondWriter(w, world, "T-2");
+    assert.deepEqual(second.result, { kind: "POLICY_REJECTED", reason_code: "WRITABLE_CONCURRENCY_CONFLICT" });
+
+    // F11 — the exact bound-child E: one transaction exchanges owner, relation and admission.
+    const admitted = submitBoundChildE(w, world, childKey);
+    assert.deepEqual(admitted.result, { kind: "ACCEPTED" });
+    assert.equal(admitted.admitted, true);
+    const child = w.store.tasks.require(childKey);
+    assert.equal(child.platform_state, "SELECTED");
+    assert.equal(child.parent_task_key, TASK_KEY);
+    const parent = w.store.tasks.require(TASK_KEY);
+    assert.equal(parent.platform_state, "SUSPENDED");
+    assert.equal(parent.state_reason?.code, `SUBFLOW_CHILD:${childKey}`);
+    assert.deepEqual(owners(w), [childKey], "the transferred child is the sole effective owner");
+    assert.equal(w.store.attempts.current(TASK_KEY)!.state, "READY", "the parent Attempt is untouched");
+
+    // Restart post-E: the transfer is durable; the child activates as the new owner.
+    const after = new ProductionCoordinator({ ...w, materializer });
+    assert.equal(after.tickOnce(RUN_ID), "ACTIVATED");
+    assert.equal(w.store.tasks.require(childKey).platform_state, "ACTIVE");
+    assert.deepEqual(owners(w), [childKey]);
+
+    // The slot stays occupied by the child — a later unrelated A is still refused.
+    const third = submitSecondWriter(w, world, "T-2");
+    assert.deepEqual(third.result, { kind: "POLICY_REJECTED", reason_code: "WRITABLE_CONCURRENCY_CONFLICT" });
+  }, POLICY, V3_OPTIONS);
+});
+
+test("D25-RN: READY — durable dispatch evidence (a FAILED row included) forbids the transfer", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    const childKey = materializeAndObserve(w, materializer);
+    submitSupervisorProposal(w, world);
+    assert.equal(w.tick(), "ACTIVATED");
+    const parentAttempt = w.store.attempts.current(TASK_KEY)!;
+    assert.equal(parentAttempt.state, "READY");
+
+    // The crash-window durable state: the workspace INTENT went out and then FAILED. Under
+    // M1-15 any durable row for the phase's protocol counts — the side effect may exist.
+    w.store.withTransaction(() => {
+      w.store.idempotency.beginIntent(actorWorkspaceOp(parentAttempt.attempt_key));
+      w.store.idempotency.markFailed(actorWorkspaceOp(parentAttempt.attempt_key));
+    });
+
+    const refused = submitBoundChildE(w, world, childKey);
+    assert.deepEqual(refused.result, { kind: "POLICY_REJECTED", reason_code: "WRITABLE_CONCURRENCY_CONFLICT" });
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE", "no partial transfer");
+    assert.deepEqual(owners(w), [TASK_KEY]);
+  }, POLICY, V3_OPTIONS);
+});
+
+const CANDIDATE = "9a8b7c6d5e4f30211203344556677889900aabbc";
+
+/** The audit round: candidate produced, verified, audited FIX_REQUIRED — the parent reworks. */
+function driveParentToReworking(w: CoordinatorWorld, world: World): void {
+  submitSupervisorProposal(w, world);
+  assert.equal(w.tick(), "ACTIVATED");
+  assert.equal(w.tick(), "IMPLEMENTATION_STARTED");
+  actorProduced(w, CANDIDATE, 1);
+  assert.equal(w.tick(), "VERIFICATION_STARTED");
+  const attempt = w.store.attempts.current(TASK_KEY)!;
+  const contractHash = w.store.contracts.hashOf(attempt.contract_snapshot_id) as string;
+  w.verification.completeWith([
+    evidenceItem({
+      evidence_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0KE1",
+      check_id: REQUIRED_CHECK,
+      target_commit: CANDIDATE,
+      task_contract_hash: contractHash,
+    }),
+  ]);
+  assert.equal(w.tick(), "AUDIT_STARTED");
+  const review = {
+    candidate_commit: CANDIDATE,
+    task_contract_hash: contractHash,
+    evidence_ids: w.store.verificationEvidence
+      .forAttempt(attempt.attempt_key)
+      .filter((row) => row.target_commit === CANDIDATE)
+      .map((row) => row.evidence_id),
+  };
+  const handle = w.store.adapterMetadata
+    .forEntity(attempt.attempt_key)
+    .find((row) => row.key.startsWith("auditor_turn-1:") && row.key.endsWith(CANDIDATE));
+  assert.notEqual(handle, undefined, "there is no durable Auditor turn handle");
+  w.runtime.turnResults.set(
+    JSON.stringify(handle?.value),
+    auditorTurnResult({ body: auditorVerdict(review, { verdict: "FIX_REQUIRED" }), protocol: AUDITOR_VERDICT_PROTOCOL }),
+  );
+  w.verification.settlement = { kind: "SETTLED" };
+  assert.equal(w.tick(), "AUDIT_COMPLETED");
+  assert.equal(w.store.attempts.current(TASK_KEY)!.state, "REWORKING");
+}
+
+/** F over the parent's live REWORKING attempt (§8.1a ACTIVE_ATTEMPT basis). */
+function reworkingF(w: CoordinatorWorld): Record<string, unknown> {
+  const attempt = w.store.attempts.current(TASK_KEY)!;
+  return fProposal(w, {
+    parent: {
+      kind: "ACTIVE_ATTEMPT",
+      task_key: TASK_KEY,
+      attempt_key: attempt.attempt_key,
+      task_contract_hash: w.store.contracts.hashOf(attempt.contract_snapshot_id) as string,
+      attempt_state: "REWORKING",
+    },
+  });
+}
+
+test("D25-W: REWORKING — past turns never count; the exact bound child E transfers before the next turn", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    driveParentToReworking(w, world);
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    assert.equal(attempt.rework_count, 0);
+
+    // Mid-rework decomposition: F on the live attempt, materialised and observed (F1–F7).
+    const childKey = materializeAndObserve(w, materializer, reworkingF(w));
+
+    // F10 — the pending child gates the next rework turn; only *past* dispatch evidence exists.
+    assert.notEqual(w.tick(), "REWORK_STARTED");
+    assert.equal(w.store.idempotency.get(actorTurnOp(attempt.attempt_key, 1))?.state, "DONE", "turn 1 is history");
+    assert.equal(w.store.idempotency.get(actorTurnOp(attempt.attempt_key, attempt.rework_count + 2)), undefined);
+    assert.equal(w.store.attempts.current(TASK_KEY)!.state, "REWORKING");
+    assert.deepEqual(owners(w), [TASK_KEY]);
+
+    // The completed turn-1 record does not block: the phase-aware fence looks only at
+    // op:<attempt>:actor-turn:<rework_count+2>, and that record does not exist.
+    const admitted = submitBoundChildE(w, world, childKey);
+    assert.deepEqual(admitted.result, { kind: "ACCEPTED" });
+    assert.equal(admitted.admitted, true);
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "SUSPENDED");
+    assert.equal(w.store.tasks.require(TASK_KEY).state_reason?.code, `SUBFLOW_CHILD:${childKey}`);
+    assert.equal(w.store.tasks.require(childKey).platform_state, "SELECTED");
+    assert.equal(w.store.attempts.current(TASK_KEY)!.state, "REWORKING", "the parent Attempt is untouched");
+    assert.equal(w.store.attempts.current(TASK_KEY)!.rework_count, 0, "no rework turn was consumed");
+    assert.deepEqual(owners(w), [childKey]);
+
+    // Restart post-E: the child activates as the new owner; the suspended parent stays put.
+    const after = new ProductionCoordinator({ ...w, materializer });
+    assert.equal(after.tickOnce(RUN_ID), "ACTIVATED");
+    assert.equal(w.store.tasks.require(childKey).platform_state, "ACTIVE");
+    assert.deepEqual(owners(w), [childKey]);
+  }, POLICY, V3_OPTIONS);
+});
+
+test("D25-WN: REWORKING — a durable record of the exact next turn forbids the transfer", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    driveParentToReworking(w, world);
+    const attempt = w.store.attempts.current(TASK_KEY)!;
+    const childKey = materializeAndObserve(w, materializer, reworkingF(w));
+
+    // The M1-15 signal: the next rework turn's INTENT is durable — its side effect may exist.
+    w.store.withTransaction(() => {
+      w.store.idempotency.beginIntent(actorTurnOp(attempt.attempt_key, attempt.rework_count + 2));
+    });
+
+    const refused = submitBoundChildE(w, world, childKey);
+    assert.deepEqual(refused.result, { kind: "POLICY_REJECTED", reason_code: "WRITABLE_CONCURRENCY_CONFLICT" });
+    assert.equal(w.store.tasks.require(childKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(TASK_KEY).platform_state, "ACTIVE", "no partial transfer");
+    assert.deepEqual(owners(w), [TASK_KEY]);
+  }, POLICY, V3_OPTIONS);
+});
+
+// --- review 5493739663 R4 regression: a COMMITTED receipt ref is not child identity --------------
+
+test("R4b: a receipt ref colliding with an unbound task confers no identity and no seat exemption", () => {
+  withWorld((world) => {
+    const materializer = new FakeChildMaterializer();
+    const w = coordinatorWorld(world, { materializer });
+    // A pre-existing same-batch task whose external ref will equal the fake's first receipt ref.
+    discover(world, "CHILD-1");
+    w.tasks.definitions.set("CHILD-1", task({ task_ref: "CHILD-1" }));
+    const collidingKey = `task:${PROJECT}:CHILD-1`;
+
+    acceptF(w);
+    assert.equal(w.tick(), "MATERIALIZATION_PUBLISHED");
+    const receipt = materializer.committedReceipt(materializeChildOp(BATCH_ID, ULID_F))!;
+    assert.equal(receipt.external_task_ref, "CHILD-1", "the collision under test");
+
+    // Pre-OBSERVED, the operation projection exposes no child identity at all.
+    const [operation] = materializationOperations(w.store, BATCH_ID);
+    assert.equal(operation!.phase, "COMMITTED_NOT_OBSERVED");
+    assert.equal(operation!.task_ref, null, "the receipt ref is publication provenance only");
+    const context = assembleSupervisorDecisionContext(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never },
+      { run_id: RUN_ID, batch_id: BATCH_ID, proposal_id: ULID_F2, observed_at: "2026-09-01T11:00:00Z" },
+    ) as { subflow_materialization?: { operations: readonly { task_ref: string | null }[] } };
+    assert.equal(context.subflow_materialization?.operations[0]?.task_ref, null);
+
+    // The colliding task gets no reservation exemption: both seats still stand against it.
+    assert.equal(materializationReservedSeats(w.store, BATCH_ID, collidingKey), 2);
+    const steal = selection({ profile: world.profile, definition: task({ task_ref: "CHILD-1" }) });
+    seedProposalAllocation(w.store, BATCH_ID, steal["proposal_id"] as string);
+    const refused = submitProposal(
+      { store: w.store, taskSource: w.tasks, repository: w.repository as never, manifests: w.manifests },
+      { run_id: RUN_ID, batch_id: BATCH_ID, observed_at: "2026-09-01T11:01:00Z", proposal: steal },
+    );
+    assert.deepEqual(refused.result, { kind: "POLICY_REJECTED", reason_code: "BATCH_MAX_TASKS_REACHED" });
+    assert.equal(w.store.tasks.require(collidingKey).platform_state, "DISCOVERED");
+    assert.equal(w.store.tasks.require(collidingKey).materialization_binding, null, "never bound by a ref");
+  }, { batch_policy: { max_tasks: 2, max_rework: 2, concurrency: 2 } }, V3_OPTIONS);
 });
