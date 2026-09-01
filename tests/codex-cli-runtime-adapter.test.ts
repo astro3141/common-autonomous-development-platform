@@ -306,6 +306,50 @@ test("SUPERVISOR schema exposes the complete Core vocabulary and exact subflow p
     const { parent: _parent, ...parentless } = proposal;
     void _parent;
     assert.throws(() => validateProposal(parentless));
+
+    // §9.1 F (Spec §17A / TD D24) — the decomposition materialisation shape is expressible,
+    // mirrors Core's exact wrapper, and offers no execution/identity field a Harness could fill.
+    const materialisation = variants.find((variant) => Object.hasOwn(variant.properties, "child"));
+    assert.notEqual(materialisation, undefined, "the F variant must be expressible (#54 class)");
+    for (const absent of [
+      "task_ref",
+      "pipeline_id",
+      "actor_profile",
+      "verification_profile",
+      "repository_scope_id",
+    ]) {
+      assert.equal(Object.hasOwn(materialisation.properties, absent), false, absent);
+    }
+    assert.deepEqual(Object.keys(materialisation.properties.expected.properties), [
+      "compiled_profile_hash",
+    ]);
+    const parentKinds = (materialisation.properties.parent.anyOf as any[]).map(
+      (branch) => branch.properties.kind.enum,
+    );
+    assert.deepEqual(parentKinds.flat().toSorted(), ["ACTIVE_ATTEMPT", "DISCOVERED_TASK"]);
+    const fProposal = {
+      proposal_id: "01JQ8ZK5T7RC9V2W4X6Y8Z0G02",
+      decision: "START_SUBFLOW",
+      parent: {
+        kind: "DISCOVERED_TASK",
+        task_key: "parent-task",
+        task_ref: "parent-ref",
+        task_version: "1",
+        task_definition_hash: "sha256:" + "0".repeat(64),
+      },
+      child: {
+        task_definition_body: {
+          title: "Split: one bounded child",
+          description: "One bounded child of the whole intent.",
+          references: [],
+          acceptance_notes: ["child acceptance"],
+        },
+      },
+      expected: { compiled_profile_hash: "sha256:" + "1".repeat(64) },
+      reason_refs: ["intent:whole"],
+    };
+    assert.equal(validateProposal(fProposal).variant, "SUBFLOW_CHILD_MATERIALIZATION");
+
     assert.deepEqual(adapter.get_turn_result(turn).structured_output?.body, proposal);
   } finally {
     rmSync(root, { recursive: true, force: true });

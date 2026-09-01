@@ -764,6 +764,59 @@ function supervisorProposalSchema(): CanonicalObject {
         },
         expected: expected(repositoryFreshness),
       }),
+      // §9.1 F (Spec §17A / TD D24) — bounded child materialisation: the complete child body plus
+      // an explicit *tagged* parent basis, and nothing else. No task_ref, pipeline, profile,
+      // scope or base_head field exists here for a Harness to fill in (§8.1a); external identity
+      // is assigned by the materialisation target's adapter, never by the model.
+      proposal(["START_SUBFLOW"], {
+        parent: {
+          anyOf: [
+            {
+              type: "object",
+              properties: {
+                kind: { type: "string", enum: ["DISCOVERED_TASK"] },
+                task_key: string,
+                task_ref: string,
+                task_version: string,
+                task_definition_hash: string,
+              },
+              required: ["kind", "task_key", "task_ref", "task_version", "task_definition_hash"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                kind: { type: "string", enum: ["ACTIVE_ATTEMPT"] },
+                task_key: string,
+                attempt_key: string,
+                task_contract_hash: string,
+                attempt_state: string,
+              },
+              required: ["kind", "task_key", "attempt_key", "task_contract_hash", "attempt_state"],
+              additionalProperties: false,
+            },
+          ],
+        },
+        child: {
+          type: "object",
+          properties: {
+            task_definition_body: {
+              type: "object",
+              properties: {
+                title: string,
+                description: string,
+                references: { type: "array", items: string },
+                acceptance_notes: { type: "array", items: string },
+              },
+              required: ["title", "description", "references", "acceptance_notes"],
+              additionalProperties: false,
+            },
+          },
+          required: ["task_definition_body"],
+          additionalProperties: false,
+        },
+        expected: expected(["compiled_profile_hash"]),
+      }),
       // Deliberately expressible but not a Core proposal variant: V1 rejects this parentless
       // START_SUBFLOW. Keeping it in the transport schema preserves Core as the policy authority.
       proposal(["START_SUBFLOW"], {
