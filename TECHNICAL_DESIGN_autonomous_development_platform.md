@@ -49,8 +49,19 @@
 > BACKEND_CHANGE=NO**, 전부 **PROSPECTIVE_REQUIREMENT**다. 새 store/state machine/framework,
 > OpenClaw/durable-jobs 변경이나 MVP 0/1 schema/state/validator seal의 소급 무효화는 없다. 다만 B13의
 > 기존 model-facing context evidence는 이 prospective contract의 충족 증거가 아니며, production
-> Coordinator의 기존 §13.4 축약은 후속 implementation verification 대상이다. #59 child materialisation
-> gap은 OPEN으로 남는다.
+> Coordinator의 기존 §13.4 축약은 후속 implementation verification 대상이다. 이 amendment 시점의 #59
+> child materialisation gap은 별도 OPEN이었고, 아래 Human-authorized #59 amendment가 후속으로 닫는다.
+>
+> **v1.5 Issue #59 Human-authorized Spec/TD amendment (Issue #52 RUN #3 comment `5489088308`):**
+> Human은 Supervisor가 whole intent를 bounded child tasks로 decomposition하고 완전한 child
+> `TaskDefinitionBodyV1` + explicit parent intent를 structured `START_SUBFLOW` materialisation Proposal로
+> 제안할 authority를 Spec v0.3 amendment로 승인했다. Platform만 validation, idempotent publish,
+> TaskSource round-trip과 durable binding을 수행한다. 이 amendment는 기존 `START_SUBFLOW` admission 앞의
+> narrow materialisation phase를 추가하고 D22 parent/suspend/resume 및 D23 decision-basis를 재설계하지
+> 않는다. Supervisor는 backend/TaskSource를 직접 mutate하지 않고 Profile-declared pipeline/role/
+> verification/scope만 이후 admission Proposal에서 선택한다. dynamic pipeline/workflow/model topology,
+> generic Planner/Task Graph/DSL은 future subject다. **SPEC_CHANGE=YES(Human approved) / TD_CHANGE=YES /
+> BACKEND_CHANGE=NO**, 전부 **PROSPECTIVE MVP 3 REQUIREMENT**이며 MVP 0/1 seal은 불변이다.
 >
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
@@ -371,6 +382,7 @@ RuntimeAdapter  WorkflowAdapter RepositoryAdapter VerificationAdapter ReportAdap
 
 Profile Compiler · Execution Policy compilation · Compiled Profile Snapshot · Decision Validator ·
 ProjectDocumentTaskSource(+ generic TaskSource contract) · Immutable Task Contract · Capability Broker ·
+Child Task Materialisation contract/Coordinator ·
 Platform Durable State/Store · Platform Coordinator(state machine, batch) · Verification Policy/Evidence binding ·
 PendingHumanDecision · Repository Gate policy · Recovery/Reconciliation logic · Report Outbox.
 
@@ -423,6 +435,22 @@ GitHub/Jira client 재구현, CI engine, PR UI, diff viewer, model provider clie
 - authoritative state: 없음. external task definition의 authority는 TaskSource(§55).
 - side effects: `update_task_projection` (optional, adapter 경유).
 - must-not-own: Platform task lifecycle 상태. **TaskSource ≠ durable state**를 코드 경계로 강제 — Coordinator는 TaskSource 응답을 Store의 `external_snapshot` 컬럼에 "관측 기록"으로만 저장한다.
+
+### 5.3a Child Task Materialisation boundary (Issue #59, prospective MVP 3)
+- responsibility: validated bounded child semantics를 §8.1b의 configured materialisation adapter에
+  idempotent publish하고, 같은 configured TaskSource의 fresh round-trip을 검증한 뒤 §8.4 discovery row에
+  immutable materialisation binding을 붙인다.
+- input: validated `SubflowChildMaterializationProposalV1`, batch-bound Compiled Profile v3,
+  `ChildMaterializationParentViewV1`, `ChildMaterializationBatchViewV1`.
+- output: immutable `ChildTaskMaterializationSnapshotV1` + exact adapter receipt + fresh TaskSource-observed
+  `DISCOVERED` child, 또는 side effect 0인 deterministic rejection/fail-closed recovery outcome.
+- authoritative state: validated semantic source는 immutable materialisation snapshot, published external
+  identity/representation은 adapter receipt, 이후 task definition authority는 fresh TaskSource observation.
+- side effects: configured target에 child representation 하나 생성. update/delete/upsert, 다른 task/source,
+  repository/runtime/workflow mutation은 범위 밖이다.
+- must-not-own: child classification/pipeline/role/verification/scope 선택, parent suspension, admission,
+  Task Contract build, scheduler priority, dynamic workflow/model topology. Supervisor/MCP/Runtime는 이
+  adapter를 직접 호출할 수 없다.
 
 ### 5.4 Decision Validator
 - responsibility: Supervisor Proposal의 deterministic 검증 (Spec §18의 11개 항목 + Backend Compatibility Gate §13).
@@ -1090,6 +1118,36 @@ project_profile:                       # platform/project-profile schema_version
   Supervisor runtime profile을 외부 default로 보완하는 것은 금지한다; 해당 composition은 v2로 명시적으로
   승격해야 한다.
 
+### 7.1e Project Profile schema v3 — one TaskSource-bound child materializer (#59, prospective MVP 3)
+
+[계약, PROSPECTIVE_REQUIREMENT] v1/v2를 수정하지 않는다. v3는 v2 body의 `task_sources` entry에 아래
+optional exact field 하나를 허용한다:
+
+```yaml
+task_sources:
+  - id: ...
+    adapter: ...
+    config: { ... }
+    child_materializer:            # 없으면 이 source에는 materialisation authority 없음
+      adapter: <non-empty string>
+      config:  { ... }             # constrained opaque config
+```
+
+MVP 3 v1 materialisation scope는 **Project Profile 전체에 task source가 정확히 하나이고 그 entry에
+`child_materializer`가 정확히 하나인 경우**뿐이다. 0개면 feature unavailable이고 profile compile 자체는
+유효하다. `child_materializer`를 선언하면서 task source가 여러 개이거나 여러 target 중 하나를 골라야 하는
+형상은 `COMPILE_ERROR`다 — Core가 parent ref, 이름, discovery order로 source/target을 추론하지 않는다.
+multi-source routing은 별도 typed revision이다.
+
+`child_materializer`는 Project가 어떤 external task representation을 사용할지 선언하는 project semantic일
+뿐 automation authority가 아니다. 실행 허용은 batch-bound `effective.policy.allow_auto_subflow`와
+`human_gate_policy`가 소유한다. Model Proposal에는 adapter/source/config 선택 field가 없으며,
+Supervisor가 backend topology를 선택하지 않는다.
+
+materializer와 TaskSource는 같은 entry에 bind되지만 **서로 다른 interface**다. `TaskSourceV1` 네 read
+operation은 변경하지 않고, write mutation reach는 §8.1b contract 하나에만 존재한다. v3는 dynamic
+pipeline/workflow/model topology, materializer registry, routing DSL을 만들지 않는다.
+
 ### 7.2 합성 규칙 (deterministic, versioned = `merge_rules_version: 1`)
 
 1. **영역 분리는 schema가 강제한다.** Project Profile v1(§7.1a)에는 automation-authority field가
@@ -1228,6 +1286,10 @@ S10 auto_merge=true → contract_drift_policy.canonical_head.action ≠ CONTINUE
 S11 auto_merge=true → verification_policy.required_verification의 어떤 check도
       accepted_assurance가 {WORKER_REPORTED, INFERRED}만으로 구성되지 않을 것 (§15.3)
 S12 Approved Override 전체가 §7.2 rule 4–7을 통과
+S13 ProjectProfileV3 child materialisation:
+      child_materializer가 존재하면 task_sources.length == 1
+      child_materializer wrapper는 exact { adapter, config }, adapter non-empty
+      Model-selectable source/materializer/default route 없음
 ```
 
 ### 7.4 적용 시점 불변성
@@ -1339,6 +1401,16 @@ compiled_version                 = 2
 merge algorithm을 바꾸지 않는다. Supervisor session의 requested runtime binding은 이 immutable
 `effective.project.supervisor_profile → roles[...].runtime_profile` chain에서만 해소한다. v1 compiled
 artifact를 v2로 silent reinterpret하거나 v1 Attempt에 v2 field를 주입하지 않는다(§7.4).
+
+### 7.7b Compiled Profile schema v3 (#59, prospective MVP 3)
+
+`ProjectProfileV3`를 소비하는 output은 `platform/compiled-profile` schema_version/compiled_version `3`다.
+v2 shape/merge rules를 그대로 유지하고 `effective.project.task_sources[*].child_materializer`를 validated
+normalized form으로 동결한다. `merge_rules_version`은 계속 `1`이며 Execution Policy schema도 v1 그대로다.
+
+materialisation target은 이 immutable Compiled Profile에서만 resolve한다. current registry, deployment
+default, installed adapter 목록, Model field로 보완하지 않는다. v1/v2 Compiled Profile과 진행 중 Attempt에는
+silent injection하지 않는다.
 
 ---
 
@@ -1461,6 +1533,48 @@ adapter hash 존재  → Core-computed hash와 exact equality 요구
 정규화된 public `TaskDefinition`에는 검증을 통과한 `definition_hash`가 항상 존재한다. raw adapter 결과
 타입과 normalized 타입을 분리할지는 local 구현 세부다. 새 authority framework를 만들지 않는다.
 drift 감지는 종전대로 hash 비교만 사용한다.
+
+### 8.1b ChildTaskMaterializationAdapterV1 (#59, prospective MVP 3)
+
+`TaskSourceV1` required read surface는 §8.1 그대로다. v3 Project Profile의 same-entry
+`child_materializer`가 구성하는 별도 interface만 child creation mutation을 가진다:
+
+```text
+materialize_child(request: ChildTaskMaterializationRequestV1)
+  -> { status: COMMITTED, receipt: ChildTaskMaterializationReceiptV1 }
+
+reconcile_child_materialization(op_key)
+  -> NOT_FOUND | COMMITTED(receipt) | UNKNOWN
+```
+
+```text
+ChildTaskMaterializationRequestV1 {
+  op_key
+  materialization_id       # accepted Proposal의 Platform-assigned proposal_id
+  materialization_hash     # §8.4b immutable snapshot hash
+  task_definition_body     # exact TaskDefinitionBodyV1
+}
+
+ChildTaskMaterializationReceiptV1 {
+  materialization_id
+  materialization_hash
+  external_task_ref        # adapter가 할당한 non-empty opaque ref
+  backend_ref?             # optional non-secret opaque receipt ref
+}
+```
+
+exact field set이며 unknown field는 reject다. `external_task_ref`를 request/Model이 공급하지 않는다.
+adapter는 같은 `op_key + materialization_hash`에 항상 같은 committed external ref를 반환하거나 exact
+COMMITTED receipt를 reconcile해야 한다. 같은 op_key에 다른 hash/request는 fail-closed conflict다.
+
+mutation reach는 **configured source에 새 task representation 하나 생성**으로 한정한다. existing task
+update/upsert/delete, issue close/label mutation, dependency graph rewrite, Project Profile/Platform lifecycle,
+repository/runtime/workflow mutation은 금지다. adapter가 target system의 최소 metadata를 추가할 수는 있지만
+fresh `TaskSource.get_task(external_task_ref)`의 normalized `TaskDefinitionBodyV1`/definition hash가 request와
+exact equality여야 한다. round-trip 불일치는 successful materialisation이 아니다.
+
+Supervisor/Runtime/MCP는 이 interface를 호출하거나 credential을 받지 않는다. Coordinator만 validated
+snapshot + durable INTENT 뒤에 호출한다(I-TD2/I-TD9/I-TD10).
 
 ### 8.2 ProjectDocumentTaskSource (초기 구현) — parser `markdown-sections-v1` (M0-2)
 
@@ -1788,6 +1902,88 @@ capability/batch를 판정하고, dependency guard는 state-machine admission pr
 `safe_independent_runnable_exists` 자동 계산과 hold-next scheduler 전체 구현은 MVP 3이며 여기서 당기지
 않는다.
 
+### 8.4b Bounded child materialisation / TaskSource round-trip (#59, prospective MVP 3)
+
+이 절의 materialisation은 §8.4의 **external observation → durable row projection**보다 앞선 별도 external
+creation operation이다. child 하나의 authority chain은 정확히 다음이다:
+
+```text
+validated SubflowChildMaterializationProposalV1
+→ immutable ChildTaskMaterializationSnapshotV1 + idempotency INTENT atomic write
+→ ChildTaskMaterializationAdapterV1.materialize_child
+→ COMMITTED receipt durable DONE
+→ same configured TaskSource.get_task(external_task_ref) fresh read
+→ normalized body/hash exact equality
+→ §8.4 DISCOVERED task row + ChildMaterializationBindingV1 one transaction
+```
+
+immutable snapshot envelope:
+
+```text
+schema = "platform/child-task-materialization", schema_version = 1
+
+ChildTaskMaterializationSnapshotV1 {
+  materialization_id       # accepted Proposal.proposal_id
+  batch_id
+  compiled_profile_hash
+  task_source_id            # Compiled Profile v3의 sole source; Model 선택 아님
+  parent_intent: MaterializationParentIntentV1
+  child_definition_body: TaskDefinitionBodyV1
+  child_definition_hash     # §8.1a envelope hash, Platform 계산
+  reason_refs               # Proposal의 order-sensitive immutable copy
+}
+```
+
+`parent_intent`는 §9.1 F의 exact tagged union을 그대로 동결한다. semantic relation identity는
+`parent_intent.task_key`이며, observed Attempt/definition fields는 publish 전 freshness basis다. Platform은
+child title/description/references/acceptance 또는 parent를 Proposal 뒤에 보완하지 않는다.
+
+`materialization_id = proposal_id`로 고정해 새 identity service를 만들지 않는다. Proposal 자체를 hash
+artifact로 승격하지 않으며, validation을 통과한 exact semantic input을 위 별도 immutable envelope로
+동결한다. 같은 identity + 같은 envelope는 idempotent success, 같은 identity + 다른 envelope는 conflict다.
+
+**Publish와 executable task의 경계.** COMMITTED receipt는 external creation authority지만 admission
+authority가 아니다. fresh TaskSource read가 다음을 모두 만족해야 한다:
+
+```text
+task.task_ref == receipt.external_task_ref
+task.body == snapshot.child_definition_body
+task.definition_hash == snapshot.child_definition_hash
+Core recomputed definition_hash == task.definition_hash
+```
+
+성공 시 ordinary §8.4 snapshot을 쓰면서 task row의 `materialization_binding_json`을 정확히 한 번 설정한다:
+
+```text
+ChildMaterializationBindingV1 {
+  materialization_id
+  materialization_hash
+  task_source_id
+  parent_task_key
+  child_definition_hash
+}
+```
+
+같은 task ref의 existing row에 binding이 없거나 다른 binding/hash/parent가 있으면 merge/upsert하지 않고
+`SUBFLOW_MATERIALIZATION_CONFLICT`다. binding은 admission 뒤에도 provenance로 남고 rewrite/clear하지 않는다.
+ordinary external/pre-existing task는 binding이 null인 것이 정상이다.
+
+**No admission / no suspension.** snapshot, publish, receipt, round-trip 어느 단계도 child를 SELECTED/ACTIVE로
+만들거나 parent를 suspend하거나 Task Contract/Grant를 생성하지 않는다. child는 DISCOVERED이고 parent는
+그 상태를 유지한다. executable relation은 이후 §9.2f/§19.5 E admission transaction만 만든다.
+
+**Bound.** F 하나는 child 하나만 만든다. validation은 §9.2g의 reservation count로
+`batch_policy.max_tasks`를 넘는 snapshot/INTENT조차 만들지 않는다. 여러 child는 여러 exact Proposal이며
+graph/priority/scheduler inference가 없다.
+
+**Failure.** validation/Human Gate 전에는 side effect 0. adapter가 definitive NOT_FOUND/no-effect를
+authoritative하게 증명한 실패만 idempotency FAILED로 끝내고 reservation을 해제할 수 있으며, parent는
+`HELD(TASK_MATERIALIZATION_FAILED)`로 전이해 whole intent 실행이 child 필요성을 조용히 무시하지 않게 한다. COMMITTED 뒤
+TaskSource visibility 지연은 DONE receipt를 보존한 채 같은 ref를 재관측한다. exact body mismatch,
+duplicate/conflicting ref, unreadable snapshot/source는 task row를 만들지 않고 batch를 기존
+`PAUSED_SAFELY`/recovery path로 보낸다. ambiguous INTENT에서 effect 존재를 판정할 수 없으면 blind retry나
+두 번째 materialization id를 만들지 않는다(§21/§22).
+
 ---
 
 ## 9. Supervisor Decision / Validation TD
@@ -1808,10 +2004,12 @@ DEFER_TASK  START_SUBFLOW   RESUME_PARENT  CLOSE_BATCH
 unknown DecisionType은 V1 schema invalid다. B4 `human_gate_policy.required_decisions`가 같은 vocabulary를
 재사용한다(§7.1b).
 
-**네 MVP 0/1 structural variant + 한 MVP 3 subflow variant.** decision별 개별 schema를 만들지도, 모든
+**네 MVP 0/1 structural variant + 두 MVP 3 subflow variant.** decision별 개별 schema를 만들지도, 모든
 decision에 의미 없는 field를 강제하는 단일 flat schema를 쓰지도 않는다. 각 variant wrapper와 `expected`
 wrapper는 **exact field set**이며 unknown field는 reject다. 기존 네 variant의 MVP 0/1 seal은 불변이다.
-`START_SUBFLOW`를 실제 적용하는 prospective MVP 3 path만 ordinary task selection과 분리된 E를 요구한다.
+prospective MVP 3의 E는 existing child admission, F는 child definition materialisation이며 서로 다른 exact
+shape다. F는 admission Proposal의 missing `task_ref/version/hash`를 Platform이 사후 보완하는 escape hatch가
+아니다 — external identity가 생긴 뒤 E를 새로 제출한다.
 
 ```yaml
 # A. TaskSelectionProposalV1  — START_TASK
@@ -1839,6 +2037,16 @@ parent: {
   task_key, attempt_key, task_contract_hash, attempt_state
 }
 expected: { task_version, task_definition_hash, base_head, compiled_profile_hash }
+
+# F. SubflowChildMaterializationProposalV1 — START_SUBFLOW materialisation phase (MVP 3, prospective)
+proposal_id, decision, parent, child, expected, reason_refs
+parent:
+  | { kind: DISCOVERED_TASK,
+      task_key, task_ref, task_version, task_definition_hash }
+  | { kind: ACTIVE_ATTEMPT,
+      task_key, attempt_key, task_contract_hash, attempt_state }
+child: { task_definition_body: TaskDefinitionBodyV1 }
+expected: { compiled_profile_hash }
 ```
 
 - **B**는 §19.3대로 동일 Attempt/snapshot/session의 rework 경로이므로 pipeline/actor_profile/
@@ -1855,6 +2063,18 @@ expected: { task_version, task_definition_hash, base_head, compiled_profile_hash
   parent relation을 authority로 가진 경우, Proposal producer가 그 relation에서 E를 deterministic하게 구성할
   수는 있다. 이때도 normalized E는 네 parent field를 모두 가지며 `reason_refs`가 relation provenance를
   지목한다. UI label, issue topology, subscriber visibility, 주변 task 수는 parent authority가 아니다.
+- **F는 child semantic authoring Proposal이지 admission이 아니다.** `decision` literal은 기존 policy
+  vocabulary를 재사용하는 `START_SUBFLOW`지만 `task_ref`/classification/pipeline/profile/scope/base_head가
+  없다. `child.task_definition_body`는 §8.1a exact four-field body이며 Supervisor의 complete semantic
+  선택이다. Platform이 empty/default title, acceptance, reference를 추가하지 않는다.
+- F의 `DISCOVERED_TASK` parent는 whole-intent intake용이다. fresh TaskSource version/hash와 durable
+  `DISCOVERED`/Attempt 없음이 exact해야 한다. `ACTIVE_ATTEMPT`는 실행 중 decomposition용이며 E의 current
+  Attempt/Contract stale guard vocabulary를 재사용한다. 두 variant 모두 semantic parent는 exact
+  `task_key` 하나이고 cardinality inference는 금지다.
+- F는 external `task_ref`/version/hash를 요구하거나 허용하지 않는다. 그것은 §8.1b adapter와 fresh
+  TaskSource round-trip이 나중에 확립한다. 이후 E에서 Supervisor가 observed child와 Profile-declared
+  classification/pipeline/role/verification/scope를 직접 선택한다. F acceptance에서 E를 Platform이 제조하지
+  않는다.
 
 **공통 field 규칙.** `proposal_id`는 valid ULID. `reason_refs`는 `string[]`이며 empty 허용, 각 item
 non-empty, **입력 순서 보존, 중복 허용** — semantic set이 아니므로 sorting/dedup/normalization을 추가하지
@@ -1915,6 +2135,9 @@ BackendManifestSet                              # B5 validated
 DecisionValidationBatchView                     # §V11
 SubflowParentValidationView | null               # §9.2f; E에서만 non-null
 SupervisorProposalIdentityView { proposal_id }     # active §13.4 turn의 Platform allocation
+ChildMaterializationParentViewV1 | null          # §9.2g; F에서만 non-null
+ChildMaterializationBatchViewV1 | null           # §9.2g reservation bound
+ChildMaterializationCapabilityViewV1 | null      # Compiled Profile v3 materializer projection
 ```
 
 ordinary submission에서 `SupervisorProposalIdentityView`의 source는 active
@@ -1936,10 +2159,14 @@ V1  Proposal structural/domain validation (variant exact shape, unknown field re
       고르는 경로도 금지한다.
       proposal_id가 valid ULID가 아니거나 SupervisorProposalIdentityView.proposal_id와 exact
       equality가 아니면 POLICY_REJECTED(PROPOSAL_SCHEMA_INVALID) at /proposal_id.
+      F.child.task_definition_body는 §8.1a exact body validation/hash recomputation을 통과해야 한다.
+      F에 task_ref/classification/pipeline/profile/scope/base_head/external identity field가 있으면 invalid다.
 
 V2  task 존재 — task-bearing variant(A/B/C/E)에만 적용, CLOSE_BATCH는 N/A
       TaskLookupView.status == NOT_FOUND → POLICY_REJECTED(TASK_NOT_FOUND)
       E는 SubflowParentValidationView도 FOUND여야 한다
+      → 아니면 POLICY_REJECTED(SUBFLOW_PARENT_NOT_FOUND)
+      F는 child lookup이 N/A이고 ChildMaterializationParentViewV1이 FOUND여야 한다
       → 아니면 POLICY_REJECTED(SUBFLOW_PARENT_NOT_FOUND)
 
 V3  expected freshness (M0-25). task-bearing variant는 아래 순서로 비교한다:
@@ -1950,6 +2177,9 @@ V3  expected freshness (M0-25). task-bearing variant는 아래 순서로 비교�
       E는 이어서 parent.task_key/attempt_key/task_contract_hash/attempt_state를
       fresh SubflowParentValidationView와 exact 비교한다
       → 하나라도 불일치: SUBFLOW_PARENT_STALE
+      F는 expected.compiled_profile_hash를 비교한 뒤 tagged parent basis를 §9.2g fresh view와 exact 비교한다.
+      DISCOVERED_TASK의 task_ref/version/definition_hash/state/Attempt 없음 또는 ACTIVE_ATTEMPT의
+      attempt/contract/state가 다르면 SUBFLOW_PARENT_STALE.
       이로써 Spec §18의 "Task version 일치"를 직접 만족한다. version은 §8.1a대로 definition hash에
       포함되지 않으므로(M0-20 유지) body 동일·version 변경도 여기서 잡힌다.
 
@@ -1957,6 +2187,7 @@ V4  classification — selection variant(A/E)에만 적용
       proposal.classification ∈ effective.project.classifications
       → 아니면 POLICY_REJECTED(CLASSIFICATION_UNKNOWN)
       control Proposal에 fake classification을 요구하지 않는다.
+      F는 classification을 아직 선택하지 않으므로 N/A다.
 
 V5  decision authorization (§9.2a) — policy/disposition만 판단. current state legality는 §19.3 소유.
 
@@ -1971,21 +2202,28 @@ V6  profile reference — selection variant(A/E)에만 적용
       semantics는 변경되지 않는다.
       E의 selected pipeline은 frozen definition의 terminal step이 RESUME_PARENT여야 한다
       → 아니면 POLICY_REJECTED(SUBFLOW_PIPELINE_INVALID)
+      F는 selection reference가 N/A이고 §9.2g capability view가 ProjectProfile/CompiledProfile v3의
+      sole TaskSource-bound materializer를 exact하게 증명해야 한다
+      → 아니면 POLICY_REJECTED(SUBFLOW_MATERIALIZER_UNAVAILABLE)
 
 V7  Human Gate (§9.2b) → HUMAN_GATE_REQUIRED (거부도, 실행 승인도 아님)
 
 V8  repository expected state — variant A/B/E에만 적용, C/D는 N/A
       expected.base_head == RepositoryValidationView.canonical_head
       → 불일치: POLICY_REJECTED(REPOSITORY_STATE_MISMATCH)
+      F는 repository mutation/admission이 아니므로 N/A다.
 
 V9  capability derivation feasibility (§9.2c) — Grant를 발급하지 않는다
       → 불가: POLICY_REJECTED(CAPABILITY_DERIVATION_FAILED)
+      F는 Actor/Auditor/Repository capability를 요청하지 않으므로 N/A다. §8.1b mutation reach는
+      §9.2g의 typed materializer capability가 소유한다.
 
 V10 Backend Compatibility Gate (§9.2d) — 실패: BACKEND_INCOMPATIBLE(detail)
       §12.2의 directional accepted-set membership만 평가한다. `receipt_supported`는 V10 조건이
       아니다 — M0-19.
+      F는 Runtime/Workflow/Repository/Verification Backend operation이 아니므로 N/A다.
 
-V11 batch admission / concurrency (§9.2e) — START_TASK/START_SUBFLOW에만 적용
+V11 batch admission / concurrency (§9.2e) — A/E admission에 적용. F는 §9.2g reservation bound를 적용
 ```
 
 `DecisionRejectReason` v1 exact vocabulary (그 외 임의 문자열 금지):
@@ -1997,13 +2235,15 @@ PROFILE_REFERENCE_UNKNOWN REPOSITORY_STATE_MISMATCH CAPABILITY_DERIVATION_FAILED
 BATCH_MAX_TASKS_REACHED   CONCURRENCY_LIMIT_REACHED WRITABLE_CONCURRENCY_CONFLICT
 SUBFLOW_PARENT_NOT_FOUND  SUBFLOW_PARENT_STALE       SUBFLOW_PARENT_INELIGIBLE
 SUBFLOW_PARENT_BATCH_MISMATCH SUBFLOW_RELATION_CONFLICT SUBFLOW_CYCLE_DETECTED
-SUBFLOW_PIPELINE_INVALID
+SUBFLOW_PIPELINE_INVALID SUBFLOW_MATERIALIZER_UNAVAILABLE SUBFLOW_MATERIALIZATION_CONFLICT
+SUBFLOW_MATERIALIZATION_DRIFT
 ```
 
 V10 실패는 이 enum이 아니라 `BACKEND_INCOMPATIBLE` result kind다.
 
 결과는 `decision_log`에 append되고 — **rejected와 HUMAN_GATE_REQUIRED도 append한다** — `ACCEPTED`인 경우에만
-Coordinator가 transition을 시작한다. pure validator와 durable append wrapper의 분리는 구현 세부이며 B2
+Coordinator가 A/E transition 또는 F의 §8.4b operation을 시작한다. F acceptance는 admission/state
+transition authority가 아니다. pure validator와 durable append wrapper의 분리는 구현 세부이며 B2
 `decision_log`를 재사용한다(새 decision table/event framework 없음). Batch 7에서 허용되는 durable write는
 이 append뿐이며 Runtime/Workflow/Repository mutation, state transition, PendingHumanDecision 생성, Report
 발송, Task Contract/Grant persistence는 하지 않는다.
@@ -2019,15 +2259,19 @@ V5는 **Execution Policy와 effective classification disposition이 이 Proposal
 | | disposition `HOLD_HUMAN` | PASS → V7에서 `HUMAN_GATE_REQUIRED` |
 | | disposition `AUTO_SUBFLOW` | `DECISION_NOT_ALLOWED` |
 | `START_SUBFLOW` | `effective.policy.allow_auto_subflow == false` | `DECISION_NOT_ALLOWED` |
-| | 위 통과 + disposition `AUTO_SUBFLOW` | PASS |
-| | 위 통과 + disposition `HOLD_HUMAN` | PASS → V7 |
-| | 위 통과 + disposition `AUTO_EXECUTE` | `DECISION_NOT_ALLOWED` |
+| E + 위 통과 + disposition `AUTO_SUBFLOW` | PASS |
+| E + 위 통과 + disposition `HOLD_HUMAN` | PASS → V7 |
+| E + 위 통과 + disposition `AUTO_EXECUTE` | `DECISION_NOT_ALLOWED` |
+| F + 위 통과 | PASS — classification disposition은 이후 E에서 판정 |
 | `REQUEST_REWORK` | — | PASS (rework_count/max_rework/AttemptState는 §19.3 guard) |
 | `PROPOSE_MERGE` | `auto_merge` 값과 무관 | PASS |
 | `HOLD_TASK` / `DEFER_TASK` / `RESUME_PARENT` / `CLOSE_BATCH` | — | PASS |
 
 - **`allow_auto_subflow=false`를 human gate 하나로 우회하지 않는다** — Execution Policy를 사람 approval로
   암묵 override하는 경로를 만들지 않는다.
+- F가 classification을 미리 선택하지 않는 것은 policy bypass가 아니다. external child를 exact하게
+  re-observe한 뒤 E가 새 Proposal로 classification/disposition/profile을 선택·검증하며, F acceptance를 E
+  acceptance로 재사용하지 않는다.
 - **`PROPOSE_MERGE`는 `auto_merge=false`에서도 V5에서 거부되지 않는다.** `auto_merge`는 automatic canonical
   side effect의 authority이지 merge proposal 자체의 권한이 아니며, MVP 1 §19.4 Human Merge 경로가 살아
   있어야 한다.
@@ -2043,6 +2287,10 @@ V5는 **Execution Policy와 effective classification disposition이 이 Proposal
 Rule A  proposal.decision ∈ effective.policy.human_gate_policy.required_decisions
 Rule B  selection variant(A/E)이고 effective classification disposition == HOLD_HUMAN
 ```
+
+F의 `decision`도 literal `START_SUBFLOW`이므로 Rule A가 적용된다. policy가 START_SUBFLOW를 Human Gate로
+지정했다면 publish **전** exact F Proposal 승인이 필요하다. 이후 E는 fresh 별도 Proposal이므로 같은 Rule
+A/B를 다시 통과하며, F approval을 admission approval로 확대하지 않는다.
 
 - V1–V6 실패가 있으면 그것이 먼저 반환된다 — human gate는 invalid proposal을 승인하는 escape hatch가 아니다.
 - V7이 `HUMAN_GATE_REQUIRED`를 반환하면 **V8–V11을 실행하지 않으며** 어떤 execution side effect도 없다.
@@ -2214,6 +2462,87 @@ child/parent/current Attempt/Contract/batch/cycle/conflict를 모두 다시 읽�
 하나라도 바뀌면 child admission, parent suspension, relation write 모두 0이다. 새 relationship engine이나
 subflow scheduler table은 만들지 않는다.
 
+### 9.2g F materialisation validation / E binding consumption (#59, prospective MVP 3)
+
+F의 fresh parent view는 exact union이다:
+
+```text
+ChildMaterializationParentViewV1 =
+  | { status: NOT_FOUND }
+  | { status: FOUND,
+      task_key, batch_id, platform_state, task_ref,
+      task_version, task_definition_hash,
+      current_attempt_key, current_attempt_state, current_task_contract_hash,
+      has_open_blocker, has_recovery_conflict }
+
+ChildMaterializationCapabilityViewV1 =
+  | { available: false }
+  | { available: true, task_source_id, materializer_adapter }
+
+ChildMaterializationBatchViewV1 {
+  admitted_task_count
+  unadmitted_materialized_child_count
+  parent_admitted
+  admission_closed
+}
+```
+
+capability view는 batch-bound Compiled Profile v3에서만 만들며 raw adapter installation/config probe를
+authority로 쓰지 않는다. `materializer_adapter`는 diagnostic/reference용 declared id이고 Model 선택값이
+아니다.
+
+F parent rule:
+
+```text
+DISCOVERED_TASK:
+  parent.platform_state == DISCOVERED
+  current_attempt_key/state/contract == null
+  task_ref/version/definition_hash == Proposal parent exact basis
+
+ACTIVE_ATTEMPT:
+  parent.platform_state == ACTIVE
+  current attempt/state/contract == Proposal parent exact basis
+  attempt_state in {READY, IMPLEMENTING, VERIFYING, AUDITING, REWORKING}
+
+both:
+  same batch, no open blocker, no recovery conflict
+```
+
+parent가 SELECTED/HELD/DEFERRED/SUSPENDED/terminal이면 F를 적용하지 않는다. F는 parent를 suspend/hold하지
+않으며 accepted relation intent는 §8.4b immutable snapshot에 동결된다.
+
+reservation rule은 external task spam과 later admission dead-end를 막는다:
+
+```text
+reserved = admitted_task_count
+         + unadmitted_materialized_child_count
+         + (parent_admitted ? 0 : 1)      # DISCOVERED whole-intent parent 자리 보존
+
+admission_closed == true OR reserved >= batch_policy.max_tasks
+  → BATCH_MAX_TASKS_REACHED
+```
+
+INTENT/COMMITTED이나 아직 TaskSource round-trip 전인 non-FAILED snapshot도
+`unadmitted_materialized_child_count`에 포함한다. definitive no-effect FAILED만 reservation에서 제외한다.
+concurrency/writable candidate는 publish 단계가 execution slot을 만들지 않으므로 F에서 N/A다.
+
+**E consumption.** child task row의 `materialization_binding_json`이 non-null이면 E만 admission 가능하고:
+
+```text
+E.parent.task_key == binding.parent_task_key
+fresh child.definition_hash == binding.child_definition_hash
+snapshot(materialization_hash)의 parent/child hash == binding
+```
+
+를 추가로 요구한다. mismatch는 parent mismatch면 `SUBFLOW_MATERIALIZATION_CONFLICT`, body drift면
+`SUBFLOW_MATERIALIZATION_DRIFT`다. A `START_TASK`로 materialized child를 ordinary top-level task처럼
+admit하거나 다른 parent E로 rebind하지 않는다. binding null인 pre-existing external child는 D22의 기존
+E path를 그대로 사용한다.
+
+F validation/Human approval은 E acceptance가 아니다. TaskSource round-trip 뒤 Supervisor가 E에서
+classification/pipeline/actor/verification/scope와 fresh expected values를 직접 선택·echo하고, V1–V11과
+§9.2f를 전부 새로 통과한다.
+
 ---
 
 ## 10. Immutable Task Contract Snapshot TD (Q7의 절반)
@@ -2321,6 +2650,12 @@ continuation point이고, restart 후 current Attempt와 불일치하면 normal 
 v2 child Contract의 `pipeline_id`가 가리키는 frozen pipeline은 terminal step `RESUME_PARENT`여야 한다.
 v1 ordinary Contract에 nullable parent field를 넣거나 `START_TASK`에 무의미한 placeholder를 강제하지 않는다.
 새 Contract store/table은 없으며 기존 content-addressed snapshot/blob 저장을 재사용한다.
+
+#59 materialized child도 Contract v2 build 시점은 E admission/activation 이후로 동일하다. builder는 fresh
+TaskSource body가 `ChildMaterializationBindingV1.child_definition_hash`와 일치함을 확인한 뒤 §10.1의
+`task.body_copy`로 동결하고, committed `parent_task_key`가 materialisation binding과 같은지도 확인한다.
+`ChildTaskMaterializationSnapshotV1`은 provenance/input authority이지 Task Contract나 completion authority의
+대체물이 아니다. F publish 시 Contract/Grant/Attempt를 미리 만들지 않는다.
 
 ### 10.2 Contract Source 보관 방식 — **Decision: content copy + raw sha256**
 
@@ -3518,9 +3853,40 @@ Model이 그 값을 되돌려 썼다고 state가 바뀌지 않는다.
 `SupervisorProposalV1` + Decision Validator로 Core architecture가 성립해야 하며, Runtime/backend는
 Proposal authority나 validation owner가 아니다.
 
-**#59 독립 경계.** `candidates`와 `current_state`는 이미 TaskSource/durable state에 존재하는 task만
-projection한다. 이 contract는 child task를 만들거나 parent를 cardinality로 추론하거나
-`START_SUBFLOW` materialisation authority를 부여하지 않는다. 따라서 #60을 닫아도 #59는 OPEN이다.
+**#59 경계와 MVP 3 context v2.** D23의 `SupervisorDecisionContextV1`은 이미 존재하는 authoritative task의
+Proposal basis만 projection하며 그대로 유지한다. Human-authorized #59 materialisation을 사용하는
+Compiled Profile v3/MVP 3 turn은 V1 exact body에 아래 한 required field를 더한
+`SupervisorDecisionContextV2`를 사용한다:
+
+```text
+subflow_materialization: {
+  available: boolean
+  remaining_task_capacity: integer >= 0
+  operations: [{
+    materialization_id
+    parent_task_key
+    child_definition_hash
+    phase: INTENT | COMMITTED_NOT_OBSERVED | OBSERVED
+    task_ref: string | null
+  }]
+}
+```
+
+`available`은 batch-bound Compiled Profile v3의 sole source/materializer binding에서만 derive한다.
+`remaining_task_capacity`는 §9.2g reservation rule의 projection이고 authority가 아니다. `operations.phase`
+는 new durable lifecycle state가 아니라 immutable snapshot + idempotency INTENT/DONE + task binding의 exact
+read-only projection이다. `task_ref`는 OBSERVED일 때만 non-null이며 adapter receipt/TaskSource observation과
+exact equality다.
+
+F에서 Supervisor가 선택하는 semantic field는 `child.task_definition_body`와 explicit `parent`뿐이다.
+Platform/Harness가 model output 뒤에 child text/parent를 채우지 않는다. materializer/source/external ref는
+Model choice가 아니며 context에도 selectable backend vocabulary로 노출하지 않는다. OBSERVED child는 ordinary
+`candidates`에도 포함되고, 그 뒤 E의 classification/pipeline/actor/verification/scope와 freshness binding은
+D23 V1 규칙을 그대로 따른다.
+
+Runtime structured schema는 F exact union과 parent kind/body constraints를 generation aid로 제공할 수 있지만
+authority는 §9 Proposal + Validator + §8.4b round-trip이다. D23 proposal_id allocation/echo와 post-output
+completion 금지는 변경되지 않는다.
 
 **turn ↔ Proposal 관계.** 한 turn의 `RuntimeTurnResult`는 **turn 완료 / Runtime health / structured
 diagnostics**용이다. Proposal 수락은 §5.1의 별도 MCP 제출로 결정된다. 따라서 turn result 본문에
@@ -4443,7 +4809,8 @@ REATTEMPT_DECISION   referenced source Attempt가 여전히 INVALIDATED이고,
 
 ```text
 category       = HUMAN_GATE_APPROVAL
-subject        = task-bearing Proposal → { kind: TASK,  task_key }
+subject        = A/B/C/E task-bearing Proposal → { kind: TASK, task_key }
+                 F materialisation Proposal    → { kind: TASK, F.parent.task_key }
                  CLOSE_BATCH Proposal  → { kind: BATCH, batch_id }
 question       = proposal.decision + proposal_id로부터 Core가 생성하는 deterministic presentation
 options        = ["APPROVE", "REJECT"]
@@ -4501,6 +4868,28 @@ framework를 만들지 않는다.
 ```
 
 즉 `V1–V6 → exact resolved V7 authorization → V8–V11`이며, first-failure precedence(§9.2)는 그대로다.
+
+**F materialisation Proposal (#59).** F의 resolved gate도 같은 exact Proposal copy/proposal_id를 쓰고
+V1–V7 + §9.2g fresh parent/capability/reservation을 모두 다시 계산한다. 통과한 뒤에만 §8.4b snapshot+INTENT를
+기록한다. approval 전에 snapshot/external task는 0이다. 이후 E는 별도 Proposal/V7 occurrence이므로 이
+approval을 admission에 재사용하지 않는다.
+
+F가 Rule A로 gate될 때 TASK_ONLY blocker는 exact parent를
+`HELD(BLOCKED_BY_DECISION:<decision_id>)`로 만든다. `gate_proposal.parent.kind`와 basis가 pre-gate origin을
+동결한다. APPROVE 적용은 현재 HELD reason이 same decision이고 underlying basis가 다음처럼 여전히 exact한
+경우만 허용한다:
+
+```text
+DISCOVERED_TASK origin → Attempt 없음 + fresh task ref/version/hash 동일
+ACTIVE_ATTEMPT origin  → same Attempt/Contract/stage가 non-terminal로 그대로 존재
+```
+
+한 transaction에서 terminal decision application ref + materialisation snapshot + op INTENT를 기록하고
+parent를 origin state(DISCOVERED 또는 ACTIVE)로 복원한다. external adapter 호출은 그 commit 뒤다. ACTIVE로
+복원돼도 pending snapshot dispatch gate(§19.3e)가 Actor turn을 막으므로 approval과 publish 사이 race가 없다.
+REJECT는 external effect 0, parent는 `HELD(MATERIALIZATION_REJECTED:<decision_id>)`로 남아 새 Supervisor
+replan 또는 existing Human/recovery path를 요구한다. stale/mismatch approval도 parent를 복원하지 않는다.
+generic “restore previous state” framework는 만들지 않고 F의 두 tagged origin에만 이 mapping을 허용한다.
 
 **Human-gated reselection (M1-7).** `HELD(SELECTION_STALE)` 해소는 그 자체로 human decision이 아니다 —
 staleness는 새 deterministic selection을 요구할 뿐이므로 **자동 PendingHumanDecision을 만들지 않는다**
@@ -5033,6 +5422,46 @@ tables                     unchanged
   MVP 0/1 schema seal을 수정하지 않고 append하며, constraint/index rewrite는 한 migration transaction에서
   수행한다.
 
+### 18.1g MVP 3 child materialisation authority storage (#59 amendment)
+
+[계약, PROSPECTIVE_REQUIREMENT] §18.1f의 “new table 0”은 D22의 **post-existing-child relation lifecycle**
+자체에 대한 결정으로 유지된다. Human-authorized #59 pre-admission materialisation은 validated semantic input을
+restart 뒤 재구성해야 하므로 별도 additive migration으로 정확히 한 immutable table과 task column 하나를
+추가한다:
+
+```text
+child_materialization_snapshot                                  # immutable
+  materialization_id  TEXT PK       # accepted Proposal.proposal_id ULID
+  hash                TEXT NOT NULL UNIQUE
+  batch_id            TEXT NOT NULL REFERENCES batch(batch_id)
+  parent_task_key     TEXT NOT NULL REFERENCES task(task_key)
+  envelope_json       TEXT NOT NULL # platform/child-task-materialization v1
+  created_at          TEXT NOT NULL
+
+task.materialization_binding_json TEXT NULL # ChildMaterializationBindingV1
+
+tables +1
+```
+
+snapshot envelope는 load 때 §6으로 re-hash한다. `materialization_id/hash/batch_id/parent_task_key` columns와
+envelope가 exact equality가 아니면 corruption이다. 같은 identity+same envelope는 idempotent, 다른 envelope는
+conflict다.
+
+`materialization_binding_json`은 §8.4b TaskSource round-trip transaction에서만 `NULL→exact binding`이
+가능하다. ordinary discovery는 null을 유지하고, refresh/selection/activation/recovery가 rewrite/clear하지
+않는다. `task.parent_task_key`는 D22대로 E admission transaction에서만 set하며 두 column의 의미를 합치지
+않는다:
+
+```text
+materialization_binding_json = proposed/published child의 immutable pre-admission relation provenance
+parent_task_key              = validated executable relation committed with parent suspension
+```
+
+external publish status/receipt는 existing `idempotency` INTENT/DONE/FAILED와 DONE `result_json`의 exact
+`ChildTaskMaterializationReceiptV1`을 사용한다. snapshot table에 status/cursor/retry count를 넣거나 새
+materialisation state machine/store/event framework를 만들지 않는다. physical migration number는 actual
+implementation history가 정하며 MVP 0/1 applied migrations를 rewrite하지 않는다.
+
 ### 18.2 트랜잭션/이력 규칙 (M0-32)
 
 - 하나의 state transition = 하나의 SQLite 트랜잭션: 상태 컬럼 갱신 + `decision_log` append +
@@ -5222,6 +5651,9 @@ B8 state machine production code는 어떤 Adapter도 import/call하지 않는�
 
 T: DEFERRED — Supervisor DEFER_TASK proposal 검증 통과 시 SELECTED 이전 상태에서만 진입.
 
+F materialisation은 Task/Attempt transition이 아니다. snapshot/publish/round-trip 뒤 child는 DISCOVERED,
+parent는 원래 상태다. `ChildMaterializationBindingV1`이 있는 child는 E 외의 admission trigger를 받을 수 없다.
+
 ### 19.3a Commit-time durable admission guard (M0-30)
 
 §9.2e V11과 이 guard는 **역할이 다르다**: V11은 Proposal validation, 이것은 commit 직전의
@@ -5238,6 +5670,23 @@ active_task_count    <  batch_policy.concurrency
   active_writable_candidate_count < 1
 hard_dependencies_clear == true          # §8.4a, Coordinator가 공급한 typed boolean
 ```
+
+materialisation relation guard를 같은 transaction에서 추가한다:
+
+```text
+A START_TASK:
+  task.materialization_binding_json == null
+
+E START_SUBFLOW:
+  binding == null                         # pre-existing child, D22 path
+  OR
+  binding.parent_task_key == E.parent.task_key
+  AND fresh child.definition_hash == binding.child_definition_hash
+  AND referenced materialization snapshot/binding exact equality
+```
+
+A가 bound child를 top-level로 admit하거나 E가 다른 parent/body로 consume하면 row/state/count 변화 0이며
+§9.2g reason으로 reject한다. successful E만 D22의 `parent_task_key`를 binding과 같은 parent로 기록한다.
 
 세 count는 §9.2e의 durable projection(§19.3c) 그대로이고, `batch_policy`는
 `batch.compiled_profile_hash`가 가리키는 immutable Compiled Profile에서 읽는다.
@@ -5398,6 +5847,16 @@ RuntimeAdapter 사용 불가를 뜻하지 않는다 — 고신뢰 Policy가 rece
 막는 기존 semantics가 그대로 그 역할을 한다.
 
 ### 19.3e READY→IMPLEMENTING external operation ordering (M1-8)
+
+**MVP 3 pending-materialized-child dispatch gate (#59).** parent Attempt가 READY이거나 새 Actor/rework turn을
+보내려는 시점에, 같은 parent task key의 non-FAILED materialisation snapshot이 아직 admitted되지 않은 child를
+가리키면 phase가 INTENT/COMMITTED_NOT_OBSERVED/OBSERVED 어느 것이든 Coordinator는 Actor external INTENT를
+만들지 않는다. 앞의 두 phase는 §21/§22 reconcile을 먼저 수행하고 Supervisor에게 존재하지 않는 task_ref를
+고르게 하지 않는다. OBSERVED가 하나 이상이면 parent/Attempt state를 그대로 두고
+`SupervisorDecisionContextV2` turn을 요청해 E 선택을 받는다. Supervisor가 child를 선택하며 Coordinator가
+priority를 추론하지 않는다. child가 여러 개면 D22의 one-current-child 규칙대로 하나씩 admit/complete/resume한
+뒤 다음 turn에서 다시 선택한다. pending operation/child가 0일 때만 아래 Actor ordering으로 진행한다. 이
+gate는 새 state/cursor/scheduler가 아니라 existing snapshot/idempotency/task binding의 commit-time predicate다.
 
 세 external operation은 서로 다른 crash window를 가지므로 **각자의 `op_key`와 INTENT/DONE**을 갖는다.
 하나의 INTENT가 셋을 덮는다고 가정하지 않는다. adapter 호출은 **SQLite transaction 밖**에서 수행한다.
@@ -5753,6 +6212,12 @@ post-suspension concurrency/writable projection을 current durable rows에서 �
 child SELECTED, parent SUSPENDED, relation, admission count가 모두 0이다. parent가 HELD/SUSPENDED/terminal이거나
 merge stage에 들어간 뒤에는 normal START_SUBFLOW를 적용하지 않는다.
 
+child에 `ChildMaterializationBindingV1`이 있으면 transaction은 §9.2g의 parent/hash/snapshot equality도
+다시 확인하고 committed `parent_task_key`를 binding의 exact parent로만 설정한다. binding은 provenance로
+남으며 relation commit 뒤에도 clear하지 않는다. binding null인 pre-existing child에는 이 추가 guard가
+N/A이고 D22 기존 chain이 그대로다. F snapshot/receipt/Human approval은 이 transaction의 fresh E Proposal,
+parent eligibility, dependency, capacity를 대체하지 않는다.
+
 child execution의 첫 external INTENT보다 먼저 parent suspension provenance와 child `parent_task_key`가
 durable해야 한다. Task Contract v2 builder는 이 committed relation을 freeze할 뿐 parent를 고르지 않는다.
 child contract build/activation이 이후 실패하면 이미 기록된 parent relation을 지우거나 다른 parent로
@@ -5915,6 +6380,30 @@ incoming transition을 갖지 않는다.** 기존 failure/safety taxonomy(§24)�
   보장되기 때문이다. 따라서 §19.3의 `op:<attempt>:contract`는 **local logical operation reference**이며
   idempotency row 생성 의무로 해석하지 않는다. local operation을 위한 별도 idempotency framework를
   만들지 않는다.
+- **Child materialisation (#59).** exact external operation identity:
+
+  ```text
+  op:<batch_id>:materialize-child:<materialization_id>
+  ```
+
+  `materialization_id`는 accepted F Proposal의 Platform-assigned `proposal_id`이며 snapshot PK와 같다.
+  INTENT transaction은 immutable `ChildTaskMaterializationSnapshotV1` insert + decision log + idempotency
+  INTENT를 함께 기록한다. adapter 호출은 transaction 밖이고 COMMITTED receipt만 DONE `result_json`에
+  기록한다. 같은 op_key/different snapshot hash는 conflict다.
+
+  ```text
+  CM1 snapshot/INTENT 전 crash             external effect 0
+  CM2 INTENT durable, adapter 호출 전       same-op 호출 허용
+  CM3 external create, receipt persist 전    reconcile_child_materialization(same op_key)
+      NOT_FOUND                             same-op 호출 허용
+      COMMITTED(exact receipt)              DONE 승격, duplicate 0
+      UNKNOWN                               blind retry 금지, batch PAUSED_SAFELY/recovery
+  CM4 DONE, TaskSource round-trip 전 crash   stored exact ref로 fresh read 재개
+  CM5 round-trip/task binding committed      두 번째 create/read-materialization 없음
+  ```
+
+  definitive no-effect failure만 FAILED로 기록한다. COMMITTED 뒤 body mismatch/visibility 문제를 rollback,
+  external delete 또는 새 materialization id로 덮지 않는다. §22가 exact receipt/ref/snapshot을 reconcile한다.
 - 대상: Batch start, Task attempt start, **Feature workspace creation(M1-8 — `op:<attempt>:workspace`,
   §14.3의 idempotent create-or-reacquire)**, Actor session spawn, Actor turn,
   **Verification run(M1-9 — `op:<attempt>:verify:<candidate_sha>`를 `VerificationOperationContextV1.op_key`로
@@ -6019,6 +6508,11 @@ Profile/Policy → Profile Registry        Task external 정의 → TaskSource
 Platform transition → Platform Store     Runtime session fact → RuntimeAdapter
 Workflow execution fact → WorkflowAdapter   Repository fact → RepositoryAdapter
 Verification fact → Verification backend    Human resolution → Platform Decision record
+Child decomposition semantics → immutable ChildTaskMaterializationSnapshotV1
+Child external creation/ref → ChildTaskMaterializationAdapterV1 receipt
+Post-publish child definition → fresh TaskSource observation
+Pre-admission parent intent → ChildMaterializationBindingV1
+Executable parent relation/suspension → Platform Store §19.5 transaction
 Runtime trusted identity 발급/보관 → Runtime(host) / RuntimeAdapter — Platform Core 아님 (I-TD5)
 Workflow controller identity → WorkflowControllerHandle 뒤의 backend identity (Core는 handle만)
 Model conversation → authority 없음 (항상)
@@ -6028,6 +6522,13 @@ Model conversation → authority 없음 (항상)
 
 ```text
 startup → active run/batch/attempt 로드
+→ unfinished child materialisation 처리 (#59): immutable snapshot마다 stable op_key를 재구성하고
+    idempotency INTENT/DONE/FAILED를 §21 CM1–CM5로 판정한다. INTENT는 adapter reconcile이 NOT_FOUND를
+    authoritative하게 증명할 때만 same-op 재호출, COMMITTED면 exact receipt로 DONE 승격, UNKNOWN이면
+    duplicate를 만들지 않고 batch PAUSED_SAFELY. DONE인데 task binding이 없으면 stored external ref로
+    같은 TaskSource fresh round-trip을 다시 수행한다. exact body/hash면 DISCOVERED row+binding을 commit하고,
+    mismatch/collision/unreadable source면 parent state를 바꾸지 않은 채 PAUSED_SAFELY. FAILED definitive
+    no-effect snapshot만 reservation에서 제외한다.
 → READY attempt의 세 external op 정합 (M1-8): `op:<attempt>:workspace` / `:actor-spawn` /
     `:actor-turn:<n>`의 idempotency row를 §21 규칙으로 각각 판정한다. workspace·spawn은 adapter가
     same-op 재획득으로 효과 존재를 authoritative하게 확인할 수 있으므로 DONE 승격 또는 재수행이
@@ -6267,6 +6768,8 @@ operational config surface는 계속 Spec §69/§27의 MVP 4 범위다.
 | Task Contract drift | Platform Store(snapshot) | immutable snapshot + §11 boundary 검사 | hash 비교 | INVALIDATED/HELD |
 | Backend restart로 duplicate side effect | Platform idempotency + backend dedup | §21 write-ahead INTENT, durable-jobs requestId dedup | INTENT 상태 스캔 | 중복 미수행; 불명 → RECOVERY_CONFLICT |
 | TaskSource ↔ Platform divergence | 각자 (분리 저장) | §8.3 물리 분리 | reconcile 대조 | STALE/HELD, 자동 동기화 없음 |
+| Supervisor child Proposal이 direct external mutation으로 우회됨 | Platform materialisation boundary | Model credential/adapter call 금지, exact F validation + write-ahead snapshot/INTENT | receipt/TaskSource round-trip/binding 대조 | 거부 또는 TASK_MATERIALIZATION_* / PAUSED_SAFELY |
+| materialisation retry가 duplicate external child를 생성 | MaterializationAdapter receipt + idempotency | stable op_key, same-op reconcile, UNKNOWN blind retry 금지 | receipt ref와 TaskSource exact ref/body 대조 | PAUSED_SAFELY |
 | 위조/가짜 Approved Override (YAML `approved_by` 자칭) | Platform Human Decision / operator_action record | 권한 확대 override는 approval_ref+approval_hash 필수, Compiler가 존재·scope·value·hash 일치 검증(§7.2). 문자열은 authority 불인정 | compile 시 검증, recovery 시 ref 정합 재검사(§22.2) | COMPILE_ERROR; 사후 불일치 발견 → PAUSED_SAFELY |
 | restart 후 capability downgrade (Backend 약화 상태로 재개) | Backend Capability Manifest + contract의 backend_requirements + EnforcementReceipt | Manifest/grant/receipt hash를 계약에 동결(§10.1, §12.6), 재개 전 재대조(§22.2) | 재대조에서 하향 감지 | CAPABILITY_BOUNDARY_CHANGED → HELD 또는 PAUSED_SAFELY, silent 재개 없음 |
 | secret runtime identity가 Platform DB에 저장됨 | Runtime 자체 store / secret storage abstraction | I-TD7: schema에 secret 필드 부재, adapter는 opaque handle/redacted fingerprint만 반환 | 저장 계층 정적 검사(스키마) + 저장 전 redaction 검증 | 위반 코드 경로 = 결함으로 취급, 발견 시 PAUSED_SAFELY + 해당 레코드 폐기 |
@@ -6293,6 +6796,11 @@ AUDIT_GATE_UNAVAILABLE           # M1-13 — valid verdict는 있으나 audit se
                                  #   확립하지 못함 → Task HELD. FIX_REQUIRED로 재해석하지 않는다
 SELECTION_STALE                  # pre-Attempt selection binding이 fresh TaskDefinition/canonical과
                                  #   불일치 → Task HELD (§19.3a M1-7). 자동 HumanDecision 없음
+TASK_MATERIALIZATION_FAILED      # definitive no-effect adapter failure; snapshot은 audit로 남고 reservation 해제
+TASK_MATERIALIZATION_UNOBSERVABLE # COMMITTED/INTENT 효과 또는 exact TaskSource round-trip을 확립하지 못함
+                                  #   duplicate/guess 금지 → batch PAUSED_SAFELY (§8.4b/§21/§22)
+TASK_MATERIALIZATION_CONFLICT    # same identity/ref에 다른 snapshot/body/parent binding → PAUSED_SAFELY
+MATERIALIZATION_REJECTED:<decision_id> # Human이 exact F publish를 거부; parent HELD, external effect 0
 CONTRACT_DRIFT → drift를 **관측해서 확정**한 경우의 인과 fact (§11). M1-12: HOLD/INVALIDATE 어느 쪽이든
                  §17 PendingDecision이 함께 열리므로 Task의 현재 reason은 `BLOCKED_BY_DECISION:<id>`이며,
                  이 code는 transition 항목과 (INVALIDATE의 경우) Attempt reason에 남는다
@@ -6467,6 +6975,32 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
    모든 batch가 terminal complete된 뒤의 `platform_run.status = COMPLETED`다(§20).
 ```
 
+**MVP 3 #59 pre-admission extension (Human-authorized Spec amendment).** 기존 MVP 1 sequence를
+소급 변경하지 않고 Supervisor step 4–6과 activation/Actor launch 사이에 다음 bounded branch를 추가한다:
+
+```text
+F1 Supervisor→MCP: F(child body + explicit DISCOVERED_TASK|ACTIVE_ATTEMPT parent) 제출
+F2 Core: V1–V7 + §9.2g capability/reservation/fresh parent validation
+   reject/gate → external side effect 0
+F3 accepted/resolved → snapshot + materialize op INTENT atomic write
+F4 Coordinator→ChildTaskMaterializationAdapter.materialize_child(same op_key)
+F5 COMMITTED receipt → idempotency DONE
+F6 same TaskSource fresh get_task(ref) exact round-trip
+F7 §8.4 DISCOVERED row + materialization binding atomic write
+
+DISCOVERED whole-intent parent였으면:
+F8 Supervisor는 ordinary A START_TASK로 parent selection/admission/activation 수행
+F9 Actor external turn 전 pending-child gate가 side effect를 막고 새 Supervisor turn 요청
+
+ACTIVE parent 또는 F8 이후:
+F10 Supervisor는 observed child에 ordinary E START_SUBFLOW 제출
+F11 existing D22: fresh E validation → atomic child admission + parent suspension → child execution
+```
+
+F1이 여러 child에 반복돼도 한 Proposal/operation은 child 하나다. selection order는 F9/F10 Supervisor가
+결정하고 Coordinator가 graph/priority를 생성하지 않는다. F Proposal에서 E를 합성하거나 external
+task_ref/version/hash를 사후 채우지 않는다.
+
 **MVP 1 production integration 책임 (명시).** 위 sequence를 실제로 구동하는 것은 MVP 1 Coordinator이며,
 다음 셋은 명시적으로 그 책임이다: (a) Repository/Runtime/Workflow/Verification 관측을 typed
 authoritative fact로 만들어 기존 use-case에 공급하는 것, (b) report outbox의 **delivery·확인·`sent_at`
@@ -6486,9 +7020,12 @@ Coordinator 발신 요청이다.
   retry, actuation을 소유하지 않는다.
 - MVP 2: RepositoryGate 활성(전제 §14.5) — 전략 A 구현 + G1–G5; 전략 B는
   `GitHubProtectedRepositoryAdapter`+`CIValidationAdapter` 추가로 동일 Gate contract 뒤에서 교체.
-- MVP 3: §9.2f/§10.1a/§18.1f/§19.5 AUTO_SUBFLOW — explicit parent Proposal, atomic
-  child admission+parent SUSPENDED binding, frozen-pipeline `SUCCEEDED`, deterministic normal RESUME_PARENT.
-  `parent_task_key`/`SUSPENDED`/`SUCCEEDED`는 sealed MVP 0/1 schema를 고치지 않는 additive migration이다.
+- MVP 3: §7.1e/§8.1b/§8.4b/§9.2f–g/§10.1a/§18.1f–g/§19.5 AUTO_SUBFLOW — bounded child body +
+  explicit parent materialisation Proposal, Platform-only idempotent publish, TaskSource exact round-trip,
+  그 뒤 existing explicit-parent admission, atomic child SELECTED+parent SUSPENDED, frozen-pipeline
+  `SUCCEEDED`, deterministic normal RESUME_PARENT. `parent_task_key`/`SUSPENDED`/`SUCCEEDED`와 one immutable
+  snapshot table/task binding column은 sealed MVP 0/1을 고치지 않는 prospective additive migration이다.
+  dynamic pipeline/workflow/model topology synthesis는 포함하지 않는다.
   dependency graph 평가, PendingDecision queue UI 없이 Slack 목록 명령, batch≤N.
 - MVP 4: §22 전체 폭 reconciliation + §22.5 read-only monitoring/liveness trigger, circuit breaker 전 조건,
   장기 무인 운용(silent 정상 progress — §21 outbox 정책은 MVP 1부터 동일). operational anomaly는
@@ -6565,7 +7102,15 @@ D23 (v1.5 Issue #60 decision-basis amendment) SupervisorDecisionContextV1 exact 
     Platform-allocated proposal_id echo binding + semantic-choice/freshness-echo 분리. 제출 뒤 field completion
     금지, V3/V8 fresh re-observation 유지, Runtime schema constraint는 generation aid only.
     Spec/Backend contract/new store/state machine/MVP0·1 schema·state·validator retroactive seal impact 없음.
-    B13 context evidence는 충족 증거가 아니며 #59는 독립 OPEN.
+    B13 context evidence는 충족 증거가 아니며 #59는 독립 OPEN(당시 기록; 후속 D24 참조).
+D24 (v1.5 Issue #59 Human-authorized Spec/TD amendment) Supervisor는 F START_SUBFLOW materialisation
+    Proposal로 bounded child TaskDefinitionBodyV1 + explicit DISCOVERED/ACTIVE parent intent를 제안한다.
+    Platform만 Compiled Profile v3/Execution Policy/Human Gate/parent/capacity를 검증하고 immutable snapshot +
+    write-ahead idempotent ChildTaskMaterializationAdapter publish + exact TaskSource round-trip을 수행한다.
+    OBSERVED child만 existing E/D22 admission path로 들어가며 F는 admission/suspension/Task Contract authority가
+    아니다. child external identity는 adapter, 이후 definition은 TaskSource, executable relation은 §19.5
+    transaction이 소유한다. one immutable table + task binding column은 prospective MVP3 additive state이며
+    MVP0/1 seal 비소급. #7 C-03 미채택; dynamic pipeline/workflow/model topology 및 generic planner/graph/DSL 없음.
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
@@ -6726,8 +7271,9 @@ M0-27 V8–V10 authoritative input / capability operation mapping
 M0-28 V11 read-model / result reason vocabulary / precedence
       (V11이 비교할 상태 field가 없었고 POLICY_REJECTED reason이 TASK_DRIFT 하나뿐이었다)
       — CLOSED: §9.2e DecisionValidationBatchView exact 3 counts와 max_tasks/concurrency/writable
-        세 규칙, lifecycle legality는 §19.3/§20 유지, §9.2의 DecisionRejectReason exact 12종과
-        V1→V11 first-failure precedence.
+        세 규칙, lifecycle legality는 §19.3/§20 유지, MVP0 seal 당시 §9.2의 DecisionRejectReason exact
+        12종과 V1→V11 first-failure precedence. 후속 D22/D24 prospective vocabulary는 이 historical
+        close-out을 소급 rewrite하지 않는다.
 M0-29 Durable domain schema / migration
       (§18.1이 "…등 domain table"로 열려 있었고 컬럼·PK·FK·CHECK·nullability가 전무했으며,
        §5.2가 요구하는 Compiled Profile immutable row에 durable home이 없었다)
@@ -7467,7 +8013,7 @@ STATUS/HANDOFF가 이긴다. (형식은 IO fork Atlas #309의 hotspot 규율 준
 | Medium | EXPLAINABLE recovery 분류 미생산 | MVP 0 recovery는 무결성 분류만. 외부 authority 관측이 붙기 전까지 catch-up 부재 | FACT (STATUS mvp0 §7) | MVP 4 reconciliation 착수 |
 | ~~High~~ | ~~I-TD8~I-TD12 applicability map 미작성 — main-sync gate~~ | **RESOLVED (v1.4 rev.2)** — §31a에 5개 invariant 분류 완료(소급 무효화 0건, sealed 코드 변경 요구 0건). gate 조건 B 충족 | 원장 | — |
 | Low | TD monolith 분리 — 운영성 계약(§5.11/§5.12)의 별도 Ops/readout 문서화 | 문서 계층 경계(§1.1 [설명]) 유지 비용 — main TD를 더 키우지 않기 위함 | FACT (v1.4, practitioner review 권고) | main-sync 시 분리 여부 결정 |
-| High | **C-03** — strong Spec/TD → bounded work graph **one-shot Plan Compilation seam** (pre-TaskSource compiler) | Spec/TD-only 프로젝트를 ADP가 직접 받으려면 필요. Supervisor 즉석 계획·TaskSource 내부 inference로 넣으면 read boundary/semantics confinement 침범 — 별도 compiler + 승인 + idempotent publish 형상만 허용. **ARCHITECTURE REOPENING 필요 — 채택 아님** | CANDIDATE (material assessment; "one-shot 충분성"은 hypothesis, MEASURED 아님) | (a) 수동 graph 작성 비용/오류 실측, (b) compiler input/output·provenance·approval·idempotency·graph validity 계약 합의, (c) 수동 대비 bounded one-shot 실험 유의미 — 셋 충족 시 reopening 절차 |
+| High | **C-03** — strong Spec/TD → bounded work graph **one-shot Plan Compilation seam** (pre-TaskSource compiler) | Spec/TD-only input 전체를 run 전 graph로 compile하는 문제. D24/#59의 Human-authorized runtime **one-child** materialisation seam과 input/timing/parent authority가 다르며 D24는 C-03을 채택·해결하지 않는다. C-03을 구현하려면 별도 compiler + approval + idempotent graph publish와 아래 reopening trigger가 여전히 필요. **ARCHITECTURE REOPENING 필요 — 채택 아님** | CANDIDATE (material assessment; "one-shot 충분성"은 hypothesis, MEASURED 아님) | (a) 수동 graph 작성 비용/오류 실측, (b) compiler input/output·provenance·approval·idempotency·graph validity 계약 합의, (c) 수동 대비 bounded one-shot 실험 유의미 — 셋 충족 시 reopening 절차 |
 | Medium | **C-12** — exact-approved deterministic finalization + expected-old-head **CAS publication**의 composed transaction | 구성 원리(exact binding, frozen proposal, fresh revalidation, CAS, write-ahead)는 각각 보유하나 native composed path 부재. **ARCHITECTURE REOPENING 필요 — 채택 아님.** #5(DELTA-3)와 원리는 같고 대상이 다름 — C-12=Task candidate publication chain, #5=플랫폼 자기 배포 승격. 중복 생성 금지 | CANDIDATE (IO Foundation #20 단일 사례; upstream native 존재는 INFERRED 부정 — C-13) | Foundation 외 두 번째 use case 출현, 또는 ADP 자기 deployment promotion에서 Human-authorized deterministic transform이 실제 필요 + exact input/output/failure/reconciliation 계약 합의 |
 | Low | Diagnostic/Measurement Projection의 component 승격 여부 | §5.11/§5.12는 contract로 시작 — heavyweight component화는 미결정 | FACT (v1.3 신설) | 라이브 파일럿에서 구현 경험 축적 후 |
 | Medium | automatic evidence-based model routing authority | §5.14 recommendation은 read-only이고 current Runtime binding은 §13.5로 고정. Measurement를 policy로 직접 소비하거나 mid-attempt fallback할 authority는 없음 | DEFERRED / CANDIDATE (v1.5; 채택 아님) | role별 comparable corpus와 충분한 sample이 축적되고, Human이 Execution Policy의 eligibility/window/floor/fallback/rebind/recovery contract를 승인할 때 |
