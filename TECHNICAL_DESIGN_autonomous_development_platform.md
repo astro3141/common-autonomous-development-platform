@@ -65,10 +65,11 @@
 >
 > **v1.5 Issue #71 D22/D24 writable-slot composition amendment (PR #69 comment `5493739663`,
 > Design Evidence이지 authority가 아님):** D24의 DISCOVERED-parent F8–F11 path에서 pending-child gate가
-> READY parent Actor effect를 막는 동안 D22의 writable projection이 같은 parent를 sole slot owner로 계속
-> 세어 exact bound E까지 거부하는 deadlock을 닫는다. READY parent가 유일한 writable owner이고 D24 child가
-> OBSERVED/bound됐으며 parent Actor dispatch INTENT가 0인 exact 경우에만 E transaction이 parent slot을
-> child에게 transfer한다. unrelated A/E/writer는 계속 거부하고 legacy D22 E는 불변이다.
+> READY parent의 최초 Actor dispatch 또는 REWORKING parent의 다음 rework dispatch를 막는 동안 D22의 writable
+> projection이 같은 parent를 sole slot owner로 계속 세어 exact bound E까지 거부하는 deadlock을 닫는다.
+> READY 또는 REWORKING parent가 유일한 writable owner이고 D24 child가 OBSERVED/bound됐으며 **현재 writable
+> phase의 exact next Actor dispatch** INTENT/ref가 0인 경우에만 E transaction이 parent slot을 child에게
+> transfer한다. unrelated A/E/writer는 계속 거부하고 legacy D22 E는 불변이다.
 > **SPEC_CHANGE=NO / TD_CHANGE=YES / NEW_AUTHORITY=NO / NEW_LIFECYCLE_STATE=NO /
 > BACKEND_CHANGE=NO**. existing task/attempt/materialisation binding/suspension/idempotency rows의 derived
 > projection만 사용하며 새 slot row, scheduler, state machine, backend operation은 없다.
@@ -2430,7 +2431,7 @@ field를 만들지 않는다 — ACTOR가 없는 review-only pipeline은 rule 3�
 PendingMaterializedChildWritableSlotViewV1 {
   active_owner_task_keys: task_key[]
   transferred_owner_task_keys: task_key[]
-  actor_dispatch_started_attempt_keys: attempt_key[]
+  current_writable_phase_dispatch_started_attempt_keys: attempt_key[]
 }
 ```
 
@@ -2459,9 +2460,9 @@ view는 Model input/Proposal field/authority가 아니고 Coordinator가 만드�
 E child has exact non-null ChildMaterializationBindingV1
 AND referenced snapshot/binding phase == OBSERVED
 AND E parent == binding.parent_task_key
-AND parent is ACTIVE with the exact current Attempt/Contract in state READY
+AND parent is ACTIVE with the exact current Attempt/Contract in state {READY, REWORKING}
 AND effective_writable_slot_owner_task_keys == { parent.task_key }
-AND parent current Attempt not in actor_dispatch_started_attempt_keys
+AND parent current Attempt not in current_writable_phase_dispatch_started_attempt_keys
 AND V1–V10, V11 rules 1–2, §9.2f and §9.2g all pass
 
 projected post-commit writable owners
@@ -2472,10 +2473,11 @@ selected child pipeline contains ACTOR
   → projected post-commit owner set must equal { child.task_key }
 ```
 
-위 exact predicate에서만 READY parent가 가진 sole slot을 E가 consume/transfer할 수 있다. 이것은 conflict
-guard 면제가 아니라 atomic post-state projection이다. parent가 sole owner가 아니거나 Actor dispatch
-protocol이 시작됐거나 child/parent/binding/snapshot이 exact하지 않으면 기존 rule 3으로 거부한다. E pipeline에
-ACTOR가 없으면 rule 3 자체는 N/A지만 나머지 parent/binding guard는 그대로다.
+위 exact predicate에서만 READY 또는 REWORKING parent가 가진 sole slot을 E가 consume/transfer할 수 있다.
+이것은 conflict guard 면제가 아니라 atomic post-state projection이다. parent가 sole owner가 아니거나 현재
+writable phase의 next Actor dispatch protocol이 시작됐거나 child/parent/binding/snapshot이 exact하지 않으면
+기존 rule 3으로 거부한다. IMPLEMENTING은 current Actor dispatch가 이미 진행 중인 state이므로 transfer 대상이
+아니다. E pipeline에 ACTOR가 없으면 rule 3 자체는 N/A지만 나머지 parent/binding guard는 그대로다.
 
 binding null인 pre-D24/existing-child E에는 이 transfer가 N/A이며 기존 D22 계산을 그대로 사용한다. 이
 projected 계산과 같은 식을 §19.5 admission transaction 안에서 current rows로 다시 평가한다.
@@ -2631,7 +2633,7 @@ snapshot(materialization_hash)의 parent/child hash == binding
 admit하거나 다른 parent E로 rebind하지 않는다. binding null인 pre-existing external child는 D22의 기존
 E path를 그대로 사용한다.
 
-**D24 READY-parent slot transfer eligibility (Issue #71).** 위 binding이 non-null인 E가 §9.2e transfer를
+**D24 pre-dispatch parent slot transfer eligibility (Issue #71).** 위 binding이 non-null인 E가 §9.2e transfer를
 사용하려면 `PendingMaterializedChildWritableSlotViewV1`이 required이고 다음 equality를 추가로 통과한다:
 
 ```text
@@ -2639,9 +2641,9 @@ snapshot.materialization_id/hash == binding.materialization_id/hash
 snapshot phase == OBSERVED
 child.task_key/definition_hash == binding child identity/hash
 E.parent.task_key == binding.parent_task_key
-E.parent attempt/contract/state == fresh parent Attempt/Contract/READY
+E.parent attempt/contract/state == fresh parent Attempt/Contract/{READY, REWORKING}
 active_owner_task_keys union transferred_owner_task_keys == { E.parent.task_key }
-E.parent.attempt_key not in actor_dispatch_started_attempt_keys
+E.parent.attempt_key not in current_writable_phase_dispatch_started_attempt_keys
 ```
 
 COMMITTED receipt의 `external_task_ref`, context의 task label, unique pending child, 또는 parent/child cardinality는
@@ -5786,7 +5788,7 @@ admitted_task_count  <  batch_policy.max_tasks
 active_task_count    <  batch_policy.concurrency
 선택된 pipeline에 ACTOR가 있으면
   effective_writable_slot_owner_task_keys is empty
-  OR §9.2e exact D24 READY-parent slot transfer predicate passes
+  OR §9.2e exact D24 pre-dispatch parent slot transfer predicate passes
 hard_dependencies_clear == true          # §8.4a, Coordinator가 공급한 typed boolean
 ```
 
@@ -5810,7 +5812,7 @@ A가 bound child를 top-level로 admit하거나 E가 다른 parent/body로 consu
 세 count와 effective writable owner set은 §9.2e의 durable projection(§19.3c) 그대로이고,
 `batch_policy`는 `batch.compiled_profile_hash`가 가리키는 immutable Compiled Profile에서 읽는다.
 exact D24 transfer를 적용할 때 transaction은 parent/child/binding/snapshot/Attempt/Contract와
-`actor_dispatch_started_attempt_keys`, active/transferred owner set을 모두 다시 계산한다. validation-time
+`current_writable_phase_dispatch_started_attempt_keys`, active/transferred owner set을 모두 다시 계산한다. validation-time
 view를 lease로 쓰지 않는다. post-state owner set이 §9.2e projected 식과 다르면 parent suspension과 child
 admission을 모두 rollback한다.
 
@@ -5960,23 +5962,39 @@ transferred_owner_task_keys
 effective_writable_slot_owner_task_keys
   = set_union(active_owner_task_keys, transferred_owner_task_keys)
 
-actor_dispatch_started_attempt_keys
-  = exact Attempt keys having any durable idempotency row or corresponding durable adapter metadata for:
-      op:<attempt>:workspace
-      op:<attempt>:actor-spawn
-      op:<attempt>:actor-turn:<n>
+current_writable_phase_dispatch_started_attempt_keys
+  = exact Attempt keys in a transferable writable state for which the phase-specific dispatch has started:
+
+      Attempt.state == READY:
+        any durable idempotency row or corresponding durable adapter metadata/ref for
+          op:<attempt>:workspace
+          op:<attempt>:actor-spawn
+          op:<attempt>:actor-turn:1
+
+      Attempt.state == REWORKING:
+        next_turn_n = current attempt.rework_count + 2
+                      # §26 M1-15 pre-transition formula; first rework is actor-turn:2
+        any durable idempotency row or corresponding durable adapter metadata/ref for
+          op:<attempt>:actor-turn:<next_turn_n>
 ```
 
-FAILED를 포함해 위 operation record가 하나라도 있으면 dispatch protocol은 started로 센다. exact D24 transfer는
-이 set에 parent Attempt가 **없을 때만** 가능하다. I-TD2상 authorized external effect는 durable INTENT보다
-먼저 일어날 수 없으므로 complete local Store projection에서 operation/ref가 모두 없다는 사실이 여기서는
-“parent Actor side effect가 아직 시작되지 않음”의 authority다. Store read failure/corruption은 absence가
-아니며 fail-closed assembly failure다.
+FAILED를 포함해 해당 phase의 exact operation record가 하나라도 있으면 current dispatch protocol은 started로
+센다. REWORKING에서 과거 `workspace`, `actor-spawn`, 또는 `actor-turn:<m>` (`m < next_turn_n`) record는 이미
+완료된 phase의 provenance이므로 이 set에 parent Attempt를 넣지 않는다. IMPLEMENTING은 current Actor dispatch가
+이미 진행 중인 state라 transfer eligibility 자체가 없고, VERIFYING/AUDITING은 writable owner가 아니므로 기존
+D22 E를 적용한다. state/rework_count와 operation ordinal이 모순되거나 필요한 read가 불완전하면 absence로
+보정하지 않고 fail-closed assembly failure다.
 
-slot은 별도 durable entity가 아니다. E commit 전에는 READY parent가 owner이고, exact transaction 뒤에는
-parent가 SUSPENDED되어 active set에서 빠지는 동시에 SELECTED child가 transferred set에 들어간다. child
-activation 뒤에는 같은 child가 transferred set에서 빠지고 active set의 READY owner가 되므로 owner 수가
-둘로 부풀지 않는다. restart는 위 rows/set을 다시 계산하며 slot row/counter/lease를 복원하지 않는다.
+exact D24 transfer는 이 set에 parent Attempt가 **없을 때만** 가능하다. I-TD2상 authorized external effect는
+durable INTENT보다 먼저 일어날 수 없으므로 complete local Store projection에서 current phase의 exact
+operation/ref가 모두 없다는 사실이 여기서는 “현재 next Actor side effect가 아직 시작되지 않음”의 authority다.
+Attempt 전역에 Actor side effect가 한 번도 없었다는 뜻은 아니다.
+
+slot은 별도 durable entity가 아니다. E commit 전에는 READY/REWORKING parent가 owner이고, exact transaction
+뒤에는 parent가 SUSPENDED되어 active set에서 빠지는 동시에 SELECTED child가 transferred set에 들어간다.
+child activation 뒤에는 같은 child가 transferred set에서 빠지고 active set의 READY owner가 되므로 owner
+수가 둘로 부풀지 않는다. child 완료 뒤 parent가 resume하면 보존된 Attempt state/rework_count가 같은 phase를
+복원한다. restart는 위 rows/set을 다시 계산하며 slot row/counter/lease를 복원하지 않는다.
 
 MVP 0 v1은 Project Profile당 canonical repository가 하나(§7.1a `repository` 단수)이므로 "동일 canonical
 repository" scope는 해당 project/run의 repository scope와 동일하다.
@@ -6020,11 +6038,12 @@ priority를 추론하지 않는다. child가 여러 개면 D22의 one-current-ch
 뒤 다음 turn에서 다시 선택한다. pending operation/child가 0일 때만 아래 Actor ordering으로 진행한다. 이
 gate는 새 state/cursor/scheduler가 아니라 existing snapshot/idempotency/task binding의 commit-time predicate다.
 
-OBSERVED child를 기다리는 READY parent는 E commit 전까지 §19.3c active writable owner로 남지만, 이 gate가
-아래 workspace/spawn/turn INTENT를 0으로 유지한다. 그 exact durable fact와 OBSERVED binding을
-`PendingMaterializedChildWritableSlotViewV1`이 projection하며, §9.2e/§19.5.1의 exact E만 slot을 child에게
-atomic transfer할 수 있다. Coordinator가 gate를 이유로 parent를 VERIFYING으로 전진시키거나 slot owner에서
-미리 제거하지 않으며, E를 합성하지도 않는다.
+OBSERVED child를 기다리는 READY/REWORKING parent는 E commit 전까지 §19.3c active writable owner로 남지만,
+이 gate가 READY의 최초 dispatch 또는 REWORKING의 §26 M1-15 exact next turn INTENT를 0으로 유지한다. 그
+phase-aware durable fact와 OBSERVED binding을 `PendingMaterializedChildWritableSlotViewV1`이 projection하며,
+§9.2e/§19.5.1의 exact E만 slot을 child에게 atomic transfer할 수 있다. 과거 Actor turn은 REWORKING current
+dispatch를 started로 만들지 않는다. Coordinator가 gate를 이유로 parent를 VERIFYING으로 전진시키거나 slot
+owner에서 미리 제거하지 않으며, E를 합성하지도 않는다.
 
 세 external operation은 서로 다른 crash window를 가지므로 **각자의 `op_key`와 INTENT/DONE**을 갖는다.
 하나의 INTENT가 셋을 덮는다고 가정하지 않는다. adapter 호출은 **SQLite transaction 밖**에서 수행한다.
@@ -6380,17 +6399,19 @@ post-suspension concurrency/writable projection을 current durable rows에서 �
 child SELECTED, parent SUSPENDED, relation, admission count가 모두 0이다. parent가 HELD/SUSPENDED/terminal이거나
 merge stage에 들어간 뒤에는 normal START_SUBFLOW를 적용하지 않는다.
 
-**D24 READY-parent writable-slot transfer (Issue #71).** child binding이 non-null이고 parent Attempt가 READY인
-경우, transaction은 §9.2e/§19.3c exact predicate를 current rows에서 다시 계산한다. pre-state effective owner
-set은 정확히 `{parent.task_key}`이고 parent Actor dispatch record/ref는 0이어야 한다. transaction의 projected
-post-state는 parent를 owner set에서 제거하고, selected child pipeline에 ACTOR가 있으면 exact child task key
-하나를 transferred owner로 추가한다. 이 post-state와 동시에 아래 relation/suspension/admission writes가
-성공할 때만 commit한다. 따라서 parent slot release만 먼저 기록하거나 child reservation만 나중에 만드는
-window가 없다.
+**D24 pre-dispatch parent writable-slot transfer (Issue #71).** child binding이 non-null이고 parent Attempt가
+READY 또는 REWORKING인 경우, transaction은 §9.2e/§19.3c exact predicate를 current rows에서 다시 계산한다.
+pre-state effective owner set은 정확히 `{parent.task_key}`이고 current writable phase의 dispatch record/ref는
+0이어야 한다. READY에서는 workspace/spawn/`actor-turn:1` 전체, REWORKING에서는 current
+`rework_count + 2`의 exact next `actor-turn`만 이 predicate를 결정한다. transaction의 projected post-state는
+parent를 owner set에서 제거하고, selected child pipeline에 ACTOR가 있으면 exact child task key 하나를
+transferred owner로 추가한다. 이 post-state와 동시에 아래 relation/suspension/admission writes가 성공할
+때만 commit한다. 따라서 parent slot release만 먼저 기록하거나 child reservation만 나중에 만드는 window가 없다.
 
 unrelated A/E, binding-null legacy E, wrong-parent E, second owner가 있는 E는 이 transfer를 사용할 수 없다.
 legacy E는 parent가 VERIFYING/AUDITING 등 기존 writable owner가 아닌 상태에서 종전 D22 rule로 계속 admission될
-수 있다. 새 `TRANSFER_SLOT` transition, slot row, lease, scheduler event는 만들지 않는다 — authority artifact는
+수 있다. IMPLEMENTING parent는 current Actor dispatch가 끝나 VERIFYING/AUDITING 같은 non-writable state가 될
+때까지 transfer할 수 없다. 새 `TRANSFER_SLOT` transition, slot row, lease, scheduler event는 만들지 않는다 — authority artifact는
 기존 child `parent_task_key` + materialisation binding + parent `SUSPENDED(SUBFLOW_CHILD:<child>)` atomic rows다.
 
 child에 `ChildMaterializationBindingV1`이 있으면 transaction은 §9.2g의 parent/hash/snapshot equality도
@@ -6716,7 +6737,9 @@ startup → active run/batch/attempt 로드
     idempotency/adapter-metadata rows에서 §19.3c owner sets를 다시 계산한다.
     parent DISCOVERED + child OBSERVED/bound이면 F8 A가 아직 필요한 동일 state,
     parent SELECTED + Attempt 없음이면 기존 pre-activation recovery,
-    parent ACTIVE/READY + Actor dispatch record 0이면 F9 gate + fresh exact E 요청,
+    parent ACTIVE/{READY,REWORKING} + current phase dispatch record/ref 0이면 F9 gate + fresh exact E 요청,
+    parent ACTIVE/REWORKING + exact next `actor-turn:<rework_count+2>` record/ref가 있으면 D25 transfer 없이
+    기존 Actor operation reconciliation을 계속하고,
     parent SUSPENDED + exact child SELECTED이면 post-E transferred child owner다.
     validation만 끝나고 E commit 전 crash는 pre-state로 남아 fresh E/commit-time recheck를 다시 거치며,
     atomic E commit 뒤 crash는 post-state로만 보인다. Model conversation, old validation view, process-local
@@ -7186,18 +7209,19 @@ F9 Actor external turn 전 pending-child gate가 side effect를 막고 새 Super
 
 ACTIVE parent 또는 F8 이후:
 F10 Supervisor는 observed child에 ordinary E START_SUBFLOW 제출
-F11 existing D22 + D25 projection: fresh E validation → READY parent sole writable slot을 exact bound child에게
-    atomic transfer + child admission + parent suspension → child execution
+F11 existing D22 + D25 projection: fresh E validation → READY/REWORKING parent sole writable slot을 exact bound
+    child에게 atomic transfer + child admission + parent suspension → child execution
 ```
 
 F1이 여러 child에 반복돼도 한 Proposal/operation은 child 하나다. selection order는 F9/F10 Supervisor가
 결정하고 Coordinator가 graph/priority를 생성하지 않는다. F Proposal에서 E를 합성하거나 external
 task_ref/version/hash를 사후 채우지 않는다.
 
-F11 transfer는 `parent Actor external operation INTENT/ref == 0`이고 current owner set이 exact parent 하나일
-때만 가능하다. unrelated A/E/second writer는 같은 owner set 때문에 계속 거부된다. F8–F10 사이 restart는
-§22.2가 durable pre/post-state에서 같은 gate/owner를 재구성하며, old Supervisor output이나 validation result를
-재사용하지 않는다.
+F11 transfer는 `current writable phase의 exact next Actor external operation INTENT/ref == 0`이고 current
+owner set이 exact parent 하나일 때만 가능하다. READY는 최초 workspace/spawn/turn protocol, REWORKING은
+§26 M1-15의 `actor-turn:<current rework_count+2>`가 current dispatch다. unrelated A/E/second writer는 같은
+owner set 때문에 계속 거부된다. F8–F10 사이 restart는 §22.2가 durable pre/post-state에서 같은 gate/owner와
+REWORKING next-turn ordinal을 재구성하며, old Supervisor output이나 validation result를 재사용하지 않는다.
 
 **MVP 1 production integration 책임 (명시).** 위 sequence를 실제로 구동하는 것은 MVP 1 Coordinator이며,
 다음 셋은 명시적으로 그 책임이다: (a) Repository/Runtime/Workflow/Verification 관측을 typed
@@ -7313,9 +7337,12 @@ D24 (v1.5 Issue #59 Human-authorized Spec/TD amendment) Supervisor는 F START_SU
     batch에서는 새 F INTENT가 불가능하다. #7 C-03 미채택; dynamic pipeline/workflow/model topology 및 generic
     planner/graph/DSL 없음.
 D25 (v1.5 Issue #71 D22/D24 writable-slot composition amendment) writable slot은 durable row가 아니라
-    §19.3c owner-set projection이다. D24 OBSERVED/bound child의 exact E에서만, parent ACTIVE/Attempt READY,
-    current effective owner set `{parent}`, parent Actor dispatch INTENT/ref 0, full V1–V11/parent/binding guard를
-    모두 만족하면 E atomic transaction이 owner를 parent→selected child로 transfer한다. post-E SELECTED child는
+    §19.3c owner-set projection이다. D24 OBSERVED/bound child의 exact E에서만, parent ACTIVE/Attempt
+    READY 또는 REWORKING, current effective owner set `{parent}`, current writable phase의 next Actor dispatch
+    INTENT/ref 0, full V1–V11/parent/binding guard를 모두 만족하면 E atomic transaction이 owner를
+    parent→selected child로 transfer한다. READY는 최초 dispatch protocol, REWORKING은 §26 M1-15의
+    `actor-turn:<current rework_count+2>`만 검사하며 과거 Actor operation은 transfer를 막지 않는다.
+    IMPLEMENTING은 transfer 대상이 아니다. post-E SELECTED child는
     existing materialisation binding + `parent_task_key` + parent SUSPENDED relation으로 slot을 reserve하고,
     activation 시 같은 child가 ACTIVE/READY owner로 이동한다. unrelated A/E/wrong parent/second writer/drift는
     기존 reason으로 fail-closed. validation은 lease가 아니며 commit/restart에서 durable rows로 재계산한다.
