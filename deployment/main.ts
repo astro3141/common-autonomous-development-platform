@@ -67,6 +67,12 @@ async function main(): Promise<void> {
     host: config.ingress.host,
     port: config.ingress.port,
     report_channel: config.report.channel,
+    ...(composition.projection === undefined
+      ? {}
+      : {
+          projection: composition.projection,
+          projection_base_branch: composition.projection_base_branch,
+        }),
   });
   log(`ingress listening on ${config.ingress.host}:${ingress.port()}`);
 

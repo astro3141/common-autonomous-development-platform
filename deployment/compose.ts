@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 
 import {
   backendRuntimePreflight,
@@ -31,6 +31,12 @@ import {
   DocumentProfileSource,
   FileContractSourceReader,
 } from "../adapters/local-drift-source/index.ts";
+import {
+  GhCliTransport,
+  GitHubIssuesChildMaterializer,
+  GitHubIssuesTaskSource,
+  GitHubPullRequestProjection,
+} from "../adapters/github/index.ts";
 import { LocalGitRepositoryAdapter } from "../adapters/local-git/index.ts";
 import {
   createLocalVerification,
@@ -51,9 +57,13 @@ import {
   type ProductionCoordinatorDependencies,
 } from "../core/coordinator/production-coordinator.ts";
 import { compileProfile, type CompileResult } from "../core/profile/compiler.ts";
+import type { TaskSourceEntry } from "../core/profile/types.ts";
 import type { CanonicalObject } from "../core/schemas/canonical-json.ts";
 import { PlatformStore } from "../core/store/platform-store.ts";
-import { ProjectDocumentTaskSource } from "../core/tasksource/index.ts";
+import {
+  ProjectDocumentTaskSource,
+  validateProjectDocumentConfig,
+} from "../core/tasksource/index.ts";
 import type { TaskSourceV1 } from "../core/tasksource/types.ts";
 import { ConfigError, type DeploymentConfig } from "./config.ts";
 import { isoNow, ulid } from "./identities.ts";
@@ -82,6 +92,9 @@ export interface Composition {
   readonly compiled: CompileResult;
   readonly coordinator: ProductionCoordinator;
   readonly deps: ProductionCoordinatorDependencies;
+  /** #78 — present exactly when the frozen Profile selects the GitHub vertical. */
+  readonly projection?: import("../adapters/interfaces/pull-request-projection.ts").PullRequestProjectionAdapterV1;
+  readonly projection_base_branch?: string;
   dispose(): void;
 }
 
@@ -119,12 +132,13 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
   });
 
   const contractSources = new FileContractSourceReader(config.contract_source_root);
-  const taskSource =
-    overrides.taskSource ??
-    new ProjectDocumentTaskSource({
-      paths: config.task_source.paths,
-      parser: "markdown-sections-v1",
-    });
+  // #78 — the TaskSource (and its optional D24 child materializer) is *selected by the frozen
+  // Compiled Profile* (§7.1a/§7.1e), never by a deployment default and never inferred from what
+  // happens to be installed. The deployment owns only host installation facts (document paths,
+  // canonical repository location); the Profile owns which source, and for GitHub, which
+  // owner/repo. Unknown adapter ids fail the whole composition closed.
+  const github = composeGitHubVertical(config, compiled);
+  const taskSource = overrides.taskSource ?? composeTaskSource(config, compiled, github);
   const repository =
     overrides.repository ??
     new LocalGitRepositoryAdapter({
@@ -211,9 +225,11 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
     contractSources,
     manifests,
     preflight,
-    ...(overrides.child_materializer === undefined
-      ? {}
-      : { materializer: overrides.child_materializer }),
+    ...(overrides.child_materializer !== undefined
+      ? { materializer: overrides.child_materializer }
+      : github?.materializer !== undefined
+        ? { materializer: github.materializer }
+        : {}),
     identities,
   };
 
@@ -222,11 +238,147 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
     store,
     compiled,
     deps,
+    ...(github === null
+      ? {}
+      : { projection: github.projection, projection_base_branch: github.base_branch }),
     coordinator: new ProductionCoordinator(deps),
     dispose() {
       store.close();
     },
   };
+}
+
+/** The deployment's registered TaskSource adapter ids. Registration is deployment vocabulary. */
+const DOCUMENT_TASK_SOURCE_ADAPTER = "ProjectDocumentTaskSource";
+const GITHUB_TASK_SOURCE_ADAPTER = "GitHubIssuesTaskSource";
+const GITHUB_CHILD_MATERIALIZER_ADAPTER = "GitHubIssuesChildMaterializer";
+
+interface GitHubVertical {
+  readonly owner: string;
+  readonly repo: string;
+  readonly transport: GhCliTransport;
+  readonly taskSource: GitHubIssuesTaskSource;
+  readonly materializer?: GitHubIssuesChildMaterializer;
+  readonly projection: GitHubPullRequestProjection;
+  readonly base_branch: string;
+}
+
+/** The single frozen Profile task-source entry, or a fail-closed refusal. */
+function profileTaskSourceEntry(compiled: CompileResult): TaskSourceEntry {
+  const entries = compiled.body.effective.project.task_sources;
+  if (entries.length !== 1) {
+    throw new ConfigError(
+      "/profiles/project_profile_path",
+      `the composition supports exactly one frozen task source; the Profile declares ${entries.length}`,
+    );
+  }
+  return entries[0]!;
+}
+
+/**
+ * #78 — constructs the production GitHub vertical exactly when the frozen Profile selects the
+ * GitHub TaskSource. Target identity (owner/repo) comes only from the Profile entry's own
+ * config; the D24 materializer is constructed only when the Profile binds one, over the same
+ * target and transport, and is handed solely to the existing Coordinator seam.
+ */
+function composeGitHubVertical(
+  config: DeploymentConfig,
+  compiled: CompileResult,
+): GitHubVertical | null {
+  const entry = profileTaskSourceEntry(compiled);
+  if (entry.adapter !== GITHUB_TASK_SOURCE_ADAPTER) return null;
+
+  const source_config = entry.config as Record<string, unknown>;
+  const owner = source_config["owner"];
+  const repo = source_config["repo"];
+  const discovery_limit = source_config["discovery_limit"];
+  if (typeof owner !== "string" || owner.length === 0 || typeof repo !== "string" || repo.length === 0) {
+    throw new ConfigError(
+      "/profiles/project_profile_path",
+      `task source ${entry.id} (${GITHUB_TASK_SOURCE_ADAPTER}) requires config.owner and config.repo`,
+    );
+  }
+
+  const transport = new GhCliTransport();
+  const taskSource = new GitHubIssuesTaskSource(transport, {
+    owner,
+    repo,
+    ...(typeof discovery_limit === "number" ? { discovery_limit } : {}),
+  });
+
+  let materializer: GitHubIssuesChildMaterializer | undefined;
+  if (entry.child_materializer !== undefined) {
+    if (entry.child_materializer.adapter !== GITHUB_CHILD_MATERIALIZER_ADAPTER) {
+      throw new ConfigError(
+        "/profiles/project_profile_path",
+        `task source ${entry.id} binds unknown child materializer ${JSON.stringify(entry.child_materializer.adapter)}`,
+      );
+    }
+    // §7.1e/D24 — the materializer is bound to this task source: same target identity. A config
+    // that names a different target is a contradiction, never a second route.
+    const declared = entry.child_materializer.config as Record<string, unknown>;
+    for (const [field, expected] of [["owner", owner], ["repo", repo]] as const) {
+      if (declared[field] !== undefined && declared[field] !== expected) {
+        throw new ConfigError(
+          "/profiles/project_profile_path",
+          `child materializer ${field} ${JSON.stringify(declared[field])} contradicts the bound task source`,
+        );
+      }
+    }
+    materializer = new GitHubIssuesChildMaterializer(transport, { owner, repo });
+  }
+
+  // The projection targets the same configured repository; the base branch is a configured
+  // canonical repository fact, never caller/model text (#52 acceptance).
+  const canonical_ref = config.repository.canonical_ref;
+  if (!canonical_ref.startsWith("refs/heads/")) {
+    throw new ConfigError(
+      "/repository/canonical_ref",
+      `PR projection requires a refs/heads/* canonical ref, got ${JSON.stringify(canonical_ref)}`,
+    );
+  }
+  const projection = new GitHubPullRequestProjection(transport, {
+    owner,
+    repo,
+    canonical_repo_path: config.repository.root,
+  });
+  return {
+    owner,
+    repo,
+    transport,
+    taskSource,
+    ...(materializer === undefined ? {} : { materializer }),
+    projection,
+    base_branch: canonical_ref.slice("refs/heads/".length),
+  };
+}
+
+/** Resolves the Profile-selected TaskSource through the deployment's adapter registry. */
+function composeTaskSource(
+  config: DeploymentConfig,
+  compiled: CompileResult,
+  github: GitHubVertical | null,
+): TaskSourceV1 {
+  if (github !== null) return github.taskSource;
+  const entry = profileTaskSourceEntry(compiled);
+  if (entry.adapter === DOCUMENT_TASK_SOURCE_ADAPTER) {
+    // #78 blocker 2 (review 5503883262) — §8.2 makes `paths`/`parser` Profile-owned adapter
+    // config. The frozen Profile decides *which* documents and *which* parser define the source;
+    // the deployment must never substitute a different semantic source from its own config.
+    // The adapter's own validator enforces the exact `{paths, parser}` contract (fail-closed on
+    // missing/empty/non-string/duplicate paths, missing/unsupported parser, unknown fields).
+    const declared = validateProjectDocumentConfig(entry.config);
+    // Profile paths are repository-relative host locations, resolved with the same rule as
+    // contract sources (§8.2 location fact only — never a source-selection authority).
+    const paths = declared.paths.map((path) =>
+      isAbsolute(path) ? path : resolve(config.contract_source_root, path),
+    );
+    return new ProjectDocumentTaskSource({ paths, parser: declared.parser });
+  }
+  throw new ConfigError(
+    "/profiles/project_profile_path",
+    `task source adapter ${JSON.stringify(entry.adapter)} is not registered in this deployment`,
+  );
 }
 
 /** Compiles the configured Profile documents through the sealed compiler. */
