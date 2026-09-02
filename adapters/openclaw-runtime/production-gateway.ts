@@ -1,31 +1,30 @@
 /**
  * The production binding of `OpenClawGatewaySeam` to an installed Backend v1 (TD §13.1, §30.2).
  *
- * **Validate everything, invent nothing, fail closed** (PR #43 finding 1). The previous revision
- * treated the audited backend as synchronous, fabricated a session `mode`, guessed the handle
- * shape and loaded the package directory as a CommonJS object — four ways of half-working against
- * a backend whose API it had never actually met. This revision does the opposite:
+ * **Validate everything, invent nothing, fail closed** (PR #43 finding 1). The backend package is
+ * resolved through its own `package.json`, shape-checked before any call, and its trusted session
+ * input is host-owned (I-TD5) — supplied only by a deployment-provided derivation, never minted
+ * here.
  *
- *   - the package entry is resolved through its own `package.json` (`exports`/`main`), never by
- *     requiring the directory;
- *   - the resolved surface is shape-checked **before any call**: `ensureSession`/`startTurn` must
- *     exist, and a declared-async `ensureSession` is refused outright — the sealed RuntimeAdapter
- *     seam is synchronous, and pretending an awaitable API is a value is exactly the reviewed
- *     defect. Driving the measured async API needs an async seam revision (BACKEND_BLOCKER);
- *   - trusted session input (the `sessionKey` the audited `ensureSession` requires) is never
- *     minted here (I-TD5). It comes only from a deployment-supplied derivation; without one,
- *     every session path refuses before any side effect;
- *   - a call that still answers with a thenable is refused and no session ref is fabricated.
+ * #81 I2 — the measured `AcpRuntime.ensureSession` is `async`. The synchronous RuntimeAdapter seam
+ * is preserved unchanged: a synchronous backend is driven directly (the audited-sync path), and a
+ * genuinely asynchronous backend is driven behind an adapter-local `BlockingBackendBridge` — one
+ * worker thread that owns the backend runtime and answers each operation synchronously via
+ * `Atomics.wait`. Either way the backend owns identity, ambiguous/timeout failures stay
+ * fail-closed, and no session/turn ref is fabricated.
  *
  * Every refusal is `GatewayUnavailable` with the concrete reason. Nothing retries, installs,
- * patches or repairs — a broken or incompatible install is reported, never worked around, and in
- * an RA-4 BLOCKED environment nothing ever reaches this seam at all.
+ * patches or repairs.
  */
 
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
+import {
+  BlockingBackendBridge,
+  type BackendTurnTerminal,
+} from "./backend-bridge.ts";
 import { GatewayUnavailable } from "./gateway-seam.ts";
 import type {
   GatewayEnsureSessionRequest,
@@ -52,6 +51,8 @@ export interface OpenClawGatewayConfig {
   readonly derive_session_input?: (
     request: GatewayEnsureSessionRequest,
   ) => Record<string, unknown>;
+  /** #81 I2 — bound for one async backend operation before the bridge fails closed. */
+  readonly async_backend_timeout_ms?: number;
 }
 
 interface LiveTurn {
@@ -59,9 +60,18 @@ interface LiveTurn {
   status: GatewayTurnStatus | undefined;
 }
 
-interface ValidatedRuntime {
-  readonly ensureSession: (input: Record<string, unknown>) => unknown;
-  readonly startTurn: (input: Record<string, unknown>) => unknown;
+/** The gateway's internal backend, either the synchronous acpx surface or the async bridge. */
+interface Backend {
+  ensureSession(input: Record<string, unknown>): { agentId: string; sessionId: string };
+  startTurn(session: GatewaySessionRef, request_id: string, instruction: string): void;
+  turnStatus(session: GatewaySessionRef, request_id: string): GatewayTurnStatus | undefined;
+}
+
+const DEFAULT_ASYNC_TIMEOUT_MS = 120_000;
+
+interface SyncRuntimeSurface {
+  ensureSession(input: Record<string, unknown>): unknown;
+  startTurn(input: Record<string, unknown>): unknown;
 }
 
 /**
@@ -71,9 +81,7 @@ interface ValidatedRuntime {
 export class OpenClawProductionGateway implements OpenClawGatewaySeam {
   readonly #config: OpenClawGatewayConfig;
   readonly #now: () => string;
-  /** RA-2a — live turn tracking is process-local; a restart forgets it, honestly. */
-  readonly #turns = new Map<string, LiveTurn>();
-  #runtime: ValidatedRuntime | undefined;
+  #backend: Backend | undefined;
 
   constructor(config: OpenClawGatewayConfig, now: () => string = () => new Date().toISOString()) {
     this.#config = config;
@@ -81,7 +89,7 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
   }
 
   ensure_session(request: GatewayEnsureSessionRequest): GatewaySessionRef {
-    const runtime = this.#acpRuntime();
+    const backend = this.#resolveBackend();
     const derive = this.#config.derive_session_input;
     if (derive === undefined) {
       // I-TD5 — the trusted input is host-owned. Refuse before any call, never fabricate it.
@@ -90,70 +98,16 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
       );
     }
     const input = derive(request);
-    const entry = runtime.ensureSession({ ...input, cwd: request.cwd });
-    if (isThenable(entry)) {
-      // The call already happened; what must not happen is treating an unresolved promise as a
-      // session. No ref is fabricated and the operation is reported unavailable (finding 1).
-      throw new GatewayUnavailable(
-        "ensureSession answered asynchronously; the synchronous RuntimeAdapter seam cannot consume it (BACKEND_BLOCKER — async seam revision required)",
-      );
-    }
-    const record = entry as { sessionId?: unknown; agentId?: unknown } | null;
-    const session_id = typeof record?.sessionId === "string" ? record.sessionId : undefined;
-    const agent_id = typeof record?.agentId === "string" ? record.agentId : undefined;
-    if (session_id === undefined || agent_id === undefined) {
-      throw new GatewayUnavailable(
-        "ensureSession answered without the audited {agentId, sessionId} shape; refusing to guess a session reference",
-      );
-    }
-    return { agent_id, session_id };
+    const entry = backend.ensureSession({ ...input, cwd: request.cwd });
+    return { agent_id: entry.agentId, session_id: entry.sessionId };
   }
 
   start_turn(session: GatewaySessionRef, request_id: string, instruction: string): void {
-    const runtime = this.#acpRuntime();
-    const key = `${session.agent_id}:${session.session_id}:${request_id}`;
-    const live: LiveTurn = { started_at: this.#now(), status: undefined };
-    const turn = runtime.startTurn({
-      handle: { agentId: session.agent_id, sessionId: session.session_id },
-      text: instruction,
-      requestId: request_id,
-    });
-    // RA-1b — the measured `startTurn` returns synchronously with `result: Promise<...>`. A turn
-    // object without that member is an incompatible API, not a turn.
-    const result = (turn as { result?: unknown } | null)?.result;
-    if (!isThenable(result)) {
-      throw new GatewayUnavailable(
-        "startTurn answered without the audited { result: Promise } shape; the turn cannot be observed and is not tracked",
-      );
-    }
-    this.#turns.set(key, live);
-    (result as Promise<{ status?: string; stopReason?: string; error?: { message?: string } }>)
-      .then((settled) => {
-        live.status = {
-          backend_status:
-            settled.status === "completed"
-              ? "COMPLETED"
-              : settled.status === "cancelled"
-                ? "CANCELLED"
-                : "RUNTIME_ERROR",
-          termination_reason:
-            settled.stopReason ?? settled.error?.message ?? String(settled.status),
-          started_at: live.started_at,
-          completed_at: this.#now(),
-        };
-      })
-      .catch((error: unknown) => {
-        live.status = {
-          backend_status: "RUNTIME_ERROR",
-          termination_reason: error instanceof Error ? error.message : String(error),
-          started_at: live.started_at,
-          completed_at: this.#now(),
-        };
-      });
+    this.#resolveBackend().startTurn(session, request_id, instruction);
   }
 
   turn_status(session: GatewaySessionRef, request_id: string): GatewayTurnStatus | undefined {
-    return this.#turns.get(`${session.agent_id}:${session.session_id}:${request_id}`)?.status;
+    return this.#backend?.turnStatus(session, request_id);
   }
 
   session_status(session: GatewaySessionRef): Record<string, unknown> {
@@ -177,9 +131,9 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
     });
   }
 
-  /** Resolves and shape-validates the acpx runtime from the configured install, once. */
-  #acpRuntime(): ValidatedRuntime {
-    if (this.#runtime !== undefined) return this.#runtime;
+  /** Resolves and shape-validates the backend once, choosing the sync or async driver. */
+  #resolveBackend(): Backend {
+    if (this.#backend !== undefined) return this.#backend;
     const dir = this.#config.agent_extension_dir;
     if (dir === null) {
       throw new GatewayUnavailable("the agent extension (acpx) is not installed (RA-4 C3)");
@@ -194,9 +148,7 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
       moduleExports = require(entry) as unknown;
     } catch (error) {
       throw new GatewayUnavailable(
-        `the agent extension entry ${entry} could not be loaded synchronously: ${
-          (error as Error).message
-        }`,
+        `the agent extension entry ${entry} could not be loaded synchronously: ${(error as Error).message}`,
       );
     }
 
@@ -211,19 +163,23 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
         "the loaded module does not expose the audited AcpRuntime surface (ensureSession/startTurn); refusing an unrecognized API",
       );
     }
-    // A declared-async ensureSession is the audited reality this synchronous seam cannot drive.
-    // Refusing here — before any call — is the whole point (finding 1).
-    if (ensureSession.constructor.name === "AsyncFunction") {
-      throw new GatewayUnavailable(
-        "the backend ensureSession is asynchronous; the synchronous RuntimeAdapter seam cannot drive it (BACKEND_BLOCKER — async seam revision required)",
-      );
-    }
 
-    this.#runtime = {
-      ensureSession: ensureSession.bind(surface) as ValidatedRuntime["ensureSession"],
-      startTurn: startTurn.bind(surface) as ValidatedRuntime["startTurn"],
-    };
-    return this.#runtime;
+    // #81 I2 — a declared-async ensureSession is the measured reality. It is no longer a blocker:
+    // the async backend is driven behind the adapter-local blocking bridge; a synchronous backend
+    // keeps the direct, in-process path (existing audited behaviour, unchanged).
+    this.#backend =
+      ensureSession.constructor.name === "AsyncFunction"
+        ? new BridgeBackend(dir, this.#config.async_backend_timeout_ms ?? DEFAULT_ASYNC_TIMEOUT_MS)
+        : new SyncBackend(
+            {
+              ensureSession: ensureSession.bind(surface) as (
+                input: Record<string, unknown>,
+              ) => unknown,
+              startTurn: startTurn.bind(surface) as (input: Record<string, unknown>) => unknown,
+            },
+            this.#now,
+          );
+    return this.#backend;
   }
 
   /** The package entry per its own manifest: `exports["."]` (any of its forms) or `main`. */
@@ -246,6 +202,117 @@ export class OpenClawProductionGateway implements OpenClawGatewaySeam {
     }
     return join(dir, relative);
   }
+}
+
+/** The audited synchronous acpx surface, driven directly in-process (unchanged behaviour). */
+class SyncBackend implements Backend {
+  readonly #runtime: SyncRuntimeSurface;
+  readonly #now: () => string;
+  /** RA-2a — live turn tracking is process-local; a restart forgets it, honestly. */
+  readonly #turns = new Map<string, LiveTurn>();
+
+  constructor(runtime: SyncRuntimeSurface, now: () => string) {
+    this.#runtime = runtime;
+    this.#now = now;
+  }
+
+  ensureSession(input: Record<string, unknown>): { agentId: string; sessionId: string } {
+    const entry = this.#runtime.ensureSession(input);
+    if (isThenable(entry)) {
+      throw new GatewayUnavailable(
+        "ensureSession answered asynchronously; the synchronous path cannot consume it",
+      );
+    }
+    return requireSessionShape(entry);
+  }
+
+  startTurn(session: GatewaySessionRef, request_id: string, instruction: string): void {
+    const key = `${session.agent_id}:${session.session_id}:${request_id}`;
+    const live: LiveTurn = { started_at: this.#now(), status: undefined };
+    const turn = this.#runtime.startTurn({
+      handle: { agentId: session.agent_id, sessionId: session.session_id },
+      text: instruction,
+      requestId: request_id,
+    });
+    const result = (turn as { result?: unknown } | null)?.result;
+    if (!isThenable(result)) {
+      throw new GatewayUnavailable(
+        "startTurn answered without the audited { result: Promise } shape; the turn cannot be observed and is not tracked",
+      );
+    }
+    this.#turns.set(key, live);
+    (result as Promise<{ status?: string; stopReason?: string; error?: { message?: string } }>)
+      .then((settled) => {
+        live.status = {
+          backend_status:
+            settled.status === "completed"
+              ? "COMPLETED"
+              : settled.status === "cancelled"
+                ? "CANCELLED"
+                : "RUNTIME_ERROR",
+          termination_reason: settled.stopReason ?? settled.error?.message ?? String(settled.status),
+          started_at: live.started_at,
+          completed_at: this.#now(),
+        };
+      })
+      .catch((error: unknown) => {
+        live.status = {
+          backend_status: "RUNTIME_ERROR",
+          termination_reason: error instanceof Error ? error.message : String(error),
+          started_at: live.started_at,
+          completed_at: this.#now(),
+        };
+      });
+  }
+
+  turnStatus(session: GatewaySessionRef, request_id: string): GatewayTurnStatus | undefined {
+    return this.#turns.get(`${session.agent_id}:${session.session_id}:${request_id}`)?.status;
+  }
+}
+
+/** The measured async acpx surface, driven synchronously behind the blocking bridge (#81 I2). */
+class BridgeBackend implements Backend {
+  readonly #bridge: BlockingBackendBridge;
+
+  constructor(agent_extension_dir: string, timeout_ms: number) {
+    this.#bridge = new BlockingBackendBridge({
+      factory_module: new URL("./acp-backend-factory.ts", import.meta.url).href,
+      factory_data: { agent_extension_dir },
+      timeout_ms,
+    });
+  }
+
+  ensureSession(input: Record<string, unknown>): { agentId: string; sessionId: string } {
+    return requireSessionShape(this.#bridge.call("ensureSession", input));
+  }
+
+  startTurn(session: GatewaySessionRef, request_id: string, instruction: string): void {
+    this.#bridge.call("startTurn", {
+      key: `${session.agent_id}:${session.session_id}:${request_id}`,
+      input: {
+        handle: { agentId: session.agent_id, sessionId: session.session_id },
+        text: instruction,
+        requestId: request_id,
+      },
+    });
+  }
+
+  turnStatus(session: GatewaySessionRef, request_id: string): GatewayTurnStatus | undefined {
+    const terminal = this.#bridge.call("turnStatus", {
+      key: `${session.agent_id}:${session.session_id}:${request_id}`,
+    }) as BackendTurnTerminal | null;
+    return terminal ?? undefined;
+  }
+}
+
+function requireSessionShape(entry: unknown): { agentId: string; sessionId: string } {
+  const record = entry as { sessionId?: unknown; agentId?: unknown } | null;
+  if (typeof record?.sessionId !== "string" || typeof record?.agentId !== "string") {
+    throw new GatewayUnavailable(
+      "ensureSession answered without the audited {agentId, sessionId} shape; refusing to guess a session reference",
+    );
+  }
+  return { agentId: record.agentId, sessionId: record.sessionId };
 }
 
 function entryFromExports(exports: unknown): string | undefined {

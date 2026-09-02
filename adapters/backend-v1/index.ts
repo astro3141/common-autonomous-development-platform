@@ -13,6 +13,7 @@ export {
   RuntimeOperationConflict,
   TurnNotObservable,
   GatewayUnavailable,
+  BlockingBackendBridge,
   type OpenClawGatewaySeam as BackendGatewaySeam,
   type GatewayEnsureSessionRequest,
   type GatewaySessionRef,

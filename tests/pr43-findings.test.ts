@@ -379,19 +379,19 @@ test("F1: a missing, unresolvable or unrecognized backend package fails before a
     });
     assert.throws(() => unrecognized.ensure_session(request), /audited AcpRuntime surface/);
 
-    // The audited reality: an async ensureSession is refused BEFORE any call is made.
+    // #81 I2 — the audited reality is an ASYNC ensureSession, and it is now consumable behind the
+    // adapter-local blocking bridge (the old "async => refused" behaviour is deliberately
+    // falsified here). The measured async surface resolves to a mapped, backend-owned handle.
     const asyncPkg = join(base, "async");
     mkdirSync(asyncPkg);
     writeFileSync(join(asyncPkg, "package.json"), JSON.stringify({ name: "a", main: "index.cjs" }));
     writeFileSync(
       join(asyncPkg, "index.cjs"),
-      `let calls = 0;
-module.exports = {
+      `module.exports = {
   AcpRuntime: {
-    ensureSession: async () => { calls += 1; return { agentId: "a", sessionId: "s" }; },
+    ensureSession: async (input) => ({ agentId: input.agent, sessionId: "s-async-1" }),
     startTurn: () => ({ result: Promise.resolve({ status: "completed" }) }),
   },
-  calls: () => calls,
 };\n`,
     );
     const asyncGateway = new BackendProductionGateway({
@@ -399,13 +399,11 @@ module.exports = {
       agent_extension_dir: asyncPkg,
       controller_agent_id: "controller",
       controller_cwd: base,
-      derive_session_input: () => ({ trusted_input: "derived-by-deployment", agent: "agent" }),
+      derive_session_input: (r) => ({ trusted_input: "derived-by-deployment", agent: r.runtime_profile }),
+      async_backend_timeout_ms: 10_000,
     });
-    assert.throws(() => asyncGateway.ensure_session(request), /asynchronous/);
-    const probe = createRequireForTest(join(asyncPkg, "package.json"))(join(asyncPkg, "index.cjs")) as {
-      calls: () => number;
-    };
-    assert.equal(probe.calls(), 0, "the async API was refused before any call — zero side effects");
+    const asyncRef = asyncGateway.ensure_session(request);
+    assert.deepEqual(asyncRef, { agent_id: request.runtime_profile, session_id: "s-async-1" });
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

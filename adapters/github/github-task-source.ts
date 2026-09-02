@@ -35,6 +35,14 @@ export interface GitHubIssuesTaskSourceConfig {
   readonly repo: string;
   /** Bounded discovery: how many open issues one pass may surface. */
   readonly discovery_limit?: number;
+  /**
+   * #81 I3 — the bounded source-intent selector. When present, discovery surfaces *exactly* the
+   * named issues and nothing else: the Supervisor never sees unrelated open work. Each entry is a
+   * positive-integer issue number as a string; a missing/PR/invalid target is fail-closed (never
+   * a fallback to all issues), and duplicates are refused. Absent selector preserves the
+   * general-purpose open-issue discovery mode (a valid adapter mode; the #52 Profile binds one).
+   */
+  readonly issue_allowlist?: readonly string[];
 }
 
 const PER_PAGE = 100;
@@ -56,11 +64,41 @@ export class GitHubIssuesTaskSource implements TaskSourceV1 {
     if (config.owner.length === 0 || config.repo.length === 0) {
       throw new TaskSourceError("CONFIG_INVALID", "/github", "owner and repo are required");
     }
+    if (config.issue_allowlist !== undefined) {
+      if (config.issue_allowlist.length === 0) {
+        throw new TaskSourceError("CONFIG_INVALID", "/github/issue_allowlist", "must not be empty when present");
+      }
+      const seen = new Set<string>();
+      for (const ref of config.issue_allowlist) {
+        if (!/^[1-9][0-9]*$/u.test(ref)) {
+          throw new TaskSourceError("CONFIG_INVALID", "/github/issue_allowlist", `not an issue number: ${JSON.stringify(ref)}`);
+        }
+        if (seen.has(ref)) {
+          throw new TaskSourceError("CONFIG_INVALID", "/github/issue_allowlist", `duplicate ref ${ref}`);
+        }
+        seen.add(ref);
+      }
+    }
     this.#transport = transport;
     this.#config = config;
   }
 
   discover_tasks(context: TaskDiscoveryContextV1): readonly TaskCandidate[] {
+    // #81 I3 — a bound allowlist surfaces exactly its issues, observed through the same
+    // authoritative per-issue path as get_task (a missing issue or a PR ref fails closed there),
+    // never the open-issue list. Absent allowlist keeps the general open-issue discovery mode.
+    if (this.#config.issue_allowlist !== undefined) {
+      return this.#config.issue_allowlist.map((ref) => {
+        const issue = this.#getIssue(ref);
+        return {
+          task_ref: String(issue.number),
+          title: issue.title,
+          summary: firstLine(issue.body ?? ""),
+          external_state: stateOf(issue),
+          discovered_at: context.observed_at,
+        };
+      });
+    }
     const limit = this.#config.discovery_limit ?? PER_PAGE;
     const issues = this.#listIssues("open").slice(0, limit);
     return issues.map((issue) => ({
