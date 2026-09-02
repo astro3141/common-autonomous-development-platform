@@ -52,7 +52,12 @@ export function nextAttemptOutcome(
       if (attempt.rework_count >= limits.max_rework) {
         return { attempt_state: from, task_state: "HELD", task_reason_code: "REWORK_LIMIT" };
       }
-      return { attempt_state: "REWORKING" };
+      // #48 — the rework's cause travels with the transition: "produced nothing" and "produced
+      // something unusable" are different facts an unattended diagnosis needs told apart.
+      return {
+        attempt_state: "REWORKING",
+        attempt_reason_code: fact.reason === "ABSENT" ? "NO_CANDIDATE_PRODUCED" : "CANDIDATE_INVALID",
+      };
     }
 
     case "VERIFICATION_PASSED": {
@@ -81,7 +86,8 @@ export function nextAttemptOutcome(
       if (attempt.rework_count >= limits.max_rework) {
         return { attempt_state: "VERIFYING", task_state: "HELD", task_reason_code: "REWORK_LIMIT" };
       }
-      return { attempt_state: "REWORKING" };
+      // #48 — a failed check is this rework's recorded cause.
+      return { attempt_state: "REWORKING", attempt_reason_code: "VERIFICATION_FAILED" };
     }
 
     case "AUDIT_DECIDED": {
@@ -105,7 +111,8 @@ export function nextAttemptOutcome(
               task_reason_code: "REWORK_LIMIT",
             };
           }
-          return { attempt_state: "REWORKING" };
+          // #48 — the settled FIX_REQUIRED verdict is this rework's recorded cause.
+          return { attempt_state: "REWORKING", attempt_reason_code: "AUDIT_FIX_REQUIRED" };
         case "HUMAN_REQUIRED":
           // The attempt stays where it is; the task parks until a person answers (§24).
           return {

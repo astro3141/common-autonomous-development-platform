@@ -29,6 +29,12 @@ export interface DeploymentConfig {
   };
   readonly report: { readonly root: string; readonly channel: string };
   readonly ingress: { readonly port: number; readonly host: string };
+  /**
+   * #55 — the read-only observation server (worker thread, own read-only store connection).
+   * `null` disables it. It exists so the read-only surface stays reachable while the lifecycle
+   * thread is inside a model turn; it holds no authority and accepts no mutation.
+   */
+  readonly observation: { readonly port: number; readonly host: string } | null;
   readonly supervisor_runtime_profile: string;
   /** Host-owned ephemeral directory for the RuntimeResultChannel; never inside a repository. */
   readonly result_channel_root: string;
@@ -112,6 +118,16 @@ export function validateConfig(raw: unknown, baseDir: string): DeploymentConfig 
       port: asPort(ingress["port"], "/ingress/port"),
       host: typeof ingress["host"] === "string" ? ingress["host"] : "127.0.0.1",
     },
+    observation:
+      root["observation"] === undefined || root["observation"] === null
+        ? null
+        : (() => {
+            const observation = asObject(root["observation"], "/observation");
+            return {
+              port: asPort(observation["port"], "/observation/port"),
+              host: typeof observation["host"] === "string" ? observation["host"] : "127.0.0.1",
+            };
+          })(),
     supervisor_runtime_profile: asString(
       root["supervisor_runtime_profile"],
       "/supervisor_runtime_profile",

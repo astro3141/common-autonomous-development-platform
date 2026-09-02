@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import socket
 import socketserver
+import tempfile
 import subprocess
 import sys
 import threading
@@ -100,6 +101,165 @@ class SessionRecord:
     bootstrap_delivered: bool = False
     active_turn: str | None = None
     turns: dict[str, TurnRecord] = field(default_factory=dict)
+
+
+class _TurnResponseChannel:
+    """ADP-owned one-shot response rendezvous for exactly one turn.
+
+    Mirrors the pinned IO mailbox rationale — turn correlation is decided on the orchestrator
+    side, every degenerate case fails safe (rejected delivery → upstream timeout/retry), never
+    fail-silent — without importing IO Control/planner/lifecycle: transport only, ADP still
+    validates every semantic. The bridge binds a fresh unguessably-named unix socket under its
+    own ``state_root`` and reads the model's JSON from the **accepted connection descriptor**,
+    never from a pathname — so no workspace filesystem state, and no path swap at any moment,
+    can redirect or forge the actual response I/O (the pre-write TOCTOU class is unreachable,
+    not merely checked for).
+
+    Identity/isolation properties:
+
+      one channel per turn        a fresh socket + a fresh slot; ``try_take`` reads only its own
+      duplicate delivery          rejected (`already delivered`); never a second result
+      late/stale delivery         the channel closes with the turn; a post-timeout/cancel
+                                  delivery is rejected and can never satisfy a later turn
+      malformed delivery          rejected at the socket; the slot stays empty and the round
+                                  times out — never COMPLETED evidence
+      pre-squatting               impossible: the per-turn directory name is minted by mkdtemp
+                                  after the turn starts and appears nowhere before the prompt
+      model swaps the socket path only breaks the model's *own* connection attempt: the bridge
+                                  listens on the bound descriptor, not the pathname
+      teardown                    descriptor-relative (unlinkat on the captured directory fd);
+                                  after model visibility no pathname is ever deleted or resolved
+
+    Mutation reach: the per-turn channel directory is an *authorized transport artifact* — the
+    same standing as the runtime result-channel root: host-owned ephemeral ground for collecting
+    a structured model result, outside every repository/workspace, carrying no lifecycle,
+    repository or policy authority. Creating it, binding one socket in it, unlinking that socket
+    descriptor-relatively, and leaving the empty directory behind is this channel's entire
+    filesystem reach.
+    """
+
+    MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, state_root: Path, turn_ref: str) -> None:
+        del state_root  # the channel deliberately lives outside both state_root and any cwd
+        # A fresh, unpredictably named host temp directory per turn: nothing model-visible names
+        # it before the prompt exists, so it cannot be pre-planted; it is short enough for the
+        # AF_UNIX path limit; and it sits outside every model-prompted workspace. A swap after
+        # creation cannot redirect the bridge either way — the listener owns the bound
+        # descriptor, not the pathname.
+        self._directory = Path(tempfile.mkdtemp(prefix="adp-io-turn-"))
+        # The directory *identity* is captured as a descriptor now — before the pathname becomes
+        # model-visible via the prompt — so teardown can operate relative to this inode and never
+        # re-resolve the (swappable) pathname. O_NOFOLLOW is defense in depth; mkdtemp just
+        # created a real directory under an unpublished, unpredictable name.
+        self._dir_fd = os.open(self._directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.turn_ref = turn_ref
+        self.socket_path = self._directory / "r.sock"
+        # Never created by anyone: the pinned response_reader branch of send_round only ever
+        # mentions this path in log strings and one diagnostic stat.
+        self.placeholder_path = self._directory / "r.placeholder.json"
+        self._lock = threading.Lock()
+        self._payload: dict[str, object] | None = None
+        self._delivered = False
+        self._closed = False
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self._server.bind(str(self.socket_path))
+        except OSError as exc:
+            self._server.close()
+            raise BridgeRefusal(
+                CAPABILITY_GAP, f"cannot bind the turn response socket: {exc}"
+            ) from exc
+        self._server.listen(8)
+        self._server.settimeout(0.2)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            with self._lock:
+                if self._closed:
+                    return
+            try:
+                connection, _peer = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(10.0)
+                try:
+                    payload = self._read_payload(connection)
+                except Exception as exc:  # noqa: BLE001 - a bad delivery is rejected, not fatal
+                    self._reply(connection, f"rejected: {exc}")
+                    continue
+                with self._lock:
+                    if self._closed:
+                        status = "rejected: turn is closed"
+                    elif self._delivered:
+                        status = "rejected: already delivered"
+                    else:
+                        self._payload = payload
+                        self._delivered = True
+                        status = "accepted"
+                self._reply(connection, status)
+
+    def _read_payload(self, connection: socket.socket) -> dict[str, object]:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > self.MAX_RESPONSE_BYTES:
+                raise ValueError("response exceeds the size bound")
+            chunks.append(chunk)
+        value = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("response must be a JSON object")
+        return value
+
+    @staticmethod
+    def _reply(connection: socket.socket, text: str) -> None:
+        try:
+            connection.sendall(text.encode("utf-8"))
+        except OSError:
+            pass
+
+    def try_take(self) -> dict[str, object] | None:
+        with self._lock:
+            payload = self._payload
+            self._payload = None
+            return payload
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        try:
+            # CHANNEL-CLEANUP TOCTOU repair (review 5502825797): once the socket pathname has
+            # been shown to the model, no teardown step may resolve it (or any parent component)
+            # again — every check-then-mutate sequence on the pathname is a race. Deletion is
+            # therefore *descriptor-relative*: `unlinkat(dir_fd, "r.sock")` removes the entry
+            # from the exact directory inode captured at creation, wherever that directory has
+            # been renamed to and whatever now sits at the old pathname. No pathname is deleted,
+            # ever. The empty host-owned temp directory itself is deliberately left behind
+            # (direction B): removing it by name would be another pathname mutation, and a
+            # bounded, unreachable, empty artifact under the host tmpdir is the safe trade.
+            if os.unlink in os.supports_dir_fd:
+                os.unlink("r.sock", dir_fd=self._dir_fd)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(self._dir_fd)
+            except OSError:
+                pass
+        self._thread.join(timeout=2.0)
 
 
 class BridgeState:
@@ -412,15 +572,27 @@ class BridgeState:
             self.turn_ops[op_key] = (session_ref, instruction_hash, turn_ref)
             self.turn_index[turn_ref] = (session_ref, turn)
 
-        response_path = self._response_path(record, turn_ref)
-        prompt = self._turn_prompt(record, instruction, response_path)
+        channel: _TurnResponseChannel | None = None
         try:
+            # PREWRITE-TOCTOU repair (review 5502523861) — the response never transits a
+            # model-writable pathname at all. The bridge owns a one-shot per-turn rendezvous
+            # (unix socket + in-memory slot, mirroring the pinned IO mailbox rationale without
+            # importing IO Control): the model delivers its JSON over a connection, the bridge
+            # reads from the *accepted descriptor*, and the pinned `send_round` runs in its
+            # `response_reader` branch, which provably touches no response file. A channel that
+            # cannot be established refuses the turn through the ordinary BridgeRefusal branch.
+            channel = _TurnResponseChannel(self.state_root, turn_ref)
+            prompt = self._turn_prompt(record, instruction, channel.socket_path)
             response = self.send_round(
                 record.io_session,
                 prompt=prompt,
-                response_file=response_path,
+                # Placeholder under the bridge's own state_root: the pinned response_reader
+                # branch never unlinks/reads/writes it (log strings and one diagnostic stat
+                # only), and it is never inside the model-prompted workspace.
+                response_file=channel.placeholder_path,
                 timeout_seconds=float(timeout),
                 role_label=record.role.lower(),
+                response_reader=channel.try_take,
             )
             if not _restricted_json(response):
                 raise BridgeRefusal(
@@ -474,19 +646,18 @@ class BridgeState:
                 failure_kind=type(exc).__name__,
             )
         finally:
-            self._cleanup_response_path(response_path)
+            if channel is not None:
+                # Closing the channel rejects every late/stale delivery: a response arriving
+                # after timeout/cancel/completion can never become this turn's (or any later
+                # turn's) success — the next turn opens a fresh socket and a fresh slot.
+                channel.close()
             with self.lock:
                 record.bootstrap_delivered = True
                 record.active_turn = None
         turn.result = result
         return {"turn_ref": turn_ref}
 
-    def _response_path(self, record: SessionRecord, turn_ref: str) -> Path:
-        directory = record.cwd / ".adp-io-runtime" / _sha256({"session": record.session_ref})
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{_sha256({'turn': turn_ref})}.json"
-
-    def _turn_prompt(self, record: SessionRecord, instruction: str, response_path: Path) -> str:
+    def _turn_prompt(self, record: SessionRecord, instruction: str, response_socket: Path) -> str:
         pieces = []
         if not record.bootstrap_delivered:
             pieces.extend(
@@ -519,8 +690,12 @@ class BridgeState:
             [
                 "IO execution response contract:",
                 response_contract,
-                f"Write it atomically to this exact path: {response_path}",
-                "Create a sibling temporary file and rename it into place only after valid JSON is complete.",
+                "Deliver the finished JSON through the ADP response socket; do not write it to any",
+                "ADP-designated file path (there is none this turn). Either stream it directly:",
+                f"  printf '%s' \"$RESPONSE_JSON\" | nc -U {response_socket}",
+                "or, if you prefer a scratch file, keep it inside your assigned workspace:",
+                f"  nc -U {response_socket} < ./adp-response.json",
+                "One delivery per turn; the socket replies `accepted` on receipt.",
             ]
         )
         return "\n".join(pieces)
@@ -549,15 +724,6 @@ class BridgeState:
             "response": response,
             "failure_kind": failure_kind,
         }
-
-    @staticmethod
-    def _cleanup_response_path(path: Path) -> None:
-        try:
-            path.unlink(missing_ok=True)
-            path.parent.rmdir()
-            path.parent.parent.rmdir()
-        except OSError:
-            pass
 
     def turn_result(self, turn_ref: str) -> dict[str, object]:
         with self.lock:

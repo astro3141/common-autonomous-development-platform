@@ -80,11 +80,20 @@ export interface MonitorCommand {
   readonly trigger_config: MonitorTriggerConfig;
 }
 
-/** §22.5 partial-result semantics: which authorities answered during this scan. */
+/**
+ * §22.5 partial-result semantics: which authorities answered during this scan.
+ *
+ * #47 (F2) — per-authority coverage is *merged across every observation of the scan*, never
+ * last-write-wins: an authority that both answered and failed within one scan is `PARTIAL`,
+ * reusing the existing partial-observation vocabulary (`AnomalyObservationV1.coverage`,
+ * routing/measurement `input_completeness`). A value here is a statement about the whole scan,
+ * not an artefact of iteration order, and §5.11's rule — never present a partial answer as a
+ * whole one — is what `PARTIAL` exists to satisfy.
+ */
 export type AuthorityCoverage = Readonly<
   Record<
     "store" | "runtime" | "repository" | "verification",
-    "AVAILABLE" | "UNAVAILABLE" | "NOT_QUERIED"
+    "AVAILABLE" | "UNAVAILABLE" | "PARTIAL" | "NOT_QUERIED"
   >
 >;
 
@@ -114,11 +123,23 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
   const anomalies: AnomalyObservationV1[] = [];
   const now = Date.parse(command.now);
   const config = command.trigger_config;
-  const coverage: Record<string, "AVAILABLE" | "UNAVAILABLE" | "NOT_QUERIED"> = {
+  const coverage: Record<string, "AVAILABLE" | "UNAVAILABLE" | "PARTIAL" | "NOT_QUERIED"> = {
     store: "AVAILABLE",
     runtime: "NOT_QUERIED",
     repository: "NOT_QUERIED",
     verification: "NOT_QUERIED",
+  };
+  // #47 — one merge rule for every per-authority observation in this scan: first observation
+  // sets the value, agreement keeps it, disagreement is PARTIAL. Nothing is erased.
+  const observe = (
+    authority: "store" | "runtime" | "repository" | "verification",
+    outcome: "AVAILABLE" | "UNAVAILABLE",
+  ): void => {
+    const current = coverage[authority];
+    coverage[authority] =
+      current === "NOT_QUERIED" || current === outcome
+        ? outcome
+        : "PARTIAL";
   };
   const report = (): MonitorReport => ({
     anomalies,
@@ -219,7 +240,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
             });
           }
         } catch {
-          coverage["store"] = "UNAVAILABLE";
+          observe("store", "UNAVAILABLE");
         }
       }
 
@@ -264,7 +285,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
         if (turn !== undefined) {
           try {
             const result = deps.runtime.get_turn_result(turn.value as unknown as RuntimeTurnHandle);
-            coverage["runtime"] = "AVAILABLE";
+            observe("runtime", "AVAILABLE");
             if (result.backend_status === "COMPLETED") {
               anomalies.push({
                 ...base,
@@ -278,9 +299,10 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
               });
             }
           } catch {
-            // The runtime authority was queried but did not answer, so its coverage is
-            // UNAVAILABLE; no anomaly can be claimed from that failed observation (§22.5).
-            coverage["runtime"] = "UNAVAILABLE";
+            // The runtime authority was queried and did not answer for this attempt. With merged
+            // coverage that is exactly what it is: one failed observation — PARTIAL if others
+            // succeeded, UNAVAILABLE if none did — never a confident absence claim (§22.5, #47).
+            observe("runtime", "UNAVAILABLE");
           }
         }
       }
@@ -293,7 +315,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
             const observation = deps.verification.get_verification_result(
               run_ref.value as unknown as VerificationRunHandle,
             );
-            coverage["verification"] = "AVAILABLE";
+            observe("verification", "AVAILABLE");
             if (observation.state !== "RUNNING") {
               anomalies.push({
                 ...base,
@@ -307,7 +329,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
               });
             }
           } catch {
-            coverage["verification"] = "UNAVAILABLE";
+            observe("verification", "UNAVAILABLE");
           }
         }
       }
@@ -323,7 +345,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
       ) {
         try {
           const head = deps.repository.snapshot_canonical().head;
-          coverage["repository"] = "AVAILABLE";
+          observe("repository", "AVAILABLE");
           const merged =
             head === attempt.candidate_commit ||
             deps.repository.verify_lineage(attempt.candidate_commit, head);
@@ -343,7 +365,7 @@ export function monitorOnce(deps: MonitorDeps, command: MonitorCommand): Monitor
             });
           }
         } catch {
-          coverage["repository"] = "UNAVAILABLE";
+          observe("repository", "UNAVAILABLE");
         }
       }
 

@@ -12,11 +12,38 @@ import { StoreError } from "./errors.ts";
 
 export type { DatabaseSync };
 
+export interface OpenDatabaseOptions {
+  /**
+   * #55 / §22.1 — an *observation* connection: SQLite-enforced read-only over the same WAL file.
+   * A WAL reader neither blocks nor is blocked by the single writer, and any write attempt fails
+   * at the database itself, so the single-writer invariant stays held by construction rather
+   * than by reviewer discipline. The journal mode must already be WAL (the writer set it);
+   * a read-only connection cannot and must not change it.
+   */
+  readonly read_only?: boolean;
+}
+
 /**
  * Opens the single writable connection and puts it in WAL mode, then verifies the mode by
  * querying the database rather than trusting the PRAGMA call.
  */
-export function openDatabase(filePath: string): DatabaseSync {
+export function openDatabase(filePath: string, options: OpenDatabaseOptions = {}): DatabaseSync {
+  if (options.read_only === true) {
+    const database = new DatabaseSync(filePath, { readOnly: true });
+    try {
+      const mode = readJournalMode(database);
+      if (mode !== "wal") {
+        throw new StoreError(
+          "JOURNAL_MODE_UNAVAILABLE",
+          `journal_mode is "${mode}", expected "wal" (TD D2 requires WAL)`,
+        );
+      }
+      return database;
+    } catch (error) {
+      database.close();
+      throw error;
+    }
+  }
   const database = new DatabaseSync(filePath);
   try {
     database.exec("PRAGMA journal_mode = WAL");

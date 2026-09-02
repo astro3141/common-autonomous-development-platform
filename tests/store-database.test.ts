@@ -77,7 +77,11 @@ test("single-writer boundary: the store opens exactly one connection", () => {
     const content = readFileSync(join(storeDirectory, name), "utf8");
     return [...content.matchAll(/new DatabaseSync\(/g)].map(() => name);
   });
-  assert.deepEqual(opens, ["database.ts"], "only database.ts may construct a connection");
+  // #55 — database.ts now constructs two connection kinds: the single writable connection and
+  // the SQLite-enforced read-only observation connection. The sealed boundary is *ownership* —
+  // no other module may construct a connection — and that is unchanged.
+  assert.deepEqual([...new Set(opens)], ["database.ts"], "only database.ts may construct a connection");
+  assert.ok(opens.length <= 2, "database.ts owns exactly the writable and read-only constructors");
 
   // No public API hands out a second writable connection or raw SQL execution.
   const publicSurface = readFileSync(join(storeDirectory, "platform-store.ts"), "utf8");

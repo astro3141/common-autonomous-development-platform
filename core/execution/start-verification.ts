@@ -319,7 +319,7 @@ function rejectCandidate(
 ): StartVerificationOutcome {
   const result = commitAttemptFact(store, {
     attempt_key,
-    fact: { kind: "CANDIDATE_REJECTED" },
+    fact: { kind: "CANDIDATE_REJECTED", reason },
   });
   return { kind: "CANDIDATE_REJECTED", attempt_key, reason, transition_seq: result.transition.seq };
 }
