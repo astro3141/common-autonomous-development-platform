@@ -353,12 +353,10 @@ Supervisor Runtime (selected execution-only RuntimeAdapter)
 │  Report Outbox (§21의 idempotent reporting)          │
 └───────────────┬─────────────────────────────────────┘
                 │  Backend Contracts (interfaces only)
-   ┌────────────┼──────────────┬───────────────┬────────────────┐
-   ▼            ▼              ▼               ▼                ▼
-RuntimeAdapter  WorkflowAdapter RepositoryAdapter VerificationAdapter ReportAdapter
-(model/turn)    (workflow owner) (local Git /     (workflow-free or    (Slack)
-                                  optional GitHub)  workflow-backed)
-                                optional GitHub)
+   ┌────────────┼────────────────┬───────────────────┬────────────────────┐
+   ▼            ▼                ▼                   ▼                    ▼
+RuntimeAdapter  WorkflowAdapter  RepositoryAdapter   VerificationAdapter  ReportAdapter
+(model/turn)    (workflow owner) (local Git/GitHub)  (workflow-free/backed) (Slack)
 ```
 
 핵심 topology 결정:
