@@ -3294,7 +3294,9 @@ hash가 authority다(§10.1의 four-way hash 유지).
 구성하기 위해 WORKFLOW와 VERIFICATION Manifest에만 schema version `2`를 추가한다. 공통 envelope/body와
 RUNTIME capability semantics는 §12.2a 그대로다. RUNTIME과 REPOSITORY Manifest는 v1을 계속 사용할 수
 있다. 기존 frozen Attempt의 v1 hash는 저장 당시 schema로 recovery하며 v2 의미로 소급 해석하지 않는다.
-이 amendment를 사용하는 **신규 production composition**은 WORKFLOW/VERIFICATION v2를 필수로 한다.
+legacy hash와 정확히 맞는 legacy recovery component가 설치되지 않았으면 mode를 추측하지 않고
+fail-closed한다. 이 amendment를 사용하는 **신규 production composition**은 WORKFLOW/VERIFICATION v2를
+필수로 한다.
 
 WORKFLOW Manifest v2는 공통 5필드에 정확히 다음 required field를 더한다:
 
@@ -4773,6 +4775,10 @@ required_fix  optional. FIX_REQUIRED에는 존재해야 하고, 존재하면 arr
 exact top-level field set / unknown-field 거부 / `reviewed` 검증은 전부 그대로다.
 
 ### 16.3 Audit decision commit 경로 (Decision)
+
+[Compatibility] pre-D26 Manifest v1에 bind된 frozen Attempt는 저장 당시 legacy settlement contract와 exact
+component hash로만 recovery한다. v1을 `NONE` 또는 `ADAPTER`로 새로 해석하지 않으며 matching legacy
+recovery component가 없으면 fail-closed한다. 아래 두-mode branch는 Manifest v2 Attempt의 contract다.
 
 - **Platform Core는 trusted owner identity를 생성·주장하지 않는다 (I-TD5).** workflow-backed
   settlement의 trusted owner/controller binding은 WorkflowAdapter와 그 backend가 소유하며, 필요한
@@ -6921,13 +6927,15 @@ startup → active run/batch/attempt 로드
        policy(execution_policy.recovery_policy.capability_downgrade: HOLD | PAUSE) 에 따라
        attempt HELD 또는 PAUSED_SAFELY. silent downgrade 재개 경로 없음
 → 각 authority에 fact 질의 (adapter별)
-→ unfinished audit decision 처리: frozen VERIFICATION Manifest v2의 `audit_settlement`를 재구성한다.
+→ unfinished audit decision 처리: frozen VERIFICATION Manifest가 v2이면 `audit_settlement`를 재구성한다.
    ADAPTER + audit-decision INTENT이면 §16.3 AD1–AD5 observe-before-act/re-observe-after만 사용하고,
    SETTLED를 authoritative하게 재확인한 뒤 audit_record/lifecycle transaction을 마무리한다.
    NONE이면 audit-decision INTENT/backend effect가 존재해서는 안 된다. 없으면 durable Auditor envelope와
    기존 evidence/binding/policy/drift gate를 다시 계산해 같은 local atomic commit으로 수렴한다.
    NONE인데 settlement INTENT/ref가 있거나 ADAPTER인데 member/provider/tuple이 맞지 않으면
-   `RECOVERY_CONFLICT`로 fail-closed하며 mode를 바꿔 복구하지 않는다.
+   `RECOVERY_CONFLICT`로 fail-closed하며 mode를 바꿔 복구하지 않는다. frozen Manifest가 v1이면 저장
+   당시 exact legacy component/hash 경로만 사용한다. v1에 v2 mode를 부여하거나 legacy component 부재를
+   NONE으로 접지 않는다.
 → attempt별 분류:
    CONSISTENT            → 재개
    EXPLAINABLE           → 대응 transition을 catch-up으로 적용 (decision_log에 RECOVERY 표기)
