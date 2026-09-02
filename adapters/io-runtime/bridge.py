@@ -412,9 +412,13 @@ class BridgeState:
             self.turn_ops[op_key] = (session_ref, instruction_hash, turn_ref)
             self.turn_index[turn_ref] = (session_ref, turn)
 
-        response_path = self._response_path(record, turn_ref)
-        prompt = self._turn_prompt(record, instruction, response_path)
+        response_path: Path | None = None
         try:
+            # BLOCKING_EXTERNAL_EFFECT repair — the path is constructed (and its containment
+            # proven) inside the try: a refusal terminates the turn as RUNTIME_ERROR through the
+            # ordinary BridgeRefusal branch instead of wedging the session's active turn.
+            response_path = self._response_path(record, turn_ref)
+            prompt = self._turn_prompt(record, instruction, response_path)
             response = self.send_round(
                 record.io_session,
                 prompt=prompt,
@@ -474,7 +478,8 @@ class BridgeState:
                 failure_kind=type(exc).__name__,
             )
         finally:
-            self._cleanup_response_path(response_path)
+            if response_path is not None:
+                self._cleanup_response_path(response_path)
             with self.lock:
                 record.bootstrap_delivered = True
                 record.active_turn = None
@@ -482,9 +487,62 @@ class BridgeState:
         return {"turn_ref": turn_ref}
 
     def _response_path(self, record: SessionRecord, turn_ref: str) -> Path:
-        directory = record.cwd / ".adp-io-runtime" / _sha256({"session": record.session_ref})
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{_sha256({'turn': turn_ref})}.json"
+        """The response location, proven to sit inside the exact assigned workspace.
+
+        BLOCKING_EXTERNAL_EFFECT repair (review 5501935839): every component of this path has a
+        deterministic, model-predictable name, and the model has workspace-write reach — so a
+        pre-planted symlink at `.adp-io-runtime`, at the session directory, or at the response
+        filename would redirect host-side mkdir/read/unlink effects outside `record.cwd`.
+        Containment is therefore established filesystem-aware (no lexical prefix checks): each
+        directory component is created one level at a time, never through a symlink, and the
+        final resolved directory must equal the resolved-root composition exactly. On any
+        failure the turn refuses before `send_round` — no external effect, no COMPLETED.
+        """
+        root = record.cwd.resolve(strict=True)
+        directory = self._contained_directory(
+            root, (".adp-io-runtime", _sha256({"session": record.session_ref}))
+        )
+        response = directory / f"{_sha256({'turn': turn_ref})}.json"
+        # A pre-existing entry at the deterministic response name is model-controlled
+        # indirection, not a fresh response. `unlink` operates on the link itself, so removing
+        # it never touches a target outside the workspace.
+        if response.is_symlink() or response.exists():
+            response.unlink()
+        if response.is_symlink() or response.exists():
+            raise BridgeRefusal(
+                CAPABILITY_GAP, f"pre-existing response target {response} cannot be cleared"
+            )
+        return response
+
+    @staticmethod
+    def _contained_directory(root: Path, components: tuple[str, ...]) -> Path:
+        """Creates `root/<components...>` while proving no component resolves elsewhere."""
+        current = root
+        for component in components:
+            current = current / component
+            if current.is_symlink():
+                raise BridgeRefusal(
+                    CAPABILITY_GAP,
+                    f"{current} is a symlink; the response path would escape the workspace",
+                )
+            try:
+                # One component at a time, never parents=True: mkdir(2) refuses a final
+                # symlink component with EEXIST, so no directory is ever created through one.
+                current.mkdir()
+            except FileExistsError:
+                if current.is_symlink() or not current.is_dir():
+                    raise BridgeRefusal(
+                        CAPABILITY_GAP,
+                        f"{current} is not a real directory inside the workspace",
+                    ) from None
+        resolved = current.resolve(strict=True)
+        expected = root.joinpath(*components)
+        if resolved != expected:
+            raise BridgeRefusal(
+                CAPABILITY_GAP,
+                f"response directory resolves to {resolved}, outside the assigned workspace",
+            )
+        return current
 
     def _turn_prompt(self, record: SessionRecord, instruction: str, response_path: Path) -> str:
         pieces = []
@@ -553,6 +611,11 @@ class BridgeState:
     @staticmethod
     def _cleanup_response_path(path: Path) -> None:
         try:
+            # If a component was swapped for a symlink mid-turn, deleting through it would be
+            # an external effect: re-verify no-follow before every removal and stand down
+            # rather than chase indirection. `unlink` itself never follows the final component.
+            if path.parent.is_symlink() or path.parent.parent.is_symlink():
+                return
             path.unlink(missing_ok=True)
             path.parent.rmdir()
             path.parent.parent.rmdir()
