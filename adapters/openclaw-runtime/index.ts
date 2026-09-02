@@ -16,3 +16,4 @@ export {
   OpenClawProductionGateway,
   type OpenClawGatewayConfig,
 } from "./production-gateway.ts";
+export { BlockingBackendBridge, type BackendTurnTerminal } from "./backend-bridge.ts";

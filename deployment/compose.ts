@@ -45,6 +45,7 @@ import {
 } from "../adapters/local-verification/index.ts";
 import type { WorkflowToolTransport } from "../adapters/local-verification/index.ts";
 import {
+  GatewayUnavailable,
   OpenClawProductionGateway,
   OpenClawRuntimeAdapter,
   type OpenClawGatewaySeam,
@@ -161,6 +162,12 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
       agent_extension_dir: config.backend.agent_extension_dir,
       controller_agent_id: config.backend.controller_agent_id,
       controller_cwd: config.backend.controller_cwd,
+      // #81 I1 — the audited `ensureSession` requires a host-owned trusted session input (I-TD5).
+      // The Platform never mints or stores it: the derivation reads the value only from the host
+      // process environment at call time, and returns just the trusted input plus the frozen
+      // role→agent mapping. A missing env value fails closed before any external effect, and the
+      // raw value never enters Profile/config/Store/Contract/handle/prompt/receipt.
+      derive_session_input: deriveBackendSessionInput,
     });
   const runtime =
     overrides.runtime ??
@@ -248,6 +255,27 @@ export function compose(config: DeploymentConfig, overrides: ComposeOverrides = 
   };
 }
 
+/**
+ * #81 I1 — the fixed host env var holding the backend's trusted session input (I-TD5). Its *name*
+ * is a non-secret installation fact stated in code; its *value* is read only here, at derive time,
+ * and never persisted or logged. A missing value fails the session path closed before any effect.
+ */
+export const TRUSTED_SESSION_INPUT_ENV = "ADP_BACKEND_TRUSTED_SESSION_INPUT";
+
+export function deriveBackendSessionInput(request: {
+  readonly runtime_profile: string;
+}): Record<string, unknown> {
+  const value = process.env[TRUSTED_SESSION_INPUT_ENV];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new GatewayUnavailable(
+      `the host trusted session input ${TRUSTED_SESSION_INPUT_ENV} is not set; ` +
+        "the backend host owns session identity (I-TD5) and the Platform will not invent it",
+    );
+  }
+  // role/runtime_profile → backend agent (Platform-frozen input); sessionKey → host-owned value.
+  return { sessionKey: value, agent: request.runtime_profile };
+}
+
 /** The deployment's registered TaskSource adapter ids. Registration is deployment vocabulary. */
 const DOCUMENT_TASK_SOURCE_ADAPTER = "ProjectDocumentTaskSource";
 const GITHUB_TASK_SOURCE_ADAPTER = "GitHubIssuesTaskSource";
@@ -292,10 +320,20 @@ function composeGitHubVertical(
   const owner = source_config["owner"];
   const repo = source_config["repo"];
   const discovery_limit = source_config["discovery_limit"];
+  const issue_allowlist = source_config["issue_allowlist"];
   if (typeof owner !== "string" || owner.length === 0 || typeof repo !== "string" || repo.length === 0) {
     throw new ConfigError(
       "/profiles/project_profile_path",
       `task source ${entry.id} (${GITHUB_TASK_SOURCE_ADAPTER}) requires config.owner and config.repo`,
+    );
+  }
+  // #81 I3 — the bounded source-intent selector is Profile-owned adapter config; the adapter
+  // validates the shape (fail-closed on empty/non-issue/duplicate). Deployment code never encodes
+  // a specific issue.
+  if (issue_allowlist !== undefined && !Array.isArray(issue_allowlist)) {
+    throw new ConfigError(
+      "/profiles/project_profile_path",
+      `task source ${entry.id} issue_allowlist must be an array of issue-number strings`,
     );
   }
 
@@ -304,6 +342,7 @@ function composeGitHubVertical(
     owner,
     repo,
     ...(typeof discovery_limit === "number" ? { discovery_limit } : {}),
+    ...(issue_allowlist === undefined ? {} : { issue_allowlist: issue_allowlist as readonly string[] }),
   });
 
   let materializer: GitHubIssuesChildMaterializer | undefined;
