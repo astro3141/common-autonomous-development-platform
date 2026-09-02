@@ -11,6 +11,7 @@
 | Measured design inputs | #89 `issuecomment-5507827981` + matrix `5507814549`; #90 `issuecomment-5508002386`; #91 `issuecomment-5508009180`; Control syncs `5507911324`, `5508030417`, `5508032252` |
 | Old-generation evidence | `TECHNICAL_DESIGN_autonomous_development_platform.md` (TD v1.5, blob `95af9e73c5c526e0bed6254482dce1047b906510`), Spec v0.3, Route-A/OpenClaw, fixed-point implementation — **HISTORICAL_OLD_GENERATION**, not architecture authority |
 | Production implementation | **NOT AUTHORIZED** by this document |
+| Revision | **r2 — bounded TD repair** after independent Review #94 `issuecomment-5509869710` (prior head `2ac11fe4c128ae642a7590f392efa0ca9ccb8b53`, blob `8dc809adcfacfbb8f7222d4224748b5382499667`). Architecture unchanged; changed sections: §2.1, §3.2, §3.3, §4.4, §4.6 (new), §5.2, §6.1, §6.4, §7.4, §9.3, §9.4, §13.1, §13.3, §15. |
 
 이 문서는 landed Spec v0.4의 K1–K7 constitutional kernel과 §8.2 autonomous-work product outcome을 구현 가능한 수준으로 닫는 최소 Technical Design이다.
 
@@ -70,8 +71,10 @@ Seven records, one store, one writer process (the Kernel Service). No Task/Attem
 - Wire and storage form: JSON (UTF-8).
 - Canonicalization scheme `cadp-jcs-1` = RFC 8785 JSON Canonicalization Scheme with two additional rules: (a) the record's own digest field (`envelope_digest`, `request_digest`, `input_digest`, `decision_digest`, `admission_digest`, `outcome_digest`) is **omitted** before canonicalization; (b) every timestamp is RFC 3339 UTC with millisecond precision and `Z` suffix.
 - Raw byte content (policy bundle, material bytes, claim payload > inline limit) uses scheme `raw-bytes-1` = the bytes as stored, no transformation.
-- Digest object is always `{ algorithm, canonicalization, value }`. Approved in this generation: `algorithm = sha256`, `canonicalization ∈ { cadp-jcs-1, raw-bytes-1 }`, `value` = lowercase hex.
-- The approved-scheme set is **policy-bound configuration**: it is carried inside the genesis policy bundle as `data.cadp.approved_digest_schemes` and re-read from the active `PolicyRefV1` content. A digest with an unapproved scheme is invalid input, never a different-but-equal identity.
+- Policy bundle payload uses scheme `cadp-bundle-payload-1` (defined in §5.2): a deterministic serialization of every bundle entry **except** `.manifest`, so that a bundle can carry its own payload identity without self-reference.
+- Digest object is always `{ algorithm, canonicalization, value }`. Approved in this generation: `algorithm = sha256`, `canonicalization ∈ { cadp-jcs-1, raw-bytes-1, cadp-bundle-payload-1 }`, `value` = lowercase hex.
+- **Bootstrap trust set (pre-genesis, fixed).** Before `policy_activation seq = 1` exists there is no active policy to consult, so the Kernel Service build carries a fixed, versioned bootstrap set `cadp-bootstrap-1` = `{ algorithms: [sha256], canonicalizations: [raw-bytes-1, cadp-jcs-1, cadp-bundle-payload-1], schema_digests: sha256 of the embedded k1..k7.v1 + genesis.v1 schemas, root_public_keys: read once from `secret/cadp-v04/root/pubkeys` at genesis }`. The bootstrap set is used **only** to (a) validate and seal the genesis `PolicyRefV1`, (b) verify the root signature on and seal the `GENESIS` envelope, (c) insert `policy_activation seq = 1`. Its digest is recorded in the `GENESIS` envelope claim (`bootstrap_set_digest`).
+- **After activation seq = 1** the approved-scheme set is **policy-bound configuration**: `data.cadp.approved_digest_schemes` in the active `PolicyRefV1` content governs every new write. It may extend but never remove `cadp-bootstrap-1` schemes while any stored row still carries them (verify-on-read must remain computable); a policy that attempts removal is rejected at `policy_ref` insert. A digest with an unapproved scheme is invalid input, never a different-but-equal identity.
 
 ### 2.2 Identity allocation
 
@@ -147,8 +150,10 @@ provenance         = { INDEPENDENT_OBSERVATION, AUTHENTICATED_SOURCE }
 ### 3.2 Tables (constitutional only)
 
 ```text
-policy_ref            (policy_id, revision) PK, content_digest, issuer_ref, bundle_cas_key
-policy_activation     seq PK (bigserial), policy_id, revision, content_digest,
+policy_ref            (policy_id, revision) PK, content_digest, issuer_ref, bundle_cas_key,
+                      payload_digest, manifest_revision                  -- impl columns, see §5.2
+policy_activation     seq PK (bigserial), expected_prev_seq NOT NULL UNIQUE,   -- CAS: seq == expected_prev_seq + 1
+                      policy_id, revision, content_digest,
                       activated_by_ref, activation_evidence_id, activated_at        -- append-only
 evidence_envelope     evidence_id PK, envelope_digest UNIQUE, envelope_json(jsonb), subject index
 effect_allocation     allocation_key PK, effect_id UNIQUE
@@ -167,7 +172,7 @@ Every `*_json` column stores the canonical JSON so that re-digesting the column 
 
 | Question (#94 D2) | Answer |
 |---|---|
-| PolicyRef activation / genesis | `policy_activation` is append-only; the **active** policy is the row with the highest `seq`. Genesis is `seq = 1`, `activated_by_ref = root key id`, `activation_evidence_id` → the signed `GENESIS` envelope (§9.4). Every later row references either an `EffectOutcomeV1(COMMITTED)` of a `POLICY_ACTIVATE` effect or a signed root/break-glass envelope (§9.4). |
+| PolicyRef activation / genesis | `policy_activation` is append-only; the **active** policy is the row with the highest `seq`. Genesis is `seq = 1`, `expected_prev_seq = 0`, `activated_by_ref = root key id`, `activation_evidence_id` → the signed `GENESIS` envelope (§9.4). Every later row references either an `EffectOutcomeV1(COMMITTED)` of a `POLICY_ACTIVATE` effect or a signed root/break-glass envelope (§9.4). **Activation CAS:** every row carries `expected_prev_seq`, `UNIQUE`, and a `CHECK (seq = expected_prev_seq + 1)`. An insert therefore succeeds only if it names the current active row as its predecessor and no other successor of that row exists; a second successor of the same predecessor is rejected by the constraint, not by application logic. This is what makes `POLICY_ACTIVATE` a target-native precondition (§6.4, §9.4). |
 | EffectRequest identity uniqueness | `effect_request.effect_id` PK. Insert of an existing `effect_id`: if `request_digest` equals the stored one → idempotent no-op (returns stored row); if it differs → insert rejected, `REQUEST_DIGEST_CONFLICT` incident written, scope hold. |
 | AdmissionInput / PolicyDecision exact binding | `policy_decision.admission_input_digest` FK → `admission_input.input_digest`; `admission_input.effect_request_digest` must equal `effect_request.request_digest` of the referenced `effect_id` (verified on write and on read). |
 | Atomic `(effect_id, dispatch_ordinal)` reservation + admission write | One transaction (§3.4). The unique constraint on `(effect_id, dispatch_ordinal)` makes the admission row itself the reservation; no separate reservation table. |
@@ -250,7 +255,9 @@ All checks run inside the admission transaction (§3.4) against rows read in tha
 9. `PEP_TARGET_IDENTITY` fresh and matching (§4.2);
 10. every `decision.constraints[]` is in the supported vocabulary (§5.3) and satisfiable now;
 11. material bytes at `material_ref` re-digest to `material_digest` (read here so that a CAS corruption refuses admission, not just dispatch);
-12. next ordinal admissible (§3.4).
+12. next ordinal admissible (§3.4);
+13. for `operation_kind = POLICY_ACTIVATE`: `material.expected_active_policy_ref` (policy_id, revision, content_digest, seq) equals the active row read in this transaction — otherwise refuse `ACTIVATION_BASE_STALE`;
+14. for every operation whose material names a mutable target subject (§4.6), the adapter's `dispatch_precondition` for that material is well-formed and, where the target offers no native CAS, the subject is a PEP-owned write-once reference (§6.4) — otherwise refuse `MUTABLE_TARGET_WITHOUT_PRECONDITION`.
 
 Any failure ⇒ no admission row, a structured refusal to the caller, and — for failures 6–8 and digest/corruption cases — a `KERNEL_INCIDENT` envelope.
 
@@ -264,6 +271,21 @@ Any failure ⇒ no admission row, a structured refusal to the caller, and — fo
 | after outcome write | admission + outcome | conclusive ⇒ nothing; `UNKNOWN` ⇒ Reconciler continues under policy bounds |
 
 There is no dispatch journal; the admission row is the pre-effect intent (Spec K6) and the target is the only authority about what happened after it.
+
+### 4.6 Dispatch-time precondition and serialization (admission→dispatch TOCTOU)
+
+Admission proves the world as of the admission transaction; the external call happens after commit. For **mutable** target subjects the PEP therefore enforces a second, dispatch-time gate. This gate never widens what was admitted; it can only turn an admitted dispatch into a no-call.
+
+1. **Precondition contract.** Every adapter operation declares in `describe()` a `dispatch_precondition ∈ { NATIVE_CAS, PEP_READ_THEN_ACT, NONE }` and, per material, the exact precondition it will apply:
+   - `NATIVE_CAS` — the target itself refuses the write unless a caller-supplied expected value matches (git ref update with `expected_old_sha`; Temporal `REJECT_DUPLICATE`; the activation log `expected_prev_seq`). Preferred; nothing can interleave.
+   - `PEP_READ_THEN_ACT` — the target has no CAS for this operation; the PEP performs a read-only `current_revision` immediately before the transport send inside the serialization domain (item 3) and aborts if it differs from the admitted binding. Permitted **only** when the subject is a PEP-owned write-once reference, so that the only writer that could move it between read and act is the PEP itself, which is excluded by item 3.
+   - `NONE` — no mutable subject in the material (e.g. `RECORD_WRITE` on an idempotency-keyed resource).
+2. **Immutable candidate references (GitHub reference path).** The PEP never opens a PR from a branch whose name is not a function of its content. Candidates are pushed to `refs/heads/cadp/candidate/<candidate_sha>`; the PEP's `GIT_PUSH` refuses any `ref` under `cadp/candidate/*` whose `new_sha ≠ <sha in ref name>` or whose `expected_old_sha ≠ 0000…` (write-once: no update, no delete). Branch protection on `cadp/candidate/**` allows the PEP App only, blocks force-push and deletion. `PR_CREATE.head_ref` must be such a candidate ref; `head_sha` is redundant with the ref name and both are recorded.
+3. **Serialization domain.** Each adapter declares `serialization_domain(material)` (GitHub: `repo_id`; record service: `tenant`; Temporal: `namespace`; store adapter: `policy_activation`). Between admission commit and outcome write the PEP holds an exclusive lock on that domain (`pg_advisory_xact_lock(hash(domain))` in a short dispatch transaction; process mutex on SQLite). Two governed effects on the same domain never interleave their read/act windows, in-process or across Kernel Service instances.
+4. **Precondition failure outcome.** If the dispatch precondition fails **before any transport send**, the PEP appends `EffectOutcomeV1(NO_EFFECT_CONFIRMED)` with `observer_ref = pep_ref`, `evidence_ref` → a `TARGET_RECONCILIATION` envelope carrying the target-authoritative `current_revision` read that failed and `transport_attempted = false`. This is the single case in which the PEP is the outcome observer: the no-effect proof is the target's own read plus the durable fact that no call was made, both inside the serialization lock. If a crash occurs after the read and before this row is written, restart finds an admission without outcome and the ordinary Reconciler path applies (`UNKNOWN` unless the target proves otherwise). A `NATIVE_CAS` rejection by the target is `REJECTED_NO_EFFECT` (§6.1) and follows §6.3.
+5. **After a precondition failure** the admitted material is stale by definition (the bound revision moved). The next ordinal of the same `effect_id` is admissible only if the material is unchanged and the subject has returned to the bound value; in every other case a **new** `EffectRequestV1` (new `effect_id`, `prior_effect_refs` naming this one) is required.
+
+Dispatch-time checks apply the admitted binding only. They do not re-evaluate policy, read new evidence, or accept a "newer" revision as equivalent.
 
 ---
 
@@ -294,9 +316,13 @@ The evaluator receives exactly the sealed `AdmissionInputV1` and the records it 
 ### 5.2 Reference implementation: OPA sidecar
 
 - OPA (measured 1.20.1, #89) runs as a sidecar in the kernel pod, listening on a unix domain socket owned by the PEP identity. Only the Kernel Service can connect.
-- **Policy content = the OPA bundle bytes.** `PolicyRefV1.content_digest = sha256(raw-bytes-1, bundle.tar.gz)`. The bundle embeds `data.cadp.policy_digest` equal to its own content digest (computed at bundle build, verified by the Ingress at `policy_ref` insert).
-- Query: `POST /v1/data/cadp/admission` with `input = ResolvedAdmissionBundle`; result object must contain `outcome`, `reason_codes`, `constraints`, and `policy_digest_echo`.
-- **Integrity proof** (`PolicyDecisionV1.evaluator.integrity_ref`): `opa:<opa_version>;bundle:<sha256 of bundle loaded, from OPA status API>;channel:unix:<socket path>;echo:<policy_digest_echo>`. The Sealer refuses to seal unless (a) status-API bundle digest, (b) `policy_digest_echo`, and (c) `decision.policy_ref.content_digest` are all equal. Signed-bundle verification (OPA `signing`) is the stronger option for remote evaluators (Unresolved U4).
+- **Policy content = the OPA bundle bytes; identity is external, not embedded.** `PolicyRefV1.content_digest = sha256(raw-bytes-1, bundle.tar.gz)` is computed by the Ingress over the exact bytes stored in CAS. **The bundle does not contain its own raw digest** (a raw digest cannot be embedded in the bytes it digests).
+- **Non-self-referential payload identity.** `payload_digest = sha256(cadp-bundle-payload-1, bundle)` where `cadp-bundle-payload-1` = for every tar entry except `.manifest`, ordered by path (bytewise), the concatenation of `path || 0x00 || uint64-BE(len(bytes)) || bytes`. Because `.manifest` is excluded, the manifest may carry a value derived from `payload_digest` without circularity.
+- **Manifest revision string.** The bundle's `.manifest` `revision` field is set at build time to `manifest_revision = "cadp-v04:policy:<policy_id>@<revision>#<payload_digest hex>"`. At `policy_ref` insert the Ingress unpacks the CAS bytes, recomputes `payload_digest`, parses `.manifest.revision`, and rejects unless the parsed `policy_id`/`revision`/`payload_digest` all match the row being inserted. Both `payload_digest` and `manifest_revision` are stored as implementation columns of `policy_ref` (§3.2); K1's four semantic fields are unchanged.
+- **Loading.** The PEP, not an external bundle server, serves the bundle to its OPA sidecar: it reads the CAS bytes for the active `content_digest`, verifies `sha256 == content_digest`, writes them to a PEP-owned local path, and OPA is configured with a `bundles.cadp` resource pointing at that path (`persist: false`). OPA never fetches policy from anywhere else.
+- **What OPA actually reports.** OPA's Status API (`GET /v1/status`) reports, per bundle, `active_revision` — the `revision` string of the currently activated bundle manifest — together with activation timestamps and errors. OPA also exposes the loaded manifest under `data.system.bundles["cadp"].manifest.revision`. OPA does **not** report a hash of the raw bundle bytes; that is why the raw `content_digest` is verified by the PEP at load time (previous bullet), not queried from OPA.
+- Query: `POST /v1/data/cadp/admission` with `input = ResolvedAdmissionBundle`; the policy's result object must contain `outcome`, `reason_codes`, `constraints`, and `revision_echo := data.system.bundles["cadp"].manifest.revision` (read from the manifest OPA loaded, not from a constant in the payload).
+- **Integrity proof** (`PolicyDecisionV1.evaluator.integrity_ref`): `opa:<opa_version>;bundle_revision:<active_revision from /v1/status>;content:<content_digest verified by PEP at load>;channel:unix:<socket path>`. The Sealer refuses to seal unless all four hold: (a) `/v1/status` shows `bundles.cadp.active_revision == policy_ref.manifest_revision` with no activation error; (b) `revision_echo == policy_ref.manifest_revision`; (c) the bytes the PEP last served to OPA re-digest to `decision.policy_ref.content_digest`; (d) `policy_ref.content_digest` is the active row's `content_digest`. Signed-bundle verification (OPA `bundles.<name>.signing` with a key from the active policy's `data.cadp.attestation_keys`) is the stronger option for remote evaluators (Unresolved U4).
 - Transport alternative (non-reference): mTLS with SPIFFE ids on both ends plus signed bundles; the integrity string then carries the peer SPIFFE id instead of the socket path.
 
 ### 5.3 Decision sealing, failure, and constraints
@@ -333,9 +359,12 @@ TargetAdapterV1 {
     target_type,
     operations[]: { operation_kind, material_schema,
                     idempotency: NONE | NATIVE_KEY | NATIVE_PRECONDITION,
+                    idempotency_horizon?: duration,      -- NATIVE_KEY valid only within this window (§6.4 Temporal)
+                    dispatch_precondition: NATIVE_CAS | PEP_READ_THEN_ACT | NONE,   -- §4.6
                     reconcile:   NONE | BY_OPERATION_REF | BY_QUERY_PREDICATE,
                     no_effect_proof_supported: bool }
   }
+  serialization_domain(material) -> string                                   (§4.6 item 3)
   prove_identity(credential) -> TargetIdentityClaim                         (read-only)
   current_revision(subject_binding) -> { revision_or_version?, content_digest?, availability }  (read-only)
   dispatch(effect_id, dispatch_ordinal, target_ref, operation_kind, material_bytes)
@@ -372,11 +401,15 @@ TargetAdapterV1 {
 
 **GitHub (development target)** — operations and what counts as authoritative:
 
-| operation_kind | material (schema) | idempotency | COMMITTED proof | NO_EFFECT_CONFIRMED proof |
+Serialization domain for all GitHub operations: `repo_id` (§4.6). Candidate references are write-once `refs/heads/cadp/candidate/<sha>` (§4.6 item 2).
+
+| operation_kind | material (schema) | idempotency / dispatch_precondition | COMMITTED proof | NO_EFFECT_CONFIRMED proof |
 |---|---|---|---|---|
-| `GIT_PUSH` | `{repo_id, ref, new_sha, expected_old_sha, bundle_cas_key}` | `NATIVE_PRECONDITION` | `GET /repos/{id}/git/ref/{ref}` returns `new_sha` | ref read (200) returns `expected_old_sha` **and** the target rejected the update with a validated reason (non-fast-forward / expected mismatch). A ref read alone showing the old sha is `UNKNOWN(REF_UNCHANGED_UNPROVEN)` unless the push transport returned a definitive rejection. |
-| `PR_CREATE` | `{repo_id, base_ref, head_ref, head_sha, title_digest, body_digest}` | `NONE` (GitHub has no create-PR idempotency key) | `POST` returned 201 with `head.sha == head_sha`, or reconcile `GET /pulls?head=owner:head_ref&state=all` (fully paginated, 200) finds exactly one PR with `head.sha == head_sha` created after `admitted_at` | list read succeeded (200, complete pagination), performed ≥ `pr_settle_window` (reference 30 s, Unresolved U5) after the last dispatch attempt, finds **zero** PRs for that head_ref created after `admitted_at`, **and** the head_ref currently exists (otherwise `UNKNOWN(HEAD_MISSING)`) |
-| `PR_MERGE` | `{repo_id, pr_number, expected_head_sha, merge_method}` | `NATIVE_PRECONDITION` (`sha` field of merge API) | `GET /pulls/{n}` → `merged == true` and `merge_commit_sha` present and PR head at merge == `expected_head_sha` | `GET /pulls/{n}` (200) → `merged == false` **and** the PR head is still `expected_head_sha` **and** no merge commit contains it on `base_ref` |
+| `GIT_PUSH` | `{repo_id, ref, new_sha, expected_old_sha, bundle_cas_key}`; for `ref` under `cadp/candidate/*` the PEP requires `ref == refs/heads/cadp/candidate/<new_sha>` and `expected_old_sha == 0000…` | `NATIVE_PRECONDITION` / `NATIVE_CAS` — git receive-pack with `expected_old_sha` (`--force-with-lease=<ref>:<expected_old_sha>` semantics; the update is rejected by the target if the ref moved) | `GET /repos/{id}/git/ref/{ref}` returns `new_sha` | the push transport returned a definitive `expected-old-sha mismatch`/`non-fast-forward` rejection **and** a subsequent ref read (200) does not return `new_sha`. A ref read alone is `UNKNOWN(REF_UNCHANGED_UNPROVEN)`. |
+| `PR_CREATE` | `{repo_id, base_ref, head_ref = refs/heads/cadp/candidate/<head_sha>, head_sha, title_digest, body_digest}`; admission refuses any other `head_ref` shape (§4.4 #14) | `NONE` (GitHub has no create-PR idempotency key) / `PEP_READ_THEN_ACT` — inside the `repo_id` lock: `GET ref head_ref` must equal `head_sha` immediately before `POST /pulls`; since the ref is write-once and PEP-only, nothing can move it between read and act | `POST` returned 201 with `head.sha == head_sha`, or reconcile `GET /pulls?head=owner:head_ref&state=all` (fully paginated, 200) finds exactly one PR with `head.sha == head_sha` created after `admitted_at` | precondition failure before send (§4.6 item 4); otherwise: list read succeeded (200, complete pagination), performed ≥ `pr_settle_window` (reference 30 s, Unresolved U5) after the last dispatch attempt, finds **zero** PRs for that head_ref created after `admitted_at`, **and** the head_ref currently exists at `head_sha` (otherwise `UNKNOWN(HEAD_MISSING)`) |
+| `PR_MERGE` | `{repo_id, pr_number, expected_head_sha, merge_method}` | `NATIVE_PRECONDITION` / `NATIVE_CAS` — the merge API `sha` field; GitHub rejects (409) if the PR head moved | `GET /pulls/{n}` → `merged == true` and `merge_commit_sha` present and PR head at merge == `expected_head_sha` | the merge call returned the target's definitive `409 head mismatch` **and** `GET /pulls/{n}` (200) → `merged == false`; a bare `merged == false` read is `UNKNOWN` |
+
+A PR whose receipt `head.sha ≠ head_sha` can no longer arise from ref drift (the ref cannot drift); if it is ever observed it is a `RECEIPT_MATERIAL_MISMATCH` incident (§6.3) and the created PR is left for a policy-governed compensation effect.
 
 **Record service (non-development target, the #89 Vertical B service or any API with the same contract):**
 
@@ -384,11 +417,43 @@ TargetAdapterV1 {
 |---|---|---|---|---|
 | `RECORD_WRITE` | `{tenant, resource_id, body_digest, body_cas_key, idempotency_key = cadp-v04:<effect_id>}` | `NATIVE_KEY` (must pass the double-dispatch test) | `GET /records?idempotency_key=` (authoritative store read, 200) returns one record whose `body_digest` matches | same read returns none **and** the service's write log query for the key returns none **and** the read is not served from a replica (service must expose `X-Read-Authority: primary` or equivalent; otherwise `UNKNOWN`) |
 
-**Temporal (continuation target, §7):**
+**Temporal (continuation target, §7)** — exact reference contract:
 
 | operation_kind | material | idempotency | COMMITTED | NO_EFFECT_CONFIRMED |
 |---|---|---|---|---|
-| `WORK_START` | `{namespace, workflow_type, workflow_id = cadp-work-<effect_id>, task_queue, args_digest, bounds, work_bindings, policy_ref}` | `NATIVE_KEY` (`WorkflowIdReusePolicy = REJECT_DUPLICATE`; `StartWorkflow` returns the existing run for the same id) | `DescribeWorkflowExecution` returns a run whose start args digest == `args_digest` | `DescribeWorkflowExecution` → `NOT_FOUND` from the namespace's persistence (not a visibility index) |
+| `WORK_START` | `{namespace, workflow_type, workflow_id = cadp-work-<effect_id>, task_queue, args_digest, bounds, work_bindings, policy_ref}`; start request also sets memo `{cadp_effect_id, cadp_args_digest}` | `NATIVE_KEY` with `idempotency_horizon = namespace retention` / `NATIVE_CAS` (see below) | `DescribeWorkflowExecution(workflow_id)` (persistence-backed, not visibility) returns an execution whose memo `cadp_effect_id == effect_id` and `cadp_args_digest == args_digest`; `run_id` is the `target_operation_ref` | `DescribeWorkflowExecution` → `NOT_FOUND` **and** `now < admitted_at + retention` (inside the horizon Temporal's answer is authoritative); outside the horizon `NOT_FOUND` is `UNKNOWN(RETENTION_EXPIRED)` |
+
+Start parameters (Temporal Server 1.31 / SDK semantics):
+
+```text
+WorkflowIdReusePolicy    = WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+                           -> a closed execution with the same workflow_id (within retention) blocks any new start
+WorkflowIdConflictPolicy = WORKFLOW_ID_CONFLICT_POLICY_FAIL
+                           -> a running execution with the same workflow_id makes StartWorkflow fail;
+                              the PEP never uses USE_EXISTING, because "the existing run" must be proven
+                              to be this effect via memo, not assumed
+```
+
+`StartWorkflow` response mapping:
+
+```text
+success (run_id)                                   -> ACCEPTED { target_operation_ref = run_id, receipt = memo echo }
+WorkflowExecutionAlreadyStartedFailure             -> AMBIGUOUS; Reconciler: Describe -> memo match ? COMMITTED
+                                                      : RECEIPT_MATERIAL_MISMATCH incident (same id, other effect)
+gRPC UNAVAILABLE / DEADLINE_EXCEEDED / conn reset  -> AMBIGUOUS -> UNKNOWN -> Reconciler (Describe)
+INVALID_ARGUMENT / PERMISSION_DENIED / NOT_FOUND(ns)-> REJECTED_NO_EFFECT { proof = the gRPC status }, since the
+                                                      service rejected the request before creating any execution
+```
+
+Retention and authority: the namespace `workflowExecutionRetentionPeriod` (reference 30 d) bounds how long Temporal remembers a closed `workflow_id`. After it expires, `REJECT_DUPLICATE` no longer protects and a second `StartWorkflow` with the same id would succeed. Therefore Temporal's dedupe is **only** a within-horizon transport safeguard; the CADP ledger remains the authority: the PEP never admits a next ordinal of a `WORK_START` whose `effect_id` has a `COMMITTED` outcome (regardless of Temporal state), and outside `idempotency_horizon` the operation is treated as `NONE` for §3.4 purposes (no re-dispatch after ambiguity without `NO_EFFECT_CONFIRMED`). Temporal history is likewise never consulted as effect authority (§7.1).
+
+**Constitutional store (policy activation target, §9.4):**
+
+| operation_kind | material | idempotency / dispatch_precondition | COMMITTED | NO_EFFECT_CONFIRMED |
+|---|---|---|---|---|
+| `POLICY_ACTIVATE` | `{new_policy_ref{policy_id, revision, content_digest}, expected_active_policy_ref{policy_id, revision, content_digest, seq}}` | `NATIVE_PRECONDITION` / `NATIVE_CAS` — insert `policy_activation(expected_prev_seq = expected.seq, …)`; the `UNIQUE(expected_prev_seq)` + `CHECK(seq = expected_prev_seq + 1)` constraints reject any insert whose base is no longer the active row | the row exists with `seq = expected.seq + 1` and `content_digest = new_policy_ref.content_digest` | the insert was rejected by the constraint **and** a read shows `max(seq) ≠ expected.seq` or a different successor already present |
+
+Serialization domain: `policy_activation` (one activation dispatch at a time per deployment). An activation admitted under policy Pₙ carries `expected_active = seq(Pₙ)`; if any other activation lands first, this one can never insert, so a superseded constitution can never be reinstated by a late dispatch.
 
 Receipt binding rule (all targets): a receipt is bound only if at least one target-native field in it is a function of the material (`head_sha`, `merge_commit_sha`, `body_digest`, `args_digest`, `new_sha`). A receipt without such a field cannot produce `COMMITTED`.
 
@@ -429,7 +494,18 @@ The PEP admits it like any effect (§3.4/§4.4) and dispatches `StartWorkflow` w
 
 - `work_run_ref = effect_id(WORK_START)`. Every ordinary step is a Temporal activity with a deterministic `step_ordinal`.
 - Each step emits `EvidenceEnvelopeV1(evidence_kind = WORK_STEP)` with `subject_bindings = [work_run_ref, step input digest, step output digest]` and `claim.prior_step_envelope_digest` — a causal chain reconstructable from the store alone.
-- Effect identity across replay: the workflow requests `allocate_effect_id(allocation_key)` with `allocation_key = sha256(work_run_ref || step_ordinal || purpose)`. The Ingress returns the same `effect_id` for the same key (§2.2). After a restart, replayed code asks for the same key and receives the same `effect_id`; the store then tells it whether a request, decision, admission, or outcome already exists. **No step ever creates a second logical effect for the same purpose.**
+- Effect identity across replay: the workflow requests `allocate_effect_id(allocation_key)` where
+
+  ```text
+  allocation_key = "cadp-v04:alloc:" + sha256( cadp-jcs-1( {
+      "schema":        "cadp.allocation-key.v1",
+      "work_run_ref":  <string, the WORK_START effect_id>,
+      "step_ordinal":  <integer, no leading zeros, ≥ 1>,
+      "purpose":       <string from the closed vocabulary declared in the policy bundle: data.cadp.allocation_purposes>
+  } ) )
+  ```
+
+  Raw concatenation is prohibited: the tuple is a versioned canonical JSON object (RFC 8785 field ordering, typed values), so component boundaries and types are unambiguous and a future `v2` tuple cannot collide with `v1`. The Ingress recomputes the key from the submitted tuple (the caller sends the tuple, not the hash) and rejects unknown `purpose` values. The Ingress returns the same `effect_id` for the same key (§2.2). After a restart, replayed code asks for the same key and receives the same `effect_id`; the store then tells it whether a request, decision, admission, or outcome already exists. **No step ever creates a second logical effect for the same purpose.**
 - Before requesting any admission, the workflow's activity reads `get_effect_state(effect_id)` from the kernel and branches on durable rows (Spec §6.3 restated): `COMMITTED` → continue with the committed result; `NO_EFFECT_CONFIRMED` → may request the next admission; `UNKNOWN`/unresolved → wait for reconcile / policy exception. Temporal retry policies are configured to retry **activities that read**, never the dispatch (dispatch is not an activity of the worker at all; it happens inside the PEP).
 
 ### 7.5 Human appears only where policy says so
@@ -501,7 +577,10 @@ cadp.human-decision.v1 {
 }
 ```
 
-- Reference Human interaction products (both commodity): (a) development — a GitHub PR review by a human account listed in policy; the adapter binds `commit_id` and the PR's `target_ref`; (b) generic — a minimal SSO-protected approval page that posts the envelope to the Ingress and signals Temporal. Slack buttons or issue comments without authenticated principal binding are not accepted as `HUMAN_DECISION` (they may be `UNATTESTED` context evidence at most).
+- **Effect-scoped approval requires the effect to exist first.** An effect-scoped `HUMAN_DECISION` is accepted only if the `EffectRequestV1` it names was sealed **before** the decision was issued and the Human was shown that exact identity. The adapter never post-fills `scope.effect_id` from context; a decision whose surface did not present the effect id is at most `UNATTESTED` context evidence and cannot satisfy §4.4 #5.
+- **Reference path A (conformance path for effect-scoped approvals): SSO approval surface.** Flow: workflow requests evaluation → `REQUIRE_EVIDENCE(HUMAN_DECISION)` → the workflow calls `seal_effect_request` first (the merge/other effect now has an `effect_id` and `request_digest`) → the approval page renders, from the kernel's `get_effect_state`, the `effect_id`, `request_digest`, `target_ref`, `material_digest`, `candidate_sha` and a link to the candidate diff → the Human approves → the page POSTs the envelope with `scope = {effect_id, target_ref, material_digest, candidate_sha}` copied from what was rendered, plus `presented_request_digest` → the Ingress verifies the authenticated principal, that `effect_request(effect_id).request_digest == presented_request_digest`, and that `issued_at > effect_request.requested_at`; otherwise reject. The workflow then assembles a new `AdmissionInputV1` including this envelope.
+- **Reference path B (GitHub-native review, subject-bound via notice).** A GitHub PR review natively binds `commit_id`, not a CADP effect. It may be admitted as effect-scoped only through a **binding notice**: after sealing the `PR_MERGE` effect, the PEP posts a check-run (or PR comment) on the PR containing `effect_id`, `request_digest`, `expected_head_sha`; the review adapter accepts a review as `HUMAN_DECISION` for that effect only if `review.commit_id == expected_head_sha`, `review.submitted_at > notice.posted_at`, the reviewer is listed in policy, and the notice is still the latest for that PR; `scope.effect_id` is taken from the notice and `claim.binding = SUBJECT_BOUND_VIA_NOTICE` is recorded so policy can accept or refuse this weaker form. If policy requires the Human to have seen the effect id explicitly, path A is mandatory.
+- Slack buttons or issue comments without authenticated principal binding are not accepted as `HUMAN_DECISION`.
 - Scope is mandatory; the PEP check §4.4 #5 makes a decision unusable for any other effect. Idempotent recovery of the **same** `effect_id` may reference the same decision; a new `effect_id` needs a new decision.
 - Freshness: policy `EVIDENCE_MAX_AGE(HUMAN_DECISION, …)`.
 
@@ -509,14 +588,14 @@ cadp.human-decision.v1 {
 
 **Genesis (out-of-band, root authority):**
 1. Root operator creates namespace resources: DB schema `k04`, Temporal namespace `cadp-v04`, secret path `secret/cadp-v04/pep/*`, PEP workload identity, network policies.
-2. Builds the genesis OPA bundle; computes `content_digest`; writes `policy_ref(policy_id=cadp-v04:policy:root, revision=1)`.
-3. Signs a genesis document `{policy_ref, issuer_ref = root key id, pep_identity, secret_path, created_at}` with the offline root key; stores it in CAS; the Ingress (bootstrapped with the root public key) seals it as `GENESIS` evidence (`SIGNED_ATTESTATION`).
-4. Inserts `policy_activation seq=1` referencing that envelope.
+2. Builds the genesis OPA bundle with `.manifest.revision = manifest_revision` (§5.2); computes `content_digest` and `payload_digest` under the fixed bootstrap set `cadp-bootstrap-1` (§2.1); writes `policy_ref(policy_id=cadp-v04:policy:root, revision=1)`.
+3. Signs a genesis document `{policy_ref, issuer_ref = root key id, pep_identity, secret_path, bootstrap_set_digest, created_at}` with the offline root key; stores it in CAS; the Ingress, validating with the bootstrap set and the root public key(s) loaded from `secret/cadp-v04/root/pubkeys`, seals it as `GENESIS` evidence (`SIGNED_ATTESTATION`).
+4. Inserts `policy_activation(seq=1, expected_prev_seq=0)` referencing that envelope. From this row on, scheme approval comes from the active policy (§2.1).
 5. Places PEP credentials in the secret path. No agent/model participates.
 
-**Policy change (ordinary):** new bundle → new `policy_ref` row (revision+1) → `EffectRequestV1(operation_kind = POLICY_ACTIVATE, target_ref = cadp-store:k04 activation log, material = new PolicyRefV1)` evaluated under the **current** policy → admission → the PEP's "store adapter" inserts the `policy_activation` row (this insert is the dispatch; `NATIVE_KEY` = `(policy_id, revision)` uniqueness; reconcile = read the log) → `COMMITTED`. Policy may require a `HUMAN_DECISION` for it.
+**Policy change (ordinary):** new bundle → new `policy_ref` row (revision+1) → `EffectRequestV1(operation_kind = POLICY_ACTIVATE, target_ref = cadp-store:k04 policy_activation, material = {new_policy_ref, expected_active_policy_ref = the active row incl. its seq})` evaluated under the **current** policy → admission (recheck #13 requires `expected_active` still active) → dispatch = insert `policy_activation(expected_prev_seq = expected_active.seq)`; the `UNIQUE(expected_prev_seq)` / `CHECK(seq = expected_prev_seq + 1)` constraints make this a target-native CAS (§6.4) → `COMMITTED`. Two activations admitted under the same base cannot both land; the loser gets `REJECTED_NO_EFFECT` and needs a new effect against the new base. Policy may require a `HUMAN_DECISION` for activation.
 
-**Root/break-glass:** a `BREAK_GLASS` envelope signed by the root key (`SIGNED_ATTESTATION`) with `{principal, reason, scope, prior_policy_ref, new_policy_ref?, release_incident_refs?, expires_at}`. Its only powers: (a) insert a `policy_activation` row referencing it; (b) act as `INCIDENT_RELEASE` for named incidents. It **cannot** admit an ordinary effect, rewrite any outcome, or be used by workers. It is append-only evidence like everything else.
+**Root/break-glass:** a `BREAK_GLASS` envelope signed by the root key (`SIGNED_ATTESTATION`) with `{principal, reason, scope, prior_policy_ref, new_policy_ref?, release_incident_refs?, expires_at}`. Its only powers: (a) insert a `policy_activation` row referencing it — subject to the same `expected_prev_seq` CAS (the signed document names the base seq it supersedes); (b) act as `INCIDENT_RELEASE` for named incidents. It **cannot** admit an ordinary effect, rewrite any outcome, or be used by workers. It is append-only evidence like everything else.
 
 ### 9.5 Retention / archival (root operation)
 
@@ -606,8 +685,15 @@ All tests are executed against the reference composition (§11) on a disposable 
 | C17 | target identity mismatch | point credential at repo A, request target repo B (same name, different id) | refusal `TARGET_MISMATCH` |
 | C18 | Human decision reuse | approve `effect_x`, present for `effect_y` | refusal §4.4 #5 |
 | C19 | break-glass misuse | present a `BREAK_GLASS` envelope as evidence for an ordinary effect | not accepted as `HUMAN_DECISION`; admission refused |
+| C20 | admission→dispatch drift (GitHub) | admit `PR_CREATE` for candidate ref at SHA A; before dispatch attempt (i) a governed `GIT_PUSH` moving that candidate ref to SHA B, (ii) an out-of-band push with an admin token | (i) refused at admission (`cadp/candidate/*` write-once rule) and rejected by branch protection; (ii) rejected by branch protection; if the test disables protection to force the move, the dispatch precondition (`GET ref ≠ head_sha`) fails → `NO_EFFECT_CONFIRMED(DISPATCH_PRECONDITION_FAILED)`, **no POST**, PR delta 0, zero PRs with `head.sha == B` |
+| C21 | admission→dispatch drift (generic CAS) | admit `GIT_PUSH` with `expected_old_sha = X`; move the ref to Y out-of-band; dispatch | target rejects (`NATIVE_CAS`) → `REJECTED_NO_EFFECT`; ref remains Y; no admission of a next ordinal without new material |
+| C22 | policy activation reorder | active P1; admit A: P1→P2 (`expected seq=1`) and B: P1→P3 (`expected seq=1`); dispatch B then A | B: `COMMITTED`, active = P3 (seq 2); A: constraint violation → `REJECTED_NO_EFFECT`; `max(seq)` stays 2, active remains P3; a re-issued A needs `expected seq=2` and a fresh evaluation under P3 |
+| C23 | allocation key ambiguity | tuples `{run R, step 12, purpose "a"}` vs `{run R, step 1, purpose "2a"}`; malformed `step_ordinal` (`"01"`, float); unknown purpose | distinct keys; malformed tuples rejected by the Ingress; no `effect_allocation` row for rejects |
+| C24 | Human approval without effect binding | (i) SSO POST whose `presented_request_digest` ≠ current; (ii) GitHub review submitted before the binding notice, or with `commit_id ≠ expected_head_sha`; (iii) adapter attempts to post-fill `scope.effect_id` | (i) Ingress rejects; (ii) not sealed as effect-scoped `HUMAN_DECISION`; (iii) adapter conformance FAIL — no envelope with `scope.effect_id` exists that the Human surface did not present |
+| C25 | Temporal dedupe horizon | `WORK_START` `COMMITTED`, workflow closed, retention expired (test namespace with 1 min retention); orchestrator requests a next ordinal | admission refused: `effect_id` already `COMMITTED`; no second execution created; `Describe NOT_FOUND` recorded as `UNKNOWN(RETENTION_EXPIRED)`, never `NO_EFFECT_CONFIRMED` |
+| C26 | OPA revision mismatch | serve a bundle whose `.manifest.revision` does not match its recomputed `payload_digest`, or activate a bundle while OPA still reports the previous `active_revision` | `policy_ref` insert rejected; Sealer refuses (`EVALUATOR_INTEGRITY_FAILURE` incident); no `PolicyDecisionV1` sealed |
 
-Guard-bite check (from #89): for C1, C2, C3, C6, C9, C10, C11 the test additionally removes the corresponding kernel check and asserts the prohibited effect **does** occur (delta 1). A control whose removal changes nothing is reported as defence-in-depth, not as load-bearing.
+Guard-bite check (from #89): for C1, C2, C3, C6, C9, C10, C11, C20, C22 the test additionally removes the corresponding kernel check and asserts the prohibited effect **does** occur (delta 1). A control whose removal changes nothing is reported as defence-in-depth, not as load-bearing.
 
 ### 13.2 Product controls (Spec §13.4–13.5, §8.2)
 
@@ -624,12 +710,14 @@ Guard-bite check (from #89): for C1, C2, C3, C6, C9, C10, C11 the test additiona
 ### 13.3 Adapter conformance suite (per target adapter, per operation)
 
 - `describe()` vs behaviour: `NATIVE_KEY` ⇒ double dispatch yields one effect; `NATIVE_PRECONDITION` ⇒ re-apply is a no-op; `no_effect_proof_supported` ⇒ the proof predicate is demonstrated on a known-absent effect **and** shown to return `UNKNOWN` under replica/partial reads.
+- `dispatch_precondition` vs behaviour: `NATIVE_CAS` ⇒ a stale expected value is rejected by the target with no effect; `PEP_READ_THEN_ACT` ⇒ the subject is demonstrably write-once/PEP-only (attempted external move fails) and the read-then-act window is covered by the serialization lock (two Kernel Service instances cannot interleave on the same domain).
+- `idempotency_horizon` ⇒ the adapter proves that after the horizon its `NATIVE_KEY` protection lapses (C25) and that `NO_EFFECT_CONFIRMED` is never emitted outside it.
 - receipt binding: every `COMMITTED` receipt contains a material-derived field.
 - evidence adapters: every `PRESENT` observed field replays from its locator.
 
 ### 13.4 Conformance report format
 
-Two separate claims, never merged (Spec §13): `CONSTITUTIONAL_KERNEL_CONFORMANCE: PASS|FAIL` over C1–C19 + adapter suite; `CADP_PRODUCT_CONFORMANCE: PASS|FAIL|KERNEL_CONFORMANT_ONLY` over P1–P7. Each line cites store row ids, target observables and the exact composition digests (kernel build digest, policy `content_digest`, adapter registry digest).
+Two separate claims, never merged (Spec §13): `CONSTITUTIONAL_KERNEL_CONFORMANCE: PASS|FAIL` over C1–C26 + adapter suite; `CADP_PRODUCT_CONFORMANCE: PASS|FAIL|KERNEL_CONFORMANT_ONLY` over P1–P7. Each line cites store row ids, target observables and the exact composition digests (kernel build digest, policy `content_digest`, adapter registry digest).
 
 ---
 
@@ -648,10 +736,13 @@ Two separate claims, never merged (Spec §13): `CONSTITUTIONAL_KERNEL_CONFORMANC
 | U1 | Signed/attested backend identity is unavailable from both measured backends (#91). Reference policies must not require `SIGNED_ATTESTATION` for `BACKEND_EXECUTION`. | none — fail-closed assurance requirement; kernel manufactures no trust |
 | U2 | Human reviewer decision provenance equivalence to machine reviewer (#90 unresolved). Design §9.3 covers it; not yet measured. | none — same envelope contract; if a Human product cannot bind scope, policy fails closed |
 | U3 | Out-of-process target adapter capability token format (§4.3 alternative). | none — reference consumes capability in-process |
-| U4 | OPA signed-bundle verification vs status-API + digest-echo as the integrity proof for remote evaluators. | none — reference uses local socket + triple digest equality |
-| U5 | `pr_settle_window` value and GitHub list-read authority guarantees for `PR_CREATE` `NO_EFFECT_CONFIRMED`. Until measured, the adapter declares `no_effect_proof_supported = false` for `PR_CREATE` and ambiguity stays `UNKNOWN`. | none — conservative default already fail-closed |
+| U4 | OPA signed-bundle verification for **remote** evaluators. The reference (local socket, PEP-served bundle, `active_revision` + `revision_echo` + PEP-verified raw digest) is fully specified in §5.2; signing is an additional assurance option, not a gap in the reference. | none — reference path closed in r2 |
+| U5 | `pr_settle_window` value and GitHub list-read authority guarantees for `PR_CREATE` `NO_EFFECT_CONFIRMED` after a **sent** call. Until measured, the adapter declares `no_effect_proof_supported = false` for that case and ambiguity stays `UNKNOWN`. Precondition failures before send are closed by §4.6. | none — conservative default already fail-closed |
 | U6 | `Authority order.md` / `README.md` still name Spec v0.3 + TD v1.5; docs-only update to name the v0.4 generation after Human merge. | none — documentation of authority, not authority itself |
 | U7 | Temporal multi-worker/parallel semantics unmeasured (Control caveat, #89). Reference product proof runs single worker. | none — product conformance claim is scoped to what is measured |
+| U8 | Exact GitHub API surface for the write-once candidate branch protection (rules vs classic protection; whether `cadp/candidate/**` glob semantics match at the deployed GitHub version) is a deployment-verification item; the PEP-side write-once rule and the dispatch precondition hold without it. | none — defence in depth; C20 covers both layers |
+
+Closed in r2 (previously implicit, now exact): OPA self-referential digest (§5.2), admission→dispatch TOCTOU (§4.6, §6.4), `POLICY_ACTIVATE` expected-active CAS (§3.3, §6.4, §9.4), canonical allocation key (§7.4), bootstrap trust set (§2.1), effect-scoped Human approval (§9.3), Temporal reuse/conflict/retention contract (§6.4).
 
 Architecture-blocking unresolved questions: **0**.
 
@@ -663,8 +754,8 @@ Architecture-blocking unresolved questions: **0**.
 |---|---|---|
 | 1 | one coherent TD candidate at exact branch/PR/head/blob | this file; receipt on #94 |
 | 2 | K1–K7 → ownership + durable representation | §1 |
-| 3 | storage/atomicity/restart | §3, §4.5 |
-| 4 | PEP/credential/target-binding topology | §4 |
+| 3 | storage/atomicity/restart | §3, §4.5, §4.6 |
+| 4 | PEP/credential/target-binding topology | §4 (incl. §4.6 dispatch-time precondition) |
 | 5 | evaluator integration, fail-closed constraints/integrity | §5 |
 | 6 | target dispatch/idempotency/reconciliation preserving UNKNOWN | §6 |
 | 7 | evidence/provenance/assurance, requested ≠ observed | §9.1–9.2 |
