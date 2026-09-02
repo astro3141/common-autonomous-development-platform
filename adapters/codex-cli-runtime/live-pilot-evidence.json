@@ -1,0 +1,86 @@
+{
+  "schema": "adp/codex-cli-supervised-live-pilot-evidence",
+  "schema_version": 1,
+  "recorded_at": "2026-08-31T23:10:16Z",
+  "local_run_date": "2026-09-01",
+  "adp_base_commit": "902edd09f4253c72adf4e4fe0bec862b41ac04c1",
+  "cli": {
+    "version": "codex-cli 0.151.0",
+    "inspected_source_tag": "rust-v0.151.0",
+    "inspected_source_commit": "78c290807ce710180111df227df3b7a4fe845452"
+  },
+  "command": "ADP_CODEX_CLI_LIVE_PILOT=1 ADP_CODEX_CLI_BIN=/opt/homebrew/bin/codex ADP_CODEX_CLI_VERSION='codex-cli 0.151.0' node --test tests/codex-cli-runtime-live-pilot.test.ts",
+  "bounds": {
+    "fresh_run": true,
+    "disposable_repository": true,
+    "repository_disposed_after_run": true,
+    "public_ingress": false,
+    "auto_merge": false,
+    "batch_max_tasks": 1,
+    "human_merge": true
+  },
+  "result": {
+    "candidate_commit": "43d4a5ad9e1cdcf9e39c3c1b63908f4a6257769d",
+    "verification": {
+      "check_id": "unit",
+      "result": "PASS",
+      "assurance_level": "REEXECUTED",
+      "evidence_id": "01M1D1B9ZQX045R39MZ6BBYJB3"
+    },
+    "supervisor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05a14-d1de-7932-8f70-98a0603801d6",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "platform-supervisor-proposal-v1",
+      "usage": {
+        "input": 15075,
+        "cached_input": 0,
+        "cache_write_input": 0,
+        "output": 273,
+        "reasoning_output": 23,
+        "unit": "token"
+      }
+    },
+    "actor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05a15-0d7f-7a73-915d-d701b0d83073",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "codex-cli-actor-turn-result-v1",
+      "usage": {
+        "input": 98620,
+        "cached_input": 78592,
+        "cache_write_input": 0,
+        "output": 1039,
+        "reasoning_output": 100,
+        "unit": "token"
+      }
+    },
+    "auditor": {
+      "status": "COMPLETED",
+      "thread_id": "01a05a15-a863-7d63-9e68-f9075ee8c1b5",
+      "requested_provider": "openai",
+      "requested_model": "gpt-5.6-sol",
+      "actual_provider": "UNKNOWN",
+      "actual_model": "UNKNOWN",
+      "protocol": "platform-auditor-verdict-v1",
+      "verdict": "AUDIT_PASS",
+      "usage": {
+        "input": 31372,
+        "cached_input": 15104,
+        "cache_write_input": 0,
+        "output": 630,
+        "reasoning_output": 68,
+        "unit": "token"
+      }
+    },
+    "final_attempt_state": "READY_TO_MERGE",
+    "pending_decision": "MERGE_APPROVAL",
+    "canonical_unchanged": true
+  }
+}

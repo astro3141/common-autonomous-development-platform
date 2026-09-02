@@ -16,3 +16,4 @@ STATUS_workflow_harness 복사본.md
 # Provider hook material installed per machine by `issue-orchestrator setup-hooks`
 .claude/
 .codex/
+__pycache__/

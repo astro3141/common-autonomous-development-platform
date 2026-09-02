@@ -13,6 +13,7 @@
  *   POST /v1/decisions/:id/apply-gate     — resolved HUMAN_GATE_APPROVAL → §17.3 revalidation
  *   POST /v1/discovery                    — one fresh discovery/materialization pass (§8.4)
  *   GET  /v1/runs/:run_id                 — read model projection (no authority, no adapters)
+ *   GET  /v1/dashboard/:run_id            — operator dashboard: HTML over the read-only projections
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -33,6 +34,7 @@ import { commitBatchResumeFromPause } from "../core/statemachine/transition-comm
 import { materializeDiscoveryPass } from "../core/discovery/materialize.ts";
 import type { PlatformStore } from "../core/store/platform-store.ts";
 import type { ProductionCoordinatorDependencies } from "../core/coordinator/production-coordinator.ts";
+import { renderDashboard, type DashboardSnapshot } from "./dashboard.ts";
 import { runProjection } from "./projections.ts";
 import { isoNow, ulid } from "./identities.ts";
 
@@ -164,6 +166,17 @@ async function handle(
           generated_at: isoNow(),
         }),
       });
+    }
+    // §5.11 — the operator dashboard. It renders the projections above and nothing else: no store
+    // query of its own, no adapter call of its own, and — being inside the GET-only block with a
+    // pure renderer — no path by which a page could reach a transition.
+    const dashboardMatch = /^\/v1\/dashboard\/(.+)$/.exec(path);
+    if (dashboardMatch !== null) {
+      return html(
+        response,
+        200,
+        renderDashboard(dashboardSnapshot(deps, decodeURIComponent(dashboardMatch[1] ?? ""))),
+      );
     }
     return fail(response, 404, "unknown path");
   }
@@ -306,6 +319,88 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   for await (const chunk of request) chunks.push(chunk as Buffer);
   const text = Buffer.concat(chunks).toString("utf8");
   return text.length === 0 ? {} : (JSON.parse(text) as unknown);
+}
+
+/**
+ * Gathers exactly the projections the JSON surfaces above already expose, and nothing more. Every
+ * read here is one of `runProjection`, `monitorOnce`, `diagnosticPacket`, `measurementPacket` or
+ * `listFindings`; the dashboard introduces no query of its own against the store's tables.
+ *
+ * A projection that throws is dropped rather than defaulted — §5.11's partial-result rule — so one
+ * unavailable derivation never costs the whole page, and nothing missing is filled in.
+ */
+function dashboardSnapshot(
+  deps: ProductionCoordinatorDependencies,
+  run_id: string,
+): DashboardSnapshot {
+  const store = deps.store;
+
+  const attempt = (subject: unknown): string | null => {
+    const key = (subject as { attempt_key?: string } | null | undefined)?.attempt_key;
+    return typeof key === "string" ? key : null;
+  };
+  const tolerate = <T>(read: () => T): T | null => {
+    try {
+      return read();
+    } catch {
+      return null;
+    }
+  };
+
+  const run = tolerate(() => runProjection(store, run_id));
+  const attemptKeys = ((run as { batches?: readonly { tasks?: readonly unknown[] }[] } | null)
+    ?.batches ?? [])
+    .flatMap((batch) => batch.tasks ?? [])
+    .map((task) => attempt((task as { attempt?: unknown }).attempt))
+    .filter((key): key is string => key !== null);
+
+  const monitor = tolerate(() =>
+          monitorOnce(deps, {
+            run_id,
+            now: isoNow(),
+            trigger_config: {
+              stale_after_ms: 30 * 60_000,
+              intent_unresolved_after_ms: 10 * 60_000,
+              config_ref: "dashboard-defaults-v1",
+            },
+          }),
+  );
+
+  const subjects = [run_id, ...attemptKeys];
+  const diagnostics = subjects
+    .map((subject) =>
+      tolerate(() => diagnosticPacket({ store, repository: deps.repository }, subject)),
+    )
+    .filter((packet): packet is NonNullable<typeof packet> => packet !== null);
+
+  const measurements = attemptKeys
+    .map((attempt_key) => {
+      const packet = tolerate(() => measurementPacket(store, attempt_key));
+      return packet === null ? null : { attempt_key, packet };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+  const findings = (tolerate(() => listFindings(store)) ?? []).map((finding) => ({
+    finding_id: finding.body.finding_id,
+    classification: finding.body.classification,
+    subject_ref: finding.body.subject_ref,
+    summary: finding.body.summary,
+  }));
+
+  return {
+    generated_at: isoNow(),
+    run_id,
+    run,
+    monitor: monitor as DashboardSnapshot["monitor"],
+    diagnostics,
+    measurements,
+    findings,
+  };
+}
+
+function html(response: ServerResponse, status: number, body: string): void {
+  response.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+  response.end(body);
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {

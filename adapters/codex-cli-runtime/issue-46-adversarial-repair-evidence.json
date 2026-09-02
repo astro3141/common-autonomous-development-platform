@@ -1,0 +1,84 @@
+{
+  "schema": "adp/codex-cli-issue-46-adversarial-repair-evidence",
+  "schema_version": 1,
+  "recorded_at": "2026-09-01T03:35:00Z",
+  "reviewed_sha": "3e1e80a5301dec8a552696057c2122dfcc8e2a71",
+  "independent_review_result": "NOT_PASS",
+  "finding": "CONTRACT_VIOLATION / SECURITY_BOUNDARY_GAP",
+  "repair_sha": "f10c750e8111024ae73159b45a0f4863779bffda",
+  "cli": {
+    "version": "codex-cli 0.151.0",
+    "inspected_source_tag": "rust-v0.151.0",
+    "inspected_source_commit": "78c290807ce710180111df227df3b7a4fe845452"
+  },
+  "reproduction_on_reviewed_profile": {
+    "disposable_root": "/Users/astro3141/.adp-issue46-adversarial-repro.hn7lIW",
+    "git_commondir_mutation_exit": 0,
+    "git_gitdir_mutation_exit": 0,
+    "git_worktrees_mutation_exit": 0,
+    "result": "REPRODUCED"
+  },
+  "repair": {
+    "permission_profile": "adp-isolated-workspace-commit",
+    "added_read_only_paths": [
+      ".git/commondir",
+      ".git/gitdir",
+      ".git/worktrees",
+      ".git/worktrees/"
+    ],
+    "held_read_only_paths": [
+      ".git/config",
+      ".git/config.worktree",
+      ".git/hooks/",
+      ".git/objects/info/"
+    ],
+    "workspace_git_write_retained": true,
+    "network_enabled": false,
+    "approval_elevation": false,
+    "full_access": false
+  },
+  "actual_enforcement_command": "ADP_CODEX_CLI_SANDBOX_ENFORCEMENT=1 ADP_CODEX_CLI_BIN=/opt/homebrew/bin/codex ADP_SANDBOX_GIT_BIN=/opt/homebrew/bin/git node --test tests/codex-cli-runtime-sandbox-enforcement.test.ts",
+  "actual_enforcement_result": {
+    "base_commit": "e0908cce012c07f8d1a3fecfbabb64bad9cf97e1",
+    "candidate_commit": "0e75e36135193a0cbecb6f6f20f1fe9f5142f9ab",
+    "candidate_commit_created": true,
+    "denied": {
+      "git_commondir": 1,
+      "git_gitdir": 1,
+      "git_worktrees": 1,
+      "git_config": 1,
+      "git_config_worktree": 1,
+      "git_hooks": 1,
+      "git_objects_info": 1,
+      "canonical_file": 1,
+      "canonical_index": 128,
+      "canonical_object_db": 1
+    },
+    "candidate_absent_from_canonical_object_store": true,
+    "canonical_unchanged": true,
+    "result": "PASS"
+  },
+  "regression": {
+    "ordinary_suite": {
+      "tests": 1164,
+      "passed": 1161,
+      "failed": 0,
+      "skipped": 3
+    },
+    "actual_sandbox_probe": {
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
+    },
+    "typecheck": "PASS"
+  },
+  "held_boundaries": {
+    "auto_merge": false,
+    "human_merge": true,
+    "canonical_main_before_and_after": "20264c439c65d07d3ce7f546fa3a6b63b8b2a163",
+    "adp_core_lifecycle_modified": false,
+    "issue_47_modified": false,
+    "issue_48_modified": false
+  }
+}

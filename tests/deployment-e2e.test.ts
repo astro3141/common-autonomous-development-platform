@@ -217,6 +217,7 @@ test("ALIVE-1: one task crosses the full lifecycle through the production compos
     assert.equal(deps.repository.snapshot_canonical().head, head);
 
     // --- the person performs the real merge; only git can say it happened ----------------------
+    world.repo.git(["fetch", "--quiet", "--no-tags", workspace.path, candidate]);
     world.repo.git(["merge", "--ff-only", candidate]);
     assert.equal(tick(), "MERGE_OBSERVED");
 
@@ -547,6 +548,7 @@ test("ALIVE-3: a platform restart mid-implementation resumes from durable state 
       });
     });
     assert.equal(coordinator.tickOnce(opened.run_id), "MERGE_APPROVAL_APPLIED");
+    world.repo.git(["fetch", "--quiet", "--no-tags", workspace.path, candidate]);
     world.repo.git(["merge", "--ff-only", candidate]);
     assert.equal(coordinator.tickOnce(opened.run_id), "MERGE_OBSERVED");
     assert.equal(coordinator.tickOnce(opened.run_id), "RUN_COMPLETED");

@@ -276,6 +276,42 @@ test("B16-8: an unprojected external completion is observed, not projected, by t
   }, SINGLE, { now: () => new Date().toISOString() });
 });
 
+test("B16-8a: runtime coverage distinguishes failed, skipped, and successful queries", () => {
+  withWorld((world) => {
+    const w = driveToImplementing(world);
+    const command = {
+      run_id: RUN_ID,
+      now: new Date(Date.now() + 1000).toISOString(),
+      trigger_config: TRIGGERS,
+    };
+
+    const failed = monitorOnce(
+      {
+        store: w.store,
+        runtime: {
+          get_turn_result() {
+            throw new Error("runtime unavailable");
+          },
+        } as never,
+      },
+      command,
+    );
+    assert.equal(failed.authority_coverage.runtime, "UNAVAILABLE");
+    assert.equal(
+      failed.anomalies.some((anomaly) => anomaly.anomaly_kind === "EXTERNAL_COMPLETION_UNPROJECTED"),
+      false,
+      "a failed runtime observation cannot support a completion claim",
+    );
+
+    const skipped = monitorOnce(w, { ...command, run_id: "run:not-present" });
+    assert.equal(skipped.authority_coverage.runtime, "NOT_QUERIED");
+
+    actorProduced(w, CANDIDATE, 1);
+    const answered = monitorOnce(w, command);
+    assert.equal(answered.authority_coverage.runtime, "AVAILABLE");
+  }, SINGLE, { now: () => new Date().toISOString() });
+});
+
 test("B16-9: unsent notifications survive a restart and are re-presented with the same identity", () => {
   withWorld((world) => {
     const w = driveToMergeApproval(world);

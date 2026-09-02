@@ -6,7 +6,14 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -176,6 +183,12 @@ test("RG6 ~ RG10 / M1B3-AC9 ~ AC11: a workspace starts at the supplied base and 
     assert.equal(adapter.snapshot_canonical().head, b, "RG8");
     assert.notEqual(workspace.path, repo.root, "RG9");
     assert.equal(workspace.path.startsWith(repo.workspaceRoot), true);
+    assert.equal(statSync(join(workspace.path, ".git")).isDirectory(), true, "Git metadata is local");
+    assert.equal(repo.git(["remote"], workspace.path).trim(), "", "no canonical remote remains");
+    assert.equal(
+      repo.git(["rev-parse", "--absolute-git-dir"], workspace.path).trim(),
+      realpathSync(join(workspace.path, ".git")),
+    );
     assert.equal(existsSync(join(workspace.path, "a.txt")), true);
     assert.equal(existsSync(join(workspace.path, "b.txt")), false, "the workspace is at A, not B");
 
@@ -206,6 +219,77 @@ test("RG11 / M1B3-AC10: an unknown or malformed base fails closed with no worksp
       assert.throws(() => adapter.create_feature_workspace(request(base)));
     }
     assert.equal(repo.git(["worktree", "list", "--porcelain"]).includes("ws-"), false);
+  });
+});
+
+test("#46: a pre-existing linked worktree fails closed instead of widening Actor access", () => {
+  withGitRepo((repo) => {
+    const base = repo.commit({ path: "a.txt", content: "a\n", message: "A" });
+    const branch = "ws-op_3a_att-1_3a_workspace";
+    const path = join(repo.workspaceRoot, branch);
+    repo.git(["worktree", "add", "--quiet", "-b", branch, path, base]);
+
+    const adapter = new LocalGitRepositoryAdapter(repo.config());
+    assert.throws(
+      () => adapter.create_feature_workspace(request(base)),
+      (error: unknown) =>
+        error instanceof GitError && error.message.includes("BACKEND_CAPABILITY_GAP"),
+    );
+    assert.equal(statSync(join(path, ".git")).isFile(), true, "the unsafe layout was not adopted");
+  });
+});
+
+test("#46: candidate observation cannot import objects or mutate canonical", () => {
+  withCandidate(({ repo, adapter, base, workspace, candidate }) => {
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    const before = {
+      head: repo.head(),
+      status: repo.git(["status", "--porcelain"]),
+      reflog: repo.git(["reflog", "--all"]),
+    };
+
+    assert.equal(adapter.inspect_candidate(workspace).candidate_commit, candidate);
+    assert.deepEqual(adapter.get_diff({ from: base, to: candidate }).changed_paths, ["src.txt"]);
+    assert.equal(adapter.verify_lineage(base, candidate), true);
+
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    assert.equal(repo.head(), before.head);
+    assert.equal(repo.git(["status", "--porcelain"]), before.status);
+    assert.equal(repo.git(["reflog", "--all"]), before.reflog);
+  });
+});
+
+test("#46: verification can clone an unmerged candidate without importing it into canonical", () => {
+  withCandidate(({ repo, adapter, base, candidate }) => {
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    const canonicalStatus = repo.git(["status", "--porcelain"]);
+
+    const verification = adapter.create_feature_workspace({
+      base_head: candidate,
+      op_key: "op:attempt:task:test:1:verify:candidate",
+    });
+
+    assert.equal(repo.git(["rev-parse", "HEAD"], verification.path).trim(), candidate);
+    assert.equal(statSync(join(verification.path, ".git")).isDirectory(), true);
+    assert.equal(repo.git(["remote"], verification.path).trim(), "");
+    assert.equal(adapter.inspect_candidate(verification).present, false);
+    assert.throws(() => repo.git(["cat-file", "-e", `${candidate}^{commit}`]));
+    assert.equal(repo.head(), base);
+    assert.equal(repo.git(["status", "--porcelain"]), canonicalStatus);
+  });
+});
+
+test("#46: workspace handles outside the assigned clone fail closed", () => {
+  withCandidate(({ repo, adapter, workspace }) => {
+    assert.throws(
+      () => adapter.inspect_candidate({ ...workspace, path: repo.root }),
+      (error: unknown) =>
+        error instanceof GitError && error.message.includes("outside its assigned path"),
+    );
+    assert.throws(
+      () => adapter.inspect_candidate({ ...workspace, branch: "../canonical" }),
+      GitError,
+    );
   });
 });
 
@@ -404,12 +488,13 @@ test("RG31 / M1B3-AC22: the Actor direction is verify_lineage(base_head, candida
 });
 
 test("RG32 / RG cluster / M1B3-AC23: the manual-merge direction is verify_lineage(candidate, canonical)", () => {
-  withCandidate(({ repo, adapter, base, candidate }) => {
+  withCandidate(({ repo, adapter, base, workspace, candidate }) => {
     // Before any human merge, canonical does not contain the candidate.
     assert.equal(adapter.snapshot_canonical().head, base);
     assert.equal(adapter.verify_lineage(candidate, adapter.snapshot_canonical().head), false);
 
     // A human merges the candidate outside the Platform, exactly as MVP 1 §19.4 expects.
+    repo.git(["fetch", "--quiet", "--no-tags", workspace.path, candidate]);
     repo.git(["merge", "--ff-only", candidate]);
 
     const canonical = adapter.snapshot_canonical();
@@ -424,7 +509,7 @@ test("RG32 / RG cluster / M1B3-AC23: the manual-merge direction is verify_lineag
 });
 
 test("§26 / M1B3-AC23: the three human-merge branches are decidable from primitives alone", () => {
-  withCandidate(({ repo, adapter, base, candidate }) => {
+  withCandidate(({ repo, adapter, base, workspace, candidate }) => {
     /** Exactly the projection TD §19.4 describes — expressed here, not implemented in Core. */
     const observe = (): string => {
       const canonical = adapter.snapshot_canonical();
@@ -439,6 +524,7 @@ test("§26 / M1B3-AC23: the three human-merge branches are decidable from primit
     repo.commit({ path: "other.txt", content: "other\n", message: "X" });
     assert.equal(observe(), "mismatch");
 
+    repo.git(["fetch", "--quiet", "--no-tags", workspace.path, candidate]);
     repo.git(["merge", "--no-edit", candidate]);
     assert.equal(observe(), "reflected");
   });
