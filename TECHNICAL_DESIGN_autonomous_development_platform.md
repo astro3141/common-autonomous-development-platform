@@ -3371,9 +3371,11 @@ adapter, preflight, manifest를 서로 독립 override해 조합할 수 없다.
 고른다. executable auto-detection도 generic registry/service locator도 아니며 Project Profile field가
 아니다. factory가 위 세 bundle과 기존 Repository component/Manifest를 함께 구성한다. production은
 bundle member를 따로 교체하지 않고, test도 검증된 whole bundle만 대체한다. component preflight는 그
-component의 첫 authorized external operation 직전에 수행한다. 따라서 workflow-free verification path는
-실제 Workflow bundle/hash를 유지하지만 WorkflowAdapter/controller/provider를 호출하거나 그 미사용
-backend의 preflight를 PASS로 꾸미지 않는다.
+component에 declared preflight가 있을 때 그 첫 authorized external operation 직전에 수행한다. 이 tranche가
+generic member로 고정하는 것은 Runtime bundle의 `RuntimePreflight`뿐이며 Workflow/Verification용 generic
+preflight interface를 발명하지 않는다. 따라서 workflow-free verification path는 실제 Workflow bundle/hash를
+유지하지만 WorkflowAdapter/controller/provider를 호출하거나 그 미사용 backend의 readiness를 PASS로
+꾸미지 않는다.
 
 Profile과 deployment의 binding은 다음으로 닫는다:
 
@@ -3899,8 +3901,10 @@ WorkflowControllerProviderV1 {
   service locator, Profile field, Runtime capability가 아니다.
 - `WorkflowControllerHandle`은 provider/WorkflowAdapter 경계 아래의 opaque non-secret handle이다.
   Core/Platform Store에는 저장하지 않고 raw session identity/token/credential도 노출하지 않는다(I-TD7).
-- controller 획득은 이미 §21 INTENT가 기록되고 policy/capability가 통과한 **해당 workflow operation
-  내부**에서만 일어난다. composition/run-open 시 eager acquisition side effect는 금지한다.
+- controller 획득은 policy/capability가 통과한 **해당 WorkflowAdapter operation 내부**에서만 일어난다.
+  operation이 external side effect이면 §21 INTENT가 먼저 기록되어야 한다. read-only status/recover는 기존
+  observation/reconciliation contract를 따른다. composition/run-open 시 eager acquisition side effect는
+  금지한다.
 - `WorkflowHandle ↔ controller authority` association, handle freshness, owner equality, restart/recovery는
   WorkflowAdapter/backend가 소유하고 fail-closed한다. Core는 association을 재구성하거나 controller를
   교체해 workflow를 암묵 rebind하지 않는다.
@@ -4274,8 +4278,9 @@ recover(workflow_handle)
 
 **호출 경로.** Core-facing interface는 Spec §30 shape를 유지하며 `WorkflowControllerHandle`을 인자로
 받지 않는다. trusted context가 필요한 operation은 WorkflowAdapter가 §13.3의 자기 backend-owned binding
-또는 정확히 하나의 constructor-injected provider로 내부에서 획득한다. controller 획득 자체는 이미
-authorize/INTENT된 operation 안에서만 일어나고, Core는 identity/handle을 만들거나 넘기지 않는다(I-TD5).
+또는 정확히 하나의 constructor-injected provider로 내부에서 획득한다. controller 획득 자체는 authorized
+operation 안에서만 일어나며 external effect라면 INTENT가 선행한다. Core는 identity/handle을 만들거나
+넘기지 않는다(I-TD5).
 
 `start` 성공 시 WorkflowAdapter는 반환한 `WorkflowHandle`을 실제 controller authority와 내부적으로
 associate한다. `status`/`resume`/`cancel`/`audit_decide`/`recover`의 owner resolution과 controller
