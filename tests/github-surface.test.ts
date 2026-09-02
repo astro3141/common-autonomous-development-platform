@@ -67,6 +67,13 @@ class FakeTransport implements GitHubTransportV1 {
     this.pushes.push({ path, sha, ref });
   }
 
+  /** #78 target binding: defaults to the configured repo; tests override to prove mismatch. */
+  remoteUrl = `https://github.com/${OWNER}/${REPO}.git`;
+
+  remote_url(_path: string): string {
+    return this.remoteUrl;
+  }
+
   posts(pattern: RegExp): GitHubApiRequest[] {
     return this.calls.filter((call) => call.method === "POST" && pattern.test(call.path));
   }

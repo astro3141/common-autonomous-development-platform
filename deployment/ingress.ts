@@ -13,6 +13,7 @@
  *   POST /v1/decisions/:id/apply-gate     — resolved HUMAN_GATE_APPROVAL → §17.3 revalidation
  *   POST /v1/discovery                    — one fresh discovery/materialization pass (§8.4)
  *   GET  /v1/runs/:run_id                 — read model projection (no authority, no adapters)
+ *   POST /v1/attempts/:key/project-pr     — #52 delivery projection via the sealed use-case
  *   GET  /v1/dashboard/:run_id            — operator dashboard: HTML over the read-only projections
  */
 
@@ -36,12 +37,22 @@ import type { PlatformStore } from "../core/store/platform-store.ts";
 import type { ProductionCoordinatorDependencies } from "../core/coordinator/production-coordinator.ts";
 import { renderDashboard, type DashboardSnapshot } from "./dashboard.ts";
 import { runProjection } from "./projections.ts";
+import type { PullRequestProjectionAdapterV1 } from "../adapters/interfaces/pull-request-projection.ts";
+import { projectPullRequest } from "../core/execution/project-pull-request.ts";
 import { isoNow, ulid } from "./identities.ts";
 
 export interface IngressOptions {
   readonly host: string;
   readonly port: number;
   readonly report_channel: string;
+  /**
+   * #78/#52 — the composed PR-projection adapter, present exactly when the frozen Profile
+   * selects the GitHub vertical. The ingress is a thin entrypoint over the sealed
+   * `projectPullRequest()` use-case; eligibility is never reimplemented here.
+   */
+  readonly projection?: PullRequestProjectionAdapterV1;
+  /** The configured canonical base branch the projection targets; never caller/model text. */
+  readonly projection_base_branch?: string;
 }
 
 export interface Ingress {
@@ -183,6 +194,29 @@ async function handle(
 
   if (request.method !== "POST") return fail(response, 405, "method not allowed");
   const body = await readJson(request);
+
+  // #52/#78 — the PR delivery projection. Thin by contract: it forwards only the durable
+  // attempt identity and the *configured* base branch to the sealed use-case; the caller can
+  // select neither a destination ref nor a base (any body field is refused), and an ineligible
+  // attempt produces zero external effect inside `projectPullRequest` itself.
+  const projectMatch = /^\/v1\/attempts\/(.+)\/project-pr$/.exec(path);
+  if (projectMatch !== null) {
+    if (options.projection === undefined || options.projection_base_branch === undefined) {
+      return fail(response, 409, "no PR projection surface is composed for this deployment");
+    }
+    if (typeof body === "object" && body !== null && Object.keys(body as object).length > 0) {
+      return fail(response, 400, "project-pr accepts no body fields; the destination is not caller-selectable");
+    }
+    const outcome = projectPullRequest(
+      { store, projection: options.projection },
+      {
+        attempt_key: decodeURIComponent(projectMatch[1] ?? ""),
+        base_branch: options.projection_base_branch,
+      },
+    );
+    if (outcome.kind === "PROJECTED") return json(response, 200, outcome);
+    return json(response, 409, outcome);
+  }
 
   // §5.13 — record a Finding. Evidence must resolve or the record is refused; recording changes
   // no lifecycle state, and re-execution goes through the ordinary admission path only.

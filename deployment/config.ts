@@ -21,7 +21,13 @@ export interface DeploymentConfig {
   };
   /** Root the declared, repository-relative contract-source paths resolve against. */
   readonly contract_source_root: string;
-  readonly task_source: { readonly paths: readonly string[] };
+  /**
+   * #78 — host installation locations for the *document* TaskSource only (which files on this
+   * machine hold the task documents). Which TaskSource the run uses is the frozen Project
+   * Profile's declaration (§7.1a), never this block; `null` is valid when the Profile selects a
+   * non-document source such as GitHub Issues.
+   */
+  readonly task_source: { readonly paths: readonly string[] } | null;
   readonly repository: {
     readonly root: string;
     readonly canonical_ref: string;
@@ -72,15 +78,22 @@ export function validateConfig(raw: unknown, baseDir: string): DeploymentConfig 
   const against = (value: string): string => (isAbsolute(value) ? value : resolve(baseDir, value));
 
   const profiles = asObject(root["profiles"], "/profiles");
-  const taskSource = asObject(root["task_source"], "/task_source");
+  const taskSource =
+    root["task_source"] === undefined || root["task_source"] === null
+      ? null
+      : asObject(root["task_source"], "/task_source");
   const repository = asObject(root["repository"], "/repository");
   const report = asObject(root["report"], "/report");
   const ingress = asObject(root["ingress"] ?? { port: 0, host: "127.0.0.1" }, "/ingress");
   const backend = asObject(root["backend"], "/backend");
 
-  const paths = taskSource["paths"];
-  if (!Array.isArray(paths) || paths.length === 0 || paths.some((p) => typeof p !== "string")) {
-    throw new ConfigError("/task_source/paths", "must be a non-empty string array");
+  let paths: readonly string[] | null = null;
+  if (taskSource !== null) {
+    const raw_paths = taskSource["paths"];
+    if (!Array.isArray(raw_paths) || raw_paths.length === 0 || raw_paths.some((p) => typeof p !== "string")) {
+      throw new ConfigError("/task_source/paths", "must be a non-empty string array");
+    }
+    paths = raw_paths as string[];
   }
 
   return {
@@ -104,7 +117,7 @@ export function validateConfig(raw: unknown, baseDir: string): DeploymentConfig 
     contract_source_root: against(
       asString(root["contract_source_root"], "/contract_source_root"),
     ),
-    task_source: { paths: (paths as string[]).map(against) },
+    task_source: paths === null ? null : { paths: paths.map(against) },
     repository: {
       root: against(asString(repository["root"], "/repository/root")),
       canonical_ref: asString(repository["canonical_ref"], "/repository/canonical_ref"),

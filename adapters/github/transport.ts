@@ -36,6 +36,11 @@ export interface GitHubTransportV1 {
    * must fail rather than force.
    */
   push_commit(local_repo_path: string, sha: string, remote_ref: string): void;
+  /**
+   * #78 — read-only: the push URL of the local clone's `origin` remote, for target binding.
+   * Throws when it cannot be read; never mutates anything.
+   */
+  remote_url(local_repo_path: string): string;
 }
 
 /** Production transport over the authenticated `gh` CLI. */
@@ -63,6 +68,19 @@ export class GhCliTransport implements GitHubTransportV1 {
     } catch {
       throw new GitHubTransportError(`gh api ${request.path} returned non-JSON output`);
     }
+  }
+
+  remote_url(local_repo_path: string): string {
+    const result = spawnSync("git", ["remote", "get-url", "--push", "origin"], {
+      cwd: local_repo_path,
+      encoding: "utf8",
+    });
+    if (result.error !== undefined || result.status !== 0) {
+      throw new GitHubTransportError(
+        `cannot read origin push url in ${local_repo_path}: ${result.error?.message ?? truncate(result.stderr)}`,
+      );
+    }
+    return result.stdout.trim();
   }
 
   push_commit(local_repo_path: string, sha: string, remote_ref: string): void {
