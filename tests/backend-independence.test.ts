@@ -56,6 +56,10 @@ const BACKEND_NAMING_ALLOWED: readonly string[] = [
   token("adapters/", "open", "claw", "-runtime/"),
   token("adapters/", "durable", "-jobs", "-workflow/"),
   "adapters/backend-v1/",
+  // #49/#50/#73 — the multi-provider CLI agent mapping adapter names the backends it maps
+  // (I-TD1: backend vocabulary belongs exactly in Adapter/Profile config). Core, testdoubles/
+  // and tests stay under the full check.
+  "adapters/cli-agent-runtime/",
 ];
 
 const namesBackend = (relativePath: string): boolean =>
