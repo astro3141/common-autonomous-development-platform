@@ -74,6 +74,18 @@
 > BACKEND_CHANGE=NO**. existing task/attempt/materialisation binding/suspension/idempotency rows의 derived
 > projection만 사용하며 새 slot row, scheduler, state machine, backend operation은 없다.
 >
+> **v1.5 Issue #87 Route-B Runtime/Workflow decoupling amendment (Issue #85 comment
+> `5506089415`, accepted Design Evidence):** Spec §27의 Runtime 책임을 model/session/turn execution으로
+> 복원하고 generic `RuntimeAdapter`에서 Workflow controller 획득을 제거한다. controller binding은
+> `WorkflowAdapter`가 소유하며, backend가 직접 소유하지 못할 때에만 한 typed constructor dependency
+> `WorkflowControllerProviderV1`을 Workflow 경계 아래에서 받는다. Verification은 Manifest v2로
+> Workflow 의존(`NONE | REQUIRED`)과 audit settlement(`NONE | ADAPTER`)을 명시하고, Deployment host는
+> 실제 adapter/preflight/manifest를 atomic bundle로 선택해 tuple 일치를 fail-closed 검증한다.
+> `runtime_profile`은 선택된 Runtime의 frozen input일 뿐 adapter selector가 아니다. four manifest hash,
+> Core lifecycle, Auditor/Verification/Repository authority, D22–D25는 불변이다. **SPEC_CHANGE=NO /
+> TD_CHANGE=YES / NEW_AUTHORITY=NO / NEW_LIFECYCLE_STATE=NO / NEW_DURABLE_STATE=NO**. 전부
+> **PROSPECTIVE_REQUIREMENT**이며 production code, OpenClaw/durable-jobs, #52 replay를 변경하지 않는다.
+>
 > **v1.3 revision (batch fold — intake #1~#6 + material assessment):** architecture decision 재개방
 > 없음. 접힌 내용 — (1) I-TD12 승격(#3 AMENDMENT-1의 좁힌 문구; 원안의 mechanism-과잉 자백 포함),
 > (2) §1.1에 TRANSFER_KIND 이전 규율(#1 AMENDMENT-1), (3) §5.11 Diagnostic Projection + §5.12
@@ -234,10 +246,12 @@ TD-level 파생 invariant (본 문서에서 추가로 고정):
   Model 산출물은 항상 (a) structured envelope + (b) provenance 표시 + (c) evidence candidate로만 취급된다.
 - **I-TD4.** same-Supervisor automatic continuation(구 P3-H H3/H4 경로)은 어떤 Core contract에도
   나타나지 않는다. Workflow 관측은 §14(Q8 결정)의 poll 기반 contract만 사용한다.
-- **I-TD5.** **Platform Core ≠ Runtime trusted identity issuer.** Core는 어떤 계층에서도
-  `agentId`/`sessionKey` 등 trusted identity를 생성·주장하지 않는다. trusted identity는 Runtime의
-  authoritative owner(host)가 발급하며, Core는 opaque `RuntimeSessionHandle` /
-  `WorkflowControllerHandle`만 소유한다 (§13.3, §16.3).
+- **I-TD5.** **Platform Core ≠ backend trusted identity issuer.** Core는 어떤 계층에서도
+  `agentId`/`sessionKey` 등 trusted identity를 생성·주장하지 않는다. Runtime session identity는
+  Runtime의 authoritative owner(host)가 발급하며 Core는 opaque `RuntimeSessionHandle`만 소유한다.
+  Workflow controller identity/handle이 필요한 backend에서는 WorkflowAdapter 또는 그 아래의 typed
+  provider가 이를 소유한다. Core/RuntimeAdapter/Profile/Model은 `WorkflowControllerHandle`을 획득·전달·
+  복원하지 않는다(§13.3, §14.1, §16.3).
 - **I-TD6.** **Runtime structured result artifact ≠ Repository candidate artifact.**
   Actor/Auditor의 structured 결과는 repository 밖의 RuntimeAdapter 소유 `RuntimeResultChannel`로
   전달되며(§13.2), repository write capability를 결과 제출의 전제로 삼지 않는다.
@@ -318,7 +332,7 @@ gap만 통상 절차로 leaf가 된다. 신설 invariant는 다음 구현 batch�
 Human / Slack
      │
      ▼
-Supervisor Runtime (OpenClaw RuntimeSession — Backend v1)
+Supervisor Runtime (selected execution-only RuntimeAdapter)
      │  MCP (Platform API transport)
      ▼
 ┌─────────────────────────────────────────────────────┐
@@ -342,7 +356,8 @@ Supervisor Runtime (OpenClaw RuntimeSession — Backend v1)
    ┌────────────┼──────────────┬───────────────┬────────────────┐
    ▼            ▼              ▼               ▼                ▼
 RuntimeAdapter  WorkflowAdapter RepositoryAdapter VerificationAdapter ReportAdapter
-(OpenClaw)      (durable-jobs)  (local Git /      (Local, 향후 CI)     (Slack)
+(model/turn)    (workflow owner) (local Git /     (workflow-free or    (Slack)
+                                  optional GitHub)  workflow-backed)
                                 optional GitHub)
 ```
 
@@ -354,26 +369,23 @@ RuntimeAdapter  WorkflowAdapter RepositoryAdapter VerificationAdapter ReportAdap
   "Platform이 Runtime 안에 살지 않는다"로 절단한다.)
 - **단일 writer.** Platform State Store에 쓰는 주체는 Core 프로세스 하나뿐이다. Supervisor/Actor/Auditor는
   Store에 직접 접근하지 않는다.
-- **Core는 trusted identity issuer가 아니다 (I-TD5).** Backend가 host-derived trusted context를 요구하는
-  호출(현재: durable-jobs `workflow.start` / `audit_decide`)은 Core가 직접 수행하지 않고, RuntimeAdapter가
-  발급·관리하는 opaque handle 뒤의 **backend-authoritative identity**를 통해 수행한다.
-  초기 OpenClaw Backend에서의 우선 검토 topology:
+- **Core는 trusted identity issuer가 아니다 (I-TD5).** Runtime session identity는 RuntimeAdapter/backend,
+  workflow controller identity와 binding은 WorkflowAdapter/backend가 소유한다. Workflow backend가 직접
+  controller를 소유하지 못할 때에만 §13.3의 exact typed provider가 그 WorkflowAdapter constructor 아래에
+  위치한다. Core/Runtime/Profile/Model은 controller handle을 얻거나 전달하지 않는다:
 
   ```text
-  Platform Coordinator
-          │  WorkflowControllerHandle (opaque)
-          ▼
-  OpenClawRuntimeAdapter
-          │
-          ▼
-  Managed Platform-Controller Session   # host가 identity 발급·관리
-          │  host-derived trusted context
-          ▼
-  durable-jobs workflow.start / audit_decide
+  Platform Coordinator → WorkflowAdapter public operation
+                                  │
+                                  ├─ backend-owned controller binding
+                                  └─ optional WorkflowControllerProviderV1
+                                             │ opaque/non-secret handle
+                                             ▼
+                                      workflow backend effect
   ```
 
-  Core는 controller session의 agentId/sessionKey를 알지 못하고 생성하지도 않는다. 상세는 §13.3/§16.3,
-  구현 확정 전 사항은 `IMPLEMENTATION GAP RA-3`(§30).
+  workflow-free Verification은 이 경로를 호출하지 않는다. OpenClaw managed-controller evidence는
+  §28/§30.2의 Backend-v1 history이며 generic topology authority가 아니다.
 
 ---
 
@@ -524,8 +536,10 @@ transition helper가 수행하며, Coordinator가 drift 판정 자체를 소유�
   Evidence 수집·envelope 검증·binding(§15.2) → verification policy 평가(§15.3).
 - authoritative state: VerificationEvidence rows (단, "fact"의 authority는 verification backend — Platform은 binding과 정책 판정을 소유).
 - must-not-own: 검증 커맨드의 프로젝트 의미(Profile 소유), verdict의 semantic 해석(Auditor 소유),
-  그리고 **verification backend의 실행 기전** — durable-jobs `WorkflowHandle`, local verification을 위한
-  `WorkflowControllerHandle`, backend job state는 전부 VerificationAdapter 아래에 있다(§15.1, M1-9).
+  그리고 **verification backend의 실행 기전**. workflow-backed verifier의 `WorkflowHandle` 및
+  WorkflowAdapter 내부 controller binding은 Verification/Core 경계 밖이며, workflow-free verifier에는
+  WorkflowAdapter/controller/provider를 주입하지 않는다. backend job state는 모두 VerificationAdapter
+  아래에 있다(§12.2b, §15.1, M1-9).
 
 ### 5.8 Pending Human Decision Store — §17.
 ### 5.9 Repository Gate — §14. canonical mutation의 유일한 수행자(MVP 2+).
@@ -916,7 +930,8 @@ project_profile:
 
   roles:
     <role_profile_id>:
-      runtime_profile: <non-empty string>   # RuntimeAdapter가 해석할 profile reference
+      runtime_profile: <non-empty string>   # 이미 Deployment가 선택한 RuntimeAdapter가 해석할 binding ref
+                                            # adapter/bundle selector가 아니다(§12.2b/§13.5)
       config: { ... }                       # opaque — tool/permission semantics는 Core가 해석 안 함
 
   pipelines:
@@ -1322,6 +1337,10 @@ classification_policy
 
 Spec의 `Automation authority = Execution Policy`를 **schema boundary에서 강제**하는 것이며, 그 결과
 "두 계약이 같은 authority field를 선언한다"는 전제의 generic merge 규칙은 v1에서 불필요해진다.
+Deployment component 선택도 같은 경계 밖이다. `runtime.adapter`, `runtime_bundle_id`, controller provider,
+preflight/manifest override 같은 host installation field를 Project Profile에 추가하지 않는다. 역할의
+`runtime_profile`은 선택된 RuntimeAdapter에 주는 project semantic input이고, adapter/bundle 선택 권한이
+아니다(§12.2b/§13.5).
 
 ### 7.6 operator-action 승인 레코드
 
@@ -2726,7 +2745,10 @@ task_contract_snapshot:            # = envelope body
   authority snapshot은 이미 존재하는 `compiled_profile_hash`가 갖고 있으므로 중복 provenance field를
   만들지 않는다. Contract가 동결하는 것은 실행에 실제 적용될 resolved scope다.
 - **`backend_requirements`**는 정확히 four component Manifest hash를 bind한다(§12.2a) — aggregate manifest
-  hash는 없다. **`capability_grants`에 SUPERVISOR grant를 넣지 않는다.**
+  hash는 없다. workflow-free Verification도 WORKFLOW slot/hash를 생략하거나 placeholder로 위조하지
+  않는다. §12.2b의 실제 Workflow component/Manifest는 그대로 동결하되, 그 Verification Manifest의
+  `workflow_dependency=NONE`이 "이 verifier가 그 component를 호출하지 않는다"를 명시한다.
+  **`capability_grants`에 SUPERVISOR grant를 넣지 않는다.**
 - `contract_sources` array는 Project Profile이 선언한 순서를 보존하며(generic array), `path`는 §7.1a와
   동일하게 non-empty·unique다.
 
@@ -3268,6 +3290,108 @@ Core는 개념적으로 `BackendManifestSet { runtime, workflow, repository, ver
 aggregate input만 취하며, **이 set 자체를 별도 hash envelope로 만들지 않는다** — 각 component envelope
 hash가 authority다(§10.1의 four-way hash 유지).
 
+### 12.2b Workflow/Verification Manifest v2 · deployment bundle binding (Issue #87)
+
+[계약, PROSPECTIVE_REQUIREMENT] Spec §27/§30/§37의 replaceable owner 경계를 deployment에서 정직하게
+구성하기 위해 WORKFLOW와 VERIFICATION Manifest에만 schema version `2`를 추가한다. 공통 envelope/body와
+RUNTIME capability semantics는 §12.2a 그대로다. RUNTIME과 REPOSITORY Manifest는 v1을 계속 사용할 수
+있다. 기존 frozen Attempt의 v1 hash는 저장 당시 schema로 recovery하며 v2 의미로 소급 해석하지 않는다.
+이 amendment를 사용하는 **신규 production composition**은 WORKFLOW/VERIFICATION v2를 필수로 한다.
+
+WORKFLOW Manifest v2는 공통 5필드에 정확히 다음 required field를 더한다:
+
+```text
+controller_binding:
+  { kind: BACKEND }
+  | { kind: PROVIDER, provider_id: <non-empty>, provider_version: <non-empty> }
+```
+
+`BACKEND`는 WorkflowAdapter/backend가 trusted controller context를 직접 소유한다는 뜻이고 provider를
+주입하지 않는다. `PROVIDER`는 §13.3의 exact provider identity와 일치하는 한 instance만 constructor로
+주입한다. missing/extra/mismatch provider는 `MANIFEST_SET_INVALID`로 run open 전에 거부한다.
+
+VERIFICATION Manifest v2는 공통 5필드에 정확히 다음 두 required field를 더한다:
+
+```text
+workflow_dependency:
+  { kind: NONE }
+  | { kind: REQUIRED,
+      adapter_id: <non-empty>,
+      adapter_version: <non-empty>,
+      backend_instance_id: <non-empty non-secret> }
+
+audit_settlement: NONE | ADAPTER
+```
+
+결정적 구성 규칙:
+
+- `workflow_dependency=NONE`: 해당 VerificationAdapter에 WorkflowAdapter/controller/provider를 주입하지
+  않는다. four-slot invariant 때문에 composition에 존재하는 WORKFLOW component를 verifier가 사용한다는
+  뜻은 아니다.
+- `workflow_dependency=REQUIRED`: 선언한 `(adapter_id, adapter_version, backend_instance_id)`가 실제
+  Workflow bundle/Manifest tuple과 exact equality여야 한다. 일치하지 않으면 run open 전에 거부한다.
+- `audit_settlement=ADAPTER`: Verification bundle에 §16.3의 `AuditSettlementAdapterV1`이 정확히 하나
+  있어야 한다. external settlement INTENT/recovery semantics는 기존 규칙 그대로다.
+- `audit_settlement=NONE`: settlement adapter를 주입하지 않는다. backend audit settlement effect와
+  그 INTENT가 모두 없고 §16.3의 local atomic commit branch를 사용한다.
+- unknown/missing declaration, runtime detection, implicit fallback은 전부 금지한다.
+
+Deployment host는 component를 개별 객체 묶음이 아니라 다음 typed bundle로 설치한다:
+
+```text
+RuntimeDeploymentBundleV1 {
+  adapter_id, adapter_version, backend_instance_id,
+  adapter: RuntimeAdapter,
+  preflight: RuntimePreflight,
+  manifest: RUNTIME Manifest
+}
+
+WorkflowDeploymentBundleV1 {
+  adapter_id, adapter_version, backend_instance_id,
+  adapter: WorkflowAdapter,
+  controller_provider?: WorkflowControllerProviderV1,
+  manifest: WORKFLOW Manifest v2
+}
+
+VerificationDeploymentBundleV1 {
+  adapter_id, adapter_version, backend_instance_id,
+  adapter: VerificationAdapter,
+  audit_settlement?: AuditSettlementAdapterV1,
+  manifest: VERIFICATION Manifest v2
+}
+```
+
+각 bundle의 `(backend_kind, adapter_id, adapter_version, backend_instance_id)`는 실제 component와 그
+Manifest에서 exact equality여야 한다. 이 검사는 **run open 전** 수행하고, **모든 external INTENT를
+쓰기 직전** current component/Manifest tuple을 다시 확인한다. Attempt-bound operation이면 frozen Task
+Contract의 해당 Manifest hash도 §22 규칙으로 함께 확인한다. mismatch는 fail-closed이며
+adapter, preflight, manifest를 서로 독립 override해 조합할 수 없다.
+
+`DeploymentConfig.runtime_bundle_id` 하나가 host에 설치된 **closed composition-root factory**를 명시적으로
+고른다. executable auto-detection도 generic registry/service locator도 아니며 Project Profile field가
+아니다. factory가 위 세 bundle과 기존 Repository component/Manifest를 함께 구성한다. production은
+bundle member를 따로 교체하지 않고, test도 검증된 whole bundle만 대체한다. component preflight는 그
+component의 첫 authorized external operation 직전에 수행한다. 따라서 workflow-free verification path는
+실제 Workflow bundle/hash를 유지하지만 WorkflowAdapter/controller/provider를 호출하거나 그 미사용
+backend의 preflight를 PASS로 꾸미지 않는다.
+
+Profile과 deployment의 binding은 다음으로 닫는다:
+
+```text
+roles[*].runtime_profile
+  = already-selected RuntimeAdapter에 주는 frozen requested binding ref
+  ≠ adapter/bundle selector
+
+verification_profiles[*].adapter
+  = Profile이 요구하는 verification implementation identity (validation reference)
+  = composed VerificationDeploymentBundleV1.adapter_id
+```
+
+두 번째 equality가 compile/run-open binding에서 성립하지 않으면 fail-closed한다. Profile에
+적힌 adapter id가 executable discovery나 Deployment component construction을 수행하지 않는다. Profile에
+`runtime.adapter`를 추가하거나 provider registry를 추가하지 않는다. Task Contract의 four manifest hash,
+BackendCompatibilityEvaluator, CapabilityGrant/Receipt schema는 변경하지 않는다.
+
 ### 12.3 Backend v1 Manifest 초기값 (capability 문서 §5에서 전사 — 감사 전 보수적 값)
 
 아래 값은 **generic contract의 example/initial data**이지 Core algorithm이 아니다. §12.2a의 directional
@@ -3555,13 +3679,13 @@ type/interface와 Broker·compatibility·receipt validation까지 구현하고, 
 
 ---
 
-## 13. RuntimeAdapter TD — OpenClawRuntimeAdapter mapping
+## 13. RuntimeAdapter TD — execution-only contract / OpenClaw mapping
 
 [계약] 이 절의 backend 주장은 §1.1 증거 등급 규칙의 적용 대상이다: §13.1의 각 mapping 행은
 MEASURED/INFERRED/CANDIDATE 등급을 명시해야 하며(기존 "실측"/"정정" 표기는 MEASURED로, "우선 검토"/
 "후보"는 CANDIDATE로 소급 해석), 등급 없는 행을 근거로 어떤 RA도 CLOSED될 수 없다.
 
-Core interface는 Spec §27 그대로 — method identity와 spawn semantics는 유지한다. Spec §27은
+Core interface는 Spec §27 그대로 — RuntimeAdapter는 model/session/turn execution만 소유한다. Spec §27은
 **최소 interface**이므로 TD는 그 위에 concrete result contract를 얹는다 (M0-7):
 
 ```text
@@ -3571,8 +3695,9 @@ spawn_session(role, runtime_profile, cwd, bootstrap_context, capability_grant)
 ```
 
 `session_handle`은 Spec §27이 규정한 반환 그대로이고, `enforcement_receipt`의 존재 조건은 §12.6의
-`receipt_supported` contract를 따른다. 나머지 method(§27 5종 + §13.3
-`acquire_workflow_controller`)의 시그니처는 변경하지 않는다.
+`receipt_supported` contract를 따른다. 나머지 method는 §27의 `send_turn`, `get_turn_result`,
+`get_session_status`, `cancel_session`, `close_session`뿐이다. Workflow controller 획득은 RuntimeAdapter
+contract에 존재하지 않는다(§13.3/§14.1).
 
 **`RuntimeOperationContextV1` (M1-8).** external Runtime operation은 §21의 write-ahead INTENT 대상이므로
 Platform의 idempotency identity가 adapter까지 도달해야 한다. Spec §27의 **operation 종류는 그대로 두고**
@@ -3631,7 +3756,6 @@ Core API에 OpenClaw 타입을 노출하지 않으며 아래는 mapping 전용 �
 | `get_session_status` | `acp_sessions` store + active-turns | 조회 가능, 안정 API로 노출 필요 (문서 §3 "expose as stable API") |
 | `cancel_session` | acpx kill-tree | 프로세스 수준 존재, API 노출 필요 |
 | `close_session` | session lifecycle | 동상 |
-| `WorkflowControllerHandle` (§13.3) | **Managed Platform-Controller Session** (adapter가 관리, host가 identity 발급) | **IMPLEMENTATION GAP RA-3** — handle↔host-managed trusted controller identity 매핑의 실측 확정 필요 |
 | `RuntimeResultChannel` (§13.2) | runtime-owned scratch 후보: session artifact 영역 / adapter 관리 temp dir (repository 밖) | RA-2에 종속 — 구체 위치/수집 방식은 실측 확정 |
 
 **행별 증거 등급 소급 명시 ([계약], v1.3 — #6 checklist 종결):**
@@ -3645,7 +3769,6 @@ get_turn_result             CANDIDATE (RA-2 종속 — envelope 수집 경로 �
 get_session_status          INFERRED (store 존재는 확인, 안정 API 노출은 미실측)
 cancel_session              INFERRED (kill-tree 존재, API 노출 미실측)
 close_session               INFERRED (동상)
-WorkflowControllerHandle    CANDIDATE (RA-3 — 매핑 자체가 조사 대상)
 RuntimeResultChannel        CANDIDATE (RA-2 종속)
 ```
 
@@ -3755,35 +3878,40 @@ RuntimeExecutionObservationV1 {
   `idempotency.DONE.result_json`에 보존한다. 이것은 measurement/evidence source이지 Task 성공,
   Verification PASS, retry, state transition authority가 아니다.
 
-### 13.3 WorkflowControllerHandle (v1.1 신설)
+### 13.3 Workflow-owned controller provider seam (Issue #87)
 
-Backend가 trusted context를 요구하는 workflow-control 호출(`workflow.start`/`audit_decide`)을 위해
-Core가 소유하는 것은 **opaque `WorkflowControllerHandle`뿐이다** (I-TD5).
+[계약, PROSPECTIVE_REQUIREMENT] Backend가 trusted context를 요구하는 workflow-control 호출의 controller
+binding은 **WorkflowAdapter가 소유**한다. RuntimeAdapter/Core/Profile/Model/Verification Coordinator가
+controller를 acquire하거나 public Workflow method에 전달하는 경로는 없다.
+
+Workflow backend가 trusted context를 직접 소유하지 못하는 경우에만 다음 exact constructor dependency를
+한 WorkflowAdapter bundle에 주입할 수 있다:
 
 ```text
-acquire_workflow_controller() -> WorkflowControllerHandle     # RuntimeAdapter 제공
+WorkflowControllerProviderV1 {
+  provider_id: <non-empty string>
+  provider_version: <non-empty string>
+  acquire_workflow_controller() -> WorkflowControllerHandle
+}
 ```
 
-**WorkflowHandle ↔ controller association (M0-8).** `start(controller_handle, workflow_spec)` 성공 시
-WorkflowAdapter는 반환한 `WorkflowHandle`을 그 start에 사용된 controller authority와 **associate한다.**
-association 자체는 **Adapter/Runtime 소유 state**이며 Core에는 존재하지 않는다.
+- provider는 §12.2b `WorkflowDeploymentBundleV1.controller_provider` 한 곳에서만 주입한다. registry,
+  service locator, Profile field, Runtime capability가 아니다.
+- `WorkflowControllerHandle`은 provider/WorkflowAdapter 경계 아래의 opaque non-secret handle이다.
+  Core/Platform Store에는 저장하지 않고 raw session identity/token/credential도 노출하지 않는다(I-TD7).
+- controller 획득은 이미 §21 INTENT가 기록되고 policy/capability가 통과한 **해당 workflow operation
+  내부**에서만 일어난다. composition/run-open 시 eager acquisition side effect는 금지한다.
+- `WorkflowHandle ↔ controller authority` association, handle freshness, owner equality, restart/recovery는
+  WorkflowAdapter/backend가 소유하고 fail-closed한다. Core는 association을 재구성하거나 controller를
+  교체해 workflow를 암묵 rebind하지 않는다.
+- §12.2b WORKFLOW Manifest v2의 `controller_binding=BACKEND|PROVIDER`와 실제 provider presence/identity는
+  run open 전에 exact equality로 검증한다.
 
-- Platform이 보관하는 `WorkflowHandle`은 **non-secret opaque handle일 뿐**이다 — raw session identity,
-  token, Authorization header, secret credential, secret-bearing backend identifier를 **일절 포함하지
-  않는다** (I-TD7). `WorkflowHandle → backend owner/controller identity` 해석은 adapter가 수행한다.
-- Core는 어떤 계층에서도 raw identity를 제공하거나 복구하지 않는다 (I-TD5).
-- 이 association은 §14.1의 `status`/`resume`/`cancel`/`recover`가 controller 인자 없이도 backend
-  ownership context를 얻는 근거다.
+OpenClaw/durable-jobs의 과거 managed-controller evidence는 generic Runtime contract가 아니다. future
+OpenClaw composition이 이 seam을 사용하려면 DurableJobs WorkflowAdapter가 controller를 직접 소유하거나
+정확한 provider를 받아야 한다. `astro3141/openclaw@7a5e94b4a7602a8a9bdc0865d0ce14b0d451fd15`는
+동기 in-realm provider를 제공한다는 증거가 없으므로 이 amendment로 production 적합 판정을 받지 않는다.
 
-- OpenClaw Backend v1 우선 검토안: adapter가 **전용 Managed Platform-Controller Session**을
-  기동·유지하고 handle을 그 session에 매핑한다. identity(agentId/sessionKey)는 host가 발급·관리하며
-  Core와 Platform DB에는 handle + redacted fingerprint만 존재한다(I-TD7). durable-jobs ownership
-  gate(ENFORCED, live-verified)는 이 controller identity를 owner로 인식한다.
-- 대안(durable-jobs가 명시적 service identity API를 제공하는 방식)은 **현재 Backend 문서에 근거가
-  없으므로 채택하지 않는다** — 추측으로 채우지 않고 RA-3의 조사 항목으로만 남긴다.
-- handle 유효성/수명은 RuntimeAdapter 소유 fact다: controller session 소실 시 Core는 재-acquire를
-  요청할 뿐 identity를 복원하지 않는다. 재-acquire 후 기존 workflow ownership과의 정합은
-  **IMPLEMENTATION GAP RA-3**의 일부다 (owner 고정 vs controller 교체 시 접근성 — 실측 확정, §30).
 - **Invariant 재확인:** `RuntimeTurnResult ≠ semantic success`. `declared_status: DONE`은 어떤 transition의
   precondition에도 단독 사용되지 않는다. IMPLEMENTING→VERIFYING의 trigger는 "turn 종료 + candidate commit
   존재(RepositoryAdapter 확인)"이지 declared가 아니다.
@@ -4084,9 +4212,11 @@ AUDITOR
   → frozen effective.project.roles[auditor_profile].runtime_profile
 ```
 
-- `runtime_profile`은 RuntimeAdapter가 해석하는 **requested binding ref**다. role/profile config가
-  CapabilityGrant를 확대할 수 없고(§12.4), provider/model 실제 identity는 Backend observation이다(§13.2a).
-  profile 이름에서 실제 model을 추정하지 않는다.
+- `runtime_profile`은 Deployment host가 이미 선택한 RuntimeAdapter가 해석하는 **requested binding ref**다.
+  adapter id, bundle id, provider 선택, fallback route가 아니며 Project Profile이 Deployment composition을
+  바꾸는 경로는 없다(§7.5/§12.2b). role/profile config가 CapabilityGrant를 확대할 수 없고(§12.4),
+  provider/model 실제 identity는 Backend observation이다(§13.2a). profile 이름에서 실제 model을 추정하지
+  않는다.
 - exact model 비교/evaluation 대상이 되려면 RuntimeAdapter가 같은 Attempt 동안 stable한 non-secret
   `actual.binding_ref`를 보고할 수 있어야 한다. 보고할 수 없으면 실행 identity는 `UNKNOWN`으로 남고 그
   run을 exact provider/model 비교나 future automatic-routing evidence로 사용할 수 없다; 가장 가까운
@@ -4131,31 +4261,30 @@ AUDITOR
 Generic interface의 method 이름은 **Spec §30 그대로 유지**한다 — 관측 primitive는 `status(handle)`이며,
 그 반환은 §14.2의 normalized `WorkflowObservation`이다 (M0-6).
 
-**Concrete public signatures (M0-8 결정, W-B+):**
+**Concrete Core-facing signatures (Issue #87 prospective amendment):**
 
 ```text
-start(controller_handle, workflow_spec)                      -> WorkflowHandle
+start(workflow_spec)                                         -> WorkflowHandle
 status(workflow_handle)                                      -> WorkflowObservation
 resume(workflow_handle)
 cancel(workflow_handle)
-audit_decide(controller_handle, workflow_handle, verdict, evidence)
+audit_decide(workflow_handle, verdict, evidence)
 recover(workflow_handle)
 ```
 
-**호출 경로 (v1.1 · M0-8로 확정):** trusted context를 요구하는 호출은 **`start`와 `audit_decide` 둘뿐**이며
-(§13.3), 이 둘만 `WorkflowControllerHandle`을 **명시적 인자로** 받는다 — Core는 handle을 넘길 뿐
-identity를 만들지 않는다 (I-TD5). `status`/`resume`/`cancel`/`recover`는 controller 인자를 받지 않고,
-adapter가 **`WorkflowHandle`에 연결된 기존 controller association**(§13.3)으로 필요한 backend ownership
-context를 해석한다. 모든 operation에 controller를 붙이지 않으며, scoped surface/factory/context 같은
-public abstraction도 두지 않는다.
+**호출 경로.** Core-facing interface는 Spec §30 shape를 유지하며 `WorkflowControllerHandle`을 인자로
+받지 않는다. trusted context가 필요한 operation은 WorkflowAdapter가 §13.3의 자기 backend-owned binding
+또는 정확히 하나의 constructor-injected provider로 내부에서 획득한다. controller 획득 자체는 이미
+authorize/INTENT된 operation 안에서만 일어나고, Core는 identity/handle을 만들거나 넘기지 않는다(I-TD5).
 
-`audit_decide`에서 adapter는 전달된 controller가 해당 `WorkflowHandle`의 original controller
-association과 정합하는지 **backend-authoritative boundary에서 확인할 수 있어야** 하며, mismatch를
-fail-open으로 처리하지 않는다 (§16.3).
+`start` 성공 시 WorkflowAdapter는 반환한 `WorkflowHandle`을 실제 controller authority와 내부적으로
+associate한다. `status`/`resume`/`cancel`/`audit_decide`/`recover`의 owner resolution과 controller
+equality는 그 association/backend authoritative fact에서 처리한다. mismatch, provider loss, ambiguous
+recovery는 fail-closed하며 새 controller로 기존 workflow를 암묵 rebind하지 않는다. public scoped
+surface/factory/context나 controller registry를 추가하지 않는다.
 
-handle↔host-managed identity 매핑, 그리고 controller 교체·소실 시 기존 workflow의 접근성/ownership 이동
-여부는 여전히 **RA-3**(§30)이다 — M0-8은 이를 닫지 않는다. 특히 "새 controller 획득 시 기존 workflow를
-암묵 rebind한다"는 규칙은 어디에도 도입하지 않는다.
+§16.3에서 workflow-backed Verification bundle의 `AuditSettlementAdapterV1`이 이 public WorkflowAdapter를
+내부 사용할 수 있다. workflow-free Verification은 이 adapter/controller/provider를 전혀 호출하지 않는다.
 
 **소유권 분리 (Spec §31 구체화):**
 
@@ -4365,18 +4494,20 @@ Platform 추가 검증 (Spec §45):
 Verification Coordinator (Core)
         │  VerificationAdapter async lifecycle (§15.1a) — 이 경계 위에는 backend 기전이 없다
         ▼
-LocalVerificationAdapter (초기, Backend v1)
-   ├─ 필요 시 RuntimeAdapter backend-preflight / controller glue
-   └─ WorkflowAdapter / durable-jobs local activity(argv) — durable 실행/retry/journal 재사용
+VerificationAdapter (selected Deployment bundle)
+   ├─ workflow-free: local process/CI/sandbox를 adapter가 직접 소유
+   └─ workflow-backed: Manifest v2 REQUIRED tuple의 WorkflowAdapter를 내부 재사용
 
 CIValidationAdapter (extension point, MVP 2 전략 B에서 활성 후보)
    └─ 자체 backend의 start/observe 구현
 ```
 
-**M1-9 경계 규칙.** Core는 선택된 Verification backend가 workflow engine을 쓰는지조차 알지 않는다.
-`WorkflowAdapter`는 별개의 replaceable backend contract로 남고(§14), LocalVerificationAdapter가
-그것을 **내부 구현으로 재사용**할 뿐이다 — `LocalVerificationAdapter → CIValidationAdapter` 교체가
-Core 변경 없이 성립해야 한다는 것이 이 경계의 판정 기준이다(Spec §37).
+**M1-9 + Issue #87 경계 규칙.** Core verification lifecycle은 선택된 backend가 workflow engine을
+쓰는지에 의존하지 않는다. 그 dependency는 §12.2b VERIFICATION Manifest v2의 `workflow_dependency`로
+구성 전에 명시한다. `NONE`이면 WorkflowAdapter/controller/provider 주입이 0이어야 하고,
+`REQUIRED`이면 exact Workflow tuple만 내부 구현으로 재사용한다. RuntimeAdapter는 어느 경우에도
+Verification workflow/controller glue를 제공하지 않는다. `LocalVerificationAdapter → CIValidationAdapter`
+교체가 Core 변경 없이 성립해야 한다는 것이 이 경계의 판정 기준이다(Spec §37).
 
 - Platform이 실행을 **개시·소유**하고 대상 commit worktree를 지정하므로 LocalVerificationAdapter 결과의
   assurance는 `REEXECUTED`다. Actor가 자기 세션에서 돌린 동일 명령 결과는 언제나 `WORKER_REPORTED`이며
@@ -4396,6 +4527,9 @@ backend 목록(Local / CI / RemoteSandbox)도 그대로다.
 **v1 production callable surface는 아래 둘뿐이다.** 동기 `run_verification(...) -> Evidence[]`는 v1
 callable surface에서 **제거**되며 병존하지 않는다 — execution authority가 둘이 되는 것을 막기 위해서다.
 동기적으로 끝나는 backend도 이 lifecycle을 구현하고, 첫 observation에서 곧바로 terminal을 반환하면 된다.
+Audit settlement는 이 두 method에 붙는 필수 VerificationAdapter method가 아니다. Manifest v2가
+`audit_settlement=ADAPTER`일 때에만 같은 `VerificationDeploymentBundleV1` 안의 별도
+`AuditSettlementAdapterV1`을 사용하고, `NONE`이면 settlement component/effect 자체가 없다(§16.3).
 
 ```text
 VerificationOperationContextV1 { op_key }        # exact 1 field
@@ -4466,9 +4600,10 @@ same op_key + different material input   → deterministic conflict, fail-closed
 same-owner `(ownerKey, requestId)` idempotency로 이를 만족한다. Core는 `op:<attempt>:verify:<candidate_sha>`를
 `VerificationOperationContextV1.op_key`로 넘길 뿐 backend requestId 매핑을 수행하지 않는다(§22).
 
-**RA-4 placement.** Backend v1이 요구하는 preflight는 LocalVerificationAdapter의 구현 세부다. generic
-Verification Coordinator는 OpenClaw packaging/preflight semantics에 의존하지 않는다 — CIValidationAdapter는
-RA-4를 알 필요가 없다.
+**Preflight placement.** Runtime preflight는 §12.2b의 selected Runtime bundle member이며 Verification
+adapter가 Runtime/controller를 얻기 위한 우회 통로가 아니다. component-specific preflight는 그
+component의 authorized external operation 직전에만 실행한다. generic Verification Coordinator와
+workflow-free adapter는 OpenClaw packaging/RA-4 semantics에 의존하지 않는다.
 
 **I-TD12 적용 ([계약], v1.3).** verification sandbox/실행 표면 정리 전, Evidence가 참조하는
 log/artifact digest의 원본이 그 표면에만 있으면 blob 캡처(§15.2의 `log_digest`/`artifact_digest`
@@ -4641,38 +4776,39 @@ exact top-level field set / unknown-field 거부 / `reviewed` 검증은 전부 �
 
 ### 16.3 Audit decision commit 경로 (Decision)
 
-- **Platform Core는 trusted owner identity를 생성·주장하지 않는다 (I-TD5, v1.1 수정).**
-  workflow의 trusted owner는 `WorkflowControllerHandle`(§13.3) 뒤의 **backend-authoritative
-  controller identity**다 — Backend v1에서는 OpenClawRuntimeAdapter가 관리하는 Managed
-  Platform-Controller Session이며, identity는 host가 발급한다. Coordinator는 stage workflow의
-  `start`와 `audit_decide`를 **동일 controller handle 경유로** 수행하여 owner 일관성을 유지한다.
+- **Platform Core는 trusted owner identity를 생성·주장하지 않는다 (I-TD5).** workflow-backed
+  settlement의 trusted owner/controller binding은 WorkflowAdapter와 그 backend가 소유하며, 필요한
+  provider도 §13.3/§14.1 경계 아래에 있다. Coordinator/RuntimeAdapter는 controller handle을 얻거나
+  전달하지 않는다.
 - Auditor session은 backend workflow를 직접 호출하지 않는다 (workflow tool이 Auditor allowlist에 없음).
-- **settle ownership 정정 (M1-13).** generic Core는 `WorkflowAdapter.audit_decide`를 **직접 호출하지
-  않는다.** 호출하려면 `WorkflowHandle`과 `WorkflowControllerHandle`이 필요한데, Core가 가진 것은
-  B7/B8이 남긴 **opaque `VerificationRunHandle`뿐**이고 그 안을 들여다보는 것은 I-TD5/I-TD7 위반이다
-  (`VerificationRunRefV1.workflow_id`, backend workflow id, ownerKey, sessionKey 전부 Core 밖).
-  audit settlement는 **그 run을 시작한 adapter**, 즉 `VerificationAdapter` 경계에 둔다:
+- **settle ownership (M1-13 + Issue #87).** generic Core는 `WorkflowAdapter.audit_decide`를 직접 호출하지
+  않고, `VerificationRunHandle` 내부의 workflow/backend ref도 해석하지 않는다. audit settlement가 있는
+  composition에서는 그 run과 같은 Verification bundle의 optional sub-interface만 호출한다:
 
 ```text
 AuditSettlementOperationContextV1 { op_key }
 
-settle_audit(operation_context, run_handle, auditor_verdict, evidence)
-  -> { kind: SETTLED } | { kind: UNAVAILABLE } | { kind: CONFLICT }
+AuditSettlementAdapterV1 {
+  settle_audit(operation_context, run_handle, auditor_verdict, evidence)
+    -> { kind: SETTLED } | { kind: UNAVAILABLE } | { kind: CONFLICT }
+}
 ```
 
-  backend workflow state를 노출하지 않고 metadata bag도 두지 않으며,
-  `JobHandle`/`AuditHandle`/workflow-ref registry도 만들지 않는다.
+  `AuditSettlementAdapterV1`은 독립 selector/service가 아니라 §12.2b
+  `VerificationDeploymentBundleV1.audit_settlement`의 optional member다. backend workflow state를
+  노출하지 않고 metadata bag도 두지 않으며 `JobHandle`/`AuditHandle`/workflow-ref registry도 만들지
+  않는다.
 - **`SETTLED`는 강한 주장이다.** 선택된 VerificationAdapter가 **자기 backend를 authoritative하게 재관측해**
   이 `VerificationRunHandle`의 audit gate가 요청한 논리 Platform verdict로 settle되었음을 증명한 경우에만
   쓴다. backend 호출 성공만으로는 부족하고, 요청 verdict의 echo도 model text도 부족하다.
-- **Backend v1 매핑은 LocalVerificationAdapter 안에만 있다:** `AUDIT_PASS→PASS`, `FIX_REQUIRED→FAIL`,
-  `HUMAN_REQUIRED→BLOCKED`. `WorkflowControllerHandle`/`WorkflowHandle`/backend evidence projection/
-  `INDEPENDENT_AUDIT` producer semantics/stage inspection은 전부 adapter 소유다. `WorkflowAdapter`
-  public contract는 바뀌지 않으며 durable-jobs도 바뀌지 않는다. `INCONCLUSIVE` 같은 backend-native
-  verdict는 Platform verdict가 되지 않는다 — 요청과 다른 settle이므로 `CONFLICT`다.
-- **settlement recovery (M1-13).** Platform idempotency identity는
+- **workflow-backed Backend v1 매핑은 settlement adapter 안에만 있다:** `AUDIT_PASS→PASS`,
+  `FIX_REQUIRED→FAIL`, `HUMAN_REQUIRED→BLOCKED`. `WorkflowHandle`/backend evidence projection/
+  `INDEPENDENT_AUDIT` producer semantics/stage inspection과 controller binding은 Workflow/
+  settlement adapter 아래에 있다. `INCONCLUSIVE` 같은 backend-native verdict는 Platform verdict가
+  되지 않는다 — 요청과 다른 settle이므로 `CONFLICT`다.
+- **`audit_settlement=ADAPTER` recovery (M1-13).** Platform idempotency identity는
   `op:<attempt>:audit-decision:<candidate_sha>`다. Backend v1은 audit 결정의 dedup을 증명하지 못하므로
-  adapter는 observe-before-act / re-observe-after를 쓴다:
+  settlement adapter는 observe-before-act / re-observe-after를 쓴다:
 
 ```text
 AD1 Platform INTENT 없음                      → 효과 없음
@@ -4686,31 +4822,40 @@ AD5 Platform op DONE                          → backend 호출 없음
 ```
 
   adapter의 local process memory가 비었다는 이유만으로 UNSETTLED를 주장하지 않는다.
-- Rationale: (a) ownership fail-closed 경계(ENFORCED, live-verified)를 **host-derived identity 그대로**
-  활용 — Core가 identity issuer가 되는 무근거 가정을 제거, (b) Auditor에게 workflow-control
-  capability를 지급하지 않음(권한 최소), (c) 구 P3-H continuation 경로 완전 비의존.
-- **Blocker 명시:** controller handle↔host-managed identity 매핑이 확정되지 않으면 Coordinator는
-  durable-jobs의 trusted workflow owner가 될 수 없다 → **MVP 1 구현 blocker RA-3** (§30).
-- **Commit ordering (M1-4 정합, I-TD2).** `audit_record`는 external side effect보다 먼저 쓰이지
-  **않는다.** side effect 이전에 필요한 durable write는 **idempotency INTENT**뿐이며(§21),
-  validated `audit_record`는 `audit_decide`의 **확인된 settle 결과와 같은 Core transaction 흐름**에서
-  commit된다. 실패한 `audit_decide`를 성공한 audit_record처럼 남기지 않는다:
+- **`audit_settlement=NONE`.** backend audit gate가 없으므로 settlement adapter 호출, external
+  settlement effect, `audit-decision` INTENT를 모두 만들지 않는다. Auditor envelope/evidence/binding/
+  policy/drift gate를 기존 순서로 통과한 뒤 Platform Store transaction 하나가 validated `audit_record`와
+  기존 lifecycle branch를 함께 commit한다. 이는 Auditor semantic authority나 Platform validation을
+  Verification/Runtime으로 이동시키지 않는다. backend가 없는 것을 `SETTLED`로 위조해 반환하는 adapter도
+  두지 않는다.
+- Rationale: (a) workflow-backed 경로는 host-derived owner identity를 Workflow 경계 안에서 fail-closed
+  사용, (b) workflow-free verifier에 허구의 controller/gate를 강제하지 않음, (c) Auditor에게
+  workflow-control capability를 지급하지 않음, (d) 구 P3-H continuation 경로 완전 비의존.
+- **Commit ordering (M1-4 정합, I-TD2).** settlement mode는 Task Contract의 frozen VERIFICATION
+  Manifest hash로 정하고 commit 직전에 actual bundle/manifest tuple과 함께 다시 검증한다(§12.2b).
+  `ADAPTER`에서는 `audit_record`를 external side effect보다 먼저 쓰지 않는다. side effect 이전 durable
+  write는 idempotency INTENT뿐이고, 확인된 `SETTLED` 뒤에 record/branch를 commit한다. `NONE`에서는
+  external effect가 없으므로 INTENT 없이 record/branch만 atomic commit한다:
 
   ```text
   FIX_REQUIRED / HUMAN_REQUIRED (§11 boundary를 넘지 않으므로 drift 평가 없음)
     Auditor envelope 수집 → §16.2 validation
-    → op:<attempt>:audit-decision:<candidate_sha> INTENT
-    → VerificationAdapter.settle_audit(...)
-    → authoritative SETTLED
-    → audit_record + lifecycle branch를 하나의 transaction으로
+    ADAPTER → op:<attempt>:audit-decision:<candidate_sha> INTENT
+            → AuditSettlementAdapterV1.settle_audit(...)
+            → authoritative SETTLED
+            → audit_record + lifecycle branch를 하나의 transaction으로
+    NONE    → settlement INTENT/effect 없음
+            → audit_record + 같은 lifecycle branch를 하나의 transaction으로
 
   AUDIT_PASS (AUDITING→READY_TO_MERGE는 §11 stage boundary다)
     Auditor envelope 수집 → §16.2 validation
     → §11 assembler/evaluator (AUDITING_TO_READY_TO_MERGE)
     non-CONTINUE → drift lifecycle 적용. audit settle side effect 없음, 이 결정의 audit_record 없음
-    CONTINUE     → op:<attempt>:audit-decision:<candidate_sha> INTENT
-                 → VerificationAdapter.settle_audit(...) → authoritative SETTLED
-                 → audit_record + AUDIT_DECIDED + READY_TO_MERGE를 하나의 transaction으로
+    CONTINUE/ADAPTER → op:<attempt>:audit-decision:<candidate_sha> INTENT
+                     → AuditSettlementAdapterV1.settle_audit(...) → authoritative SETTLED
+                     → audit_record + AUDIT_DECIDED + READY_TO_MERGE를 하나의 transaction으로
+    CONTINUE/NONE    → settlement INTENT/effect 없음
+                     → audit_record + AUDIT_DECIDED + READY_TO_MERGE를 하나의 transaction으로
   ```
 
   boundary가 이미 전이를 불허하는데 외부 audit settle 효과를 내지 않는다. `AUDIT_DECIDED`는 그대로
@@ -4719,12 +4864,15 @@ AD5 Platform op DONE                          → backend 호출 없음
   `canonical_head.boundary=MERGE_ONLY`이므로 이 boundary에서 canonical 이동은 **관측 전용**이다:
   그것만으로 HOLD하지 않고 rebase도 `base_head` 변경도 없다(§11.2, §19.4).
 
-- Failure behavior: gate 거부/관측 불가 → `HELD(AUDIT_GATE_UNAVAILABLE)` + 보고. fail-open 경로 없음.
+- Failure behavior: `ADAPTER`에서 gate 거부/관측 불가 → `HELD(AUDIT_GATE_UNAVAILABLE)` + 보고.
   `settle_audit`가 `CONFLICT`(gate가 **다른** 결정으로 이미 settle됨)를 돌려주면 backend-authoritative한
   답을 덮어쓰지 않고 기존 fail-closed `RECOVERY_CONFLICT`로 간다. 이를 `FIX_REQUIRED`로 재해석하지 않는다.
+  `NONE`은 gate 관측을 시도하지 않는다. mode/optional-member/manifest mismatch는 local commit으로 우회하지
+  않고 run open 또는 commit-time recheck에서 fail-closed한다.
 - **AUDIT_INVALID의 durable 표현 (MVP1-B11).** 사용 불가능한 구조 결과는 `decision_log`의
   orchestration fact(`audit_observation`)로만 남는다 — `audit_invalid` / `invalid_audit_record` /
-  `audit_attempt` table을 만들지 않으며, valid하고 settle된 결정만 `audit_record`가 된다(§18.1c).
+  `audit_attempt` table을 만들지 않으며, valid하고 (`ADAPTER`이면 settle까지 확인된) 결정만
+  `audit_record`가 된다(§18.1c).
 
 ---
 
@@ -5347,7 +5495,7 @@ v1/v2는 **수정하지 않는다.** v3이 추가하는 table은 정확히 셋�
 ```text
 run     → Supervisor RuntimeSessionHandle
 attempt → Actor / Auditor RuntimeSessionHandle, RuntimeTurnHandle,
-          workspace ref, WorkflowHandle, WorkflowControllerHandle reference/fingerprint
+          workspace ref, WorkflowHandle
 ```
 
 ```text
@@ -5753,11 +5901,11 @@ B8 state machine production code는 어떤 Adapter도 import/call하지 않는�
 | T: SELECTED→ACTIVE + A: (생성)→READY | trigger: Coordinator contract build / pre: **§19.3a selection binding equality 통과(M1-7 — 실패 시 아래 HELD(SELECTION_STALE) 행)** → §12.7 finalization order대로 `task.repository_scope_id`를 batch-bound Compiled Profile에서 resolve(M1-6) → grant 발급(V10 재확인) 후 Task Contract Snapshot 생성 성공(backend_requirements + grant refs 포함, §10.1) / side: snapshot·grant immutable 기록 / fail→ T: FAILED(CONTRACT_BUILD_ERROR) 또는 HELD(POLICY_BACKEND_INCOMPATIBLE) / op: `op:<attempt>:contract` — **local logical operation reference이며 idempotency row를 요구하지 않는다(§21, M0-32)** |
 | T: SELECTED→HELD(SELECTION_STALE) (M1-7) | trigger: activation 직전 fresh TaskDefinition/canonical이 `selection_binding`과 불일치 / pre: Attempt 부재 / side: 없음 / write: task row(`platform_state`, `state_reason_code=SELECTION_STALE`, `state_reason_log_seq`) + decision_log(mismatch provenance) — `selection_binding_json`·selection fields·`admitted_at`은 **그대로 유지** / fail→ — / op: — |
 | T: HELD(SELECTION_STALE)→SELECTED (M1-7, explicit reselection) | trigger: 검증된 **새** START_TASK Proposal(V1–V10 + RESELECTION mode V11, §9.2e) / pre: `state_reason_code == SELECTION_STALE` + Attempt 부재 + `admitted_at != null` + **§19.3a reselection guard** + 재계산된 `hard_dependencies_clear == true`(§8.4a) / side: 없음 / write: selection fields + `selection_binding_json`을 새 validated 값으로 교체, `state_reason_*` clear — `admitted_at`과 `batch.admission_closed`는 **불변** / fail→ HELD(SELECTION_STALE) 유지 / op: — |
-| A: READY→IMPLEMENTING | trigger: Coordinator 실행 개시 / pre: **§19.3e 순서 전체** — RA-4 preflight PASS(step 0) → workspace/spawn/turn 각각 INTENT 선행 후 수행 → 세 op DONE + 세 ref durable + **§19.3d receipt 조건부 검증** / side: create_feature_workspace + spawn_session(actor) + send_turn / write: attempt.state, workspace ref·session handle(opaque)·turn handle→adapter_metadata, **receipt는 §19.3d 조건에서만** / fail→ T: HELD(RUNTIME_FAILED) · HELD(CAPABILITY_BOUNDARY_CHANGED) · HELD(RECOVERY_CONFLICT)(§19.3e T2/T3) / op: `op:<attempt>:workspace`, `op:<attempt>:actor-spawn`, `op:<attempt>:actor-turn:1` |
+| A: READY→IMPLEMENTING | trigger: Coordinator 실행 개시 / pre: **§19.3e 순서 전체** — selected Runtime bundle의 matching preflight PASS(step 0; OpenClaw에서만 RA-4) → workspace/spawn/turn 각각 INTENT 선행 후 수행 → 세 op DONE + 세 ref durable + **§19.3d receipt 조건부 검증** / side: create_feature_workspace + spawn_session(actor) + send_turn / write: attempt.state, workspace ref·session handle(opaque)·turn handle→adapter_metadata, **receipt는 §19.3d 조건에서만** / fail→ T: HELD(RUNTIME_FAILED) · HELD(CAPABILITY_BOUNDARY_CHANGED) · HELD(RECOVERY_CONFLICT)(§19.3e T2/T3) / op: `op:<attempt>:workspace`, `op:<attempt>:actor-spawn`, `op:<attempt>:actor-turn:1` |
 | A: IMPLEMENTING→VERIFYING (M1-9 정정) | trigger: Actor turn terminal 관측 / pre: RepositoryAdapter가 candidate commit 존재+lineage(base_head 자식)+tracked clean 확인. **declared_status는 precondition 아님(I-TD3)** / side: `VerificationAdapter.start_verification(op_key, frozen verification request)` — **generic 경로에 WorkflowAdapter도 WorkflowControllerHandle도 등장하지 않는다(§15.1a)** / write(STARTED): VerificationRunHandle projection + verify op DONE + candidate_commit + A: VERIFYING + log을 **한 transaction**으로 / BLOCKED: A는 IMPLEMENTING 유지, candidate_commit 미승격, RunHandle 없음, 전이 없음 / fail→ (commit 없음·lineage 불일치) REWORKING(잔여 rework>0) 또는 T: HELD, backend infra 실패는 `VERIFICATION_INFRA` / op: `op:<attempt>:verify:<candidate_sha>` |
 | A: VERIFYING→AUDITING (M1-9 정정) | trigger: `VerificationAdapter.get_verification_result(run_handle)` 관측 — `RUNNING`이면 VERIFYING 유지, `FAILED`면 `VERIFICATION_INFRA`, `COMPLETED`면 반환 Evidence를 envelope 검증 + `target_commit`/`task_contract_hash` 재확인 + Coordinator 계산 `binding_valid`로 저장(§15.2) 후 required check·accepted assurance 평가(§15.3) / pre: 모든 required check Evidence 수집 + PASS + binding_valid + accepted assurance. **WorkflowObservation에서 verification 성공을 유도하지 않는다** / side: **없음** — Evidence gate 성립은 durable Evidence rows로만 남고 gate marker를 쓰지 않는다(M1-9) / fail→ VERIFICATION_FAILED 처리: REWORKING(rework<limit) else T: HELD |
-| A: VERIFYING→AUDITING launch (M1-10) | pre: durable Evidence + frozen policy로 gate 자격을 **재계산**(저장된 표시를 믿지 않는다) → §11 VERIFYING→AUDITING drift gate → RA-4 preflight. 이 셋이 통과하기 전에는 어떤 Runtime side effect도 없다 / side: `spawn_session(role=AUDITOR, …)` 후 `send_turn(…)` — **서로 다른 두 external operation** / write: spawn INTENT→DONE + Auditor RuntimeSessionHandle(+§19.3d receipt 조건부), 그 다음 turn INTENT→DONE + RuntimeTurnHandle + A: VERIFYING→AUDITING을 **하나의 transaction**으로 / fail→ spawn/turn 실패는 기존 `RUNTIME_FAILED` / `CAPABILITY_BOUNDARY_CHANGED` / `RECOVERY_CONFLICT` semantics. preflight BLOCKED는 VERIFYING 유지(side effect 0) / op: `op:<attempt>:audit-spawn`(Attempt 단위 session), `op:<attempt>:auditor-turn-1:<candidate_sha>`(이 candidate의 최초 review). `op:<attempt>:auditor-turn-2:<candidate_sha>`는 §16.2의 unusable-verdict 재시도 소관이며 이 launch에 속하지 않는다 — Attempt 전역 Auditor turn counter는 없다(M1-13) |
-| A: AUDITING→READY_TO_MERGE | trigger: verdict=AUDIT_PASS + §16.3 settle 성공 / pre: drift policy 평가(§11) 통과 / write: audit_record / fail→ FIX_REQUIRED→REWORKING, HUMAN_REQUIRED→T: HELD + `AUDIT_DECISION` PendingDecision. 구조 결과가 unusable하면 1회차는 `AUDIT_INVALID` + `op:<attempt>:auditor-turn-2:<candidate_sha>`, 2회차는 T: HELD(`AUDIT_UNUSABLE`) — 같은 candidate에 3번째 turn 없음. valid verdict인데 settlement를 authoritative하게 확립하지 못하면 T: HELD(`AUDIT_GATE_UNAVAILABLE`) / op: `op:<attempt>:audit-decision:<candidate_sha>` |
+| A: VERIFYING→AUDITING launch (M1-10) | pre: durable Evidence + frozen policy로 gate 자격을 **재계산**(저장된 표시를 믿지 않는다) → §11 VERIFYING→AUDITING drift gate → selected Runtime bundle matching preflight. 이 셋이 통과하기 전에는 어떤 Runtime side effect도 없다 / side: `spawn_session(role=AUDITOR, …)` 후 `send_turn(…)` — **서로 다른 두 external operation** / write: spawn INTENT→DONE + Auditor RuntimeSessionHandle(+§19.3d receipt 조건부), 그 다음 turn INTENT→DONE + RuntimeTurnHandle + A: VERIFYING→AUDITING을 **하나의 transaction**으로 / fail→ spawn/turn 실패는 기존 `RUNTIME_FAILED` / `CAPABILITY_BOUNDARY_CHANGED` / `RECOVERY_CONFLICT` semantics. preflight BLOCKED는 VERIFYING 유지(side effect 0) / op: `op:<attempt>:audit-spawn`(Attempt 단위 session), `op:<attempt>:auditor-turn-1:<candidate_sha>`(이 candidate의 최초 review). `op:<attempt>:auditor-turn-2:<candidate_sha>`는 §16.2의 unusable-verdict 재시도 소관이며 이 launch에 속하지 않는다 — Attempt 전역 Auditor turn counter는 없다(M1-13) |
+| A: AUDITING→READY_TO_MERGE | trigger: verdict=AUDIT_PASS + §16.3 frozen settlement mode branch 완료 / pre: drift policy 평가(§11) 통과 + actual Verification bundle/Manifest exact match. `ADAPTER`는 authoritative SETTLED 필수, `NONE`은 settlement effect/INTENT 없이 local atomic commit / write: audit_record / fail→ FIX_REQUIRED→REWORKING, HUMAN_REQUIRED→T: HELD + `AUDIT_DECISION` PendingDecision. 구조 결과가 unusable하면 1회차는 `AUDIT_INVALID` + `op:<attempt>:auditor-turn-2:<candidate_sha>`, 2회차는 T: HELD(`AUDIT_UNUSABLE`) — 같은 candidate에 3번째 turn 없음. `ADAPTER`인데 settlement를 authoritative하게 확립하지 못하면 T: HELD(`AUDIT_GATE_UNAVAILABLE`); mode/member/manifest mismatch는 fail-closed / op: `ADAPTER`일 때만 `op:<attempt>:audit-decision:<candidate_sha>`, `NONE`은 없음 |
 | A: REWORKING→IMPLEMENTING | trigger: Coordinator rework 개시 / pre: rework_count<max_rework, 동일 snapshot 유효(§11) / side: 동일 Actor session 재사용 가능(send_turn n+1) / write: rework_count++ / fail→ T: HELD(REWORK_LIMIT) / op: `op:<attempt>:actor-turn:<n>` |
 | A: READY_TO_MERGE→(MVP 1 경로) | §19.4 human-merge sequence |
 | A: READY_TO_MERGE→MERGING (MVP 2) | trigger: policy auto_merge=true + §14.5 전제 충족 / pre: Gate precondition 전체(G1–G5, §14.4) / side: merge intent INTENT / fail→ T: HELD(REPOSITORY_CONFLICT) — fail-closed / op: `op:<attempt>:merge:<candidate_sha>` |
@@ -6051,7 +6199,7 @@ owner에서 미리 제거하지 않으며, E를 합성하지도 않는다.
 ```text
 Attempt READY
 
-0  RA-4 backend preflight (§30.2)
+0  selected RuntimeDeploymentBundleV1.preflight (§12.2b; OpenClaw bundle이면 RA-4 §30.2)
      BLOCKED → Attempt READY 유지 / Task ACTIVE 유지
                workspace INTENT 0 · workspace side effect 0 · spawn INTENT 0 · turn INTENT 0
                새 HELD reason 없음, POLICY_BACKEND_INCOMPATIBLE로 매핑하지 않음(V10 mismatch가 아니다)
@@ -6076,9 +6224,10 @@ Attempt READY
      → **재호출 금지**, A: HELD(RECOVERY_CONFLICT)
 ```
 
-**RA-4 preflight가 workspace보다 앞인 이유.** RA-4는 Runtime readiness 검사지만 B6의 workspace는 Actor
-Runtime 실행을 위해서만 만드는 resource다. Runtime이 이미 BLOCKED임을 알면서 고아 worktree를 만들 이유가
-없으므로 이 sequence에 한해 preflight를 첫 단계로 둔다 — 모든 Repository operation의 global rule이 아니다.
+**Runtime preflight가 workspace보다 앞인 이유.** selected bundle의 preflight는 Runtime readiness
+검사지만 B6의 workspace는 Actor Runtime 실행을 위해서만 만드는 resource다. Runtime이 이미 BLOCKED임을
+알면서 고아 worktree를 만들 이유가 없으므로 이 sequence에 한해 preflight를 첫 단계로 둔다 — 모든
+Repository operation의 global rule이 아니다. RA-4는 OpenClaw bundle의 concrete preflight일 뿐이다.
 
 **crash window별 최종 semantics.**
 
@@ -6717,7 +6866,8 @@ Post-publish child definition → fresh TaskSource observation
 Pre-admission parent intent → ChildMaterializationBindingV1
 Executable parent relation/suspension → Platform Store §19.5 transaction
 Runtime trusted identity 발급/보관 → Runtime(host) / RuntimeAdapter — Platform Core 아님 (I-TD5)
-Workflow controller identity → WorkflowControllerHandle 뒤의 backend identity (Core는 handle만)
+Workflow controller identity/binding → WorkflowAdapter/backend 또는 injected WorkflowControllerProviderV1
+                                      (Core/RuntimeAdapter/Profile은 handle을 소유하지 않음)
 Model conversation → authority 없음 (항상)
 ```
 
@@ -6759,6 +6909,10 @@ startup → active run/batch/attempt 로드
     필요하다). 어느 경우에도 옛 Proposal이나 Model conversation은 필요하지 않다.
 → hash 검증: compiled_profile / contract snapshot / grant hash / backend_requirements(manifest hash) /
   CapabilityEnforcementReceipt / adapter version — Store 내부 무결성
+→ deployment composition 재검증 (Issue #87): 실제 component bundle tuple과 current Manifest tuple이
+  §12.2b exact equality인지, frozen Task Contract의 four hash가 그 Manifest를 가리키는지 확인한다.
+  VERIFICATION v2의 workflow_dependency/audit_settlement와 optional injected member도 다시 검사한다.
+  mismatch는 fallback/auto-detection/local-mode 전환 없이 fail-closed한다.
 → approval reference 정합: privilege-expanding override의 approval_ref가 여전히 존재·hash 일치(§7.2)
   — 불일치 시 해당 compiled profile 사용 run 전체 PAUSED_SAFELY (위조/유실 의심)
 → capability 재대조: Task Contract의 backend_requirements(시작 시 Manifest)
@@ -6769,6 +6923,13 @@ startup → active run/batch/attempt 로드
        policy(execution_policy.recovery_policy.capability_downgrade: HOLD | PAUSE) 에 따라
        attempt HELD 또는 PAUSED_SAFELY. silent downgrade 재개 경로 없음
 → 각 authority에 fact 질의 (adapter별)
+→ unfinished audit decision 처리: frozen VERIFICATION Manifest v2의 `audit_settlement`를 재구성한다.
+   ADAPTER + audit-decision INTENT이면 §16.3 AD1–AD5 observe-before-act/re-observe-after만 사용하고,
+   SETTLED를 authoritative하게 재확인한 뒤 audit_record/lifecycle transaction을 마무리한다.
+   NONE이면 audit-decision INTENT/backend effect가 존재해서는 안 된다. 없으면 durable Auditor envelope와
+   기존 evidence/binding/policy/drift gate를 다시 계산해 같은 local atomic commit으로 수렴한다.
+   NONE인데 settlement INTENT/ref가 있거나 ADAPTER인데 member/provider/tuple이 맞지 않으면
+   `RECOVERY_CONFLICT`로 fail-closed하며 mode를 바꿔 복구하지 않는다.
 → attempt별 분류:
    CONSISTENT            → 재개
    EXPLAINABLE           → 대응 transition을 catch-up으로 적용 (decision_log에 RECOVERY 표기)
@@ -7127,7 +7288,8 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
  6 Core(Decision Validator): V1–V11         | write: decision_log        | fail: POLICY_REJECTED → 4 재요청
                                             (HUMAN_GATE_REQUIRED → §17 PendingHumanDecision 경로, §9.2b)
  7 Core(Contract 빌더): snapshot+blob+grant  | write: 동일 트랜잭션        | fail: CONTRACT_BUILD_ERROR
- 8 Core: **RA-4 preflight(step 0)** → workspace INTENT → 생성/재획득(RepositoryAdapter — LocalGit
+ 8 Core: selected Runtime bundle의 matching preflight(step 0; OpenClaw bundle에서만 RA-4) →
+   workspace INTENT → 생성/재획득(RepositoryAdapter — LocalGit
    `git worktree`, §14.3) → spawn INTENT → Actor spawn_session/재획득 → EnforcementReceipt 대조(§12.6,
    §19.3d 조건부) → turn INTENT → send_turn                    — 정확한 순서는 §19.3e
                                             | write: 세 op 각각 INTENT 선행 + DONE, workspace/session/turn ref
@@ -7145,7 +7307,7 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
      FAILED    → VERIFICATION_INFRA
      COMPLETED → Evidence 수집·envelope 검증·binding·policy 평가
                                             | write: evidence rows       | fail: VERIFICATION_FAILED→REWORKING
-12 Core: Evidence 자격 재계산 → §11 drift gate → RA-4 preflight →
+12 Core: Evidence 자격 재계산 → §11 drift gate → selected Runtime bundle matching preflight →
    audit-spawn INTENT → spawn_session(AUDITOR, immutable auditor grant, receipt 대조) →
    auditor-turn-1:<candidate_sha> INTENT → send_turn(AuditorReviewContext 포함, §16.2) →
    RuntimeTurnHandle + VERIFYING→AUDITING (한 transaction)
@@ -7154,10 +7316,14 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
                                                     HELD(RUNTIME_FAILED | CAPABILITY_BOUNDARY_CHANGED |
                                                     RECOVERY_CONFLICT — §21 AT3/AT4)
 13 [외부] Auditor verdict envelope를 RuntimeResultChannel에 기록 (repository write 불필요, I-TD6)
-14 Core: envelope 검증(16.2, reviewed.* 정확 일치) →
-   audit-decision:<candidate_sha> INTENT 선기록 → VerificationAdapter.settle_audit (§16.3 — Core는
-   WorkflowHandle/controller를 갖지 않는다) → authoritative SETTLED 확인 후 audit_record commit
-                                            | write: INTENT 선행, 확인 후 audit_record | fail: AUDIT_* 분기
+14 Core: envelope 검증(16.2, reviewed.* 정확 일치) → frozen VERIFICATION Manifest v2 mode 확인
+   ADAPTER → audit-decision:<candidate_sha> INTENT 선기록
+           → same Verification bundle의 AuditSettlementAdapterV1.settle_audit
+           → authoritative SETTLED 확인 후 audit_record/lifecycle commit
+   NONE    → settlement INTENT/effect/WorkflowController call 0
+           → audit_record/lifecycle local atomic commit
+                                            | write: ADAPTER만 INTENT 선행; 두 mode 모두 검증 뒤 audit_record
+                                            | fail: AUDIT_* / manifest-composition conflict 분기
 15 verdict 분기: FIX_REQUIRED  → REWORKING (≤max_rework)
                               → 8'로 회귀: 동일 Actor session에 `op:<attempt>:actor-turn:<n>` 1회.
                                 `<n>`은 durable `attempt.rework_count`에서만 파생한다 (M1-15):
@@ -7189,6 +7355,29 @@ A5 Backend capability mismatch 사전 차단  → Manifest fixture를 약화시�
 19 Core tick: §20.2 조건 충족 시 batch COMPLETED + summary 1회 (§20.2). run completion은
    모든 batch가 terminal complete된 뒤의 `platform_run.status = COMPLETED`다(§20).
 ```
+
+**Route B #52 production composition target (Issue #87; implementation은 별도).**
+
+```text
+RuntimeDeploymentBundleV1
+  CodexCliRuntimeAdapter + matching Codex preflight/pin + codex-cli RUNTIME Manifest
+
+VerificationDeploymentBundleV1
+  workflow-free local-process verifier + VERIFICATION Manifest v2
+    workflow_dependency = NONE
+    audit_settlement     = NONE
+
+WorkflowDeploymentBundleV1
+  actual WorkflowAdapter + matching WORKFLOW Manifest v2
+  (four-slot invariant용 actual component이며 이 verification path에서는 호출/preflight하지 않음)
+
+Repository
+  LocalGitRepositoryAdapter + matching REPOSITORY Manifest
+```
+
+Profile의 `verification_profiles[*].adapter`는 위 verifier `adapter_id`와 일치해야 하고, 기존 checks/body는
+그 Profile semantic으로 유지한다. 각 role의 frozen `runtime_profile`은 selected Codex Runtime에 input으로
+전달할 뿐 selector가 아니다. binding 미지원은 fallback이 아니라 preflight/runtime failure다.
 
 **MVP 3 #59 pre-admission extension (Human-authorized Spec amendment).** 기존 MVP 1 sequence를
 소급 변경하지 않고 Supervisor step 4–6과 activation/Actor launch 사이에 다음 bounded branch를 추가한다:
@@ -7261,8 +7450,10 @@ Coordinator 발신 요청이다.
 
 | Backend | 재사용 항목 | 잔여 caveat |
 |---|---|---|
-| OpenClaw | persistent Supervisor session, host-managed identity, **managed ACP session spawn(`AcpRuntime.ensureSession`, §13.1)**, **Managed Platform-Controller Session(§13.3 — WorkflowControllerHandle 매핑)**, RuntimeResultChannel 구현, Slack surface; worktree service는 **선택적** workspace 구현(§14.3) | RA-1(a: safe handle / b: turn start)/RA-2/**RA-3** IMPLEMENTATION GAP; capability enforcement 미감사(§12.3); **receipt_supported=false 실측 확정**(§12.6 — valid state, adapter 사용 불가 아님); **ACPX/core 패치 미배포** — RA-4 preflight(C1–C7)가 Runtime side effect 이전에 fail-closed 검사(`BACKEND CAVEAT`) |
-| durable-jobs | workflow store/advance/resume/idempotent start/restart reconcile/audit gate/verification-level 강제/redaction — 호출은 controller handle 경유(§14.1) | `audit_decide` live round-trip DEFERRED(H4) — Platform gate 아님, fail-closed라 안전측; 명시적 service identity API는 **문서상 근거 없음**(§13.3 — 추측 채택 금지); P3-H H3/H8은 미사용 경로라 무관 |
+| Codex CLI Runtime (Route B target) | model/session/turn execution-only Runtime bundle + matching preflight/pin/Manifest (§12.2b/§26) | production adapter/preflight/manifest 구현·검증은 Issue #87 범위 밖. `runtime_profile` 미지원은 fallback이 아니라 failure |
+| OpenClaw Runtime evidence | persistent session, host-managed identity, managed ACP session spawn(`AcpRuntime.ensureSession`, §13.1), RuntimeResultChannel 후보, Slack surface; worktree service는 선택적 Repository implementation(§14.3) | Workflow controller는 더 이상 Runtime 책임이 아니다. `astro3141/openclaw@7a5e94b4a7602a8a9bdc0865d0ce14b0d451fd15`는 sync in-realm provider를 제공한다고 승격하지 않으며 Route A는 future adapter/backend work. capability enforcement 미감사, `receipt_supported=false`, ACPX/core packaging caveat는 해당 OpenClaw Runtime bundle preflight에서만 fail-closed 검사 |
+| durable-jobs Workflow evidence | workflow store/advance/resume/idempotent start/restart reconcile/audit gate/verification-level 강제/redaction | WorkflowAdapter가 controller binding을 직접 소유하거나 exact `WorkflowControllerProviderV1`을 받아야 한다(§13.3/§14.1). current evidence만으로 provider 적합성을 추측하지 않는다. `audit_decide` live round-trip DEFERRED(H4); P3-H H3/H8은 미사용 |
+| workflow-free local verification (Route B target) | local process checks를 VerificationAdapter가 직접 소유; Manifest v2 `workflow_dependency=NONE`, `audit_settlement=NONE` | production adapter/receipt 구현은 별도. Workflow/controller/preflight를 호출하지 않고 Evidence binding/policy/Auditor validation은 그대로 통과해야 함 |
 | local Git | `git worktree`/lineage/ff-only primitive (LocalGitRepositoryAdapter가 직접 사용, Runtime 비종속 §14.3) | ff-only merge activity는 신규 구현(Gate 내부) |
 | optional GitHub | protected branch/required checks/server merge | 전략 B 채택 시에만 |
 | Slack | 보고 채널(frozen route) | Report Outbox 뒤에만 위치 |
@@ -7347,11 +7538,23 @@ D25 (v1.5 Issue #71 D22/D24 writable-slot composition amendment) writable slot�
     activation 시 같은 child가 ACTIVE/READY owner로 이동한다. unrelated A/E/wrong parent/second writer/drift는
     기존 reason으로 fail-closed. validation은 lease가 아니며 commit/restart에서 durable rows로 재계산한다.
     SPEC_CHANGE/NEW_AUTHORITY/NEW_STATE/BACKEND_CHANGE=NO, legacy binding-null D22 E와 MVP0/1 seal 불변.
+D26 (v1.5 Issue #87 Route-B Runtime/Workflow decoupling amendment) Runtime owns execution sessions only.
+    WorkflowAdapter owns controller binding, optionally through one typed constructor provider. Verification
+    declares workflow dependency and audit settlement mode in its capability manifest. Deployment selects an
+    atomic Runtime bundle; runtime_profile remains frozen Runtime input. Four manifest hashes, Core lifecycle,
+    Auditor semantic authority, Platform verification policy, repository/merge authority, and D22-D25 remain
+    unchanged. SPEC_CHANGE/NEW_AUTHORITY/NEW_STATE/NEW_DURABLE_STATE=NO; generic registry, Profile adapter
+    selector, Core-wide async conversion, dynamic workflow/model topology 없음.
 ```
 
 ## 30. Remaining Implementation Questions (architecture 아님 — 구현 전 확정)
 
 ### 30.1 MVP 0 blocker (architecture decision 아님 — 구현 상세만)
+
+**Ledger reading after D26.** 아래 M1-x close-out은 당시 구현 결정을 보존하는 historical record다.
+그 안의 `RuntimeAdapter`-owned controller, mandatory `VerificationAdapter.settle_audit`, RA-4-as-generic
+preflight 문구는 소급 삭제하지 않지만 **현행 normative contract로 재사용하지 않는다**. 충돌 시
+§12.2b/§13.3/§14.1/§15.1/§16.3과 D26이 우선한다.
 
 ```text
 M0-1 (구 R6) 구현 언어/런타임 확정 (D2·adapter 인접성 고려; Core contract 무영향)
@@ -8074,6 +8277,12 @@ M1-9 MVP 1 asynchronous VerificationAdapter lifecycle
 
 ### 30.2 MVP 1 backend blocker (실측 확정 — 추측으로 닫지 않는다)
 
+**D26 scope note.** RA-1–RA-4는 OpenClaw/durable-jobs Backend-v1의 historical/current evidence이며
+generic RuntimeAdapter 요구가 아니다. 특히 RA-3의 owner/session 실측은 future WorkflowAdapter/provider
+구현 input일 뿐 current OpenClaw commit의 `WorkflowControllerProviderV1` 적합성이나 Route-A production
+readiness를 증명하지 않는다. RA-4는 OpenClaw Runtime bundle의 concrete preflight이고 Codex/다른 Runtime
+bundle에 적용하지 않는다.
+
 ```text
 RA-1  **CLOSED** (2026-08 read-only deep audit) — OpenClaw managed session spawn.
       measured / resolved:
@@ -8154,8 +8363,8 @@ RA-2  **CLOSED** (RA-2a CLOSED / RA-2b CLOSED).
              RA-4 preflight가 여전히 `BLOCKED(C2,C3,C4,C5)`이고, 제출 tool을 담을 Platform 소유 plugin의
              배포는 RA-4 host binding에 종속된다.
 
-RA-3  **CLOSED — adapter-only glue** (2026-08 read-only deep source audit). Platform
-      WorkflowControllerHandle은 durable-jobs가 실제로 쓰는 owner tuple에 매핑된다.
+RA-3  **CLOSED AS BACKEND EVIDENCE — future Workflow-side adapter/provider input**
+      (2026-08 read-only deep source audit). durable-jobs controller authority는 실제 owner tuple에 매핑된다.
       - **owner identity 실측:** `computeOwnerKey`(durable-jobs `dist/workflow-service.js`)는
         trusted context에서 `agent:<agentId>|session:<sessionKey>`, context-free에서
         `agent:<agentId>|ws:<resolve(workspaceDir)>`이다 — lone sessionKey도 deliveryRoute도
@@ -8170,10 +8379,10 @@ RA-3  **CLOSED — adapter-only glue** (2026-08 read-only deep source audit). Pl
       - **controller identity 형태:** ACP session key는 config로부터 결정적으로 파생된다
         (`buildConfiguredAcpSessionKey` → `agent:<agentId>:acp:binding:<channel>:<accountId>:<hash16>`,
         `src/acp/persistent-bindings.types.ts`) — 난수가 아니므로 **ordinary restart에 안정적**이다.
-        따라서 Managed Platform-Controller Session은 `(agentId, sessionKey)` 쌍으로 재획득 가능하고,
-        adapter는 §13.1의 `AcpRuntime.ensureSession` 경로로 같은 session을 다시 연다. Core는 계속
-        opaque handle만 보유한다(RA-1a의 non-secret `{agentId, session_id}` scheme 재사용 — 두 번째
-        identity framework를 만들지 않는다).
+        따라서 과거 Managed Platform-Controller Session candidate는 `(agentId, sessionKey)` 쌍으로
+        재획득 가능한 것으로 관측됐다. D26 이후 이 처리는 Core/RuntimeAdapter contract가 아니라 future
+        DurableJobs WorkflowAdapter 또는 exact provider 내부 구현이어야 한다. Core는 controller handle을
+        보유하지 않는다.
       - **restart:** ordinary process/Gateway restart → 같은 owner로 접근 유지. STATUS_workflow_harness
         §5.2가 이를 live로 관측했다(workflow record + frozen parent identity가 Gateway restart를
         생존, 같은 session이 restart 후 접근). **true identity loss**(sessionKey 자체가 바뀜) →
@@ -8186,16 +8395,18 @@ RA-3  **CLOSED — adapter-only glue** (2026-08 read-only deep source audit). Pl
         (`ownerAgentId`/`ownerSessionKey`/`workspaceDir`/`allowedRoots`/`deliveryRoute`)는 owner를
         *인가*할 뿐이며, context-free 호출은 static owner sessionKey를 채택하지 않는다(rotation rot
         방지). context-free owner는 `audit_decide`가 거부되므로 controller identity를 대체할 수 없다.
-        따라서 TD의 managed-controller-session 접근을 그대로 유지한다 — 새 service identity API를
-        발명하지 않는다.
+        따라서 service identity API를 발명하지 않는다. 다만 exact OpenClaw commit은 synchronous in-realm
+        `WorkflowControllerProviderV1`을 제공한다고 증명되지 않았으므로 과거 managed-session candidate를
+        production bundle로 승격하지 않는다.
       - **남는 조건은 RA-3가 아니라 RA-4다.** trusted `agentId`/`sessionKey`를 tool context로
         전달하는 managed plugin-tools binding이 없으면 `workflow.start`가 context-free로 떨어져
         gate가 fail-closed한다(STATUS_workflow_harness §5.1). 이는 RA-4 preflight가 이미 기록한
         미배포 patch(C2–C5)이며 §30.2의 environment readiness 항목이지 새 backend gap이 아니다.
       - **미검증 잔여:** `audit_decide` owner-equality는 **source-proven이며 live 미실행**이다
         (`workflowAuditEnabled=false`, STATUS_workflow_harness §5.2 — H4/H5/H6 DEFERRED).
-RA-4  **CLOSED** (2026-08 read-only audit) — ACPX/core 패치 preflight self-check의 구체 검사 항목 확정.
-      preflight는 **어떤 Runtime external side effect보다 먼저** 실행되며 결과는 `READY` 또는
+RA-4  **CLOSED AS OPENCLAW BUNDLE PREFLIGHT CONTRACT** (2026-08 read-only audit) — ACPX/core 패치
+      self-check의 구체 검사 항목 확정. 이 preflight는 해당 OpenClaw Runtime bundle의
+      **어떤 Runtime external side effect보다 먼저** 실행되며 결과는 `READY` 또는
       `BLOCKED(reason[])` 둘뿐이다. generic environment-health framework를 만들지 않는다.
       ```text
       C1  core dist에 OPENCLAW_TOOLS_MCP_AGENT_SESSION_KEY mechanism 존재
@@ -8226,8 +8437,9 @@ merge bypass resistance 검증
 optional: GitHub protected-remote 전략(P-b) 채택 여부 결정
 ```
 
-RA-1–RA-4는 MVP 1 구현 착수 시 backend 실측으로 닫는다. 30.3은 MVP 2 전 별도 backend 작업이다.
-어떤 항목도 본 TD의 architecture decision을 재개방하지 않는다.
+RA-1–RA-4는 OpenClaw Route-A/backend evidence 범위에서 읽는다. Route B는 §12.2b/§26의 selected bundle
+contract로 별도 구현·검증한다. 30.3은 MVP 2 전 별도 backend 작업이다. 어떤 항목도 본 TD의 architecture
+decision을 재개방하지 않는다.
 
 ---
 
