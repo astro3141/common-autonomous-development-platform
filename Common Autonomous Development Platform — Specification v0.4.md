@@ -6,12 +6,25 @@
 | Candidate base | `391126b0337ee80d246f5b820657405d511fc05b` |
 | Source evidence | #89 `issuecomment-5507827981`, #90 `issuecomment-5508002386`, #91 `issuecomment-5508009180` |
 | Intended succession | Human이 이 candidate를 승인하고 canonical branch에 merge한 때부터 v0.3을 supersede한다. 그 전까지 authority는 v0.3과 current TD v1.5에 있다. |
-| Scope | 장기 constitutional architecture, trust boundary, exact binding, external-effect admission, evidence 및 recovery semantics |
+| Scope | 장기 constitutional architecture, trust boundary, exact binding, external-effect admission, evidence/recovery semantics 및 autonomous-work product outcome conformance |
 | Non-scope | Technical Design, 구현 언어, 데이터베이스, policy engine 또는 workflow 제품 선택, production implementation |
 
 이 Specification은 기존 autonomous-development Core를 축소 복제하지 않는다.
 
 목표는 domain workflow를 소유하는 새 framework가 아니라, commodity policy/workflow/agent/review/backend 조합이 외부 effect를 일으킬 때 반드시 지켜야 하는 최소 constitutional contract를 정의하는 것이다.
+
+이 Specification은 두 conformance layer를 함께 정의한다.
+
+```text
+Constitutional Kernel Conformance
+= K1–K7 policy/effect/evidence safety and authority semantics
+
+CADP Autonomous-Work Product Conformance
+= Constitutional Kernel Conformance
++ commodity-backed durable autonomous continuation outcome
+```
+
+안전하게 effect를 gate하지만 Human이 ordinary message, identity, state, receipt와 next-step data를 계속 relay해야 하는 gateway는 Constitutional Kernel에 conform할 수 있다. 그러나 CADP autonomous-work product라고 claim할 수는 없다.
 
 ---
 
@@ -530,7 +543,7 @@ Missing evidence는 evaluation input의 missing requirement다. Unavailable fact
 
 ---
 
-## 8. Commodity boundary
+## 8. Commodity boundary and conformance layers
 
 다음은 Platform constitutional kernel이 소유하지 않는다.
 
@@ -557,6 +570,42 @@ Commodity component는 다음 thin conformance edge를 구현할 수 있다.
 - target query/receipt → `EffectOutcomeV1`
 
 이 edge는 service locator, capability registry, workflow DSL 또는 새 scheduler가 아니다.
+
+### 8.1 Constitutional Kernel Conformance
+
+Constitutional Kernel Conformance는 K1–K7 및 §13.1–§13.3의 policy/effect/evidence contract를 만족한다는 뜻이다.
+
+이 claim은 다음을 의미하지 않는다.
+
+- autonomous work continuation 제공
+- repeated work 또는 multi-step workflow 제공
+- process restart 후 ordinary work progress 복구
+- CADP product conformance
+
+Human-operated tool 또는 manual effect gateway도 K1–K7을 정확히 만족하면 이 제한된 claim을 사용할 수 있다.
+
+### 8.2 CADP Autonomous-Work Product Conformance
+
+CADP Autonomous-Work Product Conformance는 Constitutional Kernel Conformance에 다음 product outcome을 더한 것이다.
+
+1. policy-authorized work start 이후 bounded multi-step 또는 repeated work가 selected worker, orchestrator, policy-required verifier/reviewer 및 backend surface 사이에서 ordinary Human relay 없이 진행된다.
+2. continuation, progress와 recovery authority가 durable하며, continuation을 담당하는 relevant process가 restart/fail해도 Human이 ordinary state/data를 다시 입력하지 않고 수렴한다.
+3. Human intervention은 policy requirement, ambiguous effect, explicit exception, constitutional/root authority 또는 명시적으로 Human-valued judgment가 요구할 때만 발생한다.
+4. implementation/review/verification independence는 fixed role name이 아니라 exact evidence producer/provenance와 policy separation requirement로 증명한다.
+5. 최소 하나의 bounded repeated autonomous-work E2E path가 §13.5에 따라 증명된다. Human이 모든 step/effect를 수동 trigger하거나 relay한 sequence는 이 requirement를 만족하지 않는다.
+6. development와 non-development는 같은 generic product contract를 사용하는 peer domain composition이다. Development origin을 이유로 Task, Attempt, Supervisor, Actor, Auditor, repository 또는 merge semantics를 Core primitive로 복원하지 않는다.
+
+`policy-authorized work start`는 새 kernel primitive가 아니다. CADP product에서 autonomous execution을 시작하거나 worker/tool capability를 release하는 start/admission을 K1–K7 governed effect로 표현한 것이다. `EffectRequestV1` material은 exact work/input, active policy, enforced bounds 및 selected commodity continuation target을 bind한다. Pure read-only discovery는 start/admission 이전에 있을 수 있지만 autonomous execution authority를 만들지 않는다.
+
+`bounded`는 active policy 또는 policy-bound configuration이 step, iteration, time, cost, effect count 또는 동등한 finite termination condition 중 하나 이상을 enforce한다는 뜻이다. Bound 초과는 silent continuation이 아니라 deterministic stop/hold evidence를 만든다. Kernel은 그 scheduler나 lifecycle을 소유하지 않는다.
+
+`relevant continuation process`는 그 process가 사라지면 ordinary next-step state 또는 progress authority가 유실될 수 있는 component다. Product conformance proof는 최소한 그 책임을 가진 orchestrator/controller process 하나의 실제 restart 또는 failure를 주입해야 한다. 더 넓은 fault-tolerance claim은 claim한 process마다 별도 evidence를 요구한다.
+
+### 8.3 Commodity ownership of continuation
+
+Product outcome을 요구한다고 해서 durable workflow, retry, scheduler, planner 또는 lifecycle이 Kernel 소유가 되지는 않는다. Temporal/equivalent 또는 다른 conforming product가 continuation mechanism을 소유할 수 있다.
+
+다만 commodity mechanism의 존재나 제품명만으로 Product Conformance를 주장할 수 없다. Exact work/run identity, causal step/evidence/effect binding, durable restart result 및 Human-intervention reason을 conformance evidence로 제시해야 한다.
 
 ---
 
@@ -592,6 +641,8 @@ Policy revision 변경은 기존 decision/admission에 silent 적용되지 않�
 
 ## 10. Domain composition
 
+Development와 non-development는 같은 constitutional kernel과 product outcome contract를 사용하는 peer composition이다. Development는 v0.4의 required reference domain이지만 constitutional center가 아니다.
+
 ### 10.1 Development composition
 
 Development deployment는 다음을 commodity composition으로 가질 수 있다.
@@ -618,6 +669,8 @@ Non-development deployment는 다음을 commodity composition으로 가질 수 �
 - service target이 receipt 또는 reconciliation observation을 제공
 
 Task, Attempt, repository, branch, review 또는 merge primitive 없이도 동일 contract가 성립해야 한다.
+
+어느 domain이 CADP-conformant product route로 제시되든 §8.2의 autonomous continuation outcome을 별도로 만족해야 한다. Domain example을 한 번 안전하게 실행하거나 Human이 각 step을 relay하는 것만으로는 Product Conformance가 아니다.
 
 ---
 
@@ -658,6 +711,8 @@ Task, Attempt, repository, branch, review 또는 merge primitive 없이도 동�
 
 이 document가 Human 승인으로 canonical branch에 merge되면 v0.4가 새 architecture generation의 Specification authority가 된다.
 
+v0.4는 v0.3의 development-specific product contract를 더 넓은 autonomous-work product contract로 supersede한다. Safety/authority semantics는 K1–K7로 일반화하며, development는 required reference/peer domain composition으로 남지만 fixed Core role이나 lifecycle을 소유하지 않는다.
+
 v0.3, TD v1.5, current implementation, #85/#87/#88, OpenClaw 및 durable-jobs 설계는 v0.4의 architecture authority가 아니다. 필요한 경우 historical evidence 또는 commodity adapter implementation input으로만 사용할 수 있다.
 
 ### 12.2 Clean execution-domain boundary
@@ -691,7 +746,9 @@ v0.3 durable Attempt/Batch를 v0.4 record로 in-place migration하지 않는다.
 
 ## 13. Conformance requirements
 
-v0.4 implementation은 최소 다음 positive/negative control을 통과해야 한다.
+Constitutional Kernel Conformance는 §13.1–§13.3을 통과해야 한다.
+
+CADP Autonomous-Work Product Conformance는 Constitutional Kernel Conformance에 더하여 §13.4–§13.5와 §8.2를 통과해야 한다. 두 claim을 documentation, report 또는 deployment metadata에서 혼용해서는 안 된다.
 
 ### 13.1 Binding controls
 
@@ -723,6 +780,36 @@ v0.4 implementation은 최소 다음 positive/negative control을 통과해야 �
 - 한 non-development vertical이 authoritative input에서 gated API/service effect와 reconciliation까지 성립
 - 두 vertical 모두 Task/Attempt/Supervisor/Auditor를 constitutional primitive로 요구하지 않음
 
+### 13.5 Autonomous continuation product controls
+
+최소 한 development 또는 non-development conformance scenario는 다음 하나의 bounded E2E trace를 증명해야 한다.
+
+```text
+K1–K7 policy-authorized work-start admission
+→ causally bound ordinary work step/iteration 1
+→ durable continuation fact
+→ relevant continuation process restart/failure injection
+→ ordinary work step/iteration 2 or later
+→ required verification/review/backend evidence
+→ K1–K7 governed effect admission and authoritative outcome, when the path has an external effect
+→ policy-defined completion, hold or bounded stop
+```
+
+Acceptance:
+
+- work-start admission이 exact work/input, active policy, finite bounds 및 commodity continuation target에 bind
+- 서로 causally bound된 ordinary work step/iteration이 최소 2개 존재
+- 위 두 ordinary step은 conformance policy상 Human-valued judgment를 요구하지 않음
+- step identity, input/output, evidence 및 governed effect reference를 durable state에서 재구성 가능
+- restart 후 Human이 message, SHA, run identity, state, receipt 또는 next-step data를 relay하지 않아도 continuation이 수렴
+- ordinary transport/state-bus 목적의 Human action 수는 0
+- Human action이 있었다면 exact policy requirement, ambiguity, exception, root authority 또는 Human-valued judgment 중 하나에 bind된 evidence가 존재
+- policy가 independence를 요구한 producer/reviewer/verifier 조합은 exact provenance로 separation을 증명
+- 모든 external effect는 K1–K7을 통과하고 ambiguous outcome은 §6을 따름
+- Human이 각 step/effect를 수동 trigger한 trace는 reject
+
+Global Product Conformance에는 위 repeated E2E proof 하나와 §13.4의 두 peer-domain controls가 필요하다. 특정 domain route를 CADP-conformant라고 별도로 advertise하면 그 route도 §8.2 outcome을 만족해야 한다.
+
 ---
 
 ## 14. Non-goals
@@ -743,6 +830,8 @@ v0.4 kernel은 다음을 만들지 않는다.
 - deployment/CD platform
 - v0.3 implementation compatibility facade
 - OpenClaw/durable-jobs 전용 예외
+
+Commodity-backed autonomous continuation이라는 Product Conformance outcome은 이 Non-goal과 충돌하지 않는다. Specification은 outcome과 evidence를 요구하며 workflow/scheduler implementation을 소유하지 않는다.
 
 ---
 
@@ -769,7 +858,9 @@ Production work는 TD authority와 별도 Human authorization 후에만 시작�
 
 ## 16. Architecture acceptance
 
-이 candidate의 target architecture는 `THIN_CONSTITUTIONAL_KERNEL`이다.
+이 candidate의 target constitutional architecture는 `THIN_CONSTITUTIONAL_KERNEL`이다.
+
+CADP product claim은 그 kernel 위에 §8.2의 `CADP Autonomous-Work Product Conformance`를 추가로 요구한다.
 
 최종 경계:
 
@@ -781,6 +872,13 @@ Policy evaluates one exact requested effect.
 The PEP alone admits and reaches the governed effect.
 Durable effect identity and target-authoritative reconciliation prevent blind duplication.
 Human judgment enters only as attributable, scoped, fresh evidence unless exercising explicit root authority.
+
+Kernel-safe manual relay gateway
+≠ CADP autonomous-work product.
+
+CADP autonomous-work product
+= Thin Constitutional Kernel
++ commodity-backed durable autonomous continuation.
 ```
 
 Architecture-blocking unresolved question: **none**.
