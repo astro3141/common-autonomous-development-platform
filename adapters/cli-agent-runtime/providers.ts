@@ -39,6 +39,12 @@ export interface CliAgentProviderSeam {
   readonly reports_actual_model: boolean;
   readonly reports_cost: boolean;
   readonly version_args: readonly string[];
+  /**
+   * The measured version-display form, anchored, with capture group 1 = the exact semantic
+   * version. Encodes only the decoration actually observed on the pilot host — anything else
+   * is drift and fails preflight closed (review 5503120466 blocker 2).
+   */
+  readonly version_pattern: RegExp;
   argv(input: {
     readonly binding: CliAgentProfileBinding;
     readonly prompt: string;
@@ -66,6 +72,8 @@ export const PROVIDER_SEAMS: Readonly<Record<CliAgentProvider, CliAgentProviderS
     reports_actual_model: true,
     reports_cost: true,
     version_args: ["--version"],
+    // Measured: `2.1.221 (Claude Code)`
+    version_pattern: /^(\d+\.\d+\.\d+) \(Claude Code\)$/u,
     argv({ binding, prompt, schema_json, resume_session_ref }) {
       return {
         args: [
@@ -100,6 +108,8 @@ export const PROVIDER_SEAMS: Readonly<Record<CliAgentProvider, CliAgentProviderS
     reports_actual_model: false,
     reports_cost: false,
     version_args: ["--version"],
+    // Measured: bare `1.1.22`
+    version_pattern: /^(\d+\.\d+\.\d+)$/u,
     argv({ binding, prompt, schema_path, resume_session_ref }) {
       return {
         args: [
@@ -137,6 +147,8 @@ export const PROVIDER_SEAMS: Readonly<Record<CliAgentProvider, CliAgentProviderS
     reports_actual_model: true,
     reports_cost: true,
     version_args: ["--version"],
+    // Measured: `grok 1.0.13 (5e9a58528b76) [stable]`
+    version_pattern: /^grok (\d+\.\d+\.\d+) \([0-9a-f]+\) \[stable\]$/u,
     argv({ binding, prompt, schema_json, resume_session_ref }) {
       return {
         args: [

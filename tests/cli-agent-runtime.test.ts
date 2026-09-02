@@ -29,14 +29,18 @@ class ScriptedRunner {
   readonly invocations: CliAgentInvocation[] = [];
   readonly answers: ((invocation: CliAgentInvocation) => Partial<CliAgentCommandObservation>)[] = [];
 
+  /** Per-executable version-line override for drift/decoration controls. */
+  readonly versionByExecutable = new Map<string, string>();
+
   run(invocation: CliAgentInvocation): CliAgentCommandObservation {
     this.invocations.push(invocation);
     // Version probes answer from a fixed table so tests only script model turns.
     if (invocation.args[0] === "--version") {
       const version =
-        invocation.executable.includes("claude") ? "2.1.221 (Claude Code)"
+        this.versionByExecutable.get(invocation.executable) ??
+        (invocation.executable.includes("claude") ? "2.1.221 (Claude Code)"
         : invocation.executable.includes("second-agent") ? "1.1.22"
-        : "grok 1.0.13 (5e9a58528b76) [stable]";
+        : "grok 1.0.13 (5e9a58528b76) [stable]");
       return observation({ stdout: version });
     }
     const answer = this.answers.shift();
@@ -290,6 +294,84 @@ test("CA-4 (#51): actual identity is REPORTED only where the envelope carries it
     assert.equal(geminiTurn.structured_output?.protocol, "platform-supervisor-proposal-v1");
   } finally {
     w.dispose();
+  }
+});
+
+test("CA-7 (blocker 1): a partial actual binding never becomes a REPORTED binding fingerprint", () => {
+  const w = world();
+  try {
+    // Grok: the measured envelope reports the executed model but no provider evidence.
+    w.runner.answers.push(grokInit("s-g7"));
+    const grok = w.adapter.spawn_session({ op_key: "op:g7" }, "ACTOR", PROFILE("grok-actor"), w.root, {}, GRANT);
+    w.runner.answers.push(() => ({
+      stdout: JSON.stringify({
+        text: JSON.stringify({ declared_status: "DONE", summary: "s", refs: [] }),
+        stopReason: "end_turn",
+        sessionId: "s-g7",
+        usage: { input_tokens: 4, output_tokens: 2 },
+        // Exactly one actual model, different from the requested grok-4.6-build.
+        modelUsage: { "grok-4.6-fast": { inputTokens: 4 } },
+        total_cost_usd: 0.001,
+      }),
+    }));
+    const turn = w.adapter.get_turn_result(
+      w.adapter.send_turn({ op_key: "op:g7:t" }, grok.session_handle, "work"),
+    );
+    const observed = turn.execution_observation!;
+    assert.deepEqual(observed.actual.provider, { availability: "UNKNOWN" });
+    assert.deepEqual(observed.actual.model, { availability: "REPORTED", value: "grok-4.6-fast" });
+    // The complete actual binding is unevidenced (provider leg missing): the fingerprint is
+    // UNKNOWN — never manufactured from the requested provider.
+    assert.deepEqual(observed.actual.binding_ref, { availability: "UNKNOWN" });
+    // Availability honesty does not erase requested configuration.
+    assert.equal(typeof observed.requested_binding_ref, "string");
+    assert.ok(observed.requested_binding_ref!.length > 0);
+    assert.equal(observed.cost.kind, "REPORTED");
+  } finally {
+    w.dispose();
+  }
+});
+
+test("CA-8 (blocker 2): version pins are exact — drift and unknown decoration are BLOCKED", () => {
+  const root = mkdtempSync(join(tmpdir(), "adp-cli-agent-"));
+  try {
+    const onlySecondAgent = (runner: ScriptedRunner) =>
+      new CliAgentRuntimeAdapter(
+        config(root, {
+          profiles: { "gemini-supervisor": { provider: SECOND_AGENT_PROVIDER, model: "gemini-3.1-pro-high" } },
+        }),
+        runner,
+      );
+
+    // Same digits with a trailing digit, unknown suffix, or wrapping text merely *containing*
+    // the pin must all block — the seam was measured for exactly 1.1.22.
+    for (const drifted of ["1.1.220", "1.1.221", "1.1.22-malformed", "foo-1.1.22-bar"]) {
+      const runner = new ScriptedRunner();
+      runner.versionByExecutable.set("/bin/second-agent", drifted);
+      const preflight = onlySecondAgent(runner).preflight();
+      assert.equal(preflight.status, "BLOCKED", drifted);
+    }
+
+    // The exact measured presentation forms stay accepted, including Grok's varying build id.
+    const measured = new ScriptedRunner();
+    assert.deepEqual(onlySecondAgent(measured).preflight(), { status: "READY" });
+    const grokRunner = new ScriptedRunner();
+    grokRunner.versionByExecutable.set("/bin/grok", "grok 1.0.13 (0123456789ab) [stable]");
+    const grokOnly = new CliAgentRuntimeAdapter(
+      config(root, { profiles: { "grok-actor": { provider: GROK_PROVIDER, model: "grok-4.6-build" } } }),
+      grokRunner,
+    );
+    assert.deepEqual(grokOnly.preflight(), { status: "READY" });
+    // Unknown Grok decoration (a channel never measured) is drift, not decoration.
+    const grokBeta = new ScriptedRunner();
+    grokBeta.versionByExecutable.set("/bin/grok", "grok 1.0.13 (0123456789ab) [beta]");
+    const grokBetaOnly = new CliAgentRuntimeAdapter(
+      config(root, { profiles: { "grok-actor": { provider: GROK_PROVIDER, model: "grok-4.6-build" } } }),
+      grokBeta,
+    );
+    assert.equal(grokBetaOnly.preflight().status, "BLOCKED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

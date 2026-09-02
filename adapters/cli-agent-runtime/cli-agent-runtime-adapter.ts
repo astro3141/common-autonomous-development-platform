@@ -315,13 +315,18 @@ export class CliAgentRuntimeAdapter implements RuntimeAdapter {
             executed.parsed.actual_model === null
               ? { availability: "UNKNOWN" }
               : { availability: "REPORTED", value: executed.parsed.actual_model },
+          // Review 5503120466 blocker 1 — an actual binding fingerprint exists only when the
+          // backend evidences the COMPLETE actual binding: both provider and model REPORTED.
+          // A missing leg is never filled from the requested/configured binding — requested
+          // facts live in requested_binding_ref, and mixing them here would launder
+          // configuration into execution identity.
           binding_ref:
-            executed.parsed.actual_model === null
+            executed.parsed.actual_model === null || executed.parsed.actual_provider === null
               ? { availability: "UNKNOWN" }
               : {
                   availability: "REPORTED",
                   value: digest({
-                    provider: executed.parsed.actual_provider ?? binding.provider,
+                    provider: executed.parsed.actual_provider,
                     model: executed.parsed.actual_model,
                   }),
                 },
@@ -407,16 +412,26 @@ export class CliAgentRuntimeAdapter implements RuntimeAdapter {
     if (this.#verified.has(seam.provider_id)) return;
     const executable = this.#config.executables[seam.provider_id]!;
     const expected = this.#config.expected_cli_versions[seam.provider_id]!;
+    // Review 5503120466 blocker 2 — the pin names one exact measured semantic version; only
+    // the provider's measured presentation decoration around it is tolerated. Substring
+    // matching accepted 1.1.220 / 1.1.22-malformed / foo-1.1.22-bar for a 1.1.22 pin.
+    const pinned = /^(?:\S+ )?(\d+\.\d+\.\d+)$/u.exec(expected)?.[1];
+    if (pinned === undefined) {
+      throw new CliAgentBackendCapabilityGap(
+        `${seam.provider_id} pin ${JSON.stringify(expected)} does not name an exact version`,
+      );
+    }
     const observation = this.#runner.run({
       executable,
       args: [...seam.version_args],
       cwd: this.#config.default_cwd,
       timeout_ms: 10_000,
     });
-    const version = observation.stdout.trim().split("\n")[0] ?? "";
-    if (observation.exit_code !== 0 || !version.includes(expected)) {
+    const line = observation.stdout.trim().split("\n")[0] ?? "";
+    const observed = seam.version_pattern.exec(line)?.[1];
+    if (observation.exit_code !== 0 || observed === undefined || observed !== pinned) {
       throw new CliAgentBackendCapabilityGap(
-        `${seam.provider_id} version ${JSON.stringify(version)} does not match pinned ${JSON.stringify(expected)}`,
+        `${seam.provider_id} version ${JSON.stringify(line)} does not exactly match pinned ${JSON.stringify(pinned)}`,
       );
     }
     this.#verified.add(seam.provider_id);
