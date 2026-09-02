@@ -1,11 +1,12 @@
 /**
- * IO bridge response-path containment (review 5501935839, BLOCKING_EXTERNAL_EFFECT).
+ * IO bridge response transport (reviews 5501935839 + 5502523861, BLOCKING_EXTERNAL_EFFECT).
  *
- * The python probe loads the production `bridge.py` and drives the exact reviewer
- * counterexamples through the real `send_turn` path: a model-plantable symlink at any
- * deterministic component of the response path must fail the turn closed before `send_round`,
- * external targets must stay untouched, ordinary paths must keep working, and cleanup must never
- * delete through indirection swapped in mid-turn.
+ * The response is fileless: a bridge-owned one-shot per-turn unix socket + in-memory slot feeds
+ * the pinned runner's `response_reader` branch, so the original workspace response-file attack
+ * class — including the reviewer's pre-write TOCTOU swap — is unreachable rather than checked
+ * for. The python probe drives the real `send_turn`/`_TurnResponseChannel` code: zero workspace
+ * response-file effect, external targets byte-identical under plant+swap, server-decided turn
+ * correlation, duplicate/stale/malformed deliveries rejected, timeout never demoted to success.
  */
 
 import assert from "node:assert/strict";
@@ -18,7 +19,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-test("IO-C1: response-path containment holds against the symlink-escape counterexamples", () => {
+test("IO-C1: the fileless response transport defeats the pre-write TOCTOU class", () => {
   const work = mkdtempSync(join(tmpdir(), "adp-io-containment-"));
   try {
     const probe = spawnSync(
@@ -35,15 +36,16 @@ test("IO-C1: response-path containment holds against the symlink-escape countere
     assert.deepEqual(
       Object.fromEntries(Object.entries(verdict).map(([key, value]) => [key, value.split(" ")[0]])),
       {
-        top_level_symlink_blocked: "PASS",
-        top_level_external_untouched: "PASS",
-        top_level_session_not_wedged: "PASS",
-        nested_symlink_blocked: "PASS",
-        nested_external_untouched: "PASS",
-        normal_path_completes: "PASS",
-        normal_path_cleaned_up: "PASS",
-        planted_target_removed_not_followed: "PASS",
-        midturn_swap_cleanup_stands_down: "PASS",
+        fileless_normal_completes: "PASS",
+        no_workspace_response_file: "PASS",
+        channel_outside_workspace_and_state: "PASS",
+        prewrite_swap_turn_completes: "PASS",
+        prewrite_swap_external_intact: "PASS",
+        prewrite_swap_no_response_json_anywhere: "PASS",
+        duplicate_delivery_rejected: "PASS",
+        malformed_delivery_times_out: "PASS",
+        stale_delivery_cannot_cross_turns: "PASS",
+        timeout_releases_active_turn: "PASS",
       },
       JSON.stringify(verdict),
     );
