@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 
 import {
   backendRuntimePreflight,
@@ -60,7 +60,10 @@ import { compileProfile, type CompileResult } from "../core/profile/compiler.ts"
 import type { TaskSourceEntry } from "../core/profile/types.ts";
 import type { CanonicalObject } from "../core/schemas/canonical-json.ts";
 import { PlatformStore } from "../core/store/platform-store.ts";
-import { ProjectDocumentTaskSource } from "../core/tasksource/index.ts";
+import {
+  ProjectDocumentTaskSource,
+  validateProjectDocumentConfig,
+} from "../core/tasksource/index.ts";
 import type { TaskSourceV1 } from "../core/tasksource/types.ts";
 import { ConfigError, type DeploymentConfig } from "./config.ts";
 import { isoNow, ulid } from "./identities.ts";
@@ -359,18 +362,18 @@ function composeTaskSource(
   if (github !== null) return github.taskSource;
   const entry = profileTaskSourceEntry(compiled);
   if (entry.adapter === DOCUMENT_TASK_SOURCE_ADAPTER) {
-    // The Profile selects the document source; *where those documents live on this host* is the
-    // deployment installation fact (#78 boundary).
-    if (config.task_source === null) {
-      throw new ConfigError(
-        "/task_source",
-        "the Profile selects the document task source, but no document paths are configured",
-      );
-    }
-    return new ProjectDocumentTaskSource({
-      paths: config.task_source.paths,
-      parser: "markdown-sections-v1",
-    });
+    // #78 blocker 2 (review 5503883262) — §8.2 makes `paths`/`parser` Profile-owned adapter
+    // config. The frozen Profile decides *which* documents and *which* parser define the source;
+    // the deployment must never substitute a different semantic source from its own config.
+    // The adapter's own validator enforces the exact `{paths, parser}` contract (fail-closed on
+    // missing/empty/non-string/duplicate paths, missing/unsupported parser, unknown fields).
+    const declared = validateProjectDocumentConfig(entry.config);
+    // Profile paths are repository-relative host locations, resolved with the same rule as
+    // contract sources (§8.2 location fact only — never a source-selection authority).
+    const paths = declared.paths.map((path) =>
+      isAbsolute(path) ? path : resolve(config.contract_source_root, path),
+    );
+    return new ProjectDocumentTaskSource({ paths, parser: declared.parser });
   }
   throw new ConfigError(
     "/profiles/project_profile_path",

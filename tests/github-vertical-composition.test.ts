@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { GitHubIssuesChildMaterializer, GitHubIssuesTaskSource } from "../adapters/github/index.ts";
@@ -20,9 +20,10 @@ import { compose } from "../deployment/compose.ts";
 import { ConfigError } from "../deployment/config.ts";
 import { startIngress } from "../deployment/ingress.ts";
 import type { ProductionCoordinatorDependencies } from "../core/coordinator/production-coordinator.ts";
-import { prProjectionOp } from "../core/execution/project-pull-request.ts";
-import { world as makeWorld } from "./support/domain-fixtures.ts";
+import { projectPullRequest, prProjectionOp } from "../core/execution/project-pull-request.ts";
+import { withWorld, world as makeWorld } from "./support/domain-fixtures.ts";
 import {
+  PILOT_TASK_REF,
   pilotProjectProfile,
   pilotWorld,
   ScriptedGateway,
@@ -207,6 +208,88 @@ test("GHV-3: the projection ingress is thin — gated, and the destination is ne
     }
   } finally {
     created.dispose();
+  }
+});
+
+test("GHV-5 (blocker 1): the crash-window reconcile path refuses a wrong-target INTENT through Core", () => {
+  withWorld((created) => {
+    const merge = humanMergeWorld(created);
+    // A durable INTENT already exists for this projection op — the exact crash window the Core
+    // recovery path enters through reconcile, bypassing publish.
+    const op = prProjectionOp(merge.attempt_key);
+    created.store.withTransaction(() => {
+      created.store.idempotency.beginIntent(op);
+    });
+
+    // The wrong repository actually contains a PR at this head + exact candidate SHA.
+    const seen: string[] = [];
+    const transport = {
+      api(request: { method: string; path: string }): unknown {
+        seen.push(`${request.method} ${request.path}`);
+        return [
+          {
+            number: 999,
+            html_url: "https://github.com/someone-else/other-repo/pull/999",
+            head: { sha: merge.candidate_commit },
+          },
+        ];
+      },
+      push_commit(): void {
+        seen.push("PUSH");
+      },
+      remote_url(): string {
+        // The canonical clone pushes to acme/widgets, not the configured someone-else/other-repo.
+        return "https://github.com/acme/widgets.git";
+      },
+    };
+    const projection = new GitHubPullRequestProjection(transport as never, {
+      owner: "someone-else",
+      repo: "other-repo",
+      canonical_repo_path: "/tmp/canonical",
+    });
+
+    const outcome = projectPullRequest(
+      { store: created.store, projection },
+      { attempt_key: merge.attempt_key, base_branch: "main" },
+    );
+
+    assert.notEqual(outcome.kind, "PROJECTED", "a wrong-target INTENT must not project");
+    assert.notEqual(created.store.idempotency.get(op)?.state, "DONE");
+    assert.equal(
+      created.store.adapterMetadata.get(merge.attempt_key, "pull-request-projection", "candidate_pull_request"),
+      undefined,
+      "no receipt persisted",
+    );
+    assert.deepEqual(seen, [], "zero list/push/create over an unbound target");
+  });
+});
+
+test("GHV-6 (blocker 2): the document source is defined by the frozen Profile, never deployment config", () => {
+  const world = pilotWorld();
+  try {
+    // Two distinct documents: the Profile declares A; the deployment installation block names B.
+    const docA = readFileSync(join(world.repo.root, "TASKS.md"), "utf8");
+    writeFileSync(join(world.repo.root, "TASK-A.md"), docA);
+    writeFileSync(join(world.repo.root, "TASK-B.md"), docA.replace(`task-ref: ${PILOT_TASK_REF}`, "task-ref: B-ONLY"));
+    withProfileTaskSources(world, [
+      { id: "docs", adapter: "ProjectDocumentTaskSource", config: { paths: ["TASK-A.md"], parser: "markdown-sections-v1" } },
+    ]);
+    // The deployment legacy field deliberately points at B.
+    const config = { ...world.config, task_source: { paths: [join(world.repo.root, "TASK-B.md")] } };
+
+    const composition = compose(config, { runtime_gateway: new ScriptedGateway() });
+    try {
+      const source = composition.deps.taskSource;
+      const candidates = source.discover_tasks({ observed_at: "2026-09-02T00:00:00Z" });
+      const refs = candidates.map((c) => c.task_ref);
+      assert.ok(refs.includes(PILOT_TASK_REF), "A (the Profile's document) is observed");
+      assert.ok(!refs.includes("B-ONLY"), "B (the deployment document) is never silently executed");
+      // The Profile's adapter config, not the deployment field, must fail closed on its own errors.
+    } finally {
+      composition.dispose();
+    }
+  } finally {
+    world.dispose();
   }
 });
 

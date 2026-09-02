@@ -40,7 +40,6 @@ export class GitHubPullRequestProjection implements PullRequestProjectionAdapter
     // remote must name exactly the configured owner/repo. "The operator knows this origin is
     // correct" is not a control; a mismatch or an unprovable target refuses definitively
     // before reconcile listing, push and PR creation alike.
-    this.#assertTargetBinding();
     // Convergence before effect: an existing PR for this head ref either is this projection
     // (same candidate) or proves a definitive conflict. Unprovable state stays a plain throw so
     // the caller's INTENT remains reconcilable and no external effect is attempted over it.
@@ -112,6 +111,13 @@ export class GitHubPullRequestProjection implements PullRequestProjectionAdapter
     head_branch: string,
     candidate_commit: string,
   ): PullRequestReconcileResult {
+    // #78 blocker 1 (review 5503883262) — the crash-window recovery path enters here directly
+    // (INTENT → reconcile) without going through publish, so target binding must be a
+    // precondition of reconciliation too: a wrong/unprovable canonical push remote must never
+    // let another repository's PR at this head/SHA be returned as this operation's committed
+    // result. A binding failure is a definitive refusal, never NO_EFFECT_CONFIRMED (not proof
+    // of absence).
+    this.#assertTargetBinding();
     let raw: unknown;
     try {
       raw = this.#transport.api({
