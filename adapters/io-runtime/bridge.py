@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import socket
 import socketserver
-import stat
 import tempfile
 import subprocess
 import sys
@@ -128,6 +127,15 @@ class _TurnResponseChannel:
                                   after the turn starts and appears nowhere before the prompt
       model swaps the socket path only breaks the model's *own* connection attempt: the bridge
                                   listens on the bound descriptor, not the pathname
+      teardown                    descriptor-relative (unlinkat on the captured directory fd);
+                                  after model visibility no pathname is ever deleted or resolved
+
+    Mutation reach: the per-turn channel directory is an *authorized transport artifact* — the
+    same standing as the runtime result-channel root: host-owned ephemeral ground for collecting
+    a structured model result, outside every repository/workspace, carrying no lifecycle,
+    repository or policy authority. Creating it, binding one socket in it, unlinking that socket
+    descriptor-relatively, and leaving the empty directory behind is this channel's entire
+    filesystem reach.
     """
 
     MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -140,6 +148,11 @@ class _TurnResponseChannel:
         # creation cannot redirect the bridge either way — the listener owns the bound
         # descriptor, not the pathname.
         self._directory = Path(tempfile.mkdtemp(prefix="adp-io-turn-"))
+        # The directory *identity* is captured as a descriptor now — before the pathname becomes
+        # model-visible via the prompt — so teardown can operate relative to this inode and never
+        # re-resolve the (swappable) pathname. O_NOFOLLOW is defense in depth; mkdtemp just
+        # created a real directory under an unpublished, unpredictable name.
+        self._dir_fd = os.open(self._directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self.turn_ref = turn_ref
         self.socket_path = self._directory / "r.sock"
         # Never created by anyone: the pinned response_reader branch of send_round only ever
@@ -228,16 +241,24 @@ class _TurnResponseChannel:
         except OSError:
             pass
         try:
-            # The socket path is model-readable via the prompt, so remove only what is provably
-            # still ours: never through a swapped parent, and only a socket node — a planted
-            # regular file or an external target is left alone.
-            if not self._directory.is_symlink():
-                mode = os.lstat(self.socket_path).st_mode
-                if stat.S_ISSOCK(mode):
-                    self.socket_path.unlink()
-                os.rmdir(self._directory)
+            # CHANNEL-CLEANUP TOCTOU repair (review 5502825797): once the socket pathname has
+            # been shown to the model, no teardown step may resolve it (or any parent component)
+            # again — every check-then-mutate sequence on the pathname is a race. Deletion is
+            # therefore *descriptor-relative*: `unlinkat(dir_fd, "r.sock")` removes the entry
+            # from the exact directory inode captured at creation, wherever that directory has
+            # been renamed to and whatever now sits at the old pathname. No pathname is deleted,
+            # ever. The empty host-owned temp directory itself is deliberately left behind
+            # (direction B): removing it by name would be another pathname mutation, and a
+            # bounded, unreachable, empty artifact under the host tmpdir is the safe trade.
+            if os.unlink in os.supports_dir_fd:
+                os.unlink("r.sock", dir_fd=self._dir_fd)
         except OSError:
             pass
+        finally:
+            try:
+                os.close(self._dir_fd)
+            except OSError:
+                pass
         self._thread.join(timeout=2.0)
 
 
@@ -670,9 +691,10 @@ class BridgeState:
                 "IO execution response contract:",
                 response_contract,
                 "Deliver the finished JSON through the ADP response socket; do not write it to any",
-                "ADP-designated file path (there is none this turn):",
-                "  1. Save your JSON to a scratch file of your choice, e.g. /tmp/adp-response.json",
-                f"  2. Run exactly: nc -U {response_socket} < /tmp/adp-response.json",
+                "ADP-designated file path (there is none this turn). Either stream it directly:",
+                f"  printf '%s' \"$RESPONSE_JSON\" | nc -U {response_socket}",
+                "or, if you prefer a scratch file, keep it inside your assigned workspace:",
+                f"  nc -U {response_socket} < ./adp-response.json",
                 "One delivery per turn; the socket replies `accepted` on receipt.",
             ]
         )

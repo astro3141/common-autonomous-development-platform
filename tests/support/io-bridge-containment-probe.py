@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import stat as statlib
 import socket as socketlib
 import sys
 import threading
@@ -302,6 +303,76 @@ def main() -> int:
         state5.sessions["s5"].active_turn is None,
         "active_turn survived",
     )
+
+    # --- Case 7: the exact cleanup check/use race (review 5502825797) ----------------------------
+    # Chronology: close() begins; AFTER any teardown-side observation of the original channel
+    # directory but BEFORE any pathname mutation, the directory is renamed aside and its
+    # pathname replaced with a symlink to an external dir holding a REAL unix socket r.sock.
+    # The interposition is deterministic: os.lstat inside the bridge module is wrapped so the
+    # swap runs at the first pathname lstat — the old implementation's exact use-site. A safe
+    # implementation must never reach that point with a pathname mutation to follow.
+    import os as probe_os
+    import tempfile as probe_tempfile
+
+    ext7 = Path(probe_tempfile.mkdtemp(prefix="adp-ext7-"))
+    victim7 = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    victim7.bind(str(ext7 / "r.sock"))
+    channel7 = bridge._TurnResponseChannel(WORK / "unused-state", "t7")
+    dir7 = channel7.socket_path.parent
+
+    real_lstat = bridge.os.lstat
+    swap_state = {"fired": False}
+
+    def swapping_lstat(path, *args, **kwargs):
+        if str(path) == str(channel7.socket_path) and not swap_state["fired"]:
+            swap_state["fired"] = True
+            aside = dir7.parent / f"aside-{dir7.name[-6:]}"
+            dir7.rename(aside)
+            dir7.symlink_to(ext7)
+        return real_lstat(path, *args, **kwargs)
+
+    bridge.os.lstat = swapping_lstat
+    try:
+        channel7.close()
+    finally:
+        bridge.os.lstat = real_lstat
+    check(
+        "cleanup_swap_external_socket_survives",
+        (ext7 / "r.sock").exists() and statlib.S_ISSOCK(probe_os.lstat(ext7 / "r.sock").st_mode),
+        f"external={sorted(p.name for p in ext7.iterdir())} lstat_fired={swap_state['fired']}",
+    )
+    victim7.close()
+
+    # --- Case 8: teardown acts on directory identity, not pathname -------------------------------
+    # Post-visibility swap BEFORE close: the pathname points at an external real socket, the real
+    # directory lives elsewhere. Descriptor-relative teardown must remove r.sock from the *real*
+    # (renamed) directory and leave the external socket pathname untouched; the closed channel
+    # must refuse late delivery.
+    ext8 = Path(probe_tempfile.mkdtemp(prefix="adp-ext8-"))
+    victim8 = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    victim8.bind(str(ext8 / "r.sock"))
+    channel8 = bridge._TurnResponseChannel(WORK / "unused-state", "t8")
+    dir8 = channel8.socket_path.parent
+    aside8 = dir8.parent / f"aside8-{dir8.name[-6:]}"
+    dir8.rename(aside8)
+    dir8.symlink_to(ext8)
+    channel8.close()
+    late8: str
+    try:
+        late8 = deliver(str(aside8 / "r.sock"), json.dumps(RESPONSE).encode())
+    except OSError as exc:
+        late8 = f"refused: {exc}"
+    check(
+        "cleanup_identity_relative_unlink",
+        (ext8 / "r.sock").exists() and not (aside8 / "r.sock").exists(),
+        f"external={sorted(p.name for p in ext8.iterdir())} aside={sorted(p.name for p in aside8.iterdir())}",
+    )
+    check(
+        "cleanup_late_delivery_refused",
+        "refused" in late8 or "rejected" in late8,
+        f"late={late8!r}",
+    )
+    victim8.close()
 
     print(json.dumps(verdict, sort_keys=True))
     return 0 if ok else 1

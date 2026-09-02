@@ -46,6 +46,9 @@ test("IO-C1: the fileless response transport defeats the pre-write TOCTOU class"
         malformed_delivery_times_out: "PASS",
         stale_delivery_cannot_cross_turns: "PASS",
         timeout_releases_active_turn: "PASS",
+        cleanup_swap_external_socket_survives: "PASS",
+        cleanup_identity_relative_unlink: "PASS",
+        cleanup_late_delivery_refused: "PASS",
       },
       JSON.stringify(verdict),
     );
