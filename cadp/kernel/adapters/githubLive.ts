@@ -50,9 +50,13 @@ export class LiveGitHubTransport implements GitHubTransport {
     try {
       const bundlePath = join(dir, "candidate.bundle");
       writeFileSync(bundlePath, bundleBytes);
-      const verify = spawnSync("git", ["bundle", "verify", bundlePath], { encoding: "utf8", cwd: dir });
+      // `git bundle verify` requires a repository context; an ephemeral bare repo provides it.
+      const bare = join(dir, "verify.git");
+      const init = spawnSync("git", ["init", "--quiet", "--bare", bare], { encoding: "utf8" });
+      if (init.status !== 0) return `verify env: ${init.stderr.trim().slice(0, 200)}`;
+      const verify = spawnSync("git", ["--git-dir", bare, "bundle", "verify", bundlePath], { encoding: "utf8" });
       if (verify.status !== 0) return `verify failed: ${verify.stderr.trim().slice(0, 300)}`;
-      const heads = spawnSync("git", ["bundle", "list-heads", bundlePath], { encoding: "utf8", cwd: dir });
+      const heads = spawnSync("git", ["--git-dir", bare, "bundle", "list-heads", bundlePath], { encoding: "utf8" });
       const lines = heads.stdout.trim().split("\n").filter((l) => l.length > 0);
       if (lines.length !== 1) return `bundle must carry exactly one ref, has ${lines.length}`;
       const tip = lines[0]!.split(" ")[0];
