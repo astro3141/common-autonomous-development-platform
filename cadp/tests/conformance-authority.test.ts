@@ -9,9 +9,9 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
-import { startKernelApi } from "../../cadp/kernel/api.ts";
-import { REFERENCE_ADAPTERS, REFERENCE_IDENTITIES, REFERENCE_REGO } from "../../cadp/deployment/referencePolicy.ts";
-import { nowIso } from "../../cadp/kernel/canonical.ts";
+import { startKernelApi } from "../kernel/api.ts";
+import { REFERENCE_ADAPTERS, REFERENCE_IDENTITIES, REFERENCE_REGO } from "../deployment/referencePolicy.ts";
+import { nowIso } from "../kernel/canonical.ts";
 
 after(() => stopSharedOpa());
 

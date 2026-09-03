@@ -143,7 +143,13 @@ export class Ingress {
       throw new IngressRejection("REQUESTER_REF_MISMATCH", `declared ${draft.requester_ref} != authenticated ${identity.producer_ref}`);
     }
     const materialBytes = this.cas.get(draft.material_ref); // seal requires the material object to exist
-    const material_digest = jcsDigest(JSON.parse(Buffer.from(materialBytes).toString("utf8")));
+    const materialObject = JSON.parse(Buffer.from(materialBytes).toString("utf8")) as Record<string, unknown>;
+    // §6.2: a target-native idempotency key is bound to the effect identity at the Ingress —
+    // the requester cannot choose it; a wrong value is rejected, so material_digest covers it.
+    if (materialObject["idempotency_key"] !== undefined && materialObject["idempotency_key"] !== `cadp-v04:${draft.effect_id}`) {
+      throw new IngressRejection("IDEMPOTENCY_KEY_INVALID", `must be cadp-v04:${draft.effect_id}`);
+    }
+    const material_digest = jcsDigest(materialObject);
     const work_run_ref = draft.work_bindings.find((b) => b.namespace === "work-run")?.object_id;
 
     const record: EffectRequestV1 = {

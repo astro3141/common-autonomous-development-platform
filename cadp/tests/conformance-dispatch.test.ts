@@ -8,10 +8,10 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa } from "./support/harness.ts";
-import { REFERENCE_REGO } from "../../cadp/deployment/referencePolicy.ts";
-import { TemporalAdapter } from "../../cadp/kernel/adapters/temporal.ts";
-import type { TemporalTransport } from "../../cadp/kernel/adapters/temporal.ts";
-import { jcsDigest } from "../../cadp/kernel/canonical.ts";
+import { REFERENCE_REGO } from "../deployment/referencePolicy.ts";
+import { TemporalAdapter } from "../kernel/adapters/temporal.ts";
+import type { TemporalTransport } from "../kernel/adapters/temporal.ts";
+import { jcsDigest } from "../kernel/canonical.ts";
 
 after(() => stopSharedOpa());
 

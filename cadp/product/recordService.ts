@@ -36,7 +36,7 @@ export function startRecordService(port: number, dbPath: string): Promise<Record
   `);
 
   // Target-side fault injection: "timeout_after_commit" commits the write, then never responds.
-  let faultMode: "none" | "timeout_after_commit" | "unavailable" = "none";
+  let faultMode: "none" | "timeout_after_commit" | "unavailable" | "replica" = "none";
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://record-service");
@@ -69,6 +69,10 @@ export function startRecordService(port: number, dbPath: string): Promise<Record
         ? db.prepare("SELECT record_id, tenant, resource_id, idempotency_key, body_digest, created_at FROM records ORDER BY record_id").all()
         : db.prepare("SELECT record_id, tenant, resource_id, idempotency_key, body_digest, created_at FROM records WHERE idempotency_key = ?").all(key)) as Array<Record<string, unknown>>;
       const log = key === null ? [] : (db.prepare("SELECT at FROM write_log WHERE idempotency_key = ?").all(key) as Array<Record<string, unknown>>);
+      if (faultMode === "replica") {
+        // Eventual-consistency replica: possibly stale, and it says so by NOT claiming primary.
+        return send(200, { records: [], write_log: [] });
+      }
       return send(200, { records: rows, write_log: log }, { "X-Read-Authority": "primary" });
     }
 

@@ -9,11 +9,11 @@ import test, { after } from "node:test";
 import { join } from "node:path";
 
 import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS, PEP_REF, ScriptedTarget } from "./support/harness.ts";
-import { ConstitutionalStore } from "../../cadp/kernel/store.ts";
-import { Cas } from "../../cadp/kernel/cas.ts";
-import { Ingress } from "../../cadp/kernel/ingress.ts";
-import { Pep } from "../../cadp/kernel/pep.ts";
-import { makeAdapterRegistry } from "../../cadp/kernel/adapters/types.ts";
+import { ConstitutionalStore } from "../kernel/store.ts";
+import { Cas } from "../kernel/cas.ts";
+import { Ingress } from "../kernel/ingress.ts";
+import { Pep } from "../kernel/pep.ts";
+import { makeAdapterRegistry } from "../kernel/adapters/types.ts";
 
 after(() => stopSharedOpa());
 

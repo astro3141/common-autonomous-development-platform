@@ -10,9 +10,9 @@ import test, { after } from "node:test";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
-import { buildTar, parseTar } from "../../cadp/kernel/policyBundle.ts";
-import { evaluateAndSeal } from "../../cadp/kernel/evaluator.ts";
-import type { EvaluatorPort, ResolvedAdmissionBundle } from "../../cadp/kernel/evaluator.ts";
+import { buildTar, parseTar } from "../kernel/policyBundle.ts";
+import { evaluateAndSeal } from "../kernel/evaluator.ts";
+import type { EvaluatorPort, ResolvedAdmissionBundle } from "../kernel/evaluator.ts";
 
 after(() => stopSharedOpa());
 
@@ -146,7 +146,7 @@ test("C30: missing/corrupt CAS material refuses before K6 — no admission, no p
       await h.sealTargetIdentity();
       // Scripted-target leg: the body CAS object vanishes after sealing.
       const { request, material } = sealScriptedRequest(h, { body: "to-be-deleted" });
-      h.store.db.prepare("DELETE FROM cas_blob WHERE digest_key = ?").run(material["body_cas_key"]);
+      h.store.db.prepare("DELETE FROM cas_blob WHERE digest_key = ?").run(String(material["body_cas_key"]));
       const result = await runChain(h, request.effect_id);
       if (biteMode) {
         assert.equal(result.admitted?.kind, "ADMITTED", "guard-bite: incomplete material dispatched when #15 removed");

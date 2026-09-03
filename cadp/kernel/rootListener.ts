@@ -55,7 +55,10 @@ export function executeRootOperation(
   document: BreakGlassDocument,
   signature: Sig1,
   clock: () => number = Date.now,
+  /** TEST-ONLY guard-bite knob (TD §13.1); production callers never pass it. */
+  disabledChecks: ReadonlySet<string> = new Set(),
 ): { evidence_id: string; activated_seq?: number } {
+  const enabled = (check: string) => !disabledChecks.has(check);
   const reject = (reason: string, detail: string): never => {
     ingress.sealIncident("BREAK_GLASS_REJECTED", `${reason}: ${detail} (document digest ${jcsDigest(document).value})`, [
       { authority_ref: "cadp-store:k04", namespace: "root-operation", object_id: jcsDigest(document).value },
@@ -68,34 +71,37 @@ export function executeRootOperation(
 
   // Step 1 — execution authorization (cadp-sig-1): key in the CURRENTLY ACTIVE root set.
   const key = active.config.root_public_keys.find((k) => k.key_id === signature.key_id);
-  if (key === undefined) return reject("EXECUTION_AUTHORIZATION_FAILED", "key_id not in the active policy's root_public_keys");
-  if (!verifySignature("BREAK_GLASS", document, signature, key.public_key)) {
-    return reject("EXECUTION_AUTHORIZATION_FAILED", "signature does not verify");
-  }
-  const createdMs = Date.parse(document.created_at);
-  const expiresMs = Date.parse(document.expires_at);
-  if (Number.isNaN(createdMs) || Number.isNaN(expiresMs)) return reject("EXECUTION_AUTHORIZATION_FAILED", "invalid document times");
-  if (Date.parse(key.valid_from) > createdMs || createdMs > now) {
-    return reject("EXECUTION_AUTHORIZATION_FAILED", "valid_from ≤ created_at ≤ now violated");
-  }
-  if (key.valid_to !== undefined && now > Date.parse(key.valid_to)) {
-    // Evaluated against now, never created_at (C40).
-    return reject("EXECUTION_AUTHORIZATION_FAILED", "key expired at execution time");
-  }
-  if (!(createdMs <= now && now < expiresMs)) return reject("EXECUTION_AUTHORIZATION_FAILED", "created_at ≤ now < expires_at violated");
-  if (expiresMs - createdMs > active.config.break_glass_max_lifetime_s * 1000) {
-    return reject("EXECUTION_AUTHORIZATION_FAILED", "lifetime exceeds break_glass_max_lifetime_s");
+  if (enabled("execution_authorization")) {
+    if (key === undefined) return reject("EXECUTION_AUTHORIZATION_FAILED", "key_id not in the active policy's root_public_keys");
+    if (!verifySignature("BREAK_GLASS", document, signature, key.public_key)) {
+      return reject("EXECUTION_AUTHORIZATION_FAILED", "signature does not verify");
+    }
+    const createdMs = Date.parse(document.created_at);
+    const expiresMs = Date.parse(document.expires_at);
+    if (Number.isNaN(createdMs) || Number.isNaN(expiresMs)) return reject("EXECUTION_AUTHORIZATION_FAILED", "invalid document times");
+    if (Date.parse(key.valid_from) > createdMs || createdMs > now) {
+      return reject("EXECUTION_AUTHORIZATION_FAILED", "valid_from ≤ created_at ≤ now violated");
+    }
+    if (key.valid_to !== undefined && now > Date.parse(key.valid_to)) {
+      // Evaluated against now, never created_at (C40).
+      return reject("EXECUTION_AUTHORIZATION_FAILED", "key expired at execution time");
+    }
+    if (!(createdMs <= now && now < expiresMs)) return reject("EXECUTION_AUTHORIZATION_FAILED", "created_at ≤ now < expires_at violated");
+    if (expiresMs - createdMs > active.config.break_glass_max_lifetime_s * 1000) {
+      return reject("EXECUTION_AUTHORIZATION_FAILED", "lifetime exceeds break_glass_max_lifetime_s");
+    }
   }
   if (!Array.isArray(document.actions) || document.actions.length === 0) return reject("DOCUMENT_INVALID", "actions must be non-empty");
 
   // Step 2 — authorization base must be the exact currently active row, whatever the actions.
   const auth = document.authorization_policy_ref;
   if (
-    auth === undefined ||
-    auth.policy_id !== active.activation.policy_id ||
-    auth.revision !== active.activation.revision ||
-    auth.content_digest?.value !== active.activation.content_digest ||
-    auth.seq !== active.activation.seq
+    enabled("authorization_base") &&
+    (auth === undefined ||
+      auth.policy_id !== active.activation.policy_id ||
+      auth.revision !== active.activation.revision ||
+      auth.content_digest?.value !== active.activation.content_digest ||
+      auth.seq !== active.activation.seq)
   ) {
     return reject("AUTHORIZATION_BASE_STALE", "authorization_policy_ref does not equal the currently active policy_activation row");
   }
@@ -156,7 +162,7 @@ export function executeRootOperation(
   try {
     return store.withImmediate(() => {
       const current = store.activeActivation();
-      if (current === undefined || current.seq !== auth.seq) {
+      if (enabled("authorization_base") && (current === undefined || current.seq !== auth.seq)) {
         throw new RootRejection("AUTHORIZATION_BASE_STALE", "active row changed before commit");
       }
       store.insertEvidence(envelope, nowIso(clock));

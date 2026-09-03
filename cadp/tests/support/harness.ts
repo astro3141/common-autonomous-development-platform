@@ -9,25 +9,25 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Cas } from "../../../cadp/kernel/cas.ts";
-import { Ingress } from "../../../cadp/kernel/ingress.ts";
-import type { Principal } from "../../../cadp/kernel/ingress.ts";
-import { OpaEvaluator, evaluateAndSeal } from "../../../cadp/kernel/evaluator.ts";
-import type { EvaluateOutcome } from "../../../cadp/kernel/evaluator.ts";
-import { Pep } from "../../../cadp/kernel/pep.ts";
-import { Reconciler } from "../../../cadp/kernel/reconciler.ts";
-import { runGenesis } from "../../../cadp/kernel/genesis.ts";
-import { generateRootKey } from "../../../cadp/kernel/sig.ts";
-import { ConstitutionalStore } from "../../../cadp/kernel/store.ts";
-import { makeAdapterRegistry } from "../../../cadp/kernel/adapters/types.ts";
+import { Cas } from "../../kernel/cas.ts";
+import { Ingress } from "../../kernel/ingress.ts";
+import type { Principal } from "../../kernel/ingress.ts";
+import { OpaEvaluator, evaluateAndSeal } from "../../kernel/evaluator.ts";
+import type { EvaluateOutcome } from "../../kernel/evaluator.ts";
+import { Pep } from "../../kernel/pep.ts";
+import { Reconciler } from "../../kernel/reconciler.ts";
+import { runGenesis } from "../../kernel/genesis.ts";
+import { generateRootKey } from "../../kernel/sig.ts";
+import { ConstitutionalStore } from "../../kernel/store.ts";
+import { makeAdapterRegistry } from "../../kernel/adapters/types.ts";
 import type {
   AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
-} from "../../../cadp/kernel/adapters/types.ts";
-import type { EvidenceEnvelopeV1, SubjectBinding, TargetRef } from "../../../cadp/kernel/records.ts";
-import { StorePolicyAdapter } from "../../../cadp/kernel/adapters/storePolicy.ts";
-import { rawDigest, jcsDigest } from "../../../cadp/kernel/canonical.ts";
-import { buildReferenceBundle, buildReferenceKernelConfig } from "../../../cadp/deployment/referencePolicy.ts";
-import type { ReferencePolicyInput } from "../../../cadp/deployment/referencePolicy.ts";
+} from "../../kernel/adapters/types.ts";
+import type { EvidenceEnvelopeV1, SubjectBinding, TargetRef } from "../../kernel/records.ts";
+import { StorePolicyAdapter } from "../../kernel/adapters/storePolicy.ts";
+import { rawDigest, jcsDigest } from "../../kernel/canonical.ts";
+import { buildReferenceBundle, buildReferenceKernelConfig } from "../../deployment/referencePolicy.ts";
+import type { ReferencePolicyInput } from "../../deployment/referencePolicy.ts";
 
 export const PEP_REF = "spiffe://cadp-v04/cadp/pep";
 
@@ -171,6 +171,7 @@ export interface HarnessOptions {
   disabledChecks?: ReadonlySet<string>;
   extraAdapters?: TargetAdapterV1[];
   rego?: string;
+  extraRootPublicKeys?: Array<{ key_id: string; alg: "Ed25519"; public_key: string; valid_from: string; valid_to?: string }>;
 }
 
 export async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -189,6 +190,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
     revision: 1,
     root_public_keys: [
       { key_id: root.key_id, alg: "Ed25519", public_key: root.public_key_base64, valid_from: "2026-01-01T00:00:00.000Z" },
+      ...(options.extraRootPublicKeys ?? []),
     ],
     paramOverrides: { extra_plain_allow_operations: ["SCRIPTED_WRITE", "SCRIPTED_KEYED_WRITE", "SCRIPTED_GUARDED_WRITE"], ...options.paramOverrides },
     configOverrides: options.configOverrides,
@@ -349,15 +351,6 @@ export function sealScriptedRequest(
   const bodyBytes = Buffer.from(options.body ?? "scripted-body", "utf8");
   const body_digest = require_sha(bodyBytes);
   const body_cas_key = h.ingress.putBlob(bodyBytes);
-  const material = {
-    tenant: "scripted-1",
-    resource_id: "r-1",
-    body_digest,
-    body_cas_key,
-    idempotency_key: "",
-  };
-  const materialBytes = Buffer.from(JSON.stringify(material), "utf8");
-  const material_ref = h.ingress.putBlob(materialBytes);
   const effect_id =
     options.effect_id ??
     h.ingress.allocateEffectId({
@@ -366,6 +359,17 @@ export function sealScriptedRequest(
       step_ordinal: allocationCounter += 1,
       purpose: "record-write",
     });
+  const material: Record<string, unknown> = {
+    tenant: "scripted-1",
+    resource_id: "r-1",
+    body_digest,
+    body_cas_key,
+  };
+  if ((options.operation_kind ?? "SCRIPTED_WRITE") === "SCRIPTED_KEYED_WRITE") {
+    material["idempotency_key"] = `cadp-v04:${effect_id}`;
+  }
+  const materialBytes = Buffer.from(JSON.stringify(material), "utf8");
+  const material_ref = h.ingress.putBlob(materialBytes);
   const work_bindings = options.work_run_ref === undefined
     ? []
     : [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: options.work_run_ref }];
