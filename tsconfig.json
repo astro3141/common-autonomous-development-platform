@@ -12,6 +12,7 @@
     "noEmit": true
   },
   "include": [
+    "cadp/**/*.ts",
     "core/**/*.ts",
     "adapters/**/*.ts",
     "deployment/**/*.ts",
