@@ -36,11 +36,13 @@ async function recordSetup(options: { wrapReconcile?: (r: ReconcileResult) => Re
   if (options.wrapReconcile !== undefined) {
     const inner = adapter;
     adapter = new Proxy(inner, {
-      get(target, prop, receiver) {
+      get(target, prop) {
         if (prop === "reconcile") {
           return async (...args: Parameters<TargetAdapterV1["reconcile"]>) => options.wrapReconcile!(await inner.reconcile(...args));
         }
-        return Reflect.get(target, prop, receiver);
+        // Bind to the real target: the adapter has private fields, which a proxied `this` breaks.
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
       },
     }) as TargetAdapterV1;
   }

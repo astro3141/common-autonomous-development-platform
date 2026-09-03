@@ -374,19 +374,23 @@ export class Pep {
       if (holding !== undefined) throw new Refuse("SCOPE_HELD", `open incident ${holding.evidence_id}`);
     }
     if (this.#enabled("recheck7_prior_refs")) {
+      // §4.4 #7: each prior's LATEST outcome must be presented in the input — either the
+      // genuine TARGET_RECONCILIATION receipt envelope the outcome references, or the
+      // outcome record itself, named byte-exact by digest inside the SEALED material
+      // (K4-bound via the request; the evaluator sees it in effect_material.prior_outcomes).
+      const presentedOutcomes = (material["prior_outcomes"] as Array<{ effect_id?: string; outcome_digest?: string }> | undefined) ?? [];
       for (const prior of request.prior_effect_refs) {
         const priorAdmissions = store.admissionsByEffect(prior);
         if (priorAdmissions.length === 0) throw new Refuse("PRIOR_REF_NOT_AN_EFFECT", prior);
         const latest = this.#latestOutcome(prior);
-        const presented = evidence.some(
-          (e) =>
-            e.evidence_kind === "TARGET_RECONCILIATION" &&
-            e.subject_bindings.some((b) => b.object_id === prior) &&
-            (latest === undefined ||
-              (e.claim as { outcome_digest?: string })?.outcome_digest === latest.outcome_digest.value ||
-              latest.evidence_ref === e.evidence_id),
+        if (latest === undefined) throw new Refuse("PRIOR_EFFECT_STATE_NOT_PRESENTED", `${prior}: admission has no outcome row yet`);
+        const viaReceipt = evidence.some(
+          (e) => e.evidence_kind === "TARGET_RECONCILIATION" && latest.evidence_ref === e.evidence_id,
         );
-        if (!presented) throw new Refuse("PRIOR_EFFECT_STATE_NOT_PRESENTED", prior);
+        const viaOutcomeRecord = presentedOutcomes.some(
+          (o) => o.effect_id === prior && o.outcome_digest === latest.outcome_digest.value,
+        );
+        if (!viaReceipt && !viaOutcomeRecord) throw new Refuse("PRIOR_EFFECT_STATE_NOT_PRESENTED", prior);
       }
     }
 
@@ -748,34 +752,6 @@ export class Pep {
     // The claim's outcome_digest projection for prior-ref presentation (#7): sealed after the
     // outcome exists, by the reconciler's evidence path (see Reconciler.sealOutcomeEvidence).
     return outcome;
-  }
-
-  /**
-   * Projection of a prior effect's latest outcome as presentable evidence (recheck #7):
-   * a durable record of the target-authoritative observation already in K7.
-   */
-  sealPriorState(effect_id: string): EvidenceEnvelopeV1 {
-    const request = this.store.effectRequest(effect_id);
-    if (request === undefined) throw new Error(`no such effect ${effect_id}`);
-    const latest = this.#latestOutcome(effect_id);
-    if (latest === undefined) throw new Error(`effect ${effect_id} has no outcome to present`);
-    return this.ingress.sealInternalEvidence({
-      evidence_kind: "TARGET_RECONCILIATION",
-      subject_bindings: [
-        { authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id },
-        { authority_ref: request.target_ref.authority_ref, namespace: request.target_ref.target_type, object_id: request.target_ref.target_id },
-      ],
-      availability: "PRESENT",
-      claim_schema: "cadp.prior-effect-state.v1",
-      claim: {
-        effect_id,
-        outcome_digest: latest.outcome_digest.value,
-        result: latest.result,
-        ...(latest.unknown_reason !== undefined ? { unknown_reason: latest.unknown_reason } : {}),
-      },
-      source_ref: request.target_ref.authority_ref,
-      source_relation: "TARGET_AUTHORITY_OBSERVATION",
-    });
   }
 
   // ---------------------------------------------------------------- identity / attestations

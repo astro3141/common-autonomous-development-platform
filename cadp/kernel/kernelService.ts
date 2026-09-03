@@ -7,7 +7,7 @@
  * Run: node cadp/kernel/kernelService.ts <configPath>
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { startKernelApi, startRootListener } from "./api.ts";
@@ -37,7 +37,7 @@ export interface KernelServiceConfig {
   pep_ref: string;
   github?: { repo_id: string; repo_full_name: string; token_file: string };
   temporal?: { address: string; namespace: string; horizon_s: number };
-  record?: { base_url: string };
+  record?: { base_url: string; api_key_file?: string };
 }
 
 export interface KernelService {
@@ -86,7 +86,8 @@ export async function startKernelService(config: KernelServiceConfig): Promise<K
     adapters.push(new TemporalAdapter(transport, cas, config.temporal.namespace, config.temporal.horizon_s));
   }
   if (config.record !== undefined) {
-    adapters.push(new RecordServiceAdapter(config.record.base_url, cas));
+    const recordKey = config.record.api_key_file !== undefined ? readFileSync(config.record.api_key_file, "utf8").trim() : undefined;
+    adapters.push(new RecordServiceAdapter(config.record.base_url, cas, "cadp-disposable", recordKey));
   }
 
   const registry = makeAdapterRegistry(adapters);
@@ -122,16 +123,36 @@ export async function startKernelService(config: KernelServiceConfig): Promise<K
   const rootToken = readFileSync(join(config.secret_dir, "root-token"), "utf8").trim();
 
   const api = await startKernelApi({ store, cas, ingress, pep, reconciler, evaluator, tokens }, config.api_port);
-  const root = await startRootListener({ store, cas, ingress, rootToken }, config.root_port);
+
+  // TD §12: the root listener is DISABLED by default and enabled only for the duration of a
+  // root operation. The window is a root-owned marker file in the PEP secret path; the
+  // listener binds while the marker exists and closes when it is removed.
+  const windowMarker = join(config.secret_dir, "root-window");
+  let root: { port: number; close(): void } | undefined;
+  const syncRootWindow = async () => {
+    const open = existsSync(windowMarker);
+    if (open && root === undefined) {
+      root = await startRootListener({ store, cas, ingress, rootToken }, config.root_port);
+      console.error(`root listener ENABLED (window marker present) on port ${root.port}`);
+    } else if (!open && root !== undefined) {
+      root.close();
+      root = undefined;
+      console.error("root listener DISABLED (window marker removed)");
+    }
+  };
+  await syncRootWindow();
+  const rootTimer = setInterval(() => void syncRootWindow(), 1000);
+  rootTimer.unref();
 
   return {
     store, cas, ingress, pep, reconciler, evaluator, adapters,
     apiPort: api.port,
-    rootPort: root.port,
+    rootPort: root?.port ?? config.root_port,
     close: () => {
       clearInterval(probeTimer);
+      clearInterval(rootTimer);
       api.close();
-      root.close();
+      root?.close();
       evaluator.stop();
       store.close();
     },

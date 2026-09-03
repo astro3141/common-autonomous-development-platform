@@ -93,8 +93,4 @@ export class KernelClient {
   listEffects(work_run_ref: string): Promise<{ effect_ids: string[] }> {
     return this.#call("list_effects", { work_run_ref });
   }
-
-  sealPriorState(effect_id: string): Promise<EvidenceEnvelopeV1> {
-    return this.#call("seal_prior_state", { effect_id });
-  }
 }

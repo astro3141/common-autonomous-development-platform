@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
+import { buildWorkerSandbox, reviewerEnv, verifierEnv, workerEnv, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -203,15 +204,19 @@ export async function recordWriteStep(input: {
   const client = workflowClient();
   const evidence: string[] = [];
   const priors: string[] = [];
+  const priorOutcomes: Array<{ effect_id: string; outcome_digest: string }> = [];
   let payload = input.payload;
   if (input.prior_effect_id !== undefined) {
-    // Causal binding: B's body embeds A's target-authoritative receipt ref (P2).
+    // Causal binding: B's body embeds A's target-authoritative receipt ref (P2). The prior's
+    // LATEST outcome is presented byte-exact inside the sealed material (recheck #7) and its
+    // genuine receipt envelope rides in evidence_refs — no manufactured provenance.
     const priorState = await client.getEffectState(input.prior_effect_id);
     const committed = priorState.outcomes.find((o) => o.result === "COMMITTED");
     if (committed === undefined) throw new Error(`prior effect ${input.prior_effect_id} is not COMMITTED`);
     payload = JSON.stringify({ body: input.payload, depends_on: { effect_id: input.prior_effect_id, record: committed.target_operation_ref } });
-    const priorEvidence = await client.sealPriorState(input.prior_effect_id);
-    evidence.push(priorEvidence.evidence_id);
+    const latest = priorState.outcomes.at(-1)!;
+    priorOutcomes.push({ effect_id: input.prior_effect_id, outcome_digest: latest.outcome_digest.value });
+    if (latest.evidence_ref !== undefined) evidence.push(latest.evidence_ref);
     priors.push(input.prior_effect_id);
   }
   const payloadBytes = Buffer.from(payload, "utf8");
@@ -231,6 +236,7 @@ export async function recordWriteStep(input: {
       body_digest,
       body_cas_key,
       idempotency_key: `cadp-v04:${effect_id}`,
+      ...(priorOutcomes.length > 0 ? { prior_outcomes: priorOutcomes } : {}),
     }),
     evidence_refs: evidence,
     prior_effect_refs: priors,
@@ -293,18 +299,6 @@ function runWithHeartbeat(cmd: string, args: string[], options: { cwd?: string; 
   });
 }
 
-/** Sandboxed subprocess env (TD §4.1): fresh HOME, no ambient tokens, no gh config. */
-function sandboxEnv(home: string): Record<string, string> {
-  return {
-    PATH: process.env["PATH"] ?? "",
-    HOME: home,
-    GH_CONFIG_DIR: join(home, ".config", "gh-empty"),
-    TMPDIR: join(home, "tmp"),
-    NO_COLOR: "1",
-    TERM: "dumb",
-  };
-}
-
 export async function implementCandidate(input: {
   work_run_ref: string;
   step_ordinal: number;
@@ -334,15 +328,14 @@ export async function implementCandidate(input: {
       if (r.status !== 0) throw new Error(`checkout ${input.base_sha} failed: ${r.stderr.slice(0, 300)}`);
     }
 
-    // Worker sandbox home: codex auth copied in; NO gh config, NO ambient tokens.
-    const home = join(base, "home");
-    mkdirSync(join(home, "tmp"), { recursive: true });
-    const realCodex = join(process.env["HOME"] ?? "", ".codex");
-    if (existsSync(realCodex)) cpSync(realCodex, join(home, ".codex"), { recursive: true });
+    // Worker sandbox (finding 2): ONE shared construction — fresh HOME, ONLY codex auth.json
+    // copied, no host config/MCP; the reach attestation probes this exact profile.
+    const sandbox = buildWorkerSandbox(base);
+    const home = sandbox.home;
 
     // Pinned worker argv (TD §8.1; #89 profile trap): part of worker_profile_digest.
-    const argv = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", workspace, input.work_item];
-    const workerRun = await runWithHeartbeat("codex", argv, { cwd: workspace, env: sandboxEnv(home), timeout: 900_000 });
+    const argv = [...WORKER_ARGV_PREFIX, "-C", workspace, input.work_item];
+    const workerRun = await runWithHeartbeat("codex", argv, { cwd: workspace, env: workerEnv(home), timeout: 900_000 });
     if (workerRun.status !== 0) {
       throw new Error(`codex exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
     }
@@ -521,7 +514,9 @@ export async function verifyCandidate(input: {
       return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
     }
 
-    const test = await runWithHeartbeat("node", ["--test"], { cwd: workspace, timeout: 300_000 });
+    // Finding 1: the candidate's own tests are untrusted code — scrubbed env, no kernel
+    // URL/tokens, no credential surfaces (same construction the negative control proves).
+    const test = await runWithHeartbeat("node", ["--test"], { cwd: workspace, env: verifierEnv(join(base, "verifier-home")), timeout: 300_000 });
     const completed_at = nowMs();
     const conclusion = test.status === 0 ? "success" : "failure";
     const envelope = await verifier.submitEvidence({
@@ -579,20 +574,11 @@ export async function reviewCandidate(input: {
     const home = join(base, "home");
     mkdirSync(join(home, "tmp"), { recursive: true });
     const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
-    // Reviewer env: the second surface needs its own auth context (full user env), but every
-    // governed-target credential and kernel token is stripped — the reviewer can read the
-    // exact committed diff and nothing else it could act on.
-    const reviewerEnv: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value === undefined) continue;
-      if (key.startsWith("CADP_") || key === "GH_TOKEN" || key === "GITHUB_TOKEN") continue;
-      reviewerEnv[key] = value;
-    }
-    reviewerEnv["GH_CONFIG_DIR"] = join(home, ".config", "gh-empty");
-    reviewerEnv["NO_COLOR"] = "1";
+    // Finding 3: minimal reviewer env — Claude auth context only; git/gh/SSH credential
+    // surfaces neutralized; no CADP_* vars, no token env (shared construction, probed).
     const review = await runWithHeartbeat("claude", ["-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", prompt], {
       cwd: workspace,
-      env: reviewerEnv,
+      env: reviewerEnv(home),
       timeout: 300_000,
     });
     if (review.status !== 0 || review.stdout.trim().length === 0) {

@@ -11,10 +11,11 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadManifest, spawnComponent } from "./env.ts";
+import { buildWorkerSandbox, reviewerEnv, verifierEnv, workerEnv, workerProfileDigest, WORKER_ARGV_PREFIX } from "../product/workerProfile.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
@@ -62,7 +63,9 @@ function startComponent(name: string): void {
   const repoRoot = join(import.meta.dirname, "..", "..");
   switch (name) {
     case "record":
-      spawnComponent(dir, "record", "node", [join(repoRoot, "cadp/product/recordService.ts"), String(m.record_port), join(dir, "record-service.sqlite")]);
+      spawnComponent(dir, "record", "node", [join(repoRoot, "cadp/product/recordService.ts"), String(m.record_port), join(dir, "record-service.sqlite")], {
+        RECORD_SERVICE_API_KEY: readFileSync(join(dir, "secret", "record-api-key"), "utf8").trim(),
+      });
       break;
     case "temporal":
       spawnComponent(dir, "temporal", "temporal", [
@@ -105,55 +108,99 @@ function temporalNamespaceId(): string {
 
 async function attest(): Promise<void> {
   const m = manifest();
-  const probeHome = join(dir, "probe-home");
-  mkdirSync(join(probeHome, "empty-gh"), { recursive: true });
+  const probeBase = join(dir, "probe-profile");
+  mkdirSync(probeBase, { recursive: true });
 
-  // ---- CREDENTIAL_REACH_ATTESTATION: real negative probes under the worker sandbox env ----
-  const sandboxEnv = { PATH: process.env["PATH"] ?? "", HOME: probeHome, GH_CONFIG_DIR: join(probeHome, "empty-gh"), NO_COLOR: "1" };
+  // ---- CREDENTIAL_REACH_ATTESTATION under the EXACT production surface profiles ----
+  // Worker: the same buildWorkerSandbox()/workerEnv() construction implementCandidate uses
+  // (fresh HOME, ONLY codex auth.json copied, no host config/MCP).
+  const sandbox = buildWorkerSandbox(probeBase);
+  const wEnv = workerEnv(sandbox.home);
   const probes: Array<Record<string, unknown>> = [];
-  const ghProbe = spawnSync("gh", ["api", "/user"], { env: sandboxEnv, encoding: "utf8", timeout: 30_000 });
+  const probe = (label: string, cmd: string, args: string[], env: Record<string, string>, cwd?: string) => {
+    const r = spawnSync(cmd, args, { env, encoding: "utf8", timeout: 30_000, cwd });
+    probes.push({
+      identity: label.split(":")[0],
+      target: label,
+      argv: [cmd, ...args.slice(0, 4)],
+      exit_code: r.status,
+      reached: r.status === 0,
+      detail: ((r.stderr || r.stdout) ?? "").slice(0, 180).trim(),
+    });
+    return r;
+  };
+
+  probe("worker:github.com authenticated API", "gh", ["api", "/user"], wEnv);
+  probe(`worker:github.com/${m.repo_full_name} governed push`, "git", ["push", `https://github.com/${m.repo_full_name}.git`, `HEAD:refs/heads/cadp/probe-${Date.now()}`], wEnv, join(dir, "seed"));
+  probe("worker:record-service governed write (no key)", "curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", `http://127.0.0.1:${m.record_port}/records`, "-d", "{}"], wEnv);
+  // curl returns exit 0 even on 401 — grade record reach by HTTP status:
+  {
+    const last = probes.at(-1)!;
+    const status = String(last["detail"]);
+    last["reached"] = status.startsWith("2");
+    last["detail"] = `http ${status}`;
+  }
+  // Worker MCP/config import check: the sandbox .codex must contain ONLY the auth files.
+  const codexDir = join(sandbox.home, ".codex");
+  const codexContents = existsSync(codexDir) ? readdirSync(codexDir) : [];
   probes.push({
-    target: "github.com (authenticated API as worker identity)",
-    method: "gh api /user under sandbox env (fresh HOME, empty GH_CONFIG_DIR, no token env)",
-    exit_code: ghProbe.status,
-    reached: ghProbe.status === 0,
-    detail: (ghProbe.stderr || ghProbe.stdout).slice(0, 200).trim(),
+    identity: "worker",
+    target: "codex profile contents (no host config.toml / MCP import)",
+    contents: codexContents,
+    reached: codexContents.some((f) => f === "config.toml" || f === "mcp.json"),
+    detail: codexContents.join(","),
   });
-  const pushProbe = spawnSync(
-    "git",
-    ["push", `https://github.com/${m.repo_full_name}.git`, `HEAD:refs/heads/cadp/probe-${Date.now()}`],
-    { env: { ...sandboxEnv, GIT_TERMINAL_PROMPT: "0" }, cwd: join(dir, "seed"), encoding: "utf8", timeout: 30_000 },
-  );
+
+  // Reviewer: the same reviewerEnv() construction reviewCandidate uses.
+  const rHome = join(probeBase, "reviewer-home");
+  const rEnv = reviewerEnv(rHome);
+  probe("reviewer:github.com authenticated API", "gh", ["api", "/user"], rEnv);
+  probe(`reviewer:github.com/${m.repo_full_name} governed push`, "git", ["push", `https://github.com/${m.repo_full_name}.git`, `HEAD:refs/heads/cadp/probe-r-${Date.now()}`], rEnv, join(dir, "seed"));
+  probe("reviewer:record-service governed write (no key)", "curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", `http://127.0.0.1:${m.record_port}/records`, "-d", "{}"], rEnv);
+  {
+    const last = probes.at(-1)!;
+    const status = String(last["detail"]);
+    last["reached"] = status.startsWith("2");
+    last["detail"] = `http ${status}`;
+  }
+
+  // Verifier: the scrubbed env carries no kernel URL/token material at all (structural probe).
+  const vEnv = verifierEnv(join(probeBase, "verifier-home"));
+  const leakedVars = Object.keys(vEnv).filter((k) => k.startsWith("CADP_") || /TOKEN|SECRET|KEY/iu.test(k));
   probes.push({
-    target: `github.com/${m.repo_full_name} (governed repo push as worker identity)`,
-    method: "git push without credentials (GIT_TERMINAL_PROMPT=0)",
-    exit_code: pushProbe.status,
-    reached: pushProbe.status === 0,
-    detail: (pushProbe.stderr || "").slice(0, 200).trim(),
+    identity: "verifier",
+    target: "kernel effect authority via inherited env",
+    env_keys: Object.keys(vEnv),
+    reached: leakedVars.length > 0,
+    detail: leakedVars.length === 0 ? "no kernel URL/token variables in the verifier env" : `LEAK: ${leakedVars.join(",")}`,
   });
-  const tokenEnvLeak = ["GH_TOKEN", "GITHUB_TOKEN"].filter((k) => process.env[k] !== undefined);
-  const alternateFound = probes.some((p) => p["reached"] === true);
-  const reachDraft = {
-    evidence_kind: "CREDENTIAL_REACH_ATTESTATION" as const,
+
+  const tokenEnvLeak = ["GH_TOKEN", "GITHUB_TOKEN"].filter((k) => wEnv[k] !== undefined || rEnv[k] !== undefined || vEnv[k] !== undefined);
+  const alternateFound = probes.some((p2) => p2["reached"] === true) || tokenEnvLeak.length > 0;
+  const profileDigest = workerProfileDigest(sandbox);
+  const reach = await client("cadp-depctl-probe").submitEvidence({
+    evidence_kind: "CREDENTIAL_REACH_ATTESTATION",
     subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "deployment", object_id: "cadp-v04-live" }],
-    availability: "PRESENT" as const,
+    availability: "PRESENT",
     claim_schema: "cadp.credential-reach.v1",
     claim: {
       alternate_path_found: alternateFound,
+      worker_profile_digest: profileDigest,
+      worker_argv_prefix: [...WORKER_ARGV_PREFIX],
+      worker_auth_files: [...sandbox.copied],
       probes,
       token_env_leak: tokenEnvLeak,
-      network_policy_digest: "single-host-harness:sandbox-env",
+      network_policy_digest: "single-host-harness:profile-env-isolation",
       secret_acl_digest: sha256Hex(readFileSync(join(dir, "secret", "api-tokens.json"))),
       known_residuals: [
-        "single-host macOS: OS keychain items of the operating user remain readable by any same-user process; the worker identity boundary here is env/config isolation, not OS-level network policy (reported per TD §4.1 — deployment mechanism approximation)",
+        "single-host macOS: same-user OS keychain items and home-directory files (~/.ssh) remain readable by any same-user process; the surface identity boundary here is the exact profile env/config construction probed above, not OS-level network policy (TD §4.1 deployment-mechanism approximation, reported)",
       ],
     },
     producer_ref: "deployment-control-probe",
-    source_ref: "deployment-control live probe",
-    source_relation: "INDEPENDENT_OBSERVATION" as const,
-  };
-  const reach = await client("cadp-depctl-probe").submitEvidence(reachDraft);
-  console.log(JSON.stringify({ reach: reach.evidence_id, alternate_path_found: alternateFound, probes }, null, 2));
+    source_ref: "deployment-control live probe (production profile constructions)",
+    source_relation: "INDEPENDENT_OBSERVATION",
+  });
+  console.log(JSON.stringify({ reach: reach.evidence_id, alternate_path_found: alternateFound, worker_profile_digest: profileDigest, probes }, null, 2));
 
   // ---- TARGET_IMMUTABILITY_ATTESTATION: ruleset read + real negative probe ----
   const rulesets = JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/rulesets`], { encoding: "utf8" })) as Array<{ id: number; name: string; enforcement: string }>;
@@ -161,13 +208,11 @@ async function attest(): Promise<void> {
   const rulesetDetail = ruleset === undefined
     ? undefined
     : (JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/rulesets/${ruleset.id}`], { encoding: "utf8" })) as { enforcement: string; rules: Array<{ type: string }>; conditions: unknown; bypass_actors?: unknown[] });
-  // Negative probe: create a probe candidate ref, then attempt update + delete with an
-  // ADMIN-scoped token (expected: rejected by the active ruleset).
   const probeSha = m.base_sha;
   const probeRef = `refs/heads/cadp/candidate/${probeSha}`;
   const token = readFileSync(join(dir, "secret", "github-token"), "utf8").trim();
   const remote = `https://x-access-token:${token}@github.com/${m.repo_full_name}.git`;
-  spawnSync("git", ["push", remote, `${probeSha}:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" }); // creation allowed
+  spawnSync("git", ["push", remote, `${probeSha}:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
   const seedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: join(dir, "seed"), encoding: "utf8" }).trim();
   const moveAttempt = spawnSync("git", ["push", "--force", remote, `${seedHead}:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
   const deleteAttempt = spawnSync("git", ["push", remote, `:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
@@ -246,7 +291,7 @@ async function startWork(vertical: "development" | "record", extra: string[], or
     args_cas_key,
     args_digest: jcsDigest(args).value,
     bounds: args.bounds,
-    worker_profile_digest: jcsDigest({ argv: ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"] }).value,
+    worker_profile_digest: workerProfileDigest(),
     continuation_target: `temporal:cadp-v04:${namespaceId}`,
   };
   const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
@@ -350,6 +395,19 @@ async function main(): Promise<void> {
     case "reconcile":
       console.log(JSON.stringify(await client("cadp-workflow").requestReconcile(process.argv[4]!)));
       break;
+    case "root-window": {
+      // Root-operator action on the PEP secret path (TD §12: enabled only for the duration
+      // of a root operation).
+      const marker = join(dir, "secret", "root-window");
+      if (process.argv[4] === "open") {
+        writeFileSync(marker, new Date().toISOString());
+        console.log(JSON.stringify({ root_window: "open" }));
+      } else {
+        rmSync(marker, { force: true });
+        console.log(JSON.stringify({ root_window: "closed" }));
+      }
+      break;
+    }
     default:
       throw new Error(`unknown command ${command}`);
   }

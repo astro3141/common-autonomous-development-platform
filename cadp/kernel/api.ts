@@ -46,7 +46,6 @@ const METHOD_REACH: Record<string, readonly ProcessClass[]> = {
   get_effect_state: ["workflow", "worker", "evidence-adapter", "deployment-control", "human-surface"],
   request_reconcile: ["workflow", "deployment-control"],
   list_effects: ["workflow", "worker"],
-  seal_prior_state: ["workflow"],
 };
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -149,10 +148,6 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
       case "list_effects": {
         const body = JSON.parse(raw.toString("utf8")) as { work_run_ref: string };
         return send(200, { effect_ids: deps.store.effectIdsByWorkRun(body.work_run_ref) });
-      }
-      case "seal_prior_state": {
-        const body = JSON.parse(raw.toString("utf8")) as { effect_id: string };
-        return send(200, deps.pep.sealPriorState(body.effect_id));
       }
       default:
         return send(404, { error: "NO_SUCH_METHOD" });

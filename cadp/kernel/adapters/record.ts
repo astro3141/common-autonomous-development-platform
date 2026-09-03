@@ -23,11 +23,14 @@ interface HttpReply {
 
 class TransportAmbiguous extends Error {}
 
-function request(baseUrl: string, method: string, path: string, body?: unknown, timeout_ms = 5000): Promise<HttpReply> {
+function request(baseUrl: string, method: string, path: string, body?: unknown, timeout_ms = 5000, apiKey?: string): Promise<HttpReply> {
   return new Promise((resolve, reject) => {
     const url = new URL(path, baseUrl);
     const req = http.request(
-      { hostname: url.hostname, port: url.port, path: url.pathname + url.search, method, headers: { "content-type": "application/json" } },
+      {
+        hostname: url.hostname, port: url.port, path: url.pathname + url.search, method,
+        headers: { "content-type": "application/json", ...(apiKey !== undefined ? { "x-api-key": apiKey } : {}) },
+      },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
@@ -55,11 +58,13 @@ export class RecordServiceAdapter implements TargetAdapterV1 {
   readonly baseUrl: string;
   readonly cas: Cas;
   readonly tenant: string;
+  readonly #apiKey: string | undefined;
 
-  constructor(baseUrl: string, cas: Cas, tenant = "cadp-disposable") {
+  constructor(baseUrl: string, cas: Cas, tenant = "cadp-disposable", apiKey?: string) {
     this.baseUrl = baseUrl;
     this.cas = cas;
     this.tenant = tenant;
+    this.#apiKey = apiKey;
   }
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -128,7 +133,7 @@ export class RecordServiceAdapter implements TargetAdapterV1 {
         resource_id: material["resource_id"],
         idempotency_key: material["idempotency_key"],
         body_base64: Buffer.from(bytes).toString("base64"),
-      });
+      }, 5000, this.#apiKey);
     } catch (error) {
       return { kind: "AMBIGUOUS", raw_observation: error instanceof Error ? error.message : String(error) };
     }
@@ -153,7 +158,7 @@ export class RecordServiceAdapter implements TargetAdapterV1 {
     const key = String(material["idempotency_key"]);
     let reply: HttpReply;
     try {
-      reply = await request(this.baseUrl, "GET", `/records?idempotency_key=${encodeURIComponent(key)}`);
+      reply = await request(this.baseUrl, "GET", `/records?idempotency_key=${encodeURIComponent(key)}`, undefined, 5000, this.#apiKey);
     } catch (error) {
       return { kind: "UNKNOWN", unknown_reason: `reconcile read failed: ${error instanceof Error ? error.message : String(error)}` };
     }

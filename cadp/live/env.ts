@@ -115,6 +115,8 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
   writeFileSync(join(secretDir, "api-tokens.json"), JSON.stringify(tokenMap, null, 2), { mode: 0o600 });
   const rootToken = randomBytes(24).toString("hex");
   writeFileSync(join(secretDir, "root-token"), rootToken, { mode: 0o600 });
+  // Governed record-service credential: held ONLY in the PEP secret path (TD §4.1).
+  writeFileSync(join(secretDir, "record-api-key"), randomBytes(24).toString("hex"), { mode: 0o600 });
 
   // ---- root key + genesis ----
   const root = generateRootKey();
@@ -156,7 +158,7 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     pep_ref: "spiffe://cadp-v04/cadp/pep",
     github: { repo_id: repoId, repo_full_name: fullName, token_file: githubTokenFile },
     temporal: { address: `127.0.0.1:${ports.temporal}`, namespace: "cadp-v04", horizon_s: 86400 },
-    record: { base_url: `http://127.0.0.1:${ports.record}` },
+    record: { base_url: `http://127.0.0.1:${ports.record}`, api_key_file: join(secretDir, "record-api-key") },
   };
   const kernelConfigPath = join(dir, "kernel-config.json");
   writeFileSync(kernelConfigPath, JSON.stringify(kernelConfig, null, 2));

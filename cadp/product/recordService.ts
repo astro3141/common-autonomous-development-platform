@@ -16,7 +16,7 @@ export interface RecordServiceHandle {
   close(): void;
 }
 
-export function startRecordService(port: number, dbPath: string): Promise<RecordServiceHandle> {
+export function startRecordService(port: number, dbPath: string, apiKey?: string): Promise<RecordServiceHandle> {
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
@@ -47,6 +47,12 @@ export function startRecordService(port: number, dbPath: string): Promise<Record
 
     if (req.method === "GET" && url.pathname === "/whoami") {
       return send(200, { tenant: "cadp-disposable", principal: "record-service-key-1" });
+    }
+
+    // Governed credential seam (TD §4.1: record-service API key custody): every mutating or
+    // authoritative call requires the key only the PEP holds.
+    if (apiKey !== undefined && req.headers["x-api-key"] !== apiKey) {
+      return send(401, { error: "unauthenticated", detail: "X-Api-Key required" });
     }
 
     if (req.method === "POST" && url.pathname === "/admin/fault") {
@@ -141,7 +147,8 @@ export function startRecordService(port: number, dbPath: string): Promise<Record
 if (process.argv[1]?.endsWith("recordService.ts")) {
   const port = Number(process.argv[2] ?? 0);
   const dbPath = process.argv[3] ?? "record-service.sqlite";
-  startRecordService(port, dbPath).then((h) => {
+  const apiKey = process.env["RECORD_SERVICE_API_KEY"];
+  startRecordService(port, dbPath, apiKey).then((h) => {
     console.log(JSON.stringify({ listening: h.port }));
   });
 }
