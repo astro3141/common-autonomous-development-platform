@@ -13,8 +13,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
-import { buildWorkerSandbox, reviewerEnv, WORKER_ARGV_PREFIX, workerProfileDigest } from "./workerProfile.ts";
-import { dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
+import { buildWorkerSandbox, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
+import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import type { IsolationConfig } from "./isolation.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
@@ -610,17 +610,19 @@ export async function reviewCandidate(input: {
     const home = join(base, "home");
     mkdirSync(join(home, "tmp"), { recursive: true });
     const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
-    // Reviewer isolation (re-review blocker): the reviewer needs host Claude auth, so it runs
-    // under a Seatbelt profile that denies the PEP secret path, the Kernel/target ports, and
-    // keychain/credential-helper execution — while keeping the provider egress it needs.
+    // Reviewer isolation (re-review blocker): the reviewer runs inside a container with the
+    // host filesystem invisible and GitHub/record/Kernel egress pinned dead (http-000); the
+    // model OAuth token is injected by env (operator-extracted), so no keychain/host credential
+    // is reachable. Only the read-only checkout is mounted.
     const rconfig = isolationConfig();
+    if (!(await dockerAvailable())) throw new Error("reviewer isolation runtime (docker) unavailable — failing closed");
+    const providerToken = claudeProviderToken();
     const rHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
     let review;
     try {
       review = await runReviewer(rconfig, {
         workspace,
-        sandboxDir: home,
-        env: reviewerEnv(home),
+        providerToken,
         argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
         timeout_ms: 300_000,
       });

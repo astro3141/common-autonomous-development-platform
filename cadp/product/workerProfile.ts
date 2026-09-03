@@ -5,11 +5,9 @@
  *
  * - worker (codex): fresh HOME; ONLY `~/.codex/auth.json` is copied in (no host config.toml,
  *   no MCP servers, no sessions); pinned argv.
- * - verifier (candidate `node --test`): fully scrubbed env — no kernel URL/tokens, no
- *   credentials; untrusted candidate code sees nothing it could act on.
- * - reviewer (claude -p): real HOME (Claude authentication lives there) with every other
- *   credential surface neutralized at env level: git global/system config disabled, empty gh
- *   config, no SSH agent, no token env, no CADP_* vars.
+ * Isolation of the surfaces themselves (containers / Seatbelt) lives in ./isolation.ts; this
+ * module owns only the codex worker PROFILE (auth-only sandbox + pinned argv + profile digest)
+ * that the reach attestation binds.
  */
 
 import { cpSync, existsSync, mkdirSync } from "node:fs";
@@ -56,61 +54,4 @@ export function workerProfileDigest(sandbox?: WorkerSandbox): string {
     auth_files: sandbox === undefined ? [...WORKER_AUTH_FILES] : [...sandbox.copied],
     home: "fresh-per-invocation",
   }).value;
-}
-
-export function workerEnv(home: string): Record<string, string> {
-  return {
-    PATH: process.env["PATH"] ?? "",
-    HOME: home,
-    TMPDIR: join(home, "tmp"),
-    GH_CONFIG_DIR: join(home, ".config", "gh-empty"),
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_SYSTEM: "/dev/null",
-    GIT_TERMINAL_PROMPT: "0",
-    NO_COLOR: "1",
-    TERM: "dumb",
-  };
-}
-
-/**
- * Verifier env (finding 1): the candidate's own test process runs with NOTHING — no kernel
- * URL, no tokens, no credential surfaces. Exported so the negative control and the live
- * verifier use the identical construction.
- */
-export function verifierEnv(home: string): Record<string, string> {
-  mkdirSync(join(home, "tmp"), { recursive: true });
-  mkdirSync(join(home, ".config", "gh-empty"), { recursive: true });
-  return {
-    PATH: process.env["PATH"] ?? "",
-    HOME: home,
-    TMPDIR: join(home, "tmp"),
-    GH_CONFIG_DIR: join(home, ".config", "gh-empty"),
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_SYSTEM: "/dev/null",
-    GIT_TERMINAL_PROMPT: "0",
-    NO_COLOR: "1",
-    TERM: "dumb",
-  };
-}
-
-/**
- * Reviewer env (finding 3): minimal — Claude authentication context (real HOME + USER) plus
- * read-only terminal vars; git global/system config disabled, empty gh config, no SSH agent,
- * no token env, no CADP_* vars. Measured stable for `claude -p`.
- */
-export function reviewerEnv(sandboxHome: string): Record<string, string> {
-  mkdirSync(join(sandboxHome, "tmp"), { recursive: true });
-  mkdirSync(join(sandboxHome, ".config", "gh-empty"), { recursive: true });
-  return {
-    PATH: process.env["PATH"] ?? "",
-    HOME: process.env["HOME"] ?? sandboxHome,
-    USER: process.env["USER"] ?? "cadp",
-    TMPDIR: join(sandboxHome, "tmp"),
-    GH_CONFIG_DIR: join(sandboxHome, ".config", "gh-empty"),
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_SYSTEM: "/dev/null",
-    GIT_TERMINAL_PROMPT: "0",
-    NO_COLOR: "1",
-    TERM: "dumb",
-  };
 }

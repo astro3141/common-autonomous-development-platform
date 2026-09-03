@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 
-import { dockerAvailable, runReviewer, runVerifier, runWorker, reviewerSandboxProfile } from "../product/isolation.ts";
+import { dockerAvailable, runReviewer, runVerifier, runWorker } from "../product/isolation.ts";
 import type { IsolationConfig } from "../product/isolation.ts";
 
 const PAYLOAD = fileURLToPath(new URL("../live/probePayload.mjs", import.meta.url));
@@ -71,9 +71,9 @@ function kernelStub(): Promise<{ port: number; hits: number; close(): void }> {
   });
 }
 
-test("F6: reviewer Seatbelt denies the PEP secret path, the Kernel port, and the keychain; guard-bite proves it", async () => {
-  if (platform() !== "darwin" || spawnSync("which", ["sandbox-exec"], { stdio: "ignore" }).status !== 0) {
-    console.log("  skipped: sandbox-exec unavailable");
+test("F6: reviewer container has no host filesystem and governed egress is http-000; guard-bite (host) breaches", async () => {
+  if (!dockerOk || !imageOk) {
+    console.log("  skipped: docker/image unavailable");
     return;
   }
   const dir = mkdtempSync(join(tmpdir(), "cadp-f6-"));
@@ -83,41 +83,30 @@ test("F6: reviewer Seatbelt denies the PEP secret path, the Kernel port, and the
     mkdirSync(secretDir, { recursive: true });
     writeFileSync(join(secretDir, "github-token"), "ghp_SUPER_SECRET_TOKEN");
     writeFileSync(join(dir, "manifest.json"), JSON.stringify({ tokens: { "cadp-workflow": "wf-token" }, api_url: `http://127.0.0.1:${stub.port}` }));
-    const config: IsolationConfig = {
-      worker_image: WORKER_IMAGE,
-      governed_hosts: [],
-      denied_ports: [stub.port],
-      denied_read_paths: [secretDir, join(dir, "manifest.json")],
-    };
-    const targets = { kernel_api: `http://127.0.0.1:${stub.port}/allocate_effect_id` };
-    const env = {
-      PATH: process.env["PATH"] ?? "",
-      HOME: process.env["HOME"] ?? dir,
-      TMPDIR: dir,
-      PROBE_SEARCH_ROOTS: `${dir}:${secretDir}`,
-      PROBE_TARGETS: JSON.stringify(targets),
-    };
-    const run = await runReviewer(config, { workspace: dir, sandboxDir: dir, env, argv: ["node", PAYLOAD], timeout_ms: 60_000 });
+    const ws = join(dir, "ws");
+    mkdirSync(ws, { recursive: true });
+    spawnSync("cp", [PAYLOAD, join(ws, "probe.mjs")]);
+    const config: IsolationConfig = { worker_image: WORKER_IMAGE, governed_hosts: ["github.com", "api.github.com"], denied_ports: [], denied_read_paths: [] };
+    const run = await runReviewer(config, {
+      workspace: ws,
+      providerToken: "probe-not-used",
+      argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws:/root' PROBE_TARGETS='${JSON.stringify({ github_api: "https://api.github.com/rate_limit", kernel: `http://host.docker.internal:${stub.port}/x` })}' node /ws/probe.mjs`],
+      timeout_ms: 60_000,
+    });
     const findings = JSON.parse(run.stdout.trim().split("\n").reverse().find((l) => l.startsWith("{"))!) as {
-      fs_reads: Array<{ path: string }>; egress: Array<{ target: string; status: unknown }>; credential_use: Array<Record<string, unknown>>;
-    };
-    // The Seatbelt profile blocks reading the secret + manifest…
-    assert.equal(findings.fs_reads.length, 0, `secret/manifest reads must be denied: ${JSON.stringify(findings.fs_reads)}`);
-    // …and blocks reaching the Kernel port (status 000).
-    const kernel = findings.egress.find((e) => e.target === "kernel_api");
-    assert.equal(kernel?.status, "000", `kernel port must be refused: ${JSON.stringify(kernel)}`);
-    assert.equal(stub.hits, 0, "the Kernel stub received no request from the sandboxed surface");
-    // …and denies keychain exec.
-    assert.ok(findings.credential_use.some((c) => c["denied"] !== undefined), "keychain access denied");
-
-    // Guard-bite: WITHOUT the sandbox, the same payload reads the secret and reaches the port.
-    const bite = await spawnAsync("node", [PAYLOAD], env);
-    const biteFindings = JSON.parse(bite.stdout.trim().split("\n").reverse().find((l) => l.startsWith("{"))!) as {
       fs_reads: Array<{ path: string }>; egress: Array<{ target: string; status: unknown }>;
     };
-    assert.ok(biteFindings.fs_reads.some((f) => f.path.includes("/secret/") || f.path.endsWith("manifest.json")), "bite: secret readable");
-    assert.ok(biteFindings.egress.some((e) => e.target === "kernel_api" && e.status !== "000"), "bite: kernel port reached");
-    assert.ok(stub.hits >= 1, "bite: the Kernel stub was hit without the sandbox");
+    assert.ok(!findings.fs_reads.some((f) => f.path.includes(dir)), "host secret/manifest invisible in the reviewer container");
+    assert.ok(findings.egress.every((e) => e.status === "000"), `governed egress must all be http-000: ${JSON.stringify(findings.egress)}`);
+    assert.equal(stub.hits, 0, "the Kernel stub received nothing from the isolated reviewer");
+
+    // Guard-bite: the same payload on the HOST reads the secret and reaches the port.
+    const bite = await spawnAsync("node", [PAYLOAD], { ...process.env as Record<string, string>, PROBE_SEARCH_ROOTS: `${dir}:${secretDir}`, PROBE_TARGETS: JSON.stringify({ kernel: `http://127.0.0.1:${stub.port}/x` }) });
+    const biteFindings = JSON.parse(bite.stdout.trim().split("\n").reverse().find((l) => l.startsWith("{"))!) as {
+      fs_reads: Array<{ path: string }>; egress: Array<{ status: unknown }>;
+    };
+    assert.ok(biteFindings.fs_reads.length > 0, "bite: host secret readable");
+    assert.ok(biteFindings.egress.some((e) => e.status !== "000"), "bite: host reached the port");
   } finally {
     stub.close();
     rmSync(dir, { recursive: true, force: true });

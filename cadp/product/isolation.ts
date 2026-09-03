@@ -20,7 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { realpathSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 export interface IsolationConfig {
@@ -66,7 +66,9 @@ export function runWorker(
   config: IsolationConfig,
   input: { workspace: string; codexAuthDir: string; sessionsDir?: string; argv: readonly string[]; timeout_ms?: number },
 ): Promise<RunResult> {
-  const addHost = config.governed_hosts.flatMap((h) => ["--add-host", `${h}:127.0.0.1`]);
+  // Pin governed hosts AND the docker host bridge to a dead address: the worker container can
+  // reach the commodity provider (public DNS) but not GitHub or the host-side record service.
+  const addHost = [...config.governed_hosts, "host.docker.internal"].flatMap((h) => ["--add-host", `${h}:127.0.0.1`]);
   // auth.json is mounted read-only; a separate writable sessions dir lets the container's codex
   // write its session log where the host-side backend-scan adapter can read it (#91), without
   // exposing the read-only auth mount to writes.
@@ -102,42 +104,34 @@ export function runVerifier(
   return collect(spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] }), input.timeout_ms ?? 300_000);
 }
 
-/** Compile the reviewer Seatbelt profile (deny secret paths + governed ports + keychain). */
-export function reviewerSandboxProfile(config: IsolationConfig): string {
-  const lines = ["(version 1)", "(allow default)"];
-  for (const path of config.denied_read_paths) {
-    // Seatbelt matches the CANONICAL path; /var → /private/var etc. must be resolved or the
-    // deny silently misses. A path that does not exist yet is used verbatim.
-    let canonical = path;
-    try { canonical = realpathSync(path); } catch { /* not yet created */ }
-    lines.push(`(deny file-read* (subpath ${JSON.stringify(canonical)}))`);
-    lines.push(`(deny file-write* (subpath ${JSON.stringify(canonical)}))`);
-  }
-  for (const port of config.denied_ports) {
-    lines.push(`(deny network-outbound (remote tcp ${JSON.stringify(`localhost:${port}`)}))`);
-  }
-  // Deny the macOS keychain accessor and common credential-helper binaries.
-  for (const bin of ["/usr/bin/security", "/usr/local/bin/gh", "/opt/homebrew/bin/gh", "/usr/bin/ssh", "/usr/bin/ssh-add"]) {
-    lines.push(`(deny process-exec (literal ${JSON.stringify(bin)}))`);
-  }
-  return lines.join("\n") + "\n";
-}
-
 /**
- * Reviewer under Seatbelt: full host env is available (Claude auth), but the profile denies
- * the PEP secret path, the Kernel/target ports, and keychain/credential-helper execution.
+ * Reviewer container: like the worker, host fs invisible (only a read-only checkout), governed
+ * hosts + host bridge pinned dead → GitHub/record/Kernel egress is http-000. The provider
+ * (Anthropic) is a public host and stays reachable; the model OAuth token is passed by env so
+ * no keychain/host-credential access is needed. Only /ws (ro) is mounted.
  */
 export function runReviewer(
   config: IsolationConfig,
-  input: { workspace: string; sandboxDir: string; env: Record<string, string>; argv: readonly string[]; timeout_ms?: number },
+  input: { workspace: string; providerToken: string; argv: readonly string[]; timeout_ms?: number },
 ): Promise<RunResult> {
-  const profilePath = join(input.sandboxDir, "reviewer.sb");
-  writeFileSync(profilePath, reviewerSandboxProfile(config));
-  const args = ["-f", profilePath, ...input.argv];
-  return collect(
-    spawn("sandbox-exec", args, { cwd: input.workspace, env: input.env, stdio: ["ignore", "pipe", "pipe"] }),
-    input.timeout_ms ?? 300_000,
-  );
+  const addHost = [...config.governed_hosts, "host.docker.internal"].flatMap((h) => ["--add-host", `${h}:127.0.0.1`]);
+  const args = [
+    "run", "--rm", "--init",
+    "-v", `${input.workspace}:/ws:ro`,
+    "-e", "HOME=/root",
+    "-e", `CLAUDE_CODE_OAUTH_TOKEN=${input.providerToken}`,
+    "-w", "/ws",
+    ...addHost,
+    config.worker_image,
+    ...input.argv,
+  ];
+  return collect(spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] }), input.timeout_ms ?? 300_000);
+}
+
+/** Extract the Claude Code provider OAuth token (operator action; the surface never sees the keychain). */
+export function claudeProviderToken(): string {
+  const raw = execFileSync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], { encoding: "utf8", timeout: 5000 });
+  return (JSON.parse(raw) as { claudeAiOauth: { accessToken: string } }).claudeAiOauth.accessToken;
 }
 
 /** Is the worker/verifier container runtime actually available? (fail closed if not). */
