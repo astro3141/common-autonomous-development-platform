@@ -68,6 +68,7 @@ export interface TargetAdapterV1 {
     target_ref: TargetRef,
     operation_kind: string,
     material: Record<string, unknown>,
+    context?: { admitted_at?: string },
   ): Promise<ReconcileResult>;
   /** Receipt binding rule (TD §6.4): at least one target-native receipt field is a function of the material. */
   receipt_binds(operation_kind: string, material: Record<string, unknown>, receipt_claim: Record<string, unknown>): boolean;

@@ -65,7 +65,7 @@ export class Reconciler {
         this.#sealExhausted(effect_id, admission);
         continue;
       }
-      const result = await adapter.reconcile(effect_id, admission.dispatch_ordinal, request.target_ref, request.operation_kind, material);
+      const result = await adapter.reconcile(effect_id, admission.dispatch_ordinal, request.target_ref, request.operation_kind, material, { admitted_at: admission.admitted_at });
       const observer = `${this.pep.pep_ref}:reconciler`;
       switch (result.kind) {
         case "COMMITTED":
