@@ -49,13 +49,19 @@ export type EvidenceKind =
   | "GENESIS"
   | "BREAK_GLASS"
   | "LEGACY_V03_ARTIFACT"
-  | "RECONCILE_EXHAUSTED";
+  | "RECONCILE_EXHAUSTED"
+  // Product-layer evidence kinds (cadp.improvement-intake.v1, #104). These are ordinary
+  // code under existing TD ports: a new closed-union member + adapter_registry entry, NOT a
+  // new constitutional primitive. The claim contracts are validated by the registered product
+  // adapter before submission; ingress still only stamps identity/provenance (TD §9.1).
+  | "IMPROVEMENT_FINDING"
+  | "IMPROVEMENT_FINDING_RESOLUTION";
 
 export const EVIDENCE_KINDS: readonly EvidenceKind[] = [
   "VERIFICATION", "REVIEW", "BACKEND_EXECUTION", "HUMAN_DECISION", "TARGET_RECONCILIATION",
   "PEP_TARGET_IDENTITY", "CREDENTIAL_REACH_ATTESTATION", "TARGET_IMMUTABILITY_ATTESTATION",
   "KERNEL_INCIDENT", "WORK_STEP", "WORK_BOUND_STOP", "GENESIS", "BREAK_GLASS", "LEGACY_V03_ARTIFACT",
-  "RECONCILE_EXHAUSTED",
+  "RECONCILE_EXHAUSTED", "IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION",
 ];
 
 export interface Provenance {
