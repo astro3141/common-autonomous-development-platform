@@ -350,7 +350,10 @@ export async function implementCandidate(input: {
     // The harness commits the worker-local candidate (worker cannot push — no credential).
     run("git", ["add", "-A"], { cwd: workspace });
     r = run("git", ["-c", "user.name=cadp-worker", "-c", "user.email=worker@cadp-v04.invalid", "commit", "-m", `cadp candidate: ${input.work_item.slice(0, 60)}`], { cwd: workspace });
-    if (r.status !== 0) throw new Error(`nothing to commit: ${r.stderr.slice(0, 200)} ${r.stdout.slice(0, 200)}`);
+    if (r.status !== 0 && !/nothing to commit|커밋할 사항 없음/u.test(r.stdout + r.stderr)) {
+      throw new Error(`commit failed: ${r.stderr.slice(0, 200)} ${r.stdout.slice(0, 200)}`);
+    }
+    // A revision round where the worker changes nothing stands on the existing candidate.
     const candidate_sha = run("git", ["rev-parse", "HEAD"], { cwd: workspace }).stdout.trim();
 
     // Complete bundle whose single head IS the candidate (TD §6.6).
@@ -576,11 +579,25 @@ export async function reviewCandidate(input: {
     const home = join(base, "home");
     mkdirSync(join(home, "tmp"), { recursive: true });
     const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
+    // Reviewer env: the second surface needs its own auth context (full user env), but every
+    // governed-target credential and kernel token is stripped — the reviewer can read the
+    // exact committed diff and nothing else it could act on.
+    const reviewerEnv: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value === undefined) continue;
+      if (key.startsWith("CADP_") || key === "GH_TOKEN" || key === "GITHUB_TOKEN") continue;
+      reviewerEnv[key] = value;
+    }
+    reviewerEnv["GH_CONFIG_DIR"] = join(home, ".config", "gh-empty");
+    reviewerEnv["NO_COLOR"] = "1";
     const review = await runWithHeartbeat("claude", ["-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", prompt], {
       cwd: workspace,
-      env: { ...sandboxEnv(home), HOME: process.env["HOME"] ?? home },
+      env: reviewerEnv,
       timeout: 300_000,
     });
+    if (review.status !== 0 || review.stdout.trim().length === 0) {
+      throw new Error(`reviewer surface failed (exit ${review.status}): ${(review.stderr || review.stdout).slice(0, 200)}`);
+    }
     const lines = review.stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
     const verdict = verdictLine.startsWith("APPROVE") ? "APPROVE" : "REQUEST_CHANGES";
