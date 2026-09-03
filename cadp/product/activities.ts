@@ -274,6 +274,7 @@ function runWithHeartbeat(cmd: string, args: string[], options: { cwd?: string; 
     const child = spawn(cmd, args, {
       cwd: options.cwd,
       env: options.env ?? (process.env as Record<string, string>),
+      stdio: ["ignore", "pipe", "pipe"], // stdin closed: CLIs like codex wait for EOF on an open pipe
     });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
