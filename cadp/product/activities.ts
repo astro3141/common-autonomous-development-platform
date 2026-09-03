@@ -620,8 +620,10 @@ export async function reviewCandidate(input: {
     const rHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
     let review;
     try {
+      const reviewWs = join(base, "review-ws");
+      mkdirSync(reviewWs, { recursive: true });
       review = await runReviewer(rconfig, {
-        workspace,
+        workspace: reviewWs,
         providerToken,
         argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
         timeout_ms: 300_000,
