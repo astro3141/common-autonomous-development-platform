@@ -4,13 +4,15 @@
  * target credential. Run: node cadp/product/worker.ts (env-configured).
  */
 
-import { Worker } from "@temporalio/worker";
+import { NativeConnection, Worker } from "@temporalio/worker";
 import { fileURLToPath } from "node:url";
 
 import * as activities from "./activities.ts";
 
 async function main(): Promise<void> {
+  const connection = await NativeConnection.connect({ address: process.env["CADP_TEMPORAL_ADDRESS"] ?? "127.0.0.1:7233" });
   const worker = await Worker.create({
+    connection,
     workflowsPath: fileURLToPath(new URL("./workflows.ts", import.meta.url)),
     activities,
     taskQueue: process.env["CADP_TASK_QUEUE"] ?? "cadp-worker",
