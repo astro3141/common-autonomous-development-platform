@@ -272,6 +272,14 @@ finding_by_id(id) := e if {
 	e.evidence_id == id
 }
 
+# Resolve a claim-internal evidence ref only through the exact K4-bound K2 envelope. A role string,
+# id alone, display locator, or mismatching digest is never a resolved basis (#107 / Review B18).
+evidence_by_exact_ref(ref) := e if {
+	some e in input.evidence
+	e.evidence_id == ref.evidence_id
+	e.envelope_digest.value == ref.envelope_digest
+}
+
 # a finding id is superseded if some provided finding names it in supersedes[]
 superseded_ids contains pid if {
 	some e in improvement_findings
@@ -292,31 +300,75 @@ ancestry(tip_id) := graph.reachable(finding_graph, {tip_id})
 
 # a valid AUTHORITY_RESOLUTION naming exactly this tip clears its contract class
 authority_resolution_names(cid) if {
+	fc := finding_by_id(cid)
 	some e in input.evidence
 	e.evidence_kind == "IMPROVEMENT_FINDING_RESOLUTION"
 	e.availability == "PRESENT"
 	e.claim.resolution_kind == "AUTHORITY_RESOLUTION"
 	e.claim.finding_tip_ref.evidence_id == cid
+	e.claim.finding_tip_ref.envelope_digest == fc.envelope_digest.value
 }
 
-# §3 reclassification: a non-CONTRACT_* descendant that supersedes C via HUMAN_JUDGMENT, or via
-# DETERMINISTIC_DERIVATION whose basis binds AUTHORITY_TEXT. MODEL_PROPOSAL can NEVER clear.
-reclassified_clear(cid) if {
-	some e in improvement_findings
-	some s in object.get(e.claim, "supersedes", [])
-	s.evidence_id == cid
-	not is_contract_class(e.claim.classification)
-	e.claim.derivation.kind == "HUMAN_JUDGMENT"
+# A Human reclassification basis must resolve to a PRESENT, authenticated HUMAN_DECISION bound to
+# the exact predecessor Finding. This preserves the valid Human path without trusting a derivation
+# label or an absent/mismatched basis envelope.
+human_reclassification_basis(e, fc) if {
+	some b in e.claim.basis
+	authority := evidence_by_exact_ref(b)
+	authority.evidence_kind == "HUMAN_DECISION"
+	authority.availability == "PRESENT"
+	authority.provenance.integrity in {"AUTHENTICATED_SOURCE", "SIGNED_ATTESTATION"}
+	some subject in authority.subject_bindings
+	subject.authority_ref == "cadp-store:k04"
+	subject.namespace == "improvement-finding"
+	subject.object_id == fc.evidence_id
+	subject.content_digest.value == fc.envelope_digest.value
 }
 
-reclassified_clear(cid) if {
-	some e in improvement_findings
-	some s in object.get(e.claim, "supersedes", [])
-	s.evidence_id == cid
-	not is_contract_class(e.claim.classification)
+# A deterministic authority-text transition is an exact active-policy rule, not a claim-authored
+# role. The cited pair must resolve in this admission, and the resolved K2 envelope must match every
+# authority identity/provenance/method/transition field in one policy rule.
+deterministic_authority_basis(e, fc) if {
 	e.claim.derivation.kind == "DETERMINISTIC_DERIVATION"
 	some b in e.claim.basis
 	b.role == "AUTHORITY_TEXT"
+	authority := evidence_by_exact_ref(b)
+	authority.availability == "PRESENT"
+	some rule in object.get(params, "authority_text_rules", [])
+	authority.evidence_kind == rule.evidence_kind
+	authority.claim_schema == rule.claim_schema
+	authority.producer_ref == rule.producer_ref
+	authority.provenance.source_relation == rule.source_relation
+	authority.provenance.integrity == rule.integrity
+	some subject in authority.subject_bindings
+	subject == rule.subject_binding
+	e.claim.derivation.method_ref == rule.method_ref
+	e.claim.derivation.method_digest == rule.method_digest
+	fc.claim.classification == rule.from_classification
+	e.claim.classification == rule.to_classification
+}
+
+# §3 reclassification: a non-CONTRACT_* descendant that supersedes the exact C digest via a bound
+# HUMAN_JUDGMENT, or via a policy-declared deterministic authority rule. MODEL_PROPOSAL never clears.
+reclassified_clear(cid) if {
+	fc := finding_by_id(cid)
+	some e in improvement_findings
+	some s in object.get(e.claim, "supersedes", [])
+	s.evidence_id == cid
+	s.envelope_digest == fc.envelope_digest.value
+	not is_contract_class(e.claim.classification)
+	e.claim.derivation.kind == "HUMAN_JUDGMENT"
+	human_reclassification_basis(e, fc)
+}
+
+reclassified_clear(cid) if {
+	fc := finding_by_id(cid)
+	some e in improvement_findings
+	some s in object.get(e.claim, "supersedes", [])
+	s.evidence_id == cid
+	s.envelope_digest == fc.envelope_digest.value
+	not is_contract_class(e.claim.classification)
+	deterministic_authority_basis(e, fc)
 }
 
 cleared(cid) if authority_resolution_names(cid)
@@ -572,6 +624,9 @@ export function buildReferenceBundle(input: ReferencePolicyInput): Uint8Array {
     max_effects_cap: 1000,
     require_backend_effort: false,
     extra_plain_allow_operations: [],
+    // Empty by default: a deployment must bind every deterministic CONTRACT_* reclassification
+    // to one exact K2 authority observation + method + class transition. No ambient/latest text.
+    authority_text_rules: [],
     ...input.paramOverrides,
   };
   return buildPolicyBundle({
