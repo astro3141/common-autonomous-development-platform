@@ -170,6 +170,8 @@ export interface HarnessOptions {
   configOverrides?: ReferencePolicyInput["configOverrides"];
   disabledChecks?: ReadonlySet<string>;
   extraAdapters?: TargetAdapterV1[];
+  /** Build adapters that need the harness store/cas (e.g. a GitHub Issues adapter reading blobs). */
+  extraAdapterFactory?: (store: ConstitutionalStore, cas: Cas) => TargetAdapterV1[];
   rego?: string;
   extraRootPublicKeys?: Array<{ key_id: string; alg: "Ed25519"; public_key: string; valid_from: string; valid_to?: string }>;
 }
@@ -214,7 +216,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
 
   const target = new ScriptedTarget();
   const storePolicyAdapter = new StorePolicyAdapter(store, cas, ingress, clock);
-  const registry = makeAdapterRegistry([target, storePolicyAdapter, ...(options.extraAdapters ?? [])]);
+  const registry = makeAdapterRegistry([target, storePolicyAdapter, ...(options.extraAdapters ?? []), ...(options.extraAdapterFactory?.(store, cas) ?? [])]);
   const pep = new Pep(store, cas, ingress, registry, PEP_REF, clock, options.disabledChecks ?? new Set());
   const reconciler = new Reconciler(store, cas, ingress, pep, registry, clock);
 

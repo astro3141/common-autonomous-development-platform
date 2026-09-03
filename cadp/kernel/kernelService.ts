@@ -21,6 +21,7 @@ import { ConstitutionalStore } from "./store.ts";
 import { makeAdapterRegistry } from "./adapters/types.ts";
 import type { TargetAdapterV1 } from "./adapters/types.ts";
 import { GitHubAdapter } from "./adapters/github.ts";
+import { GitHubIssuesAdapter } from "./adapters/githubIssues.ts";
 import { LiveGitHubTransport } from "./adapters/githubLive.ts";
 import { RecordServiceAdapter } from "./adapters/record.ts";
 import { StorePolicyAdapter } from "./adapters/storePolicy.ts";
@@ -80,6 +81,9 @@ export async function startKernelService(config: KernelServiceConfig): Promise<K
         }
       }),
     );
+    // FINDING_PROJECT over GitHub Issues (#104 §6): a distinct target_type (GIT_ISSUES), not the
+    // PR ops. Shares the transport; holds no governed credential beyond the repo token custody.
+    adapters.push(new GitHubIssuesAdapter(transport, cas, repoId));
   }
   if (config.temporal !== undefined) {
     const transport = new LiveTemporalTransport(config.temporal.address, config.temporal.namespace);
