@@ -327,7 +327,12 @@ export async function implementCandidate(input: {
     let r = run("git", ["clone", "--quiet", `https://github.com/${input.repo_full_name}.git`, workspace]);
     if (r.status !== 0) throw new Error(`clone failed: ${r.stderr.slice(0, 300)}`);
     r = run("git", ["checkout", "--quiet", input.base_sha], { cwd: workspace });
-    if (r.status !== 0) throw new Error(`checkout ${input.base_sha} failed: ${r.stderr.slice(0, 300)}`);
+    if (r.status !== 0) {
+      // Revision rounds base on a prior candidate that lives only on its write-once ref.
+      run("git", ["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${input.base_sha}`], { cwd: workspace });
+      r = run("git", ["checkout", "--quiet", input.base_sha], { cwd: workspace });
+      if (r.status !== 0) throw new Error(`checkout ${input.base_sha} failed: ${r.stderr.slice(0, 300)}`);
+    }
 
     // Worker sandbox home: codex auth copied in; NO gh config, NO ambient tokens.
     const home = join(base, "home");
@@ -555,7 +560,7 @@ export async function reviewCandidate(input: {
   candidate_sha: string;
   work_item: string;
   prior_step_envelope_digest?: string;
-}): Promise<{ review_evidence_id: string; verdict: string; work_step_envelope_digest: string }> {
+}): Promise<{ review_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
   const reviewer = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_REVIEWER_TOKEN"));
   const base = mkdtempSync(join(tmpdir(), "cadp-review-"));
   try {
@@ -576,8 +581,10 @@ export async function reviewCandidate(input: {
       env: { ...sandboxEnv(home), HOME: process.env["HOME"] ?? home },
       timeout: 300_000,
     });
-    const firstLine = review.stdout.trim().split("\n")[0]?.trim() ?? "";
-    const verdict = firstLine.includes("APPROVE") && !firstLine.includes("REQUEST_CHANGES") ? "APPROVE" : "REQUEST_CHANGES";
+    const lines = review.stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
+    const verdict = verdictLine.startsWith("APPROVE") ? "APPROVE" : "REQUEST_CHANGES";
+    const reason = lines[lines.indexOf(verdictLine) + 1] ?? review.stdout.trim().slice(0, 200);
 
     const envelope = await reviewer.submitEvidence({
       evidence_kind: "REVIEW",
@@ -594,7 +601,7 @@ export async function reviewCandidate(input: {
       input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
       summary: `review ${verdict}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
     });
-    return { review_evidence_id: envelope.evidence_id, verdict, work_step_envelope_digest: workStep.envelope_digest.value };
+    return { review_evidence_id: envelope.evidence_id, verdict, reason, work_step_envelope_digest: workStep.envelope_digest.value };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

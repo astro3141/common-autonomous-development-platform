@@ -98,59 +98,77 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
   // ---- development vertical ----
   const dev = args.development!;
 
-  const implStep = await nextStep();
-  if (implStep === undefined) return { ...trace, stopped: "BOUND" };
-  const implemented = await acts.implementCandidate({
-    work_run_ref: workRunRef,
-    step_ordinal: implStep,
-    repo_full_name: dev.repo_full_name,
-    base_sha: dev.base_sha,
-    work_item: dev.work_item,
-    prior_step_envelope_digest: priorStepDigest,
-  });
-  priorStepDigest = implemented.work_step_envelope_digest;
-  trace["candidate_sha"] = implemented.candidate_sha;
+  // Iterate: implement → push → verify → review; on REQUEST_CHANGES revise once with the
+  // reviewer's stated reason (P1: address feedback with a NEW candidate — a new immutable ref).
+  let baseSha = dev.base_sha;
+  let workItem = dev.work_item;
+  let implemented!: Awaited<ReturnType<typeof acts.implementCandidate>>;
+  let verified!: Awaited<ReturnType<typeof acts.verifyCandidate>>;
+  let reviewed!: Awaited<ReturnType<typeof acts.reviewCandidate>>;
+  let approved = false;
+  for (let round = 1; round <= 2 && !approved; round += 1) {
+    const implStep = await nextStep();
+    if (implStep === undefined) return { ...trace, stopped: "BOUND" };
+    implemented = await acts.implementCandidate({
+      work_run_ref: workRunRef,
+      step_ordinal: implStep,
+      repo_full_name: dev.repo_full_name,
+      base_sha: baseSha,
+      work_item: workItem,
+      prior_step_envelope_digest: priorStepDigest,
+    });
+    priorStepDigest = implemented.work_step_envelope_digest;
+    trace["candidate_sha"] = implemented.candidate_sha;
 
-  const pushStep = await nextStep();
-  if (pushStep === undefined) return { ...trace, stopped: "BOUND" };
-  const pushed = await acts.governedGitPush({
-    work_run_ref: workRunRef,
-    step_ordinal: pushStep,
-    repo_id: dev.repo_id,
-    candidate_sha: implemented.candidate_sha,
-    bundle_cas_key: implemented.bundle_cas_key,
-    prior_step_envelope_digest: priorStepDigest,
-  });
-  priorStepDigest = pushed.work_step_envelope_digest;
-  if (pushed.outcome !== "COMMITTED") return { ...trace, stopped: `PUSH_${pushed.outcome}`, detail: pushed.detail };
-  trace["push_effect_id"] = pushed.effect_id;
+    const pushStep = await nextStep();
+    if (pushStep === undefined) return { ...trace, stopped: "BOUND" };
+    const pushed = await acts.governedGitPush({
+      work_run_ref: workRunRef,
+      step_ordinal: pushStep,
+      repo_id: dev.repo_id,
+      candidate_sha: implemented.candidate_sha,
+      bundle_cas_key: implemented.bundle_cas_key,
+      prior_step_envelope_digest: priorStepDigest,
+    });
+    priorStepDigest = pushed.work_step_envelope_digest;
+    if (pushed.outcome !== "COMMITTED") return { ...trace, stopped: `PUSH_${pushed.outcome}`, detail: pushed.detail };
+    trace["push_effect_id"] = pushed.effect_id;
 
-  const verifyStep = await nextStep();
-  if (verifyStep === undefined) return { ...trace, stopped: "BOUND" };
-  const verified = await acts.verifyCandidate({
-    work_run_ref: workRunRef,
-    step_ordinal: verifyStep,
-    repo_full_name: dev.repo_full_name,
-    candidate_sha: implemented.candidate_sha,
-    repo_id: dev.repo_id,
-    prior_step_envelope_digest: priorStepDigest,
-  });
-  priorStepDigest = verified.work_step_envelope_digest;
-  trace["verification_evidence_id"] = verified.verification_evidence_id;
+    const verifyStep = await nextStep();
+    if (verifyStep === undefined) return { ...trace, stopped: "BOUND" };
+    verified = await acts.verifyCandidate({
+      work_run_ref: workRunRef,
+      step_ordinal: verifyStep,
+      repo_full_name: dev.repo_full_name,
+      candidate_sha: implemented.candidate_sha,
+      repo_id: dev.repo_id,
+      prior_step_envelope_digest: priorStepDigest,
+    });
+    priorStepDigest = verified.work_step_envelope_digest;
+    trace["verification_evidence_id"] = verified.verification_evidence_id;
 
-  const reviewStep = await nextStep();
-  if (reviewStep === undefined) return { ...trace, stopped: "BOUND" };
-  const reviewed = await acts.reviewCandidate({
-    work_run_ref: workRunRef,
-    step_ordinal: reviewStep,
-    repo_full_name: dev.repo_full_name,
-    candidate_sha: implemented.candidate_sha,
-    repo_id: dev.repo_id,
-    work_item: dev.work_item,
-    prior_step_envelope_digest: priorStepDigest,
-  });
-  priorStepDigest = reviewed.work_step_envelope_digest;
-  trace["review_evidence_id"] = reviewed.review_evidence_id;
+    const reviewStep = await nextStep();
+    if (reviewStep === undefined) return { ...trace, stopped: "BOUND" };
+    reviewed = await acts.reviewCandidate({
+      work_run_ref: workRunRef,
+      step_ordinal: reviewStep,
+      repo_full_name: dev.repo_full_name,
+      candidate_sha: implemented.candidate_sha,
+      repo_id: dev.repo_id,
+      work_item: dev.work_item,
+      prior_step_envelope_digest: priorStepDigest,
+    });
+    priorStepDigest = reviewed.work_step_envelope_digest;
+    trace["review_evidence_id"] = reviewed.review_evidence_id;
+
+    approved = reviewed.verdict === "APPROVE" && verified.conclusion === "success";
+    if (!approved) {
+      baseSha = implemented.candidate_sha;
+      workItem = `${dev.work_item}\n\nA reviewer requested changes on the previous candidate with this reason: ${reviewed.reason}. Address the feedback with a minimal follow-up commit.`;
+      trace[`round_${round}_verdict`] = `${reviewed.verdict}/${verified.conclusion}`;
+    }
+  }
+  if (!approved) return { ...trace, stopped: "REVIEW_NOT_APPROVED", detail: reviewed.reason };
 
   const prStep = await nextStep();
   if (prStep === undefined) return { ...trace, stopped: "BOUND" };
