@@ -53,6 +53,73 @@ function submitObservation(h: Harness, opts: { authority_ref?: string; namespace
   );
 }
 
+const AUTHORITY_SUBJECT: SubjectBinding = {
+  authority_ref: "git:github.com/astro3141/common-autonomous-development-platform",
+  namespace: "repository-path",
+  object_id: "Common Autonomous Development Platform — Specification v0.4.md",
+  content_digest: { algorithm: "sha256", canonicalization: "raw-bytes-1", value: "ef6814e0a423916b229a46a4d64f24377792cd1ac301b90a4ccbad2b3556ae77" },
+};
+
+const AUTHORITY_METHOD = {
+  method_ref: "cadp:authority-reclassification:test-rule",
+  method_digest: "sha256:test-authority-rule",
+};
+
+const AUTHORITY_TEXT_RULE = {
+  evidence_kind: "VERIFICATION",
+  claim_schema: "cadp.authority-text-observation.v1",
+  producer_ref: "verifier:harness",
+  source_relation: "INDEPENDENT_OBSERVATION",
+  integrity: "AUTHENTICATED_SOURCE",
+  subject_binding: AUTHORITY_SUBJECT,
+  ...AUTHORITY_METHOD,
+  from_classification: "CONTRACT_GAP",
+  to_classification: "IMPLEMENTATION_GAP",
+};
+
+function submitAuthorityText(h: Harness): EvidenceEnvelopeV1 {
+  const completed_at = new Date(h.clock.now).toISOString();
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "VERIFICATION",
+      subject_bindings: [AUTHORITY_SUBJECT],
+      availability: "PRESENT",
+      claim_schema: "cadp.authority-text-observation.v1",
+      claim: { conclusion: "success", completed_at },
+      produced_at: completed_at,
+      producer_ref: "verifier:harness",
+      source_ref: "clean-checkout:spec-v0.4",
+      source_relation: "INDEPENDENT_OBSERVATION",
+    },
+    PRINCIPALS.verifier,
+  );
+}
+
+function submitHumanDesignDecision(h: Harness, finding: EvidenceEnvelopeV1): EvidenceEnvelopeV1 {
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "HUMAN_DECISION",
+      subject_bindings: [{
+        authority_ref: "cadp-store:k04",
+        namespace: "improvement-finding",
+        object_id: finding.evidence_id,
+        content_digest: finding.envelope_digest,
+      }],
+      availability: "PRESENT",
+      claim_schema: "cadp.human-design-decision.v1",
+      claim: {
+        decision: "APPROVE",
+        scope: { work_run_ref: finding.evidence_id },
+        statement: "the exact contract boundary has been decided",
+      },
+      producer_ref: "human:astro3141",
+      source_ref: "design-decision",
+      source_relation: "INDEPENDENT_OBSERVATION",
+    },
+    PRINCIPALS.human,
+  );
+}
+
 let counter = 0;
 /** Build + submit an IMPROVEMENT_FINDING via the product adapter (validated). */
 async function makeFinding(h: Harness, over: Partial<FindingBuildInput> & { classification: Classification }): Promise<EvidenceEnvelopeV1> {
@@ -119,14 +186,27 @@ async function evalWorkStart(h: Harness, input: {
   return { outcome: evaluated.decision.outcome, reason_codes: [...evaluated.decision.reason_codes] };
 }
 
-/** Seal a non-index mutation (e.g. GIT_PUSH) bound to a finding and evaluate. */
-async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1, evidence: EvidenceEnvelopeV1[]): Promise<{ outcome: string; reason_codes: string[] }> {
+/** Seal a non-index mutation bound to a finding and evaluate. */
+async function evalNonIndexMutation(
+  h: Harness,
+  finding: EvidenceEnvelopeV1,
+  evidence: EvidenceEnvelopeV1[],
+  operation: "GIT_PUSH" | "PR_MERGE" | "POLICY_ACTIVATE" = "GIT_PUSH",
+): Promise<{ outcome: string; reason_codes: string[] }> {
   const bodyKey = h.ingress.putBlob(Buffer.from("body", "utf8"));
-  const material = { repo_id: "r", ref: "refs/heads/cadp/candidate/x", new_sha: "x", expected_old_sha: "0".repeat(40), bundle_cas_key: bodyKey };
+  const material = operation === "GIT_PUSH"
+    ? { repo_id: "r", ref: "refs/heads/cadp/candidate/x", new_sha: "x", expected_old_sha: "0".repeat(40), bundle_cas_key: bodyKey }
+    : operation === "PR_MERGE"
+      ? { repo_id: "r", pr_number: 1, expected_head_sha: "x" }
+      : { proposed_policy_ref: {}, bundle_cas_ref: bodyKey, expected_active_policy_ref: {} };
+  const purpose = operation === "GIT_PUSH" ? "git-push" : operation === "PR_MERGE" ? "pr-merge" : "policy-activate";
+  const target_ref = operation === "POLICY_ACTIVATE"
+    ? { authority_ref: "cadp-store:k04", target_type: "POLICY_STORE", target_id: "active" }
+    : { authority_ref: "github.com", target_type: operation === "PR_MERGE" ? "GIT_PR" : "GIT_REPOSITORY", target_id: "r" };
   const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-    step_ordinal: (counter += 1), purpose: "git-push",
+    step_ordinal: (counter += 1), purpose,
   });
   h.ingress.sealEffectRequest(
     {
@@ -135,8 +215,8 @@ async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1, evi
         { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: `wr-${effect_id}` },
         findingWorkBinding(refOf(finding)),
       ],
-      target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "r" },
-      operation_kind: "GIT_PUSH", material_schema: "cadp.git-push.v1", material_ref, prior_effect_refs: [],
+      target_ref,
+      operation_kind: operation, material_schema: `cadp.${operation.toLowerCase().replaceAll("_", "-")}.v1`, material_ref, prior_effect_refs: [],
     },
     PRINCIPALS.workflow,
   );
@@ -239,11 +319,11 @@ test("C8/C16: unresolved CONTRACT_* → implementation WORK_START DENY; bound GI
 
 // ---------------------------------------------------------------- control 11 / 17
 test("C11/C17: MODEL_PROPOSAL reclassification of CONTRACT_* (even citing authority) keeps the barrier → DENY", async () => {
-  const h = await makeHarness();
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG1" });
     // F2 supersedes the CONTRACT_GAP, cites AUTHORITY_TEXT, but is MODEL_PROPOSAL → cannot clear (§3).
-    const authorityEnv = submitObservation(h, { authority_ref: "authority:spec", namespace: "authority", object_id: "spec-v0.4", revision: "01ce0e78" });
+    const authorityEnv = submitAuthorityText(h);
     const f2 = await makeReclass(h, c, {
       classification: "IMPLEMENTATION_GAP",
       derivation: { kind: "MODEL_PROPOSAL", method_ref: "prompt:reclass", method_digest: "pr", execution_or_run_ref: "run:9" },
@@ -252,18 +332,112 @@ test("C11/C17: MODEL_PROPOSAL reclassification of CONTRACT_* (even citing author
         { evidence_id: authorityEnv.evidence_id, envelope_digest: authorityEnv.envelope_digest.value, role: "AUTHORITY_TEXT" },
       ],
     });
-    const r = await evalWorkStart(h, { finding: f2, evidence: [f2, c] });
+    const r = await evalWorkStart(h, { finding: f2, evidence: [f2, c, authorityEnv] });
     assert.equal(r.outcome, "DENY");
     assert.ok(r.reason_codes.includes("contract_barrier"), JSON.stringify(r.reason_codes));
     // Contrast: HUMAN_JUDGMENT reclassification clears the barrier → ALLOW.
-    const humanEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "human-design", revision: "decision-1" });
+    const humanEnv = submitHumanDesignDecision(h, c);
     const f3 = await makeReclass(h, c, {
       classification: "IMPLEMENTATION_GAP",
       derivation: { kind: "HUMAN_JUDGMENT", method_ref: "design:decision", method_digest: "hd", execution_or_run_ref: "human:astro3141" },
       basis: [{ evidence_id: humanEnv.evidence_id, envelope_digest: humanEnv.envelope_digest.value, role: "AUTHORITY_TEXT" }],
     });
-    const r3 = await evalWorkStart(h, { finding: f3, evidence: [f3, c] });
+    const r3 = await evalWorkStart(h, { finding: f3, evidence: [f3, c, humanEnv] });
     assert.equal(r3.outcome, "ALLOW", JSON.stringify(r3));
+  } finally { h.close(); }
+});
+
+test("#107 B18: resolved ordinary evidence self-labelled AUTHORITY_TEXT cannot clear CONTRACT_*", async () => {
+  const h = await makeHarness();
+  try {
+    const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18" });
+    const ordinaryObservation = submitObservation(h, {
+      authority_ref: "telemetry.example",
+      namespace: "span",
+      object_id: "ordinary-observation",
+      revision: "1",
+    });
+    const reclassified = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", method_ref: "detector:self-declared", method_digest: "untrusted" },
+      basis: [{
+        evidence_id: ordinaryObservation.evidence_id,
+        envelope_digest: ordinaryObservation.envelope_digest.value,
+        role: "AUTHORITY_TEXT",
+      }],
+    });
+
+    const result = await evalWorkStart(h, { finding: reclassified, evidence: [reclassified, contractFinding, ordinaryObservation] });
+    assert.equal(result.outcome, "DENY", JSON.stringify(result));
+    assert.ok(result.reason_codes.includes("contract_barrier"), JSON.stringify(result.reason_codes));
+  } finally { h.close(); }
+});
+
+test("#107 B18: authority basis digest mismatch or absent exact envelope fails closed", async () => {
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
+  try {
+    const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18-EXACT" });
+    const authority = submitAuthorityText(h);
+
+    const mismatched = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: [{ evidence_id: authority.evidence_id, envelope_digest: "0".repeat(64), role: "AUTHORITY_TEXT" }],
+    });
+    const mismatchResult = await evalWorkStart(h, { finding: mismatched, evidence: [mismatched, contractFinding, authority] });
+    assert.equal(mismatchResult.outcome, "DENY", JSON.stringify(mismatchResult));
+    assert.ok(mismatchResult.reason_codes.includes("contract_barrier"));
+
+    const absent = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: [{ evidence_id: authority.evidence_id, envelope_digest: authority.envelope_digest.value, role: "AUTHORITY_TEXT" }],
+    });
+    const absentResult = await evalWorkStart(h, { finding: absent, evidence: [absent, contractFinding] });
+    assert.equal(absentResult.outcome, "DENY", JSON.stringify(absentResult));
+    assert.ok(absentResult.reason_codes.includes("contract_barrier"));
+  } finally { h.close(); }
+});
+
+test("#107 B18 positive: exact policy-declared landed authority basis permits only its deterministic transition", async () => {
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
+  try {
+    const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18-POS" });
+    const authority = submitAuthorityText(h);
+    const reclassified = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: [{ evidence_id: authority.evidence_id, envelope_digest: authority.envelope_digest.value, role: "AUTHORITY_TEXT" }],
+    });
+    const result = await evalWorkStart(h, { finding: reclassified, evidence: [reclassified, contractFinding, authority] });
+    assert.equal(result.outcome, "ALLOW", JSON.stringify(result));
+
+    const wrongMethod = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", method_ref: AUTHORITY_METHOD.method_ref, method_digest: "wrong-method-digest" },
+      basis: [{ evidence_id: authority.evidence_id, envelope_digest: authority.envelope_digest.value, role: "AUTHORITY_TEXT" }],
+    });
+    const wrongMethodResult = await evalWorkStart(h, { finding: wrongMethod, evidence: [wrongMethod, contractFinding, authority] });
+    assert.equal(wrongMethodResult.outcome, "DENY", JSON.stringify(wrongMethodResult));
+    assert.ok(wrongMethodResult.reason_codes.includes("contract_barrier"));
+  } finally { h.close(); }
+});
+
+test("#107 B18: PR_MERGE and POLICY_ACTIVATE remain denied while an authority basis is unresolved", async () => {
+  const h = await makeHarness();
+  try {
+    const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18-HIGH-RISK" });
+    const ordinary = submitObservation(h, { authority_ref: "telemetry.example", namespace: "span", object_id: "not-authority", revision: "1" });
+    const reclassified = await makeReclass(h, contractFinding, {
+      classification: "IMPLEMENTATION_GAP",
+      derivation: { kind: "DETERMINISTIC_DERIVATION", method_ref: "detector:self-declared", method_digest: "untrusted" },
+      basis: [{ evidence_id: ordinary.evidence_id, envelope_digest: ordinary.envelope_digest.value, role: "AUTHORITY_TEXT" }],
+    });
+    for (const operation of ["PR_MERGE", "POLICY_ACTIVATE"] as const) {
+      const result = await evalNonIndexMutation(h, reclassified, [reclassified, contractFinding, ordinary], operation);
+      assert.equal(result.outcome, "DENY", `${operation}: ${JSON.stringify(result)}`);
+      assert.ok(result.reason_codes.includes("contract_barrier_nonindex_denied"), `${operation}: ${JSON.stringify(result.reason_codes)}`);
+    }
   } finally { h.close(); }
 });
 
