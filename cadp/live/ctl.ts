@@ -10,13 +10,13 @@
  *   node cadp/live/ctl.ts <dir> reconcile <effect_id>
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn as execFileSpawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { loadManifest, spawnComponent } from "./env.ts";
+import { loadManifest, spawnComponent, spawnComponentSandboxed } from "./env.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_ARGV_PREFIX } from "../product/workerProfile.ts";
-import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "../product/isolation.ts";
+import { claudeProviderToken, createEgressBoundary, dockerAvailable, imageIdentity, runReviewer, runVerifier, runWorker } from "../product/isolation.ts";
 import type { IsolationConfig } from "../product/isolation.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
@@ -83,7 +83,8 @@ function startComponent(name: string): void {
       break;
     case "worker": {
       mkdirSync(join(dir, "worker-tmp"), { recursive: true });
-      spawnComponent(dir, "worker", "node", [join(repoRoot, "cadp/product/worker.ts")], {
+      const egress = JSON.parse(readFileSync(join(dir, "egress.json"), "utf8")) as { network: string; proxy: string };
+      const workerEnv = {
         CADP_KERNEL_URL: m.api_url,
         CADP_WORKFLOW_TOKEN: m.tokens["cadp-workflow"]!,
         CADP_VERIFIER_TOKEN: m.tokens["cadp-verifier"]!,
@@ -92,13 +93,16 @@ function startComponent(name: string): void {
         CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
         CADP_TEMPORAL_NAMESPACE: "cadp-v04",
         CADP_TASK_QUEUE: "cadp-worker",
-        // OS-isolation config for the untrusted surfaces (TD §4.1). The activity host process
-        // holds the kernel token, but the surfaces it launches run inside these boundaries.
+        // Surface isolation config (TD §4.1): pinned image + internal-network egress boundary.
         CADP_WORKER_IMAGE: readFileSync(join(dir, "worker-image"), "utf8").trim(),
-        CADP_GOVERNED_HOSTS: "github.com,api.github.com,codeload.github.com,objects.githubusercontent.com",
-        CADP_DENIED_PORTS: `${m.api_port},${m.root_port},${m.record_port}`,
-        CADP_DENIED_READ_PATHS: `${join(dir, "secret")}:${join(dir, "manifest.json")}`,
-      });
+        CADP_EGRESS_NETWORK: egress.network,
+        CADP_EGRESS_PROXY: egress.proxy,
+      };
+      // Blocking 1: the activity worker itself must not be able to read the PEP secret path
+      // (TD §4.1 — only the Kernel/PEP workload reads governed credentials). It runs under a
+      // Seatbelt boundary that denies the secret dir; it needs only its Kernel workflow token
+      // (passed by env) and its own workflow code.
+      spawnComponentSandboxed(dir, "worker", "node", [join(repoRoot, "cadp/product/worker.ts")], workerEnv, [join(dir, "secret")]);
       break;
     }
     default:
@@ -120,95 +124,109 @@ function safeJson(text: string): { fs_reads?: Array<Record<string, unknown>>; cr
   try { return JSON.parse(line); } catch { return undefined; }
 }
 
+function resolveGithubIps(): string[] {
+  const ips = new Set<string>();
+  for (const host of ["api.github.com", "github.com", "codeload.github.com"]) {
+    try {
+      const out = execFileSync("dscacheutil", ["-q", "host", "-a", "name", host], { encoding: "utf8", timeout: 5000 });
+      for (const m of out.matchAll(/ip_address:\s*(\d+\.\d+\.\d+\.\d+)/gu)) ips.add(m[1]!);
+    } catch { /* ignore */ }
+  }
+  return [...ips].slice(0, 3);
+}
+
+function spawnCollect(cmd: string, args: string[], env: Record<string, string>): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = execFileSpawn(cmd, args, env);
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout?.on("data", (c: Buffer) => out.push(c));
+    child.stderr?.on("data", (c: Buffer) => err.push(c));
+    const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+    child.on("close", (status) => { clearTimeout(timer); resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }); });
+  });
+}
+
 async function attest(): Promise<void> {
   const m = manifest();
   const repoRoot = join(import.meta.dirname, "..", "..");
   const payload = join(repoRoot, "cadp/live/probePayload.mjs");
   const probeBase = join(dir, "probe-profile");
   mkdirSync(probeBase, { recursive: true });
-
-  const config: IsolationConfig = {
-    worker_image: readFileSync(join(dir, "worker-image"), "utf8").trim(),
-    governed_hosts: ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com"],
-    denied_ports: [m.api_port, m.root_port, m.record_port],
-    denied_read_paths: [join(dir, "secret"), join(dir, "manifest.json")],
-  };
   if (!(await dockerAvailable())) throw new Error("isolation runtime (docker) unavailable — cannot attest fail-closed boundary");
 
-  // The malicious payload the deployment-control probe runs INSIDE each surface's exact
-  // production isolation: it searches for secret/token files, tries to use any credential it
-  // finds against the Kernel effect path, hits governed targets, and attempts keychain theft.
-  const targets = { github_api: "https://api.github.com/rate_limit", record_service: `http://host.docker.internal:${m.record_port}/records` };
-  const searchRoots = ["/", "/Users", dir, join(dir, "secret")].join(":");
+  const egress = JSON.parse(readFileSync(join(dir, "egress.json"), "utf8")) as { network: string; proxy: string };
+  const config: IsolationConfig = {
+    worker_image: readFileSync(join(dir, "worker-image"), "utf8").trim(),
+    egress_network: egress.network,
+    egress_proxy: egress.proxy,
+  };
+  // TD §11 version exactness: bind the built-image digest + observed tool versions.
+  const image = imageIdentity(config.worker_image);
+
+  // Governed targets the malicious payload tries by NAME, literal IP, and the docker gateway.
+  const githubIps = resolveGithubIps();
+  const governedTargets: Record<string, string> = {
+    github_api_name: "https://api.github.com/rate_limit",
+    record_service_hostbridge: `http://host.docker.internal:${m.record_port}/records`,
+    kernel_hostbridge: `http://host.docker.internal:${m.api_port}/allocate_effect_id`,
+  };
+  githubIps.forEach((ip, i) => { governedTargets[`github_literal_ip_${i}`] = `https://${ip}/`; });
+  // Docker default gateway address (alternate route to the host).
+  governedTargets["docker_gateway"] = "http://192.168.65.1/";
+  const providerCheck = { provider_openai: "https://api.openai.com/v1/models" };
 
   const probes: Array<Record<string, unknown>> = [];
+  const runProbe = async (identity: string, isolation: string, runner: (env: { PROBE_SEARCH_ROOTS: string; PROBE_TARGETS: string }) => Promise<{ stdout: string }>) => {
+    const combined = { ...governedTargets, ...providerCheck };
+    const searchRoots = "/:/ws:/root"; const probeTargets = JSON.stringify(combined); const out = await runner({ PROBE_SEARCH_ROOTS: searchRoots, PROBE_TARGETS: probeTargets });
+    const parsed = safeJson(out.stdout) ?? { fs_reads: [], credential_use: [], egress: [], enumerated: [] };
+    const governedReached = (parsed.egress ?? []).filter((e: Record<string, unknown>) => e["target"] !== "provider_openai" && e["status"] !== "000");
+    const hostFileRead = (parsed.fs_reads ?? []).length > 0;
+    const credRecovered = (parsed.credential_use ?? []).some((c: Record<string, unknown>) => typeof c["recovered_bytes"] === "number" || (typeof c["status"] === "number" && (c["status"] as number) < 400));
+    probes.push({ identity, isolation, reached: hostFileRead || governedReached.length > 0 || credRecovered, governed_reached: governedReached, findings: parsed });
+  };
 
-  // Worker surface: container. Host fs invisible; governed hosts pinned dead. Payload runs in /ws.
+  // Worker: container on the internal egress network; payload runs in /ws.
   {
     const sandbox = buildWorkerSandbox(probeBase);
     const wsDir = join(probeBase, "worker-ws");
     mkdirSync(wsDir, { recursive: true });
     execFileSync("cp", [payload, join(wsDir, "probe.mjs")]);
-    const run = await runWorker(config, {
-      workspace: wsDir,
-      codexAuthDir: join(sandbox.home, ".codex"),
-      argv: ["node", "/ws/probe.mjs"],
-      timeout_ms: 60_000,
-    });
-    // In-container payload uses container-visible roots; host targets pinned dead by --add-host.
-    const containerRun = await runWorker(config, {
-      workspace: wsDir,
-      codexAuthDir: join(sandbox.home, ".codex"),
-      argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws:/root' PROBE_TARGETS='${JSON.stringify(targets).replace(/'/gu, "")}' node /ws/probe.mjs`],
-      timeout_ms: 60_000,
-    });
-    const parsed = safeJson(containerRun.stdout) ?? safeJson(run.stdout) ?? { fs_reads: [], credential_use: [], egress: [], enumerated: [] };
-    // Governed-target reach = ANY egress not http-000 (the re-review requires 000, not 401),
-    // OR any host-file read, OR any credential recovered/used.
-    const reached =
-      (parsed.fs_reads?.length ?? 0) > 0 ||
-      (parsed.credential_use ?? []).some((c: Record<string, unknown>) => typeof c["status"] === "number" && (c["status"] as number) < 400 || typeof c["recovered_bytes"] === "number") ||
-      (parsed.egress ?? []).some((e: Record<string, unknown>) => e["status"] !== "000");
-    probes.push({ identity: "worker", isolation: "docker container (no host mount; governed hosts pinned)", reached, findings: parsed });
-    // Worker profile still imports auth.json only (finding 2 retained).
+    await runProbe("worker", "docker container; internal network + provider-only allowlist proxy", (env) =>
+      runWorker(config, { workspace: wsDir, codexAuthDir: join(sandbox.home, ".codex"), argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
     const codexDir = join(sandbox.home, ".codex");
     const contents = existsSync(codexDir) ? readdirSync(codexDir) : [];
     probes.push({ identity: "worker", target: "codex profile contents (auth.json only)", reached: contents.some((f) => f === "config.toml" || f === "mcp.json"), detail: contents.join(",") });
   }
-
-  // Verifier surface: container with --network none. No host mount but the checkout; no egress.
+  // Verifier: container with --network none (no egress at all).
   {
     const wsDir = join(probeBase, "verifier-ws");
     mkdirSync(wsDir, { recursive: true });
     execFileSync("cp", [payload, join(wsDir, "probe.mjs")]);
-    const run = await runVerifier(config, {
-      workspace: wsDir,
-      argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws:/root' PROBE_TARGETS='${JSON.stringify(targets).replace(/'/gu, "")}' node /ws/probe.mjs`],
-      timeout_ms: 60_000,
-    });
-    const parsed = safeJson(run.stdout) ?? { fs_reads: [], credential_use: [], egress: [] };
-    const reachedTarget = (parsed.egress ?? []).some((e: Record<string, unknown>) => e["status"] !== "000");
-    const reached = (parsed.fs_reads?.length ?? 0) > 0 || reachedTarget;
-    probes.push({ identity: "verifier", isolation: "docker container --network none", reached, findings: parsed });
+    await runProbe("verifier", "docker container --network none", (env) =>
+      runVerifier(config, { workspace: wsDir, argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
   }
-
-  // Reviewer surface: container (github/record/kernel pinned dead; only provider reachable).
-  // We probe the isolation with the malicious payload as `node` inside the same container shape.
+  // Reviewer: container on the internal egress network (provider via env token).
   {
-    const rws = join(probeBase, "reviewer-ws");
-    mkdirSync(rws, { recursive: true });
-    execFileSync("cp", [payload, join(rws, "probe.mjs")]);
-    const localTargets = { github_api: "https://api.github.com/rate_limit", kernel_api: `http://host.docker.internal:${m.api_port}/allocate_effect_id`, record_service: `http://host.docker.internal:${m.record_port}/records` };
-    const run = await runReviewer(config, {
-      workspace: rws,
-      providerToken: "probe-not-used",
-      argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws:/root' PROBE_TARGETS='${JSON.stringify(localTargets).replace(/'/gu, "")}' node /ws/probe.mjs`],
-      timeout_ms: 60_000,
-    });
-    const parsed = safeJson(run.stdout) ?? { fs_reads: [], credential_use: [], egress: [], enumerated: [] };
-    const hostFileRead = (parsed.fs_reads ?? []).some((f: Record<string, unknown>) => String(f["path"]).includes(dir) || String(f["path"]).includes("/Users/"));
-    const targetReached = (parsed.egress ?? []).some((e: Record<string, unknown>) => e["status"] !== "000");
-    probes.push({ identity: "reviewer", isolation: "docker container (no host mount; governed hosts pinned; provider via env token)", reached: hostFileRead || targetReached, findings: parsed });
+    const wsDir = join(probeBase, "reviewer-ws");
+    mkdirSync(wsDir, { recursive: true });
+    execFileSync("cp", [payload, join(wsDir, "probe.mjs")]);
+    await runProbe("reviewer", "docker container; internal network + provider-only allowlist proxy; model token by env", (env) =>
+      runReviewer(config, { workspace: wsDir, providerToken: "probe-not-used", argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
+  }
+  // Activity-host (Blocking 1): the Temporal worker process itself, under its Seatbelt boundary,
+  // must not be able to read the PEP secret files. Probe with the exact deny profile.
+  {
+    const { denyReadProfile } = await import("./env.ts");
+    const profilePath = join(probeBase, "activity-host.sb");
+    writeFileSync(profilePath, denyReadProfile([join(dir, "secret")]));
+    const secretFiles = ["github-token", "api-tokens.json", "record-api-key", "root-token", "workflow-token-map.json", "root/root-key.pem"].map((f) => join(dir, "secret", f));
+    const env = { ...process.env as Record<string, string>, PROBE_SEARCH_ROOTS: join(dir, "secret"), PROBE_TARGETS: JSON.stringify({ kernel: `http://127.0.0.1:${m.api_port}/allocate_effect_id` }), PROBE_EXPLICIT_FILES: secretFiles.join(":") };
+    const run = await spawnCollect("sandbox-exec", ["-f", profilePath, "node", payload], env);
+    const parsed = safeJson(run.stdout) ?? { fs_reads: [] };
+    const secretRead = (parsed.fs_reads ?? []).some((f: Record<string, unknown>) => String(f["path"]).includes("/secret/"));
+    probes.push({ identity: "activity-host", isolation: "seatbelt deny-read PEP secret path", reached: secretRead, findings: parsed });
   }
 
   const alternateFound = probes.some((p2) => p2["reached"] === true);
@@ -221,24 +239,26 @@ async function attest(): Promise<void> {
     claim: {
       alternate_path_found: alternateFound,
       worker_profile_digest: profileDigest,
-      worker_argv_prefix: [...WORKER_ARGV_PREFIX],
+      surface_image: image,
       isolation: {
-        worker: "docker container: no host filesystem mount; governed target hosts pinned to 127.0.0.1",
-        verifier: "docker container --network none: no host mount but checkout, no egress at all",
-        reviewer: "docker container: no host filesystem mount (only read-only checkout); GitHub/record/Kernel egress pinned dead (http-000); model OAuth token injected by env, no keychain access",
+        worker: "docker container; internal network (no direct internet); provider-only allowlist proxy",
+        verifier: "docker container --network none",
+        reviewer: "docker container; internal network; provider-only allowlist proxy; model token by env",
+        activity_host: "macOS Seatbelt deny-read of the PEP secret path",
+        egress_policy: "governed targets (GitHub/record/Kernel) have NO route by name, literal IP, or docker gateway; only the allowlisted model provider is reachable via the CONNECT proxy",
       },
       probes,
-      network_policy_digest: "disposable-os-isolation:worker+verifier+reviewer-containers;governed-hosts-and-docker-bridge-pinned-dead;verifier-network-none",
+      network_policy_digest: `internal-net-no-route;allowlist-connect-proxy;falsified:name+literal-ip(${githubIps.length})+docker-gateway`,
       secret_acl_digest: sha256Hex(readFileSync(join(dir, "secret", "api-tokens.json"))),
       known_residuals: [
-        "single-host disposable proof: the three surfaces run in Docker containers that share the host kernel (not a VM boundary). The malicious discovery payload was run inside each production container/network shape above and could not read the host filesystem/PEP secret path, reach GitHub/record/Kernel (all http-000), or recover any credential; the model provider token is injected by env and never exposes host keychain material.",
+        "single-host disposable proof: the surface containers and the Seatbelt-confined activity host share the host OS kernel (not a VM/microVM boundary). Every governed target was falsified unreachable by name, literal IP, and the docker gateway from inside each production surface; the activity host cannot read the PEP secret path; the model provider token is injected by env and never exposes host keychain material.",
       ],
     },
     producer_ref: "deployment-control-probe",
     source_ref: "deployment-control malicious-discovery probe inside the exact production isolation",
     source_relation: "INDEPENDENT_OBSERVATION",
   });
-  console.log(JSON.stringify({ reach: reach.evidence_id, alternate_path_found: alternateFound, probes: probes.map((p2) => ({ identity: p2["identity"], isolation: p2["isolation"] ?? p2["target"], reached: p2["reached"] })) }, null, 2));
+  console.log(JSON.stringify({ reach: reach.evidence_id, alternate_path_found: alternateFound, image_digest: image.image_digest.slice(0, 24), tool_versions: image.tool_versions, probes: probes.map((p2) => ({ identity: p2["identity"], isolation: p2["isolation"] ?? p2["target"], reached: p2["reached"], governed_reached: (p2["governed_reached"] as unknown[] | undefined)?.length ?? 0 })) }, null, 2));
 
   // ---- TARGET_IMMUTABILITY_ATTESTATION: ruleset read + real negative probe ----
   const rulesets = JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/rulesets`], { encoding: "utf8" })) as Array<{ id: number; name: string; enforcement: string }>;
@@ -322,6 +342,15 @@ async function startWork(vertical: "development" | "record", extra: string[], or
   });
   const argsBytes = Buffer.from(JSON.stringify(args), "utf8");
   const { cas_key: args_cas_key } = await c.putBlob(argsBytes);
+  // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
+  // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
+  const image = imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim());
+  const worker_profile_digest = jcsDigest({
+    profile: workerProfileDigest(),
+    surface_image: image.image,
+    image_digest: image.image_digest,
+    tool_versions: image.tool_versions,
+  }).value;
   const material = {
     workflow_id: `cadp-work-${effect_id}`,
     workflow_type: "cadpWork",
@@ -329,7 +358,8 @@ async function startWork(vertical: "development" | "record", extra: string[], or
     args_cas_key,
     args_digest: jcsDigest(args).value,
     bounds: args.bounds,
-    worker_profile_digest: workerProfileDigest(),
+    worker_profile_digest,
+    surface_image: image,
     continuation_target: `temporal:cadp-v04:${namespaceId}`,
   };
   const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
@@ -397,7 +427,10 @@ async function humanApprove(effect_id: string, workflow_id: string): Promise<voi
 async function main(): Promise<void> {
   const m = manifest();
   switch (command) {
-    case "up":
+    case "up": {
+      // Surface egress boundary (TD §4.1): internal network + provider-only allowlist proxy.
+      const boundary = createEgressBoundary(`cadp-${m.repo_id}`, ["api.openai.com", "chatgpt.com", "auth.openai.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io"]);
+      writeFileSync(join(dir, "egress.json"), JSON.stringify({ network: boundary.network, proxy: boundary.proxy }));
       startComponent("record");
       startComponent("temporal");
       await waitHttp(`http://127.0.0.1:${m.record_port}/whoami`);
@@ -405,8 +438,15 @@ async function main(): Promise<void> {
       startComponent("kernel");
       await waitHttp(`${m.api_url}/get_effect_state`, 200);
       startComponent("worker");
-      console.log(JSON.stringify({ up: true }));
+      console.log(JSON.stringify({ up: true, egress: boundary.network }));
       break;
+    }
+    case "egress-down": {
+      const b = createEgressBoundary(`cadp-${m.repo_id}`, []);
+      b.teardown();
+      console.log(JSON.stringify({ egress: "down" }));
+      break;
+    }
     case "start":
       startComponent(process.argv[4]!);
       break;

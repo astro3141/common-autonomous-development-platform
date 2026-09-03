@@ -7,8 +7,8 @@
  * Usage: node cadp/live/env.ts setup <dir> [--repo <owner/name>]
  */
 
-import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, openSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdirSync, openSync, readFileSync, realpathSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -164,7 +164,7 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
   writeFileSync(kernelConfigPath, JSON.stringify(kernelConfig, null, 2));
 
   // Build/record the disposable surface-isolation image (node + git + codex) once.
-  const imageTag = "cadp-surface:1";
+  const imageTag = "cadp-surface:0.151.0-2.1.221";
   const imageDir = join(repoRootFrom(dir), "cadp/live/image");
   try {
     sh("docker", ["build", "-q", "-t", imageTag, imageDir]);
@@ -223,6 +223,43 @@ export function spawnComponent(dir: string, name: string, cmd: string, args: str
   child.unref();
   writeFileSync(join(dir, `${name}.pid`), String(child.pid));
   return child.pid!;
+}
+
+/**
+ * Seatbelt profile denying a set of read paths (TD §4.1): the Temporal activity worker hosts
+ * activities and holds only its Kernel workflow token — it must NOT be able to read the PEP
+ * secret directory (governed credentials, root key). It never needs those files.
+ */
+export function denyReadProfile(denyReadPaths: readonly string[]): string {
+  const lines = ["(version 1)", "(allow default)"];
+  for (const path of denyReadPaths) {
+    let canonical = path;
+    try { canonical = realpathSync(path); } catch { /* not created yet */ }
+    lines.push(`(deny file-read* (subpath ${JSON.stringify(canonical)}))`);
+    lines.push(`(deny file-write* (subpath ${JSON.stringify(canonical)}))`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Spawn a component under a macOS Seatbelt boundary denying `denyReadPaths` (fail closed if
+ * `sandbox-exec` is unavailable). Used for the activity worker so the process that launches the
+ * surface containers cannot itself read the PEP secret path.
+ */
+export function spawnComponentSandboxed(
+  dir: string,
+  name: string,
+  cmd: string,
+  args: string[],
+  env: Record<string, string>,
+  denyReadPaths: readonly string[],
+): number {
+  if (spawnSync("which", ["sandbox-exec"], { stdio: "ignore" }).status !== 0) {
+    throw new Error(`activity-worker isolation (sandbox-exec) unavailable — refusing to run ${name} unconfined`);
+  }
+  const profilePath = join(dir, `${name}.sb`);
+  writeFileSync(profilePath, denyReadProfile(denyReadPaths));
+  return spawnComponent(dir, name, "sandbox-exec", ["-f", profilePath, cmd, ...args], env);
 }
 
 if (process.argv[2] === "setup") {

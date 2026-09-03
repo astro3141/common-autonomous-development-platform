@@ -34,9 +34,8 @@ function workflowClient(): KernelClient {
 function isolationConfig(): IsolationConfig {
   return {
     worker_image: env("CADP_WORKER_IMAGE"),
-    governed_hosts: (process.env["CADP_GOVERNED_HOSTS"] ?? "github.com,api.github.com,codeload.github.com,objects.githubusercontent.com").split(",").filter(Boolean),
-    denied_ports: (process.env["CADP_DENIED_PORTS"] ?? "").split(",").map((p) => Number(p)).filter((n) => Number.isInteger(n) && n > 0),
-    denied_read_paths: (process.env["CADP_DENIED_READ_PATHS"] ?? "").split(":").filter(Boolean),
+    egress_network: env("CADP_EGRESS_NETWORK"),
+    egress_proxy: env("CADP_EGRESS_PROXY"),
   };
 }
 
