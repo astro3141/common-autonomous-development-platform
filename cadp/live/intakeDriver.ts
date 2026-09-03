@@ -229,7 +229,10 @@ async function contractNegative(): Promise<void> {
 
   // (5) Valid Human authority resolution names the exact tip → allows a later HUMAN_JUDGMENT reclassification to implement.
   const humanAuthority = await client("sso:a.t.laplace@gmail.com").submitEvidence({
-    evidence_kind: "HUMAN_DECISION", subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: cg.evidence_id }],
+    evidence_kind: "HUMAN_DECISION", subject_bindings: [{
+      authority_ref: "cadp-store:k04", namespace: "improvement-finding", object_id: cg.evidence_id,
+      content_digest: cg.envelope_digest,
+    }],
     availability: "PRESENT", claim_schema: "cadp.human-decision.v1",
     claim: { principal: "sso:a.t.laplace@gmail.com", decision: "APPROVE", scope: { work_run_ref: cg.evidence_id, finding: cg.evidence_id }, statement: "authority boundary decided", issued_at: new Date().toISOString() },
     producer_ref: "human:astro3141", source_ref: "design-decision", source_relation: "INDEPENDENT_OBSERVATION",
@@ -247,7 +250,7 @@ async function contractNegative(): Promise<void> {
     basis: diag, basisRole: "DIAGNOSTIC", derivationKind: "HUMAN_JUDGMENT", execution_or_run_ref: "human:astro3141",
     supersedes: [cg], extraBasis: [{ env: humanAuthority, role: "AUTHORITY_TEXT" }],
   });
-  const wsHuman = await evalImplementationWorkStart(humanReclass, [humanReclass.evidence_id, cg.evidence_id, authorityRes.evidence_id]);
+  const wsHuman = await evalImplementationWorkStart(humanReclass, [humanReclass.evidence_id, cg.evidence_id, humanAuthority.evidence_id, authorityRes.evidence_id]);
   receipt["human_reclass_workstart"] = { outcome: wsHuman.outcome, reason_codes: wsHuman.reason_codes };
 
   console.log(JSON.stringify({ scenario: "CONTRACT_* Option-A negative", receipt }, null, 2));
