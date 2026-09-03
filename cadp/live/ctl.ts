@@ -81,9 +81,23 @@ function startComponent(name: string): void {
     case "kernel":
       spawnComponent(dir, "kernel", "node", [join(repoRoot, "cadp/kernel/kernelService.ts"), m.kernel_config_path]);
       break;
+    case "broker": {
+      const egress = JSON.parse(readFileSync(join(dir, "egress.json"), "utf8")) as { network: string; proxy: string };
+      const brokerEnv = {
+        CADP_BROKER_PORT: String(m.broker_port),
+        // The broker owns the surface isolation: pinned image + internal-network egress boundary.
+        CADP_WORKER_IMAGE: readFileSync(join(dir, "worker-image"), "utf8").trim(),
+        CADP_EGRESS_NETWORK: egress.network,
+        CADP_EGRESS_PROXY: egress.proxy,
+      };
+      // The bounded surface launcher (TD §4.1): it clones (public read) and drives Docker, so it
+      // keeps network + daemon access, but it holds NO Kernel token and its Seatbelt profile
+      // denies the PEP secret path — it can neither read the secret nor forge a governed effect.
+      spawnComponentSandboxed(dir, "broker", "node", [join(repoRoot, "cadp/product/surfaceBroker.ts")], brokerEnv, [join(dir, "secret")]);
+      break;
+    }
     case "worker": {
       mkdirSync(join(dir, "worker-tmp"), { recursive: true });
-      const egress = JSON.parse(readFileSync(join(dir, "egress.json"), "utf8")) as { network: string; proxy: string };
       const workerEnv = {
         CADP_KERNEL_URL: m.api_url,
         CADP_WORKFLOW_TOKEN: m.tokens["cadp-workflow"]!,
@@ -93,16 +107,19 @@ function startComponent(name: string): void {
         CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
         CADP_TEMPORAL_NAMESPACE: "cadp-v04",
         CADP_TASK_QUEUE: "cadp-worker",
-        // Surface isolation config (TD §4.1): pinned image + internal-network egress boundary.
-        CADP_WORKER_IMAGE: readFileSync(join(dir, "worker-image"), "utf8").trim(),
-        CADP_EGRESS_NETWORK: egress.network,
-        CADP_EGRESS_PROXY: egress.proxy,
+        // Surface work is delegated to the bounded broker over its localhost port.
+        CADP_BROKER_URL: `http://127.0.0.1:${m.broker_port}`,
       };
-      // Blocking 1: the activity worker itself must not be able to read the PEP secret path
-      // (TD §4.1 — only the Kernel/PEP workload reads governed credentials). It runs under a
-      // Seatbelt boundary that denies the secret dir; it needs only its Kernel workflow token
-      // (passed by env) and its own workflow code.
-      spawnComponentSandboxed(dir, "worker", "node", [join(repoRoot, "cadp/product/worker.ts")], workerEnv, [join(dir, "secret")]);
+      // Activity-host isolation (TD §4.1; re-review 5101871379): the Temporal activity worker holds
+      // the Kernel workflow tokens, so its Seatbelt profile (a) denies the PEP secret path and (b)
+      // pins network egress to ONLY the Kernel/Temporal/broker localhost ports. It therefore has no
+      // direct GitHub or record-service reach (governed targets are http-000) and no Docker daemon
+      // socket — it cannot be a confused deputy for a secret-path mount. All GitHub/Docker work is
+      // delegated to the broker.
+      spawnComponentSandboxed(
+        dir, "worker", "node", [join(repoRoot, "cadp/product/worker.ts")], workerEnv,
+        [join(dir, "secret")], [m.api_port, m.temporal_port, m.broker_port],
+      );
       break;
     }
     default:
@@ -215,18 +232,41 @@ async function attest(): Promise<void> {
     await runProbe("reviewer", "docker container; internal network + provider-only allowlist proxy; model token by env", (env) =>
       runReviewer(config, { workspace: wsDir, providerToken: "probe-not-used", argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
   }
-  // Activity-host (Blocking 1): the Temporal worker process itself, under its Seatbelt boundary,
-  // must not be able to read the PEP secret files. Probe with the exact deny profile.
+  // Activity-host (re-review 5101871379): the Temporal worker process holds the Kernel tokens.
+  // Under its EXACT production Seatbelt profile it must (1) not read the PEP secret files, (2) not
+  // reach a governed target directly — GitHub by name/IP and the record-service port are pinned
+  // http-000 while only the Kernel/Temporal/broker localhost ports are allowed — and (3) not use
+  // the docker daemon as a confused deputy to bind-mount and read the secret path.
   {
-    const { denyReadProfile } = await import("./env.ts");
+    const { activityHostProfile } = await import("./env.ts");
     const profilePath = join(probeBase, "activity-host.sb");
-    writeFileSync(profilePath, denyReadProfile([join(dir, "secret")]));
+    writeFileSync(profilePath, activityHostProfile([join(dir, "secret")], [m.api_port, m.temporal_port, m.broker_port]));
     const secretFiles = ["github-token", "api-tokens.json", "record-api-key", "root-token", "workflow-token-map.json", "root/root-key.pem"].map((f) => join(dir, "secret", f));
-    const env = { ...process.env as Record<string, string>, PROBE_SEARCH_ROOTS: join(dir, "secret"), PROBE_TARGETS: JSON.stringify({ kernel: `http://127.0.0.1:${m.api_port}/allocate_effect_id` }), PROBE_EXPLICIT_FILES: secretFiles.join(":") };
+    // Governed targets the activity host must NOT reach directly (its Kernel/Temporal/broker ports
+    // are the legitimate, intentionally-allowed seam; GitHub + the record-service port are not).
+    const ahTargets: Record<string, string> = {
+      github_api_name: "https://api.github.com/rate_limit",
+      record_service_port: `http://127.0.0.1:${m.record_port}/records`,
+    };
+    githubIps.forEach((ip, i) => { ahTargets[`github_literal_ip_${i}`] = `https://${ip}/`; });
+    const env = { ...process.env as Record<string, string>, PROBE_SEARCH_ROOTS: join(dir, "secret"), PROBE_TARGETS: JSON.stringify(ahTargets), PROBE_EXPLICIT_FILES: secretFiles.join(":") };
     const run = await spawnCollect("sandbox-exec", ["-f", profilePath, "node", payload], env);
-    const parsed = safeJson(run.stdout) ?? { fs_reads: [] };
+    const parsed = safeJson(run.stdout) ?? { fs_reads: [], egress: [] };
     const secretRead = (parsed.fs_reads ?? []).some((f: Record<string, unknown>) => String(f["path"]).includes("/secret/"));
-    probes.push({ identity: "activity-host", isolation: "seatbelt deny-read PEP secret path", reached: secretRead, findings: parsed });
+    const governedReached = (parsed.egress ?? []).filter((e: Record<string, unknown>) => e["status"] !== "000");
+    // Confused-deputy control: the exact profile tries to drive the docker daemon to bind-mount
+    // the PEP secret path into a container and read it. The daemon socket is denied by the profile.
+    const mount = await spawnCollect("sandbox-exec", ["-f", profilePath, "docker", "run", "--rm", "--network", "none", "-v", `${join(dir, "secret")}:/stolen:ro`, config.worker_image, "cat", "/stolen/github-token"], process.env as Record<string, string>);
+    const daemonMediatedRead = mount.status === 0 && mount.stdout.trim().length > 0;
+    probes.push({
+      identity: "activity-host",
+      isolation: "seatbelt: deny-read PEP secret path + egress pinned to Kernel/Temporal/broker localhost ports (no GitHub, no record-service, no docker daemon socket)",
+      reached: secretRead || governedReached.length > 0 || daemonMediatedRead,
+      governed_reached: governedReached,
+      daemon_mediated_secret_read: daemonMediatedRead,
+      daemon_mount_stderr: mount.stderr.slice(0, 200),
+      findings: parsed,
+    });
   }
 
   const alternateFound = probes.some((p2) => p2["reached"] === true);
@@ -244,14 +284,15 @@ async function attest(): Promise<void> {
         worker: "docker container; internal network (no direct internet); provider-only allowlist proxy",
         verifier: "docker container --network none",
         reviewer: "docker container; internal network; provider-only allowlist proxy; model token by env",
-        activity_host: "macOS Seatbelt deny-read of the PEP secret path",
+        activity_host: "macOS Seatbelt: deny-read PEP secret path + egress pinned to ONLY the Kernel/Temporal/broker localhost ports (no GitHub, no record-service port, no docker daemon socket)",
+        surface_broker: "bounded launcher: owns GitHub clones + Docker with fixed mount args; holds NO Kernel token; Seatbelt-denied the PEP secret path — the activity host delegates all GitHub/Docker work to it",
         egress_policy: "governed targets (GitHub/record/Kernel) have NO route by name, literal IP, or docker gateway; only the allowlisted model provider is reachable via the CONNECT proxy",
       },
       probes,
-      network_policy_digest: `internal-net-no-route;allowlist-connect-proxy;falsified:name+literal-ip(${githubIps.length})+docker-gateway`,
+      network_policy_digest: `internal-net-no-route;allowlist-connect-proxy;activity-host-port-pinned;falsified:name+literal-ip(${githubIps.length})+docker-gateway+record-port+daemon-mount`,
       secret_acl_digest: sha256Hex(readFileSync(join(dir, "secret", "api-tokens.json"))),
       known_residuals: [
-        "single-host disposable proof: the surface containers and the Seatbelt-confined activity host share the host OS kernel (not a VM/microVM boundary). Every governed target was falsified unreachable by name, literal IP, and the docker gateway from inside each production surface; the activity host cannot read the PEP secret path; the model provider token is injected by env and never exposes host keychain material.",
+        "single-host disposable proof: the surface containers and the Seatbelt-confined activity host / broker share the host OS kernel (not a VM/microVM boundary). Every governed target was falsified unreachable by name, literal IP, and the docker gateway from inside each production surface; the activity host cannot read the PEP secret path, cannot reach GitHub or the record-service port directly (egress pinned to the Kernel/Temporal/broker ports), and cannot use the docker daemon to mount+read the secret (daemon socket denied); GitHub/Docker work is delegated to the credential-less bounded broker; the model provider token is injected by env and never exposes host keychain material.",
       ],
     },
     producer_ref: "deployment-control-probe",
@@ -437,6 +478,8 @@ async function main(): Promise<void> {
       await new Promise((r) => setTimeout(r, 4000)); // temporal grpc boot
       startComponent("kernel");
       await waitHttp(`${m.api_url}/get_effect_state`, 200);
+      startComponent("broker");
+      await waitHttp(`http://127.0.0.1:${m.broker_port}/`, 100);
       startComponent("worker");
       console.log(JSON.stringify({ up: true, egress: boundary.network }));
       break;

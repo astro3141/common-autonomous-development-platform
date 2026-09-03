@@ -28,6 +28,7 @@ export interface LiveEnvManifest {
   record_port: number;
   temporal_port: number;
   temporal_ui_port: number;
+  broker_port: number;
   repo_full_name: string;
   repo_id: string;
   base_sha: string;
@@ -54,7 +55,7 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
 
   // ---- ports ----
   const base = 42000 + Math.floor(Math.random() * 800);
-  const ports = { api: base, root: base + 1, record: base + 2, temporal: base + 3, temporalUi: base + 4 };
+  const ports = { api: base, root: base + 1, record: base + 2, temporal: base + 3, temporalUi: base + 4, broker: base + 5 };
 
   // ---- disposable GitHub repository ----
   let fullName = repoFullName;
@@ -182,6 +183,7 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     record_port: ports.record,
     temporal_port: ports.temporal,
     temporal_ui_port: ports.temporalUi,
+    broker_port: ports.broker,
     repo_full_name: fullName,
     repo_id: repoId,
     base_sha: baseSha,
@@ -242,9 +244,33 @@ export function denyReadProfile(denyReadPaths: readonly string[]): string {
 }
 
 /**
+ * Activity-host Seatbelt profile (TD §4.1; PR #102 re-review 5101871379). Denies the PEP secret
+ * path AND pins network egress to only the localhost ports the Temporal activity host legitimately
+ * needs (Kernel / Temporal / broker). Every other remote is denied — governed targets (GitHub by
+ * name/IP, the record-service port) are http-000, and the docker daemon's unix socket is denied
+ * too, so the host cannot use the daemon as a confused deputy to bind-mount the secret path.
+ */
+export function activityHostProfile(denyReadPaths: readonly string[], allowLocalhostPorts: readonly number[]): string {
+  const lines = ["(version 1)", "(allow default)"];
+  for (const path of denyReadPaths) {
+    let canonical = path;
+    try { canonical = realpathSync(path); } catch { /* not created yet */ }
+    lines.push(`(deny file-read* (subpath ${JSON.stringify(canonical)}))`);
+    lines.push(`(deny file-write* (subpath ${JSON.stringify(canonical)}))`);
+  }
+  lines.push("(deny network*)");
+  for (const port of allowLocalhostPorts) {
+    lines.push(`(allow network-outbound (remote ip ${JSON.stringify(`localhost:${port}`)}))`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/**
  * Spawn a component under a macOS Seatbelt boundary denying `denyReadPaths` (fail closed if
- * `sandbox-exec` is unavailable). Used for the activity worker so the process that launches the
- * surface containers cannot itself read the PEP secret path.
+ * `sandbox-exec` is unavailable). Used for the surface broker (denies only the secret path — it
+ * legitimately needs GitHub + Docker). When `allowLocalhostPorts` is given the profile ALSO pins
+ * network egress to just those localhost ports (the activity host: no GitHub, no Docker, no
+ * governed record-service port).
  */
 export function spawnComponentSandboxed(
   dir: string,
@@ -253,12 +279,14 @@ export function spawnComponentSandboxed(
   args: string[],
   env: Record<string, string>,
   denyReadPaths: readonly string[],
+  allowLocalhostPorts?: readonly number[],
 ): number {
   if (spawnSync("which", ["sandbox-exec"], { stdio: "ignore" }).status !== 0) {
     throw new Error(`activity-worker isolation (sandbox-exec) unavailable — refusing to run ${name} unconfined`);
   }
   const profilePath = join(dir, `${name}.sb`);
-  writeFileSync(profilePath, denyReadProfile(denyReadPaths));
+  const profile = allowLocalhostPorts !== undefined ? activityHostProfile(denyReadPaths, allowLocalhostPorts) : denyReadProfile(denyReadPaths);
+  writeFileSync(profilePath, profile);
   return spawnComponent(dir, name, "sandbox-exec", ["-f", profilePath, cmd, ...args], env);
 }
 

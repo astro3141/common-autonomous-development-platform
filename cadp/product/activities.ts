@@ -1,21 +1,20 @@
 /**
  * Temporal activities (TD §7.4, §8): every governed effect converges through durable kernel
  * state (`get_effect_state`) before any admission request — a replayed/retried activity
- * re-reads rows, never blind-retries a dispatch. Worker/reviewer/verifier surfaces run as
- * sandboxed subprocesses with their own principals; no governed credential exists here.
+ * re-reads rows, never blind-retries a dispatch.
+ *
+ * This activity host holds ONLY the Kernel workflow tokens; it has no governed credential, no
+ * GitHub reach, and no Docker access (its Seatbelt profile allows only the Kernel/Temporal/broker
+ * localhost ports and denies the daemon socket). All surface work that needs GitHub or Docker —
+ * cloning, running codex/claude/tests in containers — is delegated to the bounded surface broker
+ * (./surfaceBroker.ts) over its localhost port; the broker returns raw observed data and the
+ * activity submits every evidence envelope here with its Kernel tokens.
  */
 
-import { spawn, spawnSync } from "node:child_process";
 import { heartbeat } from "@temporalio/activity";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
-import { buildWorkerSandbox, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
-import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
-import type { IsolationConfig } from "./isolation.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -30,21 +29,31 @@ function workflowClient(): KernelClient {
   return new KernelClient(env("CADP_KERNEL_URL"), env("CADP_WORKFLOW_TOKEN"));
 }
 
-/** OS-isolation config for untrusted surfaces (TD §4.1). Fail closed if runtime is absent. */
-function isolationConfig(): IsolationConfig {
-  return {
-    worker_image: env("CADP_WORKER_IMAGE"),
-    egress_network: env("CADP_EGRESS_NETWORK"),
-    egress_proxy: env("CADP_EGRESS_PROXY"),
-  };
-}
-
 function sha256(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function nowMs(): string {
-  return new Date().toISOString();
+/**
+ * Call the bounded surface broker over its localhost port. The activity host's network is pinned
+ * to only the Kernel/Temporal/broker ports; the broker owns GitHub + Docker. Heartbeat while the
+ * (possibly long) surface run is in flight.
+ */
+async function brokerCall<T>(path: string, body: unknown, timeout_ms: number): Promise<T> {
+  const url = env("CADP_BROKER_URL");
+  const beat = setInterval(() => { try { heartbeat(); } catch { /* outside activity context (tests) */ } }, 5000);
+  try {
+    const res = await fetch(`${url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout_ms),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`broker ${path} ${res.status}: ${text.slice(0, 300)}`);
+    return JSON.parse(text) as T;
+  } finally {
+    clearInterval(beat);
+  }
 }
 
 // ---------------------------------------------------------------- WORK_STEP evidence
@@ -266,50 +275,6 @@ export async function recordWriteStep(input: {
 
 // ---------------------------------------------------------------- development vertical
 
-function run(cmd: string, args: string[], options: { cwd?: string; env?: Record<string, string>; timeout?: number } = {}): {
-  status: number | null;
-  stdout: string;
-  stderr: string;
-} {
-  const result = spawnSync(cmd, args, {
-    cwd: options.cwd,
-    env: options.env ?? (process.env as Record<string, string>),
-    encoding: "utf8",
-    timeout: options.timeout ?? 600_000,
-    maxBuffer: 32 * 1024 * 1024,
-  });
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
-}
-
-/** Async runner that heartbeats while a long subprocess (codex/claude/tests) executes. */
-function runWithHeartbeat(cmd: string, args: string[], options: { cwd?: string; env?: Record<string, string>; timeout?: number } = {}): Promise<{
-  status: number | null;
-  stdout: string;
-  stderr: string;
-}> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, {
-      cwd: options.cwd,
-      env: options.env ?? (process.env as Record<string, string>),
-      stdio: ["ignore", "pipe", "pipe"], // stdin closed: CLIs like codex wait for EOF on an open pipe
-    });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    child.stdout.on("data", (c: Buffer) => out.push(c));
-    child.stderr.on("data", (c: Buffer) => err.push(c));
-    const beat = setInterval(() => {
-      try { heartbeat(); } catch { /* outside activity context (tests) */ }
-    }, 5000);
-    const timer = setTimeout(() => child.kill("SIGKILL"), options.timeout ?? 600_000);
-    child.on("error", (error) => { clearInterval(beat); clearTimeout(timer); reject(error); });
-    child.on("close", (status) => {
-      clearInterval(beat);
-      clearTimeout(timer);
-      resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") });
-    });
-  });
-}
-
 export async function implementCandidate(input: {
   work_run_ref: string;
   step_ordinal: number;
@@ -325,122 +290,41 @@ export async function implementCandidate(input: {
   backend_evidence_id: string;
 }> {
   const client = workflowClient();
-  const base = mkdtempSync(join(tmpdir(), "cadp-impl-"));
-  try {
-    // Fresh workspace at exactly base_sha (TD §8.1 — never a reused dirty tree).
-    const workspace = join(base, "ws");
-    let r = run("git", ["clone", "--quiet", `https://github.com/${input.repo_full_name}.git`, workspace]);
-    if (r.status !== 0) throw new Error(`clone failed: ${r.stderr.slice(0, 300)}`);
-    r = run("git", ["checkout", "--quiet", input.base_sha], { cwd: workspace });
-    if (r.status !== 0) {
-      // Revision rounds base on a prior candidate that lives only on its write-once ref.
-      run("git", ["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${input.base_sha}`], { cwd: workspace });
-      r = run("git", ["checkout", "--quiet", input.base_sha], { cwd: workspace });
-      if (r.status !== 0) throw new Error(`checkout ${input.base_sha} failed: ${r.stderr.slice(0, 300)}`);
-    }
+  // The bounded broker clones at base_sha, runs codex in the isolated worker container, commits
+  // the worker-local candidate, and bundles it (TD §8.1/§6.6). It returns the candidate sha, the
+  // bundle bytes, and the model scanned from the worker's own codex session log (#91).
+  const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_model?: string; backend_locator?: string }>(
+    "/implement",
+    { repo_full_name: input.repo_full_name, base_sha: input.base_sha, work_item: input.work_item },
+    960_000,
+  );
+  const { cas_key: bundle_cas_key } = await client.putBlob(Buffer.from(impl.bundle_b64, "base64"));
+  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_model, impl.backend_locator);
 
-    // Worker isolation (re-review blocker): codex runs inside a container. Its ONLY mounts are
-    // /ws (the checkout) and a copied auth.json — the host filesystem, the PEP secret dir, and
-    // manifest token material are unreachable; governed hosts are pinned dead. The sandbox
-    // still supplies only auth.json (finding 2), and the profile digest binds it.
-    const sandbox = buildWorkerSandbox(base);
-    const home = sandbox.home;
-    const config = isolationConfig();
-    if (!(await dockerAvailable())) throw new Error("worker isolation runtime (docker) unavailable — failing closed");
-    const heartbeatTimer = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
-    let workerRun;
-    try {
-      const sessionsDir = join(home, "codex-sessions");
-      mkdirSync(sessionsDir, { recursive: true });
-      workerRun = await runWorker(config, {
-        workspace,
-        codexAuthDir: join(home, ".codex"),
-        sessionsDir,
-        argv: ["codex", ...WORKER_ARGV_PREFIX, "-C", "/ws", input.work_item],
-        timeout_ms: 900_000,
-      });
-    } finally {
-      clearInterval(heartbeatTimer);
-    }
-    if (workerRun.status !== 0) {
-      throw new Error(`worker container exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
-    }
-
-    // The harness commits the worker-local candidate (worker cannot push — no credential).
-    run("git", ["add", "-A"], { cwd: workspace });
-    r = run("git", ["-c", "user.name=cadp-worker", "-c", "user.email=worker@cadp-v04.invalid", "commit", "-m", `cadp candidate: ${input.work_item.slice(0, 60)}`], { cwd: workspace });
-    if (r.status !== 0 && !/nothing to commit|커밋할 사항 없음/u.test(r.stdout + r.stderr)) {
-      throw new Error(`commit failed: ${r.stderr.slice(0, 200)} ${r.stdout.slice(0, 200)}`);
-    }
-    // A revision round where the worker changes nothing stands on the existing candidate.
-    const candidate_sha = run("git", ["rev-parse", "HEAD"], { cwd: workspace }).stdout.trim();
-
-    // Complete bundle whose single head IS the candidate (TD §6.6).
-    run("git", ["branch", "-f", "cadp-candidate", candidate_sha], { cwd: workspace });
-    const bundlePath = join(base, "candidate.bundle");
-    r = run("git", ["bundle", "create", bundlePath, "cadp-candidate"], { cwd: workspace });
-    if (r.status !== 0) throw new Error(`bundle create failed: ${r.stderr.slice(0, 300)}`);
-    const { cas_key: bundle_cas_key } = await client.putBlob(readFileSync(bundlePath));
-
-    // Backend identity: scan, don't address (#91) — locator-bearing observed facts only.
-    const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, join(home, "codex-sessions"), workerRun.stdout);
-
-    const workStep = await submitWorkStep({
-      work_run_ref: input.work_run_ref,
-      step_ordinal: input.step_ordinal,
-      input_digest: sha256(JSON.stringify({ base_sha: input.base_sha, work_item: input.work_item })),
-      output_digest: candidate_sha,
-      summary: `implement candidate ${candidate_sha.slice(0, 12)}`,
-      prior_step_envelope_digest: input.prior_step_envelope_digest,
-    });
-    return {
-      candidate_sha,
-      bundle_cas_key,
-      work_step_envelope_id: workStep.evidence_id,
-      work_step_envelope_digest: workStep.envelope_digest.value,
-      backend_evidence_id: backendEvidence,
-    };
-  } finally {
-    rmSync(base, { recursive: true, force: true });
-  }
+  const workStep = await submitWorkStep({
+    work_run_ref: input.work_run_ref,
+    step_ordinal: input.step_ordinal,
+    input_digest: sha256(JSON.stringify({ base_sha: input.base_sha, work_item: input.work_item })),
+    output_digest: impl.candidate_sha,
+    summary: `implement candidate ${impl.candidate_sha.slice(0, 12)}`,
+    prior_step_envelope_digest: input.prior_step_envelope_digest,
+  });
+  return {
+    candidate_sha: impl.candidate_sha,
+    bundle_cas_key,
+    work_step_envelope_id: workStep.evidence_id,
+    work_step_envelope_digest: workStep.envelope_digest.value,
+    backend_evidence_id: backendEvidence,
+  };
 }
 
-/** #91 method: scan the worker's own session log; PRESENT facts carry locators; absent = UNKNOWN. */
-async function submitBackendExecution(work_run_ref: string, step_ordinal: number, home: string, stdout: string): Promise<string> {
+/** #91 method: the broker scanned the worker's own session log; PRESENT facts carry a locator. */
+async function submitBackendExecution(work_run_ref: string, step_ordinal: number, model?: string, locator?: string): Promise<string> {
   const scanClient = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_BACKEND_SCAN_TOKEN"));
-  const sessionsDir = home; // caller passes the codex sessions dir directly
-  let modelValue: string | undefined;
-  let locator: string | undefined;
-  const scan = (file: string): void => {
-    const content = readFileSync(file, "utf8");
-    const idx = content.search(/"model"\s*:\s*"/u);
-    if (idx >= 0) {
-      const m = /"model"\s*:\s*"([^"]+)"/u.exec(content.slice(idx, idx + 200));
-      if (m !== null) {
-        modelValue = m[1];
-        locator = `${file}#offset=${idx}`;
-      }
-    }
-  };
-  try {
-    const walk = (dir: string): void => {
-      for (const entry of readdirSync(dir)) {
-        const p = join(dir, entry);
-        if (statSync(p).isDirectory()) walk(p);
-        else if (modelValue === undefined && (entry.endsWith(".jsonl") || entry.endsWith(".json"))) scan(p);
-      }
-    };
-    if (existsSync(sessionsDir)) walk(sessionsDir);
-  } catch { /* absent facts stay UNKNOWN */ }
-  const stdoutModel = /model:\s*(\S+)/u.exec(stdout);
-  if (modelValue === undefined && stdoutModel !== null) {
-    modelValue = stdoutModel[1];
-    locator = "worker-stdout#pattern=model:";
-  }
   const observed: Record<string, unknown> = {
     model:
-      modelValue !== undefined
-        ? { availability: "PRESENT", value: modelValue, locator }
+      model !== undefined
+        ? { availability: "PRESENT", value: model, locator }
         : { availability: "UNKNOWN" },
     provider: { availability: "UNKNOWN" },
     run_id: { availability: "UNKNOWN" },
@@ -507,82 +391,60 @@ export async function verifyCandidate(input: {
   prior_step_envelope_digest?: string;
 }): Promise<{ verification_evidence_id: string; conclusion: string; work_step_envelope_digest: string }> {
   const verifier = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_VERIFIER_TOKEN"));
-  const base = mkdtempSync(join(tmpdir(), "cadp-verify-"));
-  const started_at = nowMs();
-  try {
-    // Fresh clone at exactly the candidate sha (TD §8.2 harness alternative).
-    const workspace = join(base, "ws");
-    let r = run("git", ["clone", "--quiet", `https://github.com/${input.repo_full_name}.git`, workspace]);
-    if (r.status !== 0) throw new Error(`clone failed: ${r.stderr.slice(0, 300)}`);
-    r = run("git", ["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${input.candidate_sha}`], { cwd: workspace });
-    r = run("git", ["checkout", "--quiet", input.candidate_sha], { cwd: workspace });
-    if (r.status !== 0) throw new Error(`checkout candidate failed: ${r.stderr.slice(0, 300)}`);
-    const cloneHead = run("git", ["rev-parse", "HEAD"], { cwd: workspace }).stdout.trim();
-    const porcelain = run("git", ["status", "--porcelain"], { cwd: workspace }).stdout.trim();
+  // The broker fresh-clones at exactly the candidate sha (TD §8.2) and runs `node --test` inside
+  // the --network none verifier container; it returns the clone head + a DIRTY/MISMATCH verdict,
+  // or the container conclusion. The activity submits the VERIFICATION evidence with its token.
+  const v = await brokerCall<
+    | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
+    | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
+  >("/verify", { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha }, 360_000);
 
-    if (porcelain.length > 0 || cloneHead !== input.candidate_sha) {
-      // Dirty tree ⇒ UNKNOWN, never PASS (C11 / #89 false-PASS).
-      const envelope = await verifier.submitEvidence({
-        evidence_kind: "VERIFICATION",
-        subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
-        availability: "UNKNOWN",
-        claim_schema: "cadp.verification.harness.v1",
-        unknown_reason: porcelain.length > 0 ? "DIRTY_WORKSPACE" : "HEAD_MISMATCH",
-        producer_ref: "verifier:harness",
-        source_ref: `fresh-clone:${cloneHead}`,
-        source_relation: "INDEPENDENT_OBSERVATION",
-      });
-      const workStep = await submitWorkStep({
-        work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
-        input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
-        summary: "verification UNKNOWN", prior_step_envelope_digest: input.prior_step_envelope_digest,
-      });
-      return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
-    }
-
-    // Verifier isolation (re-review blocker): the candidate's OWN test process runs inside a
-    // container with --network none and no host mount but the checkout — it cannot read the
-    // PEP secret path / manifest, and cannot reach the Kernel or any target.
-    const vconfig = isolationConfig();
-    if (!(await dockerAvailable())) throw new Error("verifier isolation runtime (docker) unavailable — failing closed");
-    const vHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
-    let test;
-    try {
-      test = await runVerifier(vconfig, { workspace, argv: ["node", "--test"], timeout_ms: 300_000 });
-    } finally {
-      clearInterval(vHeartbeat);
-    }
-    const completed_at = nowMs();
-    const conclusion = test.status === 0 ? "success" : "failure";
+  if (v.status === "UNKNOWN") {
+    // Dirty tree / head mismatch ⇒ UNKNOWN, never PASS (C11 / #89 false-PASS).
     const envelope = await verifier.submitEvidence({
       evidence_kind: "VERIFICATION",
       subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
-      availability: "PRESENT",
+      availability: "UNKNOWN",
       claim_schema: "cadp.verification.harness.v1",
-      claim: {
-        head_sha: input.candidate_sha,
-        clone_head: cloneHead,
-        porcelain_empty: true,
-        conclusion,
-        runner: "node --test",
-        started_at,
-        completed_at,
-        output_digest: sha256(test.stdout + test.stderr),
-      },
-      produced_at: completed_at, // SOURCE contract /completed_at (TD §9.1)
+      unknown_reason: v.unknown_reason,
       producer_ref: "verifier:harness",
-      source_ref: `fresh-clone:${cloneHead}`,
+      source_ref: `fresh-clone:${v.clone_head}`,
       source_relation: "INDEPENDENT_OBSERVATION",
     });
     const workStep = await submitWorkStep({
       work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
       input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
-      summary: `verification ${conclusion}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
+      summary: "verification UNKNOWN", prior_step_envelope_digest: input.prior_step_envelope_digest,
     });
-    return { verification_evidence_id: envelope.evidence_id, conclusion, work_step_envelope_digest: workStep.envelope_digest.value };
-  } finally {
-    rmSync(base, { recursive: true, force: true });
+    return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
   }
+
+  const envelope = await verifier.submitEvidence({
+    evidence_kind: "VERIFICATION",
+    subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
+    availability: "PRESENT",
+    claim_schema: "cadp.verification.harness.v1",
+    claim: {
+      head_sha: input.candidate_sha,
+      clone_head: v.clone_head,
+      porcelain_empty: true,
+      conclusion: v.conclusion,
+      runner: "node --test",
+      started_at: v.started_at,
+      completed_at: v.completed_at,
+      output_digest: v.output_digest,
+    },
+    produced_at: v.completed_at, // SOURCE contract /completed_at (TD §9.1)
+    producer_ref: "verifier:harness",
+    source_ref: `fresh-clone:${v.clone_head}`,
+    source_relation: "INDEPENDENT_OBSERVATION",
+  });
+  const workStep = await submitWorkStep({
+    work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
+    input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
+    summary: `verification ${v.conclusion}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
+  });
+  return { verification_evidence_id: envelope.evidence_id, conclusion: v.conclusion, work_step_envelope_digest: workStep.envelope_digest.value };
 }
 
 export async function reviewCandidate(input: {
@@ -595,68 +457,30 @@ export async function reviewCandidate(input: {
   prior_step_envelope_digest?: string;
 }): Promise<{ review_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
   const reviewer = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_REVIEWER_TOKEN"));
-  const base = mkdtempSync(join(tmpdir(), "cadp-review-"));
-  try {
-    const workspace = join(base, "ws");
-    let r = run("git", ["clone", "--quiet", `https://github.com/${input.repo_full_name}.git`, workspace]);
-    if (r.status !== 0) throw new Error(`clone failed: ${r.stderr.slice(0, 300)}`);
-    run("git", ["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${input.candidate_sha}`], { cwd: workspace });
-    r = run("git", ["checkout", "--quiet", input.candidate_sha], { cwd: workspace });
-    if (r.status !== 0) throw new Error(`checkout failed: ${r.stderr.slice(0, 300)}`);
-    const diff = run("git", ["show", "--stat", "--patch", input.candidate_sha], { cwd: workspace }).stdout.slice(0, 40_000);
-
-    // Second-surface reviewer (measured #90: Claude Code, read-only): exact committed diff.
-    const home = join(base, "home");
-    mkdirSync(join(home, "tmp"), { recursive: true });
-    const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
-    // Reviewer isolation (re-review blocker): the reviewer runs inside a container with the
-    // host filesystem invisible and GitHub/record/Kernel egress pinned dead (http-000); the
-    // model OAuth token is injected by env (operator-extracted), so no keychain/host credential
-    // is reachable. Only the read-only checkout is mounted.
-    const rconfig = isolationConfig();
-    if (!(await dockerAvailable())) throw new Error("reviewer isolation runtime (docker) unavailable — failing closed");
-    const providerToken = claudeProviderToken();
-    const rHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
-    let review;
-    try {
-      const reviewWs = join(base, "review-ws");
-      mkdirSync(reviewWs, { recursive: true });
-      review = await runReviewer(rconfig, {
-        workspace: reviewWs,
-        providerToken,
-        argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
-        timeout_ms: 300_000,
-      });
-    } finally {
-      clearInterval(rHeartbeat);
-    }
-    if (review.status !== 0 || review.stdout.trim().length === 0) {
-      throw new Error(`reviewer surface failed (exit ${review.status}): ${(review.stderr || review.stdout).slice(0, 200)}`);
-    }
-    const lines = review.stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
-    const verdict = verdictLine.startsWith("APPROVE") ? "APPROVE" : "REQUEST_CHANGES";
-    const reason = lines[lines.indexOf(verdictLine) + 1] ?? review.stdout.trim().slice(0, 200);
-
-    const envelope = await reviewer.submitEvidence({
-      evidence_kind: "REVIEW",
-      subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
-      availability: "PRESENT",
-      claim_schema: "cadp.review.v1",
-      claim: { verdict, body_digest: sha256(review.stdout), reviewer_run_id: `claude-p:${Date.now()}` },
-      producer_ref: "reviewer:claude-code",
-      source_ref: `claude-code:plan-mode`,
-      source_relation: "INDEPENDENT_OBSERVATION",
-    });
-    const workStep = await submitWorkStep({
-      work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
-      input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
-      summary: `review ${verdict}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
-    });
-    return { review_evidence_id: envelope.evidence_id, verdict, reason, work_step_envelope_digest: workStep.envelope_digest.value };
-  } finally {
-    rmSync(base, { recursive: true, force: true });
-  }
+  // The broker fresh-clones the candidate and runs the second-surface reviewer (measured #90:
+  // Claude Code, read-only) inside the isolated reviewer container over the exact committed diff;
+  // it returns the verdict, a short reason, and the raw stdout. The activity submits REVIEW here.
+  const rv = await brokerCall<{ verdict: string; reason: string; stdout: string }>(
+    "/review",
+    { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item },
+    360_000,
+  );
+  const envelope = await reviewer.submitEvidence({
+    evidence_kind: "REVIEW",
+    subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
+    availability: "PRESENT",
+    claim_schema: "cadp.review.v1",
+    claim: { verdict: rv.verdict, body_digest: sha256(rv.stdout), reviewer_run_id: `claude-p:${Date.now()}` },
+    producer_ref: "reviewer:claude-code",
+    source_ref: `claude-code:plan-mode`,
+    source_relation: "INDEPENDENT_OBSERVATION",
+  });
+  const workStep = await submitWorkStep({
+    work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
+    input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
+    summary: `review ${rv.verdict}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
+  });
+  return { review_evidence_id: envelope.evidence_id, verdict: rv.verdict, reason: rv.reason, work_step_envelope_digest: workStep.envelope_digest.value };
 }
 
 export async function governedPrCreate(input: {

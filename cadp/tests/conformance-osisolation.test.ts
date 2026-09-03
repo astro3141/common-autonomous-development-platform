@@ -7,8 +7,12 @@
  *      http-000; provider reachable via proxy. Guard-bite (host node) reads secret + reaches.
  *  F7  verifier container (--network none): no host fs, no egress at all.
  *  F8  worker container: no host fs; governed targets unreachable by every route.
- *  F9  activity host: under the worker Seatbelt profile a payload cannot read the PEP secret
- *      files; guard-bite (no sandbox) reads them.
+ *  F9  surface broker: under the broker Seatbelt profile (deny-read secret) a payload cannot read
+ *      the PEP secret files; guard-bite (no sandbox) reads them.
+ *  F10 activity host: under the EXACT production activity-host profile (deny-read secret + egress
+ *      pinned to only its allowed localhost ports) a payload cannot read the secret, cannot reach a
+ *      governed target (denied port / GitHub by name+IP are http-000 while the allowed port works),
+ *      and cannot use the docker daemon to bind-mount+read the secret. Guard-bites breach each.
  *
  * Container legs skip (not fail) when Docker is unavailable; Seatbelt legs skip off macOS.
  */
@@ -24,7 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import { createEgressBoundary, dockerAvailable, runReviewer, runVerifier, runWorker } from "../product/isolation.ts";
 import type { EgressBoundary, IsolationConfig } from "../product/isolation.ts";
-import { denyReadProfile } from "../live/env.ts";
+import { activityHostProfile, denyReadProfile } from "../live/env.ts";
 
 const PAYLOAD = fileURLToPath(new URL("../live/probePayload.mjs", import.meta.url));
 const WORKER_IMAGE = "cadp-surface:0.151.0-2.1.221";
@@ -150,7 +154,7 @@ test("F8: worker container — no host fs; governed targets unreachable by name/
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("F9: activity host under Seatbelt cannot read the PEP secret path; guard-bite reads it", async () => {
+test("F9: surface broker under Seatbelt (deny-read secret) cannot read the PEP secret path; guard-bite reads it", async () => {
   if (platform() !== "darwin" || spawnSync("which", ["sandbox-exec"], { stdio: "ignore" }).status !== 0) {
     console.log("  skipped: sandbox-exec unavailable");
     return;
@@ -174,6 +178,62 @@ test("F9: activity host under Seatbelt cannot read the PEP secret path; guard-bi
     const bf = parse(bite.stdout);
     assert.ok(bf.fs_reads.length >= files.length, `bite: unconfined host reads every secret file (${bf.fs_reads.length})`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("F10: activity host under its exact profile — secret unread, governed egress http-000, daemon-mount denied; guard-bites breach", async () => {
+  if (platform() !== "darwin" || spawnSync("which", ["sandbox-exec"], { stdio: "ignore" }).status !== 0) {
+    console.log("  skipped: sandbox-exec unavailable");
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "cadp-f10-"));
+  const allowed = await kernelStub(); // the legitimate seam (Kernel/Temporal/broker port stand-in)
+  const denied = await kernelStub();  // a governed port the activity host must NOT reach
+  try {
+    const secret = join(dir, "secret");
+    mkdirSync(join(secret, "root"), { recursive: true });
+    for (const f of ["github-token", "api-tokens.json", "record-api-key", "root-token", "workflow-token-map.json"]) writeFileSync(join(secret, f), "SECRET-" + f);
+    writeFileSync(join(secret, "root", "root-key.pem"), "ROOT-KEY");
+    const files = ["github-token", "api-tokens.json", "record-api-key", "root-token", "workflow-token-map.json", "root/root-key.pem"].map((f) => join(secret, f));
+
+    // The EXACT production activity-host profile: deny the secret path, allow ONLY the seam port.
+    const profilePath = join(dir, "activity-host.sb");
+    writeFileSync(profilePath, activityHostProfile([secret], [allowed.port]));
+
+    const targets = {
+      allowed_seam: `http://127.0.0.1:${allowed.port}/`,
+      denied_port: `http://127.0.0.1:${denied.port}/`,
+      github_name: "https://api.github.com/",
+      github_ip: "https://140.82.112.3/",
+    };
+    const env = { ...process.env as Record<string, string>, PROBE_SEARCH_ROOTS: secret, PROBE_TARGETS: JSON.stringify(targets), PROBE_EXPLICIT_FILES: files.join(":") };
+    const confined = await spawnAsync("sandbox-exec", ["-f", profilePath, "node", PAYLOAD], env);
+    const cf = parse(confined.stdout);
+    assert.equal(cf.fs_reads.length, 0, `confined activity host reads NO secret file: ${JSON.stringify(cf.fs_reads)}`);
+    for (const e of cf.egress) {
+      if (e.target === "allowed_seam") assert.notEqual(e.status, "000", "the allowed seam port must be reachable");
+      else assert.equal(e.status, "000", `governed target ${e.target} must be http-000: ${JSON.stringify(e)}`);
+    }
+    assert.equal(denied.hits, 0, "the denied governed port was never actually reached");
+
+    // Guard-bite (no profile): the denied port is reachable and every secret file is read.
+    const bite = await spawnAsync("node", [PAYLOAD], env);
+    const bf = parse(bite.stdout);
+    assert.ok(bf.fs_reads.length >= files.length, `bite: unconfined host reads every secret file (${bf.fs_reads.length})`);
+    assert.ok(bf.egress.some((e) => e.target === "denied_port" && e.status !== "000"), "bite: reached the governed port");
+
+    // Confused-deputy control: under the profile the docker daemon socket is denied, so the host
+    // cannot bind-mount the secret path into a container and read it. Guard-bite (no profile) can.
+    if (await dockerAvailable() && spawnSync("docker", ["image", "inspect", WORKER_IMAGE], { stdio: "ignore" }).status === 0) {
+      const mountArgs = ["run", "--rm", "--network", "none", "-v", `${secret}:/stolen:ro`, WORKER_IMAGE, "cat", "/stolen/github-token"];
+      const denyMount = await spawnAsync("sandbox-exec", ["-f", profilePath, "docker", ...mountArgs], process.env as Record<string, string>);
+      assert.notEqual(denyMount.status, 0, `daemon-mount of the secret must fail under the profile: ${denyMount.stdout}${denyMount.stderr}`);
+      assert.ok(!denyMount.stdout.includes("SECRET-github-token"), "the secret bytes must NOT come back through a container mount");
+      const biteMount = await spawnAsync("docker", mountArgs, process.env as Record<string, string>);
+      assert.ok(biteMount.stdout.includes("SECRET-github-token"), "bite: unconfined docker mount reads the secret bytes");
+    } else {
+      console.log("  daemon-mount leg skipped (docker/image absent)");
+    }
+  } finally { allowed.close(); denied.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 function kernelStub(): Promise<{ port: number; hits: number; close(): void }> {
