@@ -23,7 +23,9 @@ import { makeAdapterRegistry } from "../../../cadp/kernel/adapters/types.ts";
 import type {
   AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
 } from "../../../cadp/kernel/adapters/types.ts";
-import type { SubjectBinding, TargetRef } from "../../../cadp/kernel/records.ts";
+import type { EvidenceEnvelopeV1, SubjectBinding, TargetRef } from "../../../cadp/kernel/records.ts";
+import { StorePolicyAdapter } from "../../../cadp/kernel/adapters/storePolicy.ts";
+import { rawDigest, jcsDigest } from "../../../cadp/kernel/canonical.ts";
 import { buildReferenceBundle, buildReferenceKernelConfig } from "../../../cadp/deployment/referencePolicy.ts";
 import type { ReferencePolicyInput } from "../../../cadp/deployment/referencePolicy.ts";
 
@@ -53,10 +55,17 @@ export class ScriptedTarget implements TargetAdapterV1 {
       operation_kind: "SCRIPTED_KEYED_WRITE", material_schema: "test.scripted-write.v1", available: true,
       idempotency: "NATIVE_KEY", idempotency_horizon_s: 3600, dispatch_precondition: "NONE", reconcile: "BY_QUERY_PREDICATE", no_effect_proof_supported: true,
     },
+    {
+      operation_kind: "SCRIPTED_GUARDED_WRITE", material_schema: "test.scripted-write.v1", available: true,
+      idempotency: "NONE", dispatch_precondition: "PEP_READ_THEN_ACT", reconcile: "BY_QUERY_PREDICATE", no_effect_proof_supported: true,
+    },
   ];
 
   /** The "target side": committed effects observed at the target, keyed by effect_id|ordinal. */
   readonly committed = new Map<string, Record<string, unknown>>();
+  /** Every transport call that REACHED the target and took effect (external-effect delta). */
+  readonly effects: string[] = [];
+  onPreconditionRead: (() => string | undefined) | undefined;
   onDispatch: ((effect_id: string, ordinal: number, material: Record<string, unknown>) => DispatchResult) | undefined;
   onReconcile: ((effect_id: string, ordinal: number, material: Record<string, unknown>) => ReconcileResult) | undefined;
   onRevision: ((subject: SubjectBinding) => RevisionRead) | undefined;
@@ -84,17 +93,36 @@ export class ScriptedTarget implements TargetAdapterV1 {
   async verify_material(): Promise<void> {}
 
   async dispatch_precondition_read(): Promise<string | undefined> {
-    return undefined;
+    return this.onPreconditionRead?.();
   }
 
-  async dispatch(effect_id: string, ordinal: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<DispatchResult> {
+  async dispatch(effect_id: string, ordinal: number, _t: TargetRef, op: string, material: Record<string, unknown>): Promise<DispatchResult> {
+    // NATIVE_KEY target-side dedup: same idempotency key never takes effect twice.
+    if (op === "SCRIPTED_KEYED_WRITE" && this.committed.has(effect_id)) {
+      const result = this.onDispatch?.(effect_id, ordinal, material);
+      if (result !== undefined && result.kind !== "ACCEPTED") return result;
+      return {
+        kind: "ACCEPTED",
+        target_operation_ref: `scripted-op-${effect_id}-dedup`,
+        receipt_claim: { body_digest: material["body_digest"], applied: true, deduplicated: true },
+      };
+    }
     const result = this.onDispatch?.(effect_id, ordinal, material) ?? {
       kind: "ACCEPTED" as const,
       target_operation_ref: `scripted-op-${effect_id}-${ordinal}`,
       receipt_claim: { body_digest: material["body_digest"], applied: true },
     };
-    if (result.kind === "ACCEPTED") this.committed.set(`${effect_id}`, material);
+    if (result.kind === "ACCEPTED") {
+      this.committed.set(`${effect_id}`, material);
+      this.effects.push(effect_id);
+    }
     return result;
+  }
+
+  /** Target-side commit used by fault-injection scripts (the call took effect even if the reply was lost). */
+  commitSilently(effect_id: string, material: Record<string, unknown>): void {
+    this.committed.set(effect_id, material);
+    this.effects.push(effect_id);
   }
 
   async reconcile(effect_id: string, ordinal: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<ReconcileResult> {
@@ -130,6 +158,8 @@ export interface Harness {
   evaluate(input_digest: string): Promise<EvaluateOutcome>;
   sealReach(alternate?: boolean): void;
   sealTargetIdentity(): Promise<void>;
+  humanApprove(effect_id: string): EvidenceEnvelopeV1;
+  activatePolicy(input: { revision: number; paramOverrides?: Record<string, unknown>; configOverrides?: ReferencePolicyInput["configOverrides"]; rego?: string; expectedSeqOverride?: number }): Promise<{ admitted: unknown; bundle: Uint8Array; effect_id: string }>;
   close(): void;
 }
 
@@ -140,6 +170,7 @@ export interface HarnessOptions {
   configOverrides?: ReferencePolicyInput["configOverrides"];
   disabledChecks?: ReadonlySet<string>;
   extraAdapters?: TargetAdapterV1[];
+  rego?: string;
 }
 
 export async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -159,8 +190,9 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
     root_public_keys: [
       { key_id: root.key_id, alg: "Ed25519", public_key: root.public_key_base64, valid_from: "2026-01-01T00:00:00.000Z" },
     ],
-    paramOverrides: { extra_plain_allow_operations: ["SCRIPTED_WRITE", "SCRIPTED_KEYED_WRITE"], ...options.paramOverrides },
+    paramOverrides: { extra_plain_allow_operations: ["SCRIPTED_WRITE", "SCRIPTED_KEYED_WRITE", "SCRIPTED_GUARDED_WRITE"], ...options.paramOverrides },
     configOverrides: options.configOverrides,
+    rego: options.rego,
   };
   const bundle = buildReferenceBundle(policyInput);
   runGenesis(store, cas, {
@@ -179,7 +211,8 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
   const evaluator = sharedEvaluator;
 
   const target = new ScriptedTarget();
-  const registry = makeAdapterRegistry([target, ...(options.extraAdapters ?? [])]);
+  const storePolicyAdapter = new StorePolicyAdapter(store, cas, ingress, clock);
+  const registry = makeAdapterRegistry([target, storePolicyAdapter, ...(options.extraAdapters ?? [])]);
   const pep = new Pep(store, cas, ingress, registry, PEP_REF, clock, options.disabledChecks ?? new Set());
   const reconciler = new Reconciler(store, cas, ingress, pep, registry, clock);
 
@@ -209,6 +242,85 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
     },
     async sealTargetIdentity() {
       await pep.refreshTargetIdentity(target);
+      await pep.refreshTargetIdentity(storePolicyAdapter);
+    },
+    humanApprove(effect_id: string): EvidenceEnvelopeV1 {
+      const request = store.effectRequest(effect_id);
+      if (request === undefined) throw new Error(`no request ${effect_id}`);
+      return ingress.submitEvidence(
+        {
+          evidence_kind: "HUMAN_DECISION",
+          subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id }],
+          availability: "PRESENT",
+          claim_schema: "cadp.human-decision.v1",
+          claim: {
+            principal: "sso:a.t.laplace@gmail.com",
+            decision: "APPROVE",
+            scope: { effect_id, target_ref: request.target_ref, material_digest: request.material_digest.value },
+            presented_request_digest: request.request_digest,
+            statement: "approved in conformance harness",
+            issued_at: new Date(clock()).toISOString(),
+          },
+          producer_ref: "human:astro3141",
+          source_ref: "sso-approval-page",
+          source_relation: "INDEPENDENT_OBSERVATION",
+        },
+        PRINCIPALS.human,
+      );
+    },
+    async activatePolicy(input) {
+      const bundleB = buildReferenceBundle({
+        ...policyInput,
+        revision: input.revision,
+        paramOverrides: { ...policyInput.paramOverrides, ...input.paramOverrides },
+        configOverrides: { ...policyInput.configOverrides, ...input.configOverrides },
+        rego: input.rego ?? policyInput.rego,
+      });
+      const bundle_cas_ref = ingress.putBlob(bundleB);
+      const active = store.activeActivation()!;
+      const material = {
+        proposed_policy_ref: {
+          policy_id: "cadp-v04:policy:root",
+          revision: input.revision,
+          content_digest: rawDigest(bundleB),
+          issuer_ref: "workflow:cadp-work",
+        },
+        bundle_cas_ref,
+        expected_active_policy_ref: {
+          policy_id: active.policy_id,
+          revision: active.revision,
+          content_digest: { algorithm: "sha256", canonicalization: "raw-bytes-1", value: active.content_digest },
+          seq: input.expectedSeqOverride ?? active.seq,
+        },
+      };
+      const material_ref = ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
+      const effect_id = ingress.allocateEffectId({
+        schema: "cadp.allocation-key.v1",
+        work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
+        step_ordinal: (allocationCounter += 1),
+        purpose: "policy-activate",
+      });
+      ingress.sealEffectRequest(
+        {
+          effect_id,
+          requester_ref: "workflow:cadp-work",
+          work_bindings: [],
+          target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },
+          operation_kind: "POLICY_ACTIVATE",
+          material_schema: "cadp.policy-activate.v1",
+          material_ref,
+          prior_effect_refs: [],
+        },
+        PRINCIPALS.workflow,
+      );
+      const human = harness.humanApprove(effect_id);
+      const inputRec = ingress.assembleAdmissionInput(effect_id, [human.evidence_id]);
+      const evaluated = await harness.evaluate(inputRec.input_digest.value);
+      if (evaluated.kind !== "DECISION" || evaluated.decision.outcome !== "ALLOW") {
+        return { admitted: { kind: "NOT_ALLOWED", evaluated }, bundle: bundleB, effect_id };
+      }
+      const admitted = await pep.admitAndDispatch(effect_id, evaluated.decision.decision_id);
+      return { admitted, bundle: bundleB, effect_id };
     },
     close() {
       store.close();

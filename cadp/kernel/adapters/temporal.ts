@@ -153,15 +153,16 @@ export class TemporalAdapter implements TargetAdapterV1 {
     run_id: string | undefined,
   ): DispatchResult {
     if (described.kind === "found") {
-      if (described.memo["cadp_effect_id"] === effect_id && described.memo["cadp_args_digest"] === argsDigest) {
-        return {
-          kind: "ACCEPTED",
-          target_operation_ref: described.run_id,
-          // The receipt memo comes from the Describe response, never from the request.
-          receipt_claim: { run_id: described.run_id, memo: described.memo, status: described.status },
-        };
-      }
-      return { kind: "AMBIGUOUS", raw_observation: `MEMO_MISMATCH: workflow id occupied by memo ${JSON.stringify(described.memo).slice(0, 200)}` };
+      // The receipt memo comes from the Describe response, never from the request; a memo that
+      // does not bind fails the PEP receipt-binding check → RECEIPT_MATERIAL_MISMATCH incident
+      // + UNKNOWN(RECEIPT_UNBOUND), never COMMITTED (§6.4, C34).
+      void effect_id;
+      void argsDigest;
+      return {
+        kind: "ACCEPTED",
+        target_operation_ref: described.run_id,
+        receipt_claim: { run_id: described.run_id, memo: described.memo, status: described.status },
+      };
     }
     if (described.kind === "not_found") {
       return { kind: "AMBIGUOUS", raw_observation: `describe NOT_FOUND after start${run_id !== undefined ? ` (run ${run_id})` : ""}` };
@@ -186,15 +187,15 @@ export class TemporalAdapter implements TargetAdapterV1 {
       return { kind: "UNKNOWN", unknown_reason: error instanceof Error ? error.message : String(error) };
     }
     if (described.kind === "found") {
-      if (described.memo["cadp_effect_id"] === effect_id && described.memo["cadp_args_digest"] === argsDigest) {
-        return {
-          kind: "COMMITTED",
-          target_operation_ref: described.run_id,
-          receipt_claim: { run_id: described.run_id, memo: described.memo, status: described.status },
-        };
-      }
-      // Same id, other effect: the PEP records RECEIPT_MATERIAL_MISMATCH via receipt binding.
-      return { kind: "UNKNOWN", unknown_reason: `MEMO_MISMATCH: ${JSON.stringify(described.memo).slice(0, 200)}` };
+      // Found → return the target-returned receipt; the reconciler's receipt-binding check
+      // converts a same-id-other-effect memo into RECEIPT_MATERIAL_MISMATCH + UNKNOWN (C34).
+      void effect_id;
+      void argsDigest;
+      return {
+        kind: "COMMITTED",
+        target_operation_ref: described.run_id,
+        receipt_claim: { run_id: described.run_id, memo: described.memo, status: described.status },
+      };
     }
     if (described.kind === "not_found") {
       // Inside the retention horizon Temporal's NOT_FOUND is authoritative; outside it is not
@@ -218,6 +219,8 @@ export class TemporalAdapter implements TargetAdapterV1 {
 
   receipt_binds(_operation: string, material: Record<string, unknown>, receipt: Record<string, unknown>): boolean {
     const memo = receipt["memo"] as Record<string, unknown> | undefined;
-    return memo?.["cadp_args_digest"] === material["args_digest"];
+    const workflowId = String(material["workflow_id"]);
+    const expectedEffect = workflowId.startsWith("cadp-work-") ? workflowId.slice("cadp-work-".length) : undefined;
+    return memo?.["cadp_args_digest"] === material["args_digest"] && memo?.["cadp_effect_id"] === expectedEffect;
   }
 }

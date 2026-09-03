@@ -163,7 +163,7 @@ export class Ingress {
     validateEffectRequest(sealed);
     this.assertSchemesApproved([sealed.material_digest, sealed.request_digest], active);
 
-    return this.store.withImmediate(() => {
+    const outcome = this.store.withImmediate((): { kind: "row"; row: EffectRequestV1 } | { kind: "conflict" } => {
       const existing = this.store.effectRequest(sealed.effect_id);
       if (existing !== undefined) {
         // Same effect_id: identical semantic content → idempotent no-op returning the stored
@@ -174,16 +174,21 @@ export class Ingress {
             operation_kind: r.operation_kind, material_schema: r.material_schema,
             material_digest: r.material_digest, material_ref: r.material_ref, prior_effect_refs: r.prior_effect_refs,
           });
-        if (semantic(existing) === semantic(sealed)) return existing;
-        this.sealIncident("REQUEST_DIGEST_CONFLICT", `effect ${sealed.effect_id} re-sealed with different material`, [
-          { authority_ref: "cadp-store:k04", namespace: "effect", object_id: sealed.effect_id },
-          { authority_ref: sealed.target_ref.authority_ref, namespace: sealed.target_ref.target_type, object_id: sealed.target_ref.target_id },
-        ]);
-        throw new IngressRejection("REQUEST_DIGEST_CONFLICT");
+        if (semantic(existing) === semantic(sealed)) return { kind: "row", row: existing };
+        return { kind: "conflict" };
       }
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
-      return sealed;
+      return { kind: "row", row: sealed };
     });
+    if (outcome.kind === "conflict") {
+      // The incident must survive the rejected write: sealed in its OWN transaction.
+      this.sealIncident("REQUEST_DIGEST_CONFLICT", `effect ${sealed.effect_id} re-sealed with different material`, [
+        { authority_ref: "cadp-store:k04", namespace: "effect", object_id: sealed.effect_id },
+        { authority_ref: sealed.target_ref.authority_ref, namespace: sealed.target_ref.target_type, object_id: sealed.target_ref.target_id },
+      ]);
+      throw new IngressRejection("REQUEST_DIGEST_CONFLICT");
+    }
+    return outcome.row;
   }
 
   // ---------------------------------------------------------------- submit_evidence
@@ -227,6 +232,10 @@ export class Ingress {
       produced_at = sourceValue;
     } else {
       produced_at = nowIso(this.clock);
+    }
+
+    if (draft.availability === "UNKNOWN" && ((draft as { claim?: unknown }).claim !== undefined)) {
+      throw new IngressRejection("UNKNOWN_WITH_CLAIM", "UNKNOWN forbids claim/claim_digest (Spec K2)");
     }
 
     // Kind-specific ingress rules.
@@ -310,18 +319,22 @@ export class Ingress {
         availability: e.availability,
         unknown_reason: e.unknown_reason,
       });
-    return this.store.withImmediate(() => {
+    const outcome = this.store.withImmediate((): { kind: "row"; row: EvidenceEnvelopeV1 } | { kind: "conflict" } => {
       const existing = this.store.workStepByOrdinal(workRun, ordinal as number);
       if (existing !== undefined) {
-        if (semantic(existing) === semantic(envelope)) return existing; // replay converges, no incident
-        this.sealIncidentInTx("WORK_STEP_CONFLICT", `work run ${workRun} step ${ordinal} re-submitted with different payload`, [
-          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: workRun },
-        ]);
-        throw new IngressRejection("WORK_STEP_CONFLICT");
+        if (semantic(existing) === semantic(envelope)) return { kind: "row", row: existing }; // replay converges, no incident
+        return { kind: "conflict" };
       }
       this.store.insertEvidence(envelope, received_at, workRun, ordinal as number);
-      return envelope;
+      return { kind: "row", row: envelope };
     });
+    if (outcome.kind === "conflict") {
+      this.sealIncident("WORK_STEP_CONFLICT", `work run ${workRun} step ${ordinal} re-submitted with different payload`, [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: workRun },
+      ]);
+      throw new IngressRejection("WORK_STEP_CONFLICT");
+    }
+    return outcome.row;
   }
 
   private assertBackendObservedLocators(claim: unknown): void {

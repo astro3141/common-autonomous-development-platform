@@ -157,7 +157,7 @@ export class Pep {
       try {
         await adapter.verify_material(request.operation_kind, material);
       } catch (error) {
-        if (error instanceof MaterialIncomplete) {
+        if (error instanceof MaterialIncomplete || error instanceof CasMissing || error instanceof CasCorruption) {
           return { kind: "REFUSAL", reason: "MATERIAL_INCOMPLETE", detail: error.message };
         }
         throw error;
@@ -205,7 +205,10 @@ export class Pep {
           this.ingress.sealIncident(
             error.reason === "DIGEST_CORRUPTION" ? "DIGEST_CORRUPTION" : error.reason === "UNSUPPORTED_CONSTRAINT" ? "UNSUPPORTED_CONSTRAINT" : "DIGEST_CORRUPTION",
             error.message,
-            [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: request.effect_id }],
+            [
+              { authority_ref: "cadp-store:k04", namespace: "effect", object_id: request.effect_id },
+              { authority_ref: request.target_ref.authority_ref, namespace: request.target_ref.target_type, object_id: request.target_ref.target_id },
+            ],
           );
         }
         return { kind: "REFUSAL", reason: error.reason, detail: error.detail };
