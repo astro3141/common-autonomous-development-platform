@@ -17,7 +17,9 @@ import { join } from "node:path";
 
 import { jcsDigest } from "../kernel/canonical.ts";
 
-export const WORKER_ARGV_PREFIX: readonly string[] = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"];
+// Inside the isolation container the container itself is the sandbox boundary, so codex runs
+// with container-native full access (nesting bubblewrap adds no security and stalls startup).
+export const WORKER_ARGV_PREFIX: readonly string[] = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"];
 
 /** Relative paths copied from the host `~/.codex` into the worker sandbox — auth only. */
 export const WORKER_AUTH_FILES: readonly string[] = ["auth.json"];

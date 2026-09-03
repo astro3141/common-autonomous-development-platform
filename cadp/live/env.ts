@@ -163,6 +163,16 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
   const kernelConfigPath = join(dir, "kernel-config.json");
   writeFileSync(kernelConfigPath, JSON.stringify(kernelConfig, null, 2));
 
+  // Build/record the disposable surface-isolation image (node + git + codex) once.
+  const imageTag = "cadp-surface:1";
+  const imageDir = join(repoRootFrom(dir), "cadp/live/image");
+  try {
+    sh("docker", ["build", "-q", "-t", imageTag, imageDir]);
+  } catch (error) {
+    console.error(`warning: could not build worker image (${error instanceof Error ? error.message : error}); live surfaces will fail closed`);
+  }
+  writeFileSync(join(dir, "worker-image"), imageTag);
+
   const manifest: LiveEnvManifest = {
     dir,
     api_url: `http://127.0.0.1:${ports.api}`,
@@ -180,12 +190,25 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     kernel_config_path: kernelConfigPath,
     policy_content_digest: policyDigest,
   };
-  writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  // The principal→token map is credential material: it lives ONLY in the isolation-denied
+  // secret path (workflow-token-map.json), never in the manifest a surface might read.
+  writeFileSync(join(secretDir, "workflow-token-map.json"), JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  const publicManifest = { ...manifest, tokens: {} };
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify(publicManifest, null, 2), { mode: 0o644 });
   return manifest;
 }
 
 export function loadManifest(dir: string): LiveEnvManifest {
-  return JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as LiveEnvManifest;
+  const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as LiveEnvManifest;
+  // Tokens are held in the secret path, not the public manifest; the operator ctl re-hydrates
+  // them (it runs as the deployment operator, not as an untrusted surface).
+  const tokenPath = join(dir, "secret", "workflow-token-map.json");
+  if (existsSync(tokenPath)) manifest.tokens = JSON.parse(readFileSync(tokenPath, "utf8")) as Record<string, string>;
+  return manifest;
+}
+
+function repoRootFrom(_dir: string): string {
+  return join(import.meta.dirname, "..", "..");
 }
 
 /** Spawn a component in its own real OS process; pid file for later kill/restart scenarios. */

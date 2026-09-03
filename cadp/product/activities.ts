@@ -13,7 +13,9 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
-import { buildWorkerSandbox, reviewerEnv, verifierEnv, workerEnv, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
+import { buildWorkerSandbox, reviewerEnv, WORKER_ARGV_PREFIX, workerProfileDigest } from "./workerProfile.ts";
+import { dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
+import type { IsolationConfig } from "./isolation.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -26,6 +28,16 @@ function env(name: string): string {
 
 function workflowClient(): KernelClient {
   return new KernelClient(env("CADP_KERNEL_URL"), env("CADP_WORKFLOW_TOKEN"));
+}
+
+/** OS-isolation config for untrusted surfaces (TD §4.1). Fail closed if runtime is absent. */
+function isolationConfig(): IsolationConfig {
+  return {
+    worker_image: env("CADP_WORKER_IMAGE"),
+    governed_hosts: (process.env["CADP_GOVERNED_HOSTS"] ?? "github.com,api.github.com,codeload.github.com,objects.githubusercontent.com").split(",").filter(Boolean),
+    denied_ports: (process.env["CADP_DENIED_PORTS"] ?? "").split(",").map((p) => Number(p)).filter((n) => Number.isInteger(n) && n > 0),
+    denied_read_paths: (process.env["CADP_DENIED_READ_PATHS"] ?? "").split(":").filter(Boolean),
+  };
 }
 
 function sha256(bytes: Uint8Array | string): string {
@@ -328,16 +340,31 @@ export async function implementCandidate(input: {
       if (r.status !== 0) throw new Error(`checkout ${input.base_sha} failed: ${r.stderr.slice(0, 300)}`);
     }
 
-    // Worker sandbox (finding 2): ONE shared construction — fresh HOME, ONLY codex auth.json
-    // copied, no host config/MCP; the reach attestation probes this exact profile.
+    // Worker isolation (re-review blocker): codex runs inside a container. Its ONLY mounts are
+    // /ws (the checkout) and a copied auth.json — the host filesystem, the PEP secret dir, and
+    // manifest token material are unreachable; governed hosts are pinned dead. The sandbox
+    // still supplies only auth.json (finding 2), and the profile digest binds it.
     const sandbox = buildWorkerSandbox(base);
     const home = sandbox.home;
-
-    // Pinned worker argv (TD §8.1; #89 profile trap): part of worker_profile_digest.
-    const argv = [...WORKER_ARGV_PREFIX, "-C", workspace, input.work_item];
-    const workerRun = await runWithHeartbeat("codex", argv, { cwd: workspace, env: workerEnv(home), timeout: 900_000 });
+    const config = isolationConfig();
+    if (!(await dockerAvailable())) throw new Error("worker isolation runtime (docker) unavailable — failing closed");
+    const heartbeatTimer = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
+    let workerRun;
+    try {
+      const sessionsDir = join(home, "codex-sessions");
+      mkdirSync(sessionsDir, { recursive: true });
+      workerRun = await runWorker(config, {
+        workspace,
+        codexAuthDir: join(home, ".codex"),
+        sessionsDir,
+        argv: ["codex", ...WORKER_ARGV_PREFIX, "-C", "/ws", input.work_item],
+        timeout_ms: 900_000,
+      });
+    } finally {
+      clearInterval(heartbeatTimer);
+    }
     if (workerRun.status !== 0) {
-      throw new Error(`codex exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
+      throw new Error(`worker container exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
     }
 
     // The harness commits the worker-local candidate (worker cannot push — no credential).
@@ -357,7 +384,7 @@ export async function implementCandidate(input: {
     const { cas_key: bundle_cas_key } = await client.putBlob(readFileSync(bundlePath));
 
     // Backend identity: scan, don't address (#91) — locator-bearing observed facts only.
-    const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, home, workerRun.stdout);
+    const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, join(home, "codex-sessions"), workerRun.stdout);
 
     const workStep = await submitWorkStep({
       work_run_ref: input.work_run_ref,
@@ -382,7 +409,7 @@ export async function implementCandidate(input: {
 /** #91 method: scan the worker's own session log; PRESENT facts carry locators; absent = UNKNOWN. */
 async function submitBackendExecution(work_run_ref: string, step_ordinal: number, home: string, stdout: string): Promise<string> {
   const scanClient = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_BACKEND_SCAN_TOKEN"));
-  const sessionsDir = join(home, ".codex", "sessions");
+  const sessionsDir = home; // caller passes the codex sessions dir directly
   let modelValue: string | undefined;
   let locator: string | undefined;
   const scan = (file: string): void => {
@@ -514,9 +541,18 @@ export async function verifyCandidate(input: {
       return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
     }
 
-    // Finding 1: the candidate's own tests are untrusted code — scrubbed env, no kernel
-    // URL/tokens, no credential surfaces (same construction the negative control proves).
-    const test = await runWithHeartbeat("node", ["--test"], { cwd: workspace, env: verifierEnv(join(base, "verifier-home")), timeout: 300_000 });
+    // Verifier isolation (re-review blocker): the candidate's OWN test process runs inside a
+    // container with --network none and no host mount but the checkout — it cannot read the
+    // PEP secret path / manifest, and cannot reach the Kernel or any target.
+    const vconfig = isolationConfig();
+    if (!(await dockerAvailable())) throw new Error("verifier isolation runtime (docker) unavailable — failing closed");
+    const vHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
+    let test;
+    try {
+      test = await runVerifier(vconfig, { workspace, argv: ["node", "--test"], timeout_ms: 300_000 });
+    } finally {
+      clearInterval(vHeartbeat);
+    }
     const completed_at = nowMs();
     const conclusion = test.status === 0 ? "success" : "failure";
     const envelope = await verifier.submitEvidence({
@@ -574,13 +610,23 @@ export async function reviewCandidate(input: {
     const home = join(base, "home");
     mkdirSync(join(home, "tmp"), { recursive: true });
     const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
-    // Finding 3: minimal reviewer env — Claude auth context only; git/gh/SSH credential
-    // surfaces neutralized; no CADP_* vars, no token env (shared construction, probed).
-    const review = await runWithHeartbeat("claude", ["-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", prompt], {
-      cwd: workspace,
-      env: reviewerEnv(home),
-      timeout: 300_000,
-    });
+    // Reviewer isolation (re-review blocker): the reviewer needs host Claude auth, so it runs
+    // under a Seatbelt profile that denies the PEP secret path, the Kernel/target ports, and
+    // keychain/credential-helper execution — while keeping the provider egress it needs.
+    const rconfig = isolationConfig();
+    const rHeartbeat = setInterval(() => { try { heartbeat(); } catch { /* outside activity */ } }, 5000);
+    let review;
+    try {
+      review = await runReviewer(rconfig, {
+        workspace,
+        sandboxDir: home,
+        env: reviewerEnv(home),
+        argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
+        timeout_ms: 300_000,
+      });
+    } finally {
+      clearInterval(rHeartbeat);
+    }
     if (review.status !== 0 || review.stdout.trim().length === 0) {
       throw new Error(`reviewer surface failed (exit ${review.status}): ${(review.stderr || review.stdout).slice(0, 200)}`);
     }
