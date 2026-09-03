@@ -41,6 +41,7 @@ export interface LiveEnvManifest {
 const PRINCIPAL_TOKEN_NAMES = [
   "cadp-workflow", "cadp-worker-codex", "cadp-backend-scan", "cadp-reviewer-claude",
   "cadp-verifier", "sso:a.t.laplace@gmail.com", "cadp-depctl-probe", "cadp-depctl-target",
+  "cadp-improvement-intake",
 ];
 
 function sh(cmd: string, args: string[], options: { cwd?: string; input?: string } = {}): string {
@@ -74,6 +75,13 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     writeFileSync(
       join(seed, "test", "stats.test.mjs"),
       'import assert from "node:assert/strict";\nimport test from "node:test";\nimport { mean } from "../src/stats.mjs";\n\ntest("mean of empty is 0", () => assert.equal(mean([]), 0));\ntest("mean averages", () => assert.equal(mean([2, 4]), 3));\n',
+    );
+    // A regression test for an UNIMPLEMENTED function: `median` does not exist in src/stats.mjs,
+    // so `node --test` FAILS on the seed. This is the exact failing-CI anomaly the #104 intake
+    // development-positive proof repairs (implement median → regression + replay PASS).
+    writeFileSync(
+      join(seed, "test", "regression-median.test.mjs"),
+      'import assert from "node:assert/strict";\nimport test from "node:test";\nimport { median } from "../src/stats.mjs";\n\ntest("median of [1,3,2] is 2", () => assert.equal(median([1, 3, 2]), 2));\ntest("median of [] is 0", () => assert.equal(median([]), 0));\n',
     );
     writeFileSync(join(seed, "README.md"), "# cadp-v04 live target\n\nDisposable repository governed by the CADP v0.4 reference kernel.\n");
     sh("git", ["init", "--quiet", "-b", "main"], { cwd: seed });
