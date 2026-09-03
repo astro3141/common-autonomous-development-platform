@@ -5,7 +5,8 @@
  * sandboxed subprocesses with their own principals; no governed credential exists here.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { heartbeat } from "@temporalio/activity";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -263,6 +264,34 @@ function run(cmd: string, args: string[], options: { cwd?: string; env?: Record<
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
+/** Async runner that heartbeats while a long subprocess (codex/claude/tests) executes. */
+function runWithHeartbeat(cmd: string, args: string[], options: { cwd?: string; env?: Record<string, string>; timeout?: number } = {}): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      cwd: options.cwd,
+      env: options.env ?? (process.env as Record<string, string>),
+    });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => out.push(c));
+    child.stderr.on("data", (c: Buffer) => err.push(c));
+    const beat = setInterval(() => {
+      try { heartbeat(); } catch { /* outside activity context (tests) */ }
+    }, 5000);
+    const timer = setTimeout(() => child.kill("SIGKILL"), options.timeout ?? 600_000);
+    child.on("error", (error) => { clearInterval(beat); clearTimeout(timer); reject(error); });
+    child.on("close", (status) => {
+      clearInterval(beat);
+      clearTimeout(timer);
+      resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") });
+    });
+  });
+}
+
 /** Sandboxed subprocess env (TD §4.1): fresh HOME, no ambient tokens, no gh config. */
 function sandboxEnv(home: string): Record<string, string> {
   return {
@@ -307,7 +336,7 @@ export async function implementCandidate(input: {
 
     // Pinned worker argv (TD §8.1; #89 profile trap): part of worker_profile_digest.
     const argv = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", workspace, input.work_item];
-    const workerRun = run("codex", argv, { cwd: workspace, env: sandboxEnv(home), timeout: 900_000 });
+    const workerRun = await runWithHeartbeat("codex", argv, { cwd: workspace, env: sandboxEnv(home), timeout: 900_000 });
     if (workerRun.status !== 0) {
       throw new Error(`codex exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
     }
@@ -483,7 +512,7 @@ export async function verifyCandidate(input: {
       return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
     }
 
-    const test = run("node", ["--test"], { cwd: workspace, timeout: 300_000 });
+    const test = await runWithHeartbeat("node", ["--test"], { cwd: workspace, timeout: 300_000 });
     const completed_at = nowMs();
     const conclusion = test.status === 0 ? "success" : "failure";
     const envelope = await verifier.submitEvidence({
@@ -541,7 +570,7 @@ export async function reviewCandidate(input: {
     const home = join(base, "home");
     mkdirSync(join(home, "tmp"), { recursive: true });
     const prompt = `You are reviewing the exact committed change below (commit ${input.candidate_sha}) implementing: "${input.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
-    const review = run("claude", ["-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", prompt], {
+    const review = await runWithHeartbeat("claude", ["-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", prompt], {
       cwd: workspace,
       env: { ...sandboxEnv(home), HOME: process.env["HOME"] ?? home },
       timeout: 300_000,

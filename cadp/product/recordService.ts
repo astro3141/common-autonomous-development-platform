@@ -77,6 +77,11 @@ export function startRecordService(port: number, dbPath: string): Promise<Record
     }
 
     if (req.method === "PUT" && url.pathname === "/records") {
+      if (faultMode === "unavailable") {
+        // Hard outage: the connection dies before the request is processed — nothing lands.
+        res.destroy();
+        return;
+      }
       const chunks: Buffer[] = [];
       req.on("data", (c: Buffer) => chunks.push(c));
       req.on("end", () => {

@@ -32,6 +32,9 @@ export const humanDecisionSignal = defineSignal<[string]>("humanDecision");
 
 const acts = proxyActivities<typeof activities>({
   startToCloseTimeout: "15 minutes",
+  // Long activities heartbeat; a killed worker is detected within ~30s instead of the full
+  // start-to-close timeout, so restart recovery (P4) converges quickly.
+  heartbeatTimeout: "30 seconds",
   retry: {
     // Activities converge via durable kernel state reads (get_effect_state), never via blind
     // re-dispatch: the PEP refuses non-admissible ordinals, so retries are safe reads.

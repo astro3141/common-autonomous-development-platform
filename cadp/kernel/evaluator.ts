@@ -6,7 +6,7 @@
  */
 
 import { spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
 import { join } from "node:path";
 
@@ -99,6 +99,14 @@ export class OpaEvaluator implements EvaluatorPort {
 
   async start(): Promise<void> {
     if (this.#process !== undefined) return;
+    // The sidecar belongs to THIS PEP: a crashed kernel leaves an orphan holding the socket
+    // and serving a stale bundle — kill it and unlink the socket before binding fresh.
+    const pidPath = join(this.workDir, "opa.pid");
+    if (existsSync(pidPath)) {
+      const stale = Number(readFileSync(pidPath, "utf8").trim());
+      try { process.kill(stale, "SIGKILL"); } catch { /* already gone */ }
+    }
+    try { unlinkSync(this.#socketPath); } catch { /* absent */ }
     const config = {
       bundles: { cadp: { resource: `file://${this.#bundlePath}`, persist: false, polling: { min_delay_seconds: 1, max_delay_seconds: 2 } } },
       status: { console: true }, // enables GET /v1/status (TD §5.2: active_revision proof)
@@ -115,8 +123,10 @@ export class OpaEvaluator implements EvaluatorPort {
     });
     // status.console floods stderr with large status dumps; an unread pipe would block OPA.
     this.#process.stderr?.resume();
-    this.#process.on("exit", () => { this.#process = undefined; });
-    await this.#waitReady();
+    writeFileSync(join(this.workDir, "opa.pid"), String(this.#process.pid));
+    let exited = false;
+    this.#process.on("exit", () => { exited = true; this.#process = undefined; });
+    await this.#waitReady(() => exited);
     this.#opaVersion = await new Promise<string>((resolve) => {
       const p = spawn("opa", ["version"]);
       const chunks: Buffer[] = [];
@@ -128,8 +138,9 @@ export class OpaEvaluator implements EvaluatorPort {
     });
   }
 
-  async #waitReady(): Promise<void> {
+  async #waitReady(exited?: () => boolean): Promise<void> {
     for (let i = 0; i < 100; i += 1) {
+      if (exited?.() === true) throw new EvaluationUnavailable("OPA sidecar exited during startup");
       try {
         const res = await opaRequest(this.#socketPath, "GET", "/health");
         if (res.status === 200) return;
