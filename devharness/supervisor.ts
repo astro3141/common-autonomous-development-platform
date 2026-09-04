@@ -20,6 +20,8 @@ export type GitPort = {
   checkpointCommit(worktree: string, message: string): void
   changedFiles(worktree: string, baseSha: string): string[]
   push(worktree: string, branch: string): void
+  /** Ancestor check in the base clone (design-artifact visibility proof). */
+  isAncestorInBase(ancestor: string, descendant: string): boolean
 }
 
 export function realGitPort(cfg: HarnessConfig): GitPort {
@@ -34,6 +36,7 @@ export function realGitPort(cfg: HarnessConfig): GitPort {
     checkpointCommit: realGit.checkpointCommit,
     changedFiles: realGit.changedFiles,
     push: realGit.push,
+    isAncestorInBase: (anc, desc) => realGit.isAncestor(base, anc, desc),
   }
 }
 
@@ -163,17 +166,70 @@ export class Supervisor {
     return lane.status
   }
 
-  /** Is the design dependency merged? null = no dependency. */
-  private async designDependencyMerged(lane: Lane): Promise<boolean | null> {
-    if (lane.dependsOnDesignIssue === undefined) return null
+  /** Design dependency merge state. merged=null means no dependency. */
+  private async designDependency(lane: Lane): Promise<{ merged: boolean | null; mergeCommitSha?: string }> {
+    if (lane.dependsOnDesignIssue === undefined) return { merged: null }
     const designLaneId = laneIdFor('DESIGN', lane.dependsOnDesignIssue)
     const local = this.d.store.getLane(designLaneId)
     const branch = local?.branch ?? `harness/${designLaneId}`
-    if (local?.status === 'MERGED') return true
     const pr = local?.prNumber !== undefined
       ? await this.d.github.getPr(lane.repo, local.prNumber)
       : await this.d.github.findPrForBranch(lane.repo, branch)
-    return pr?.merged === true
+    if (pr?.merged === true) return { merged: true, mergeCommitSha: pr.mergeCommitSha }
+    if (local?.status === 'MERGED') return { merged: true }
+    return { merged: false }
+  }
+
+  /**
+   * B1: refresh the lane base to the exact post-design-merge base branch SHA
+   * and prove the landed design is contained in it, BEFORE any worktree is
+   * created. Returns false (and holds the lane) when the refresh is unsafe.
+   */
+  private async refreshBaseAfterDesignMerge(lane: Lane, designMergeCommitSha?: string): Promise<boolean> {
+    if (this.d.config.dryRun) {
+      this.d.log(`[dry-run] [${lane.laneId}] would refresh base to post-design-merge ${lane.baseBranch} and verify the design merge commit is contained`)
+      return true
+    }
+    if (lane.worktree !== '') return true // worktree already exists; base is fixed
+    const freshBase = this.d.git.resolveRemoteSha(lane.baseBranch)
+    if (designMergeCommitSha !== undefined && !this.d.git.isAncestorInBase(designMergeCommitSha, freshBase)) {
+      await this.step2(lane, {
+        type: 'BASE_REFRESH_FAILED',
+        reason: `design merge commit ${designMergeCommitSha.slice(0, 12)} is not contained in ${lane.baseBranch}@${freshBase.slice(0, 12)}`,
+      })
+      return false
+    }
+    if (lane.baseSha !== freshBase) {
+      this.d.log(`[${lane.laneId}] base refreshed ${lane.baseSha.slice(0, 12)} -> ${freshBase.slice(0, 12)} (post-design-merge)`)
+      lane.baseSha = freshBase
+      this.d.store.upsertLane(lane)
+    }
+    return true
+  }
+
+  /**
+   * B2: exact review identity must also hold on GitHub, not just in the local
+   * worktree. Raises a drift event and returns true when drift was handled.
+   */
+  private async remoteIdentityDrifted(lane: Lane, expectedHead: string): Promise<boolean> {
+    if (lane.prNumber !== undefined) {
+      const pr = await this.d.github.getPr(lane.repo, lane.prNumber)
+      if (pr.state === 'open' && pr.headSha !== '' && pr.headSha !== expectedHead) {
+        await this.step2(lane, { type: 'REMOTE_HEAD_DRIFT', observedRemoteHead: pr.headSha })
+        return true
+      }
+    }
+    const baseNow = await this.d.github.getBranchHead(lane.repo, lane.baseBranch)
+    if (lane.candidate !== undefined && baseNow !== lane.candidate.baseSha) {
+      lane.reviewerFindings = [
+        `Base branch ${lane.baseBranch} advanced to ${baseNow} after this candidate was based on ${lane.candidate.baseSha}. ` +
+        `Rebase the branch onto the new base (git fetch origin && git rebase ${baseNow}), resolve any conflicts, keep the work intact, rerun validation, and commit.`,
+      ]
+      lane.baseSha = baseNow
+      await this.step2(lane, { type: 'BASE_DRIFT', observedBaseSha: baseNow })
+      return true
+    }
+    return false
   }
 
   /**
@@ -184,14 +240,26 @@ export class Supervisor {
     const cfg = this.d.config
     switch (lane.status) {
       case 'PENDING': {
-        const dep = await this.designDependencyMerged(lane)
-        await this.step2(lane, { type: 'ADMIT', designDependencyMerged: dep })
+        const dep = await this.designDependency(lane)
+        if (dep.merged === true) {
+          // Design already landed at admission time: still take the refresh path.
+          const ok = await this.refreshBaseAfterDesignMerge(lane, dep.mergeCommitSha)
+          if (!ok) return true
+        }
+        await this.step2(lane, { type: 'ADMIT', designDependencyMerged: dep.merged })
         return this.statusOf(lane) === 'BLOCKED_ON_DESIGN'
       }
 
       case 'BLOCKED_ON_DESIGN': {
-        const dep = await this.designDependencyMerged(lane)
-        await this.step2(lane, { type: dep === true ? 'DESIGN_DEP_MERGED' : 'DESIGN_DEP_STILL_UNMERGED' })
+        const dep = await this.designDependency(lane)
+        if (dep.merged !== true) {
+          await this.step2(lane, { type: 'DESIGN_DEP_STILL_UNMERGED' })
+          return true
+        }
+        // B1: the dependent execution must build on the Human-landed design.
+        const ok = await this.refreshBaseAfterDesignMerge(lane, dep.mergeCommitSha)
+        if (!ok) return true
+        await this.step2(lane, { type: 'DESIGN_DEP_MERGED' })
         return this.statusOf(lane) === 'BLOCKED_ON_DESIGN'
       }
 
@@ -313,11 +381,20 @@ export class Supervisor {
           await this.step2(lane, { type: 'CANDIDATE_MUTATED', observedHeadSha: headBefore })
           return false
         }
+        // B2: exact identity must also hold remotely before review starts.
+        if (await this.remoteIdentityDrifted(lane, cand.headSha)) {
+          return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+        }
         const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
         this.d.log(`[${lane.laneId}] invoking ${this.d.reviewer.providerName} on ${cand.headSha.slice(0, 12)}`)
         const res = await this.d.reviewer.review({ lane, worktree: lane.worktree, issue, candidate: cand })
         const headAfter = this.d.git.headSha(lane.worktree)
         lane.currentHeadSha = headAfter
+        // B2: re-verify remote identity after review; a verdict for a drifted
+        // identity is discarded, never recorded.
+        if (res.outcome.kind === 'COMPLETE' && await this.remoteIdentityDrifted(lane, cand.headSha)) {
+          return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+        }
         if (res.outcome.kind === 'COMPLETE' && res.verdict !== undefined && headAfter === cand.headSha) {
           lane.reviews.push({
             baseSha: cand.baseSha, headSha: cand.headSha,
@@ -356,7 +433,18 @@ export class Supervisor {
         }
         if (lane.prNumber === undefined) return true
         const pr = await this.d.github.getPr(lane.repo, lane.prNumber)
-        await this.step2(lane, { type: pr.merged ? 'OBSERVED_MERGED' : 'OBSERVED_PR_STILL_OPEN' })
+        if (pr.merged) {
+          await this.step2(lane, { type: 'OBSERVED_MERGED' })
+          return this.statusOf(lane) !== 'MERGED'
+        }
+        // B2: a stale GO must not survive remote head or base drift while
+        // waiting on the human merge boundary.
+        if (!cfg.dryRun && lane.reviewedHeadSha !== undefined) {
+          if (await this.remoteIdentityDrifted(lane, lane.reviewedHeadSha)) {
+            return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+          }
+        }
+        await this.step2(lane, { type: 'OBSERVED_PR_STILL_OPEN' })
         return this.statusOf(lane) !== 'MERGED'
       }
 
@@ -432,7 +520,12 @@ export class Supervisor {
       }
       if (!cfg.dryRun) {
         this.d.store.upsertLane(lane)
-        await this.postReceipt('LANE_CREATED', lane, { depends_on_design: dependsOn ?? null })
+        await this.postReceipt('LANE_CREATED', lane, {
+          depends_on_design: dependsOn ?? null,
+          // Disclosure: worker isolation is registry/prompt-level, not a
+          // filesystem sandbox, so the exact invocation args stay on record.
+          actor_invocation_args: cfg.actorExtraArgs,
+        })
       } else {
         this.d.store.state.lanes[laneId] = lane // ephemeral store in dry-run
       }

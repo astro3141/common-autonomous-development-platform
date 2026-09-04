@@ -22,6 +22,9 @@ export type Event =
   | { type: 'CANDIDATE_FROZEN' }
   | { type: 'REVIEW_RESULT'; outcome: Outcome; verdict?: ReviewVerdict; headShaAtReviewEnd: string }
   | { type: 'CANDIDATE_MUTATED'; observedHeadSha: string }
+  | { type: 'REMOTE_HEAD_DRIFT'; observedRemoteHead: string } // foreign push to the lane branch
+  | { type: 'BASE_DRIFT'; observedBaseSha: string }           // base branch advanced past reviewed base
+  | { type: 'BASE_REFRESH_FAILED'; reason: string }           // post-design-merge base incoherent
   | { type: 'OBSERVED_MERGED' }
   | { type: 'OBSERVED_PR_STILL_OPEN' }
   | { type: 'RESTART_OBSERVED' } // lane found in a *_RUNNING status at startup
@@ -67,6 +70,44 @@ const hold = (status: 'HOLD_CAPACITY' | 'HOLD_UNKNOWN', reason: string): Decisio
 })
 
 /**
+ * Exact-candidate identity drift observed on GitHub rather than in the local
+ * worktree. Any such drift voids prior review authority (safety rules 5, 6).
+ */
+function routeIdentityDrift(
+  lane: Lane,
+  event: { type: 'REMOTE_HEAD_DRIFT'; observedRemoteHead: string } | { type: 'BASE_DRIFT'; observedBaseSha: string },
+  policy: RetryPolicy,
+): Decision {
+  if (event.type === 'REMOTE_HEAD_DRIFT') {
+    // A push to the lane branch that the supervisor did not perform is a
+    // foreign mutation of an owned lane: void reviews and stop for a human.
+    return {
+      status: 'HOLD_UNKNOWN',
+      actions: ['INVALIDATE_REVIEWS', 'POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
+      holdReason: `remote PR head ${event.observedRemoteHead.slice(0, 12)} diverged from the frozen candidate (foreign push to lane branch)`,
+      note: 'remote head drift; prior review authority void; holding for human',
+    }
+  }
+  // Base branch advanced: the reviewed identity's base is stale. Automatic
+  // supervisor rebase is out of scope; the bounded repair round instructs the
+  // worker (which owns the worktree) to rebase, then the full
+  // validate/freeze/re-review chain re-establishes every guarantee.
+  if (lane.attempt < policy.maxRepairRounds) {
+    return {
+      status: 'REPAIR_PENDING',
+      actions: ['INVALIDATE_REVIEWS', 'POST_RECEIPT'],
+      note: `base branch advanced to ${event.observedBaseSha.slice(0, 12)}; prior review void; routing bounded rebase repair`,
+    }
+  }
+  return {
+    status: 'HOLD_UNKNOWN',
+    actions: ['INVALIDATE_REVIEWS', 'POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
+    holdReason: `base branch advanced to ${event.observedBaseSha.slice(0, 12)} but repair bound is exhausted`,
+    note: 'base drift beyond repair bound; holding for human',
+  }
+}
+
+/**
  * Shared routing for non-COMPLETE provider outcomes. Identical rules for actor
  * and reviewer; the caller supplies role only for receipts. No provider
  * fallback exists anywhere in this table. (Safety rule 10.)
@@ -84,22 +125,29 @@ function routeProviderFailure(
     case 'AUTH_REQUIRED':
       return hold('HOLD_CAPACITY', `${role} AUTH_REQUIRED${inj}: ${outcome.detail}`)
     case 'RATE_LIMITED': {
-      if (
-        outcome.retryAfterSeconds !== undefined &&
-        lane.retryCount < policy.maxProviderRetries
-      ) {
+      // Retry is allowed only under the EXACT provider retry condition. The
+      // configured cap never shortens retry_after into an earlier retry: a
+      // retry_after beyond the maximum acceptable wait is a HOLD, not a
+      // faster retry.
+      if (outcome.retryAfterSeconds === undefined) {
+        return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (no authoritative retry condition)${inj}: ${outcome.detail}`)
+      }
+      if (outcome.retryAfterSeconds > policy.retryAfterCapSeconds) {
+        return hold(
+          'HOLD_CAPACITY',
+          `${role} RATE_LIMITED (retry_after=${outcome.retryAfterSeconds}s exceeds configured maximum wait ${policy.retryAfterCapSeconds}s; will not retry early)${inj}: ${outcome.detail}`,
+        )
+      }
+      if (lane.retryCount < policy.maxProviderRetries) {
         return {
           status: lane.status, // stay; supervisor re-runs the same step
           actions: ['RETRY_AFTER_DELAY'],
-          retryDelaySeconds: Math.min(outcome.retryAfterSeconds, policy.retryAfterCapSeconds),
+          retryDelaySeconds: outcome.retryAfterSeconds, // exactly the provider condition
           countsProviderRetry: true,
-          note: `${role} RATE_LIMITED with exact retry_after; bounded retry ${lane.retryCount + 1}/${policy.maxProviderRetries}`,
+          note: `${role} RATE_LIMITED with exact retry_after=${outcome.retryAfterSeconds}s; bounded retry ${lane.retryCount + 1}/${policy.maxProviderRetries}`,
         }
       }
-      const why = outcome.retryAfterSeconds === undefined
-        ? 'no authoritative retry condition'
-        : 'retry bound exhausted'
-      return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (${why})${inj}: ${outcome.detail}`)
+      return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (retry bound exhausted)${inj}: ${outcome.detail}`)
     }
     case 'PROVIDER_UNAVAILABLE': {
       if (lane.retryCount < policy.maxProviderRetries) {
@@ -173,10 +221,13 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
 
     case 'BLOCKED_ON_DESIGN':
       if (event.type === 'DESIGN_DEP_MERGED') {
-        return { status: 'WORKTREE_SETUP', actions: ['CREATE_WORKTREE'], note: 'design dependency merged; admitting execution' }
+        return { status: 'WORKTREE_SETUP', actions: ['CREATE_WORKTREE'], note: 'design dependency merged; admitting execution from refreshed post-merge base' }
       }
       if (event.type === 'DESIGN_DEP_STILL_UNMERGED') {
         return { status: 'BLOCKED_ON_DESIGN', actions: ['STOP_LANE_PROCESSING'], note: 'still blocked on design merge' }
+      }
+      if (event.type === 'BASE_REFRESH_FAILED') {
+        return hold('HOLD_UNKNOWN', `post-design-merge base refresh failed: ${event.reason}`)
       }
       break
 
@@ -255,6 +306,9 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           note: `candidate mutated (head ${event.observedHeadSha.slice(0, 12)}); prior review authority void; re-validating`,
         }
       }
+      if (event.type === 'REMOTE_HEAD_DRIFT' || event.type === 'BASE_DRIFT') {
+        return routeIdentityDrift(lane, event, policy)
+      }
       if (event.type === 'REVIEW_RESULT') {
         if (event.outcome.kind !== 'COMPLETE') {
           // Candidate remains frozen; actor is NOT re-invoked; no self-review.
@@ -316,6 +370,9 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           actions: ['INVALIDATE_REVIEWS', 'POST_RECEIPT', 'RUN_VALIDATION'],
           note: 'candidate mutated after GO; GO does not carry to new SHA; re-validating',
         }
+      }
+      if (event.type === 'REMOTE_HEAD_DRIFT' || event.type === 'BASE_DRIFT') {
+        return routeIdentityDrift(lane, event, policy)
       }
       break
 

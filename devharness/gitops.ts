@@ -64,3 +64,13 @@ export function changedFiles(worktree: string, baseSha: string): string[] {
 export function push(worktree: string, branch: string): void {
   git(worktree, ['push', '-u', 'origin', `HEAD:refs/heads/${branch}`])
 }
+
+/** True if `ancestor` is an ancestor of (or equal to) `descendant` in `repoDir`. */
+export function isAncestor(repoDir: string, ancestor: string, descendant: string): boolean {
+  try {
+    git(repoDir, ['merge-base', '--is-ancestor', ancestor, descendant])
+    return true
+  } catch {
+    return false
+  }
+}

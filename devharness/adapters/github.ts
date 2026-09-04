@@ -11,7 +11,7 @@ async function gh(args: string[]): Promise<string> {
 
 function toPr(raw: {
   number: number; headRefName: string; headRefOid: string; baseRefName: string
-  mergedAt: string | null; state: string
+  mergedAt: string | null; state: string; mergeCommit: { oid: string } | null
 }): PrInfo {
   const merged = raw.mergedAt !== null || raw.state === 'MERGED'
   return {
@@ -20,11 +20,12 @@ function toPr(raw: {
     headSha: raw.headRefOid,
     baseRefName: raw.baseRefName,
     merged,
+    mergeCommitSha: raw.mergeCommit?.oid,
     state: merged ? 'merged' : raw.state === 'OPEN' ? 'open' : 'closed',
   }
 }
 
-const PR_FIELDS = 'number,headRefName,headRefOid,baseRefName,mergedAt,state'
+const PR_FIELDS = 'number,headRefName,headRefOid,baseRefName,mergedAt,state,mergeCommit'
 
 /**
  * gh-CLI-backed GitHub adapter. Exposes NO merge operation: merging is the
@@ -71,6 +72,11 @@ export function createGitHubAdapter(readOnly: boolean): GitHubPort {
     async getPr(repo, num): Promise<PrInfo> {
       const out = await gh(['pr', 'view', String(num), '--repo', repo, '--json', PR_FIELDS])
       return toPr(JSON.parse(out) as Parameters<typeof toPr>[0])
+    },
+
+    async getBranchHead(repo, branch): Promise<string> {
+      const out = await gh(['api', `repos/${repo}/branches/${branch}`, '--jq', '.commit.sha'])
+      return out.trim()
     },
 
     async comment(repo, issueOrPr, body): Promise<void> {

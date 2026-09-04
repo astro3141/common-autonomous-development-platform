@@ -15,9 +15,13 @@ export class FakeGit implements GitPort {
   heads = new Map<string, string>()
   worktrees = new Set<string>()
   pushes: { worktree: string; branch: string; sha: string }[] = []
+  addWorktreeCalls: { worktree: string; branch: string; baseSha: string }[] = []
+  ancestorCalls: { ancestor: string; descendant: string }[] = []
   changed = new Map<string, string[]>()
   private seq = 0
   baseSha = 'base'.padEnd(40, '0')
+  ancestorResult = true
+  onPush?: (branch: string, sha: string) => void
 
   newSha(prefix = 'sha'): string {
     this.seq += 1
@@ -25,7 +29,8 @@ export class FakeGit implements GitPort {
   }
   ensureBaseClone(): string { return '/fake/base' }
   resolveRemoteSha(): string { return this.baseSha }
-  addWorktree(worktree: string, _branch: string, baseSha: string): void {
+  addWorktree(worktree: string, branch: string, baseSha: string): void {
+    this.addWorktreeCalls.push({ worktree, branch, baseSha })
     this.worktrees.add(worktree)
     this.heads.set(worktree, baseSha)
   }
@@ -35,7 +40,13 @@ export class FakeGit implements GitPort {
   checkpointCommit(): void {}
   changedFiles(worktree: string): string[] { return this.changed.get(worktree) ?? ['src/x.ts'] }
   push(worktree: string, branch: string): void {
-    this.pushes.push({ worktree, branch, sha: this.headSha(worktree) })
+    const sha = this.headSha(worktree)
+    this.pushes.push({ worktree, branch, sha })
+    this.onPush?.(branch, sha)
+  }
+  isAncestorInBase(ancestor: string, descendant: string): boolean {
+    this.ancestorCalls.push({ ancestor, descendant })
+    return this.ancestorResult
   }
 }
 
@@ -44,6 +55,8 @@ export class FakeGitHub implements GitHubPort {
   issues = new Map<number, IssueInfo>()
   prs = new Map<number, PrInfo>()
   branchPr = new Map<string, number>()
+  branchHeads = new Map<string, string>()
+  mainHead = 'base'.padEnd(40, '0')
   comments: { num: number; body: string }[] = []
   writeCalls: string[] = []
   private nextPr = 100
@@ -68,6 +81,10 @@ export class FakeGitHub implements GitHubPort {
     if (p === undefined) throw new Error(`no pr #${num}`)
     return p
   }
+  async getBranchHead(_repo: string, branch: string): Promise<string> {
+    if (branch === 'main') return this.mainHead
+    return this.branchHeads.get(branch) ?? ''
+  }
   async comment(_repo: string, num: number, body: string): Promise<void> {
     if (this.readOnly) throw new Error('dry-run: GitHub write refused (comment)')
     this.writeCalls.push(`comment#${num}`)
@@ -78,7 +95,8 @@ export class FakeGitHub implements GitHubPort {
     this.writeCalls.push(`createPr:${args.head}`)
     this.nextPr += 1
     const pr: PrInfo = {
-      number: this.nextPr, headRefName: args.head, headSha: '', baseRefName: args.base,
+      number: this.nextPr, headRefName: args.head,
+      headSha: this.branchHeads.get(args.head) ?? '', baseRefName: args.base,
       merged: false, state: 'open',
     }
     this.prs.set(pr.number, pr)
@@ -86,11 +104,15 @@ export class FakeGitHub implements GitHubPort {
     return pr.number
   }
   /** Test-only: the HUMAN merges. The harness has no path to this. */
-  humanMerge(num: number): void {
+  humanMerge(num: number, opts: { newMainSha?: string } = {}): void {
     const p = this.prs.get(num)
     if (p === undefined) throw new Error(`no pr #${num}`)
     p.merged = true
     p.state = 'merged'
+    if (opts.newMainSha !== undefined) {
+      p.mergeCommitSha = opts.newMainSha
+      this.mainHead = opts.newMainSha
+    }
   }
 }
 
@@ -160,6 +182,15 @@ export function makeWorld(overrides: Partial<HarnessConfig> = {}, stateDir?: str
   const store = new Store(dir, REPO, 1, { ephemeral: false })
   const git = new FakeGit()
   const github = new FakeGitHub()
+  // Pushing the lane branch updates the remote view, like a real push.
+  git.onPush = (branch, sha) => {
+    github.branchHeads.set(branch, sha)
+    const prNum = github.branchPr.get(branch)
+    if (prNum !== undefined) {
+      const pr = github.prs.get(prNum)
+      if (pr !== undefined) pr.headSha = sha
+    }
+  }
   const actor = new FakeActor(git)
   const reviewer = new FakeReviewer()
   const sleeps: number[] = []

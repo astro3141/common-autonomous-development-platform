@@ -39,13 +39,34 @@ Invariants enforced:
 
 - Exact-candidate rule: reviews bind `{repo, base SHA, head SHA, tree SHA,
   changed files}`; any head mutation (including rebase) invalidates prior
-  review; GO never carries to a new SHA.
+  review; GO never carries to a new SHA. Identity is checked locally AND
+  remotely (PR head + base branch SHA) before review, after review, and while
+  waiting on human merge: a foreign push to the lane branch voids reviews and
+  holds for a human; a base-branch advance voids reviews and routes a bounded
+  worker rebase-repair round (automatic supervisor rebase is out of scope).
+- Design-before-execution freshness: when a design dependency merges, the
+  dependent execution lane refreshes its base to the exact post-merge base
+  branch SHA and proves the design merge commit is contained in it before any
+  worktree is created.
 - Worktree ownership: one lane per worktree, registry-enforced.
 - Design must land (human merge) before dependent execution admits.
 - Resource exhaustion / UNKNOWN → durable HOLD receipts; partial output never
   becomes a review candidate; reviewer exhaustion never re-invokes the actor.
-- RATE_LIMITED retries only with an exact provider retry condition, bounded.
+- RATE_LIMITED retries only under the exact provider retry condition, bounded;
+  a `retry_after` beyond the configured maximum wait is a HOLD — the cap never
+  shortens a provider retry condition into an earlier retry.
 - Human merge only; no production deployment; no automatic Spec mutation.
+
+Explicit v1 semantics/limitations (accepted bootstrap scope):
+
+- GitHub is the canonical handoff/projection medium; the local durable store
+  is authoritative for in-flight execution. A failed receipt post is journaled
+  locally and does not stop the lane; the next receipt re-projects state.
+- Worker isolation is registry- and prompt-level, not a filesystem sandbox;
+  the exact worker invocation args are recorded in the LANE_CREATED receipt.
+- The supervisor does not semantically infer DESIGN from arbitrary issue
+  content: a lane is DESIGN only via marker/label/`--work N:design`, or via a
+  worker `STOP_DESIGN_REQUIRED` signal followed by human direction.
 
 Worker results are normalized to
 `COMPLETE | FAILED_WORK | RESOURCE_EXHAUSTED | RATE_LIMITED | AUTH_REQUIRED |

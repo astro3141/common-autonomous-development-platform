@@ -20,6 +20,7 @@ export type PrInfo = {
   headSha: string
   baseRefName: string
   merged: boolean
+  mergeCommitSha?: string
   state: 'open' | 'closed' | 'merged'
 }
 
@@ -32,6 +33,8 @@ export type GitHubPort = {
   listWorkIssues(repo: string, label: string): Promise<IssueInfo[]>
   findPrForBranch(repo: string, branch: string): Promise<PrInfo | undefined>
   getPr(repo: string, num: number): Promise<PrInfo>
+  /** Current tip SHA of a branch on GitHub (exact-identity drift checks). */
+  getBranchHead(repo: string, branch: string): Promise<string>
   comment(repo: string, issueOrPr: number, body: string): Promise<void>
   createPr(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<number>
   readonly readOnly: boolean
