@@ -127,6 +127,70 @@ human via `--work N:kind` annotations, which is the supported v1 mechanism;
 `#96`'s single-design dependency is a simplification of the canonical
 triple-gate — see known limitations.)
 
+## Control repair round — focused live proofs (issuecomment-5535154804)
+
+Run 2026-09-04, after landing B1/B2/B3 repairs. Same real composition.
+
+### B1 live — Design→Execution base freshness  ✅
+
+Design issue #18 (checksum design; one organic Codex design-review repair
+round) → GO `2ec171f21d96` (PR #20) → human proof-boundary merge advanced main
+`aca9b9656a44 → 613d16118af9`. Next run, dependent execution #19:
+
+```
+[exec-i19] base refreshed aca9b9656a44 -> 613d16118af9 (post-design-merge)
+worktree created FROM 613d16118af9; docs/design-checksum.md visible
+design merge commit verified as ancestor of the execution HEAD
+frozen candidate baseSha == 613d16118af9; changed files lib/checksum.js, tests/checksum.test.js
+→ real Codex review → GO b305f84e3ce4 → HUMAN_MERGE_READY (PR #21)
+```
+
+### B2 live — remote head drift (foreign push)  ✅
+
+An external clone pushed a commit (`9ed9d5c21136`) to `harness/exec-i12`
+while the local worktree stayed at the GO'd candidate `e5a6d83abae8`:
+
+```
+[exec-i12] HUMAN_MERGE_WAIT --REMOTE_HEAD_DRIFT--> HOLD_UNKNOWN
+both reviews (REQUEST_CHANGES, GO) invalidated; reviewedHeadSha cleared
+no re-review, no rebuild on the drifted identity; durable receipt posted
+```
+
+### B2 live — base/main advancement  ✅ (organic, at scale)
+
+Main had genuinely advanced (`→ aca9b9656a44` via the scenario-E design
+merge) after six lanes' GOs were frozen against older bases. On the first run
+with the repaired code, ALL six stale GOs were voided and repaired:
+
+```
+exec-i1/i3/i5/i7/i10/i15: HUMAN_MERGE_WAIT --BASE_DRIFT--> REPAIR_PENDING
+→ real Fable rebase-repair (explicit rebase instruction in findings)
+→ new exact heads, re-frozen with baseSha == aca9b9656a44
+→ real Codex re-reviews → GO on every lane (attempts 1–3, all within bound)
+```
+
+### B3 live — real provider limit (not injected)  ✅
+
+During exec-i19's first actor invocation the real Fable CLI returned a
+provider limit error (is_error, no authoritative retry condition):
+
+```
+ACTOR_RESULT RATE_LIMITED (no authoritative retry condition)
+→ HOLD_CAPACITY immediately; no shortened-interval retry; no fallback
+```
+
+This is genuine (non-FAULT_INJECTION) provider-limit evidence for the
+exhaustion semantics.
+
+### Empty-candidate guard (defect found and fixed during this round)
+
+The provider-limit death above left exec-i19's branch with zero commits; the
+human resume path then attempted to freeze an empty candidate (head == base),
+failing only at PR creation (safety net → HOLD_UNKNOWN). Repair: FREEZING now
+detects head == base / empty diff and routes CANDIDATE_EMPTY → bounded repair
+(never freezing, pushing, or reviewing empty work). Proven live on the next
+resume (log above) and pinned by a deterministic test.
+
 ## Deviations / operator notes
 
 - Proof-boundary merges performed: PR #16 (scenario E design). PRs
