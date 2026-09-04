@@ -127,6 +127,29 @@ test('B2c: base advancement detected before review start; reviewer never sees th
   assert.match(lane.reviewerFindings?.[0] ?? '', /Rebase/)
 })
 
+// Empty-candidate guard (surfaced by live proof): a lane whose worker died
+// before committing anything must never freeze or review an empty candidate.
+test('empty candidate (head == base) routes bounded repair, never review', async () => {
+  const w = makeWorld()
+  w.github.addIssue(78, 'work', 'body')
+  // First actor invocation "completes" without committing anything (e.g. it
+  // was resumed after a provider limit killed the real work).
+  w.actor.script = [
+    () => ({ outcome: { kind: 'COMPLETE', detail: 'claims done' }, actorSignal: 'COMPLETE' }),
+    // Second (repair) invocation actually commits.
+  ]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i78')
+  assert.equal(lane?.status, 'HUMAN_MERGE_WAIT')
+  assert.equal(w.actor.invocations.length, 2)
+  assert.equal(w.actor.invocations[1]?.taskKind, 'repair')
+  assert.match(w.actor.invocations[1]?.findings?.[0] ?? '', /no committed work/)
+  // The empty state was never frozen, pushed, or reviewed.
+  assert.equal(w.reviewer.invocations.length, 1)
+  assert.notEqual(w.reviewer.invocations[0]?.headSha, lane.baseSha)
+  assert.ok(w.git.pushes.every((p) => p.sha !== lane.baseSha))
+})
+
 // B3: provider retry_after is never shortened by the local cap.
 test('B3: retry_after exceeding the configured maximum wait holds instead of retrying early', async () => {
   const w = makeWorld() // cap = 120s

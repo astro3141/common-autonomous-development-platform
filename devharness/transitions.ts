@@ -20,6 +20,7 @@ export type Event =
   | { type: 'ACTOR_RESULT'; outcome: Outcome; actorSignal?: ActorSignal }
   | { type: 'VALIDATION_RESULT'; pass: boolean; detail: string }
   | { type: 'CANDIDATE_FROZEN' }
+  | { type: 'CANDIDATE_EMPTY' } // no committed work beyond base; not reviewable
   | { type: 'REVIEW_RESULT'; outcome: Outcome; verdict?: ReviewVerdict; headShaAtReviewEnd: string }
   | { type: 'CANDIDATE_MUTATED'; observedHeadSha: string }
   | { type: 'REMOTE_HEAD_DRIFT'; observedRemoteHead: string } // foreign push to the lane branch
@@ -287,6 +288,18 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
     case 'FREEZING':
       if (event.type === 'CANDIDATE_FROZEN') {
         return { status: 'REVIEW_RUNNING', actions: ['POST_RECEIPT', 'INVOKE_REVIEWER'], note: 'candidate frozen; invoking independent reviewer' }
+      }
+      if (event.type === 'CANDIDATE_EMPTY') {
+        // An empty candidate (head == base, no changed files) is never frozen
+        // or reviewed; the worker did not actually deliver.
+        if (lane.attempt < policy.maxRepairRounds) {
+          return {
+            status: 'REPAIR_PENDING',
+            actions: ['POST_RECEIPT'],
+            note: 'no committed work beyond base; routing bounded repair instead of reviewing an empty candidate',
+          }
+        }
+        return hold('HOLD_UNKNOWN', 'no committed work beyond base and repair bound exhausted')
       }
       break
 

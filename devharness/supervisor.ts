@@ -335,6 +335,13 @@ export class Supervisor {
         }
         this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
         const headSha = this.d.git.headSha(lane.worktree)
+        if (headSha === lane.baseSha || this.d.git.changedFiles(lane.worktree, lane.baseSha).length === 0) {
+          lane.reviewerFindings = [
+            'The branch contains no committed work beyond the base SHA. Complete the issue and commit the result on this branch.',
+          ]
+          await this.step2(lane, { type: 'CANDIDATE_EMPTY' })
+          return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+        }
         lane.candidate = {
           repo: lane.repo,
           baseSha: lane.baseSha,
