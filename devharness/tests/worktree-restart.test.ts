@@ -40,14 +40,16 @@ test('14: second lane claiming an owned worktree is refused and held', async () 
 test('16: restart during actor invocation resumes the same bounded lane without human relay', async () => {
   const w = makeWorld()
   w.github.addIssue(52, 'work', 'body')
-  // Simulate a crash mid-actor-invocation: persist ACTOR_RUNNING then "die".
-  w.actor.script = [(req) => {
-    w.git.heads.set(req.worktree, w.git.newSha('partial'))
-    throw new Error('simulated process death') // never reaches a result
-  }]
-  await w.sup.run([]).catch(() => {}) // the "crash"
+  // Simulate a machine stop mid-actor-invocation: the supervisor persisted
+  // ACTOR_RUNNING before spawning, then the process died — the invocation
+  // never produced a result (we simply never step past the persist point).
+  await w.sup.admitWork([])
   const persisted = w.store.getLane('exec-i52')
-  assert.equal(persisted?.status, 'ACTOR_RUNNING')
+  assert.ok(persisted)
+  await w.sup.step(persisted) // PENDING -> WORKTREE_SETUP
+  await w.sup.step(persisted) // worktree created -> ACTOR_RUNNING persisted; "death" here
+  assert.equal(persisted.status, 'ACTOR_RUNNING')
+  w.git.heads.set(persisted.worktree, 'partialX'.padEnd(40, '0')) // partial on-disk work
 
   // New process: same state dir, fresh supervisor. No human pastes anything.
   const w2 = makeWorld({}, w.stateDir)
@@ -67,11 +69,18 @@ test('16: restart during actor invocation resumes the same bounded lane without 
 test('16b: restart during review re-invokes reviewer on the same frozen candidate; actor untouched', async () => {
   const w = makeWorld()
   w.github.addIssue(53, 'work', 'body')
-  w.reviewer.script = [() => { throw new Error('simulated death mid-review') }]
-  await w.sup.run([]).catch(() => {})
+  // Drive to the point where REVIEW_RUNNING is persisted (candidate frozen),
+  // then "die" before the review step ever runs.
+  await w.sup.admitWork([])
   const persisted = w.store.getLane('exec-i53')
-  assert.equal(persisted?.status, 'REVIEW_RUNNING')
-  assert.ok(persisted?.candidate)
+  assert.ok(persisted)
+  await w.sup.step(persisted) // PENDING -> WORKTREE_SETUP
+  await w.sup.step(persisted) // -> ACTOR_RUNNING
+  await w.sup.step(persisted) // actor completes -> VALIDATING
+  await w.sup.step(persisted) // validation -> FREEZING
+  await w.sup.step(persisted) // frozen -> REVIEW_RUNNING persisted; "death" here
+  assert.equal(persisted.status, 'REVIEW_RUNNING')
+  assert.ok(persisted.candidate)
 
   const w2 = makeWorld({}, w.stateDir)
   const lane2 = w2.store.getLane('exec-i53')

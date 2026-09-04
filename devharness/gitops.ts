@@ -62,7 +62,10 @@ export function changedFiles(worktree: string, baseSha: string): string[] {
 }
 
 export function push(worktree: string, branch: string): void {
-  git(worktree, ['push', '-u', 'origin', `HEAD:refs/heads/${branch}`])
+  // force-with-lease: a rebase repair rewrites lane-branch history. The lane
+  // exclusively owns its branch (foreign pushes hold the lane), and the lease
+  // still refuses to clobber an unexpected remote head.
+  git(worktree, ['push', '--force-with-lease', '-u', 'origin', `HEAD:refs/heads/${branch}`])
 }
 
 /** True if `ancestor` is an ancestor of (or equal to) `descendant` in `repoDir`. */

@@ -551,7 +551,20 @@ export class Supervisor {
         // One pass per lane per round; yielded lanes are revisited next round
         // only if some other lane progressed (e.g. design merged unblocks).
         const before = lane.status
-        const yielded = await this.step(lane)
+        let yielded: boolean
+        try {
+          yielded = await this.step(lane)
+        } catch (err) {
+          // Outermost safety net: an unexpected step failure never crashes the
+          // run or guesses success — the lane holds durably for a human.
+          lane.status = 'HOLD_UNKNOWN'
+          lane.holdReason = `supervisor step error: ${String(err).slice(0, 300)}`
+          this.d.store.upsertLane(lane)
+          this.d.store.log({ stepError: true, laneId: lane.laneId, error: String(err) })
+          this.d.log(`[${lane.laneId}] step error -> HOLD_UNKNOWN: ${String(err)}`)
+          await this.postReceipt('HOLD_UNKNOWN', lane, { hold_reason: lane.holdReason })
+          yielded = true
+        }
         steps += 1
         if (!yielded || lane.status !== before) progress = true
         if (steps >= maxSteps) break

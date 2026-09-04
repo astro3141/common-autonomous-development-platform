@@ -36,6 +36,25 @@ test('11: unknown reviewer result holds with candidate frozen', async () => {
   assert.equal(w.actor.invocations.length, 1) // actor not reinvoked
 })
 
+// An unexpected exception inside a supervisor step is a durable hold, never a
+// crash of the run and never assumed success.
+test('step exception routes the lane to HOLD_UNKNOWN and the run survives', async () => {
+  const w = makeWorld()
+  w.github.addIssue(44, 'work', 'body')
+  w.github.addIssue(45, 'other work', 'body')
+  const orig = w.actor.defaultBehavior
+  w.actor.defaultBehavior = (req) => {
+    if (req.lane.laneId === 'exec-i44') throw new Error('adapter blew up')
+    return orig(req)
+  }
+  await w.sup.run([])
+  const broken = w.store.getLane('exec-i44')
+  assert.equal(broken?.status, 'HOLD_UNKNOWN')
+  assert.match(broken.holdReason ?? '', /supervisor step error: .*adapter blew up/)
+  // The other lane still completed normally.
+  assert.equal(w.store.getLane('exec-i45')?.status, 'HUMAN_MERGE_WAIT')
+})
+
 // STOP_DESIGN_REQUIRED routes to the human boundary, not invention.
 test('actor STOP_DESIGN_REQUIRED routes HUMAN_DIRECTION_WAIT', async () => {
   const w = makeWorld()
