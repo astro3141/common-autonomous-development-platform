@@ -1,5 +1,5 @@
 import type {
-  ActorSignal, Lane, LaneStatus, Outcome, RetryPolicy, ReviewVerdict,
+  ActorSignal, Lane, LaneStatus, Outcome, PendingDirection, RetryPolicy, ReviewVerdict,
 } from './types.ts'
 
 /**
@@ -17,7 +17,7 @@ export type Event =
   | { type: 'DESIGN_DEP_STILL_UNMERGED' }
   | { type: 'WORKTREE_READY' }
   | { type: 'WORKTREE_CONFLICT'; reason: string }
-  | { type: 'ACTOR_RESULT'; outcome: Outcome; actorSignal?: ActorSignal }
+  | { type: 'ACTOR_RESULT'; outcome: Outcome; actorSignal?: ActorSignal; actorSummary?: string }
   | { type: 'VALIDATION_RESULT'; pass: boolean; detail: string }
   | { type: 'CANDIDATE_FROZEN' }
   | { type: 'CANDIDATE_EMPTY' }         // no committed work beyond base; not reviewable
@@ -63,6 +63,10 @@ export type Decision = {
   countsRepairRound?: boolean
   /** which role's failure produced this hold (drives resume routing) */
   provenance?: 'actor' | 'reviewer'
+  /** persist this worker-reported direction request before yielding */
+  pendingDirection?: Omit<PendingDirection, 'at'>
+  /** a successful worker completion supersedes any stale direction request */
+  clearsPendingDirection?: boolean
   note: string
 }
 
@@ -277,14 +281,28 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           return routeProviderFailure('actor', lane, event.outcome, policy)
         }
         if (event.actorSignal === 'COMPLETE') {
-          return { status: 'VALIDATING', actions: ['RUN_VALIDATION'], resetsProviderRetry: true, note: 'actor complete; validating' }
+          return {
+            status: 'VALIDATING',
+            actions: ['RUN_VALIDATION'],
+            resetsProviderRetry: true,
+            clearsPendingDirection: true, // successful completion supersedes any stale direction request
+            note: 'actor complete; validating',
+          }
         }
         if (event.actorSignal === 'STOP_DESIGN_REQUIRED') {
           return {
             status: 'HUMAN_DIRECTION_WAIT',
             actions: ['POST_RECEIPT', 'STOP_LANE_PROCESSING'],
             resetsProviderRetry: true,
-            note: 'actor reports landed contract insufficient; routing to human direction (missing contract must not be invented)',
+            // Preserve the worker's exact reason: without it the human boundary
+            // is non-actionable. This is transported as a worker REPORT only;
+            // it is never answered or reinterpreted by the supervisor.
+            pendingDirection: {
+              actorSignal: 'STOP_DESIGN_REQUIRED',
+              directionSummary: event.actorSummary ?? '(worker provided no structured summary)',
+              sourceRole: lane.ownerRole,
+            },
+            note: 'worker reports landed contract insufficient; routing to human direction with the exact worker-reported reason (missing contract must not be invented)',
           }
         }
         return hold('HOLD_UNKNOWN', 'actor exited cleanly but produced no typed signal; success is not assumed', 'actor')

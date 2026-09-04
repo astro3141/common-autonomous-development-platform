@@ -228,3 +228,31 @@ reviewer-side resume keeps the frozen-candidate path with the actor untouched).
   (pid 1590) on the operator machine instead of the actor child; the scenario
   was redone with exact-PID kills. Harness code was not involved — operator
   procedure error only.
+
+## Issue #111 manual recovery — direction-summary preservation (live proof)
+
+Manual bounded Execution outside the harness per #111
+`issuecomment-5537739999` (the landed harness could not transport its own
+stop reason). Branch `recovery/issue-111` from landed main `2a49d909`.
+
+REAL provider STOP (not injected, not scripted): disposable issue #23 asks
+for an implementation whose pricing policy is deliberately absent and may not
+be substituted. The real Fable actor genuinely stopped:
+
+```
+[exec-i23] ACTOR_RESULT (real claude -p invocation)
+→ STOP_DESIGN_REQUIRED with the worker's own detailed reason
+  ("Cannot implement lib/pricing.js: the pricing tier policy … must land
+   before implementation. No changes committed; branch is clean.")
+→ HUMAN_DIRECTION_WAIT
+→ durable state: actor_signal / direction_summary (byte-exact) / source_role=actor
+→ canonical receipt on issue #23 carries the exact summary plus
+  authority = WORKER_REPORTED_INFORMATION_ONLY (not Human/Design authority)
+→ fresh-process status AND run: text preserved byte-exact, boundary held,
+  no worker re-invoked, nothing auto-answered
+```
+
+Falsification suite `direction-preservation.test.ts` (7 tests) additionally
+pins: designer source_role, restart preservation, COMPLETE-path absence of
+direction records, resume→completion superseding stale text, no-auto-answer
+across repeated runs, and the explicit no-summary placeholder.

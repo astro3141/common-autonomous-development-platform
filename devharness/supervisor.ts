@@ -139,6 +139,11 @@ export class Supervisor {
       }
       lane.reviewedHeadSha = undefined
     }
+    if (decision.pendingDirection !== undefined) {
+      lane.pendingDirection = { ...decision.pendingDirection, at: new Date().toISOString() }
+    } else if (decision.clearsPendingDirection === true) {
+      lane.pendingDirection = undefined
+    }
     if (decision.countsProviderRetry === true) lane.retryCount += 1
     if (decision.resetsProviderRetry === true) lane.retryCount = 0
     if (decision.countsRepairRound === true) lane.attempt += 1
@@ -152,7 +157,15 @@ export class Supervisor {
     if (decision.actions.includes('POST_HOLD_RECEIPT')) {
       await this.postReceipt(decision.status, lane, { hold_reason: decision.holdReason })
     } else if (decision.actions.includes('POST_RECEIPT')) {
-      await this.postReceipt(decision.status, lane, { note: decision.note })
+      const directionExtra = decision.status === 'HUMAN_DIRECTION_WAIT' && lane.pendingDirection !== undefined
+        ? {
+            actor_signal: lane.pendingDirection.actorSignal,
+            direction_summary: lane.pendingDirection.directionSummary,
+            source_role: lane.pendingDirection.sourceRole,
+            authority: 'WORKER_REPORTED_INFORMATION_ONLY — an Actor/Design-worker report, not Human or Design authority',
+          }
+        : {}
+      await this.postReceipt(decision.status, lane, { note: decision.note, ...directionExtra })
     }
     if (decision.actions.includes('RETRY_AFTER_DELAY') && decision.retryDelaySeconds !== undefined) {
       this.d.log(`[${lane.laneId}] bounded retry in ${decision.retryDelaySeconds}s`)
@@ -314,7 +327,10 @@ export class Supervisor {
         })
         lane.currentHeadSha = this.d.git.worktreeExists(lane.worktree) ? this.d.git.headSha(lane.worktree) : lane.currentHeadSha
         if (res.outcome.kind === 'COMPLETE') lane.reviewerFindings = undefined
-        await this.step2(lane, { type: 'ACTOR_RESULT', outcome: res.outcome, actorSignal: res.actorSignal })
+        await this.step2(lane, {
+          type: 'ACTOR_RESULT', outcome: res.outcome,
+          actorSignal: res.actorSignal, actorSummary: res.summary,
+        })
         return TERMINALLY_YIELDED.includes(this.statusOf(lane))
       }
 
@@ -604,7 +620,8 @@ export class Supervisor {
       (l.prNumber !== undefined ? `  pr=#${l.prNumber}` : '') +
       (l.candidate !== undefined ? `  frozen=${l.candidate.headSha.slice(0, 12)}` : '') +
       (l.reviewedHeadSha !== undefined ? `  reviewedGO=${l.reviewedHeadSha.slice(0, 12)}` : '') +
-      (l.holdReason !== undefined ? `  hold="${l.holdReason.slice(0, 100)}"` : ''),
+      (l.holdReason !== undefined ? `  hold="${l.holdReason.slice(0, 100)}"` : '') +
+      (l.pendingDirection !== undefined ? `  direction[${l.pendingDirection.sourceRole}]="${l.pendingDirection.directionSummary.slice(0, 120)}"` : ''),
     )
   }
 }
