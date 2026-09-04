@@ -20,7 +20,8 @@ export type Event =
   | { type: 'ACTOR_RESULT'; outcome: Outcome; actorSignal?: ActorSignal }
   | { type: 'VALIDATION_RESULT'; pass: boolean; detail: string }
   | { type: 'CANDIDATE_FROZEN' }
-  | { type: 'CANDIDATE_EMPTY' } // no committed work beyond base; not reviewable
+  | { type: 'CANDIDATE_EMPTY' }         // no committed work beyond base; not reviewable
+  | { type: 'CANDIDATE_BASE_UNPROVEN' } // recorded baseSha is not an ancestor of HEAD
   | { type: 'REVIEW_RESULT'; outcome: Outcome; verdict?: ReviewVerdict; headShaAtReviewEnd: string }
   | { type: 'CANDIDATE_MUTATED'; observedHeadSha: string }
   | { type: 'REMOTE_HEAD_DRIFT'; observedRemoteHead: string } // foreign push to the lane branch
@@ -60,13 +61,20 @@ export type Decision = {
   resetsProviderRetry?: boolean
   /** increment lane.attempt (repair round) */
   countsRepairRound?: boolean
+  /** which role's failure produced this hold (drives resume routing) */
+  provenance?: 'actor' | 'reviewer'
   note: string
 }
 
-const hold = (status: 'HOLD_CAPACITY' | 'HOLD_UNKNOWN', reason: string): Decision => ({
+const hold = (
+  status: 'HOLD_CAPACITY' | 'HOLD_UNKNOWN',
+  reason: string,
+  provenance?: 'actor' | 'reviewer',
+): Decision => ({
   status,
   actions: ['POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
   holdReason: reason,
+  provenance,
   note: `durable hold: ${reason}`,
 })
 
@@ -122,21 +130,22 @@ function routeProviderFailure(
   const inj = outcome.faultInjected ? ' [FAULT_INJECTION]' : ''
   switch (outcome.kind) {
     case 'RESOURCE_EXHAUSTED':
-      return hold('HOLD_CAPACITY', `${role} RESOURCE_EXHAUSTED${inj}: ${outcome.detail}`)
+      return hold('HOLD_CAPACITY', `${role} RESOURCE_EXHAUSTED${inj}: ${outcome.detail}`, role)
     case 'AUTH_REQUIRED':
-      return hold('HOLD_CAPACITY', `${role} AUTH_REQUIRED${inj}: ${outcome.detail}`)
+      return hold('HOLD_CAPACITY', `${role} AUTH_REQUIRED${inj}: ${outcome.detail}`, role)
     case 'RATE_LIMITED': {
       // Retry is allowed only under the EXACT provider retry condition. The
       // configured cap never shortens retry_after into an earlier retry: a
       // retry_after beyond the maximum acceptable wait is a HOLD, not a
       // faster retry.
       if (outcome.retryAfterSeconds === undefined) {
-        return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (no authoritative retry condition)${inj}: ${outcome.detail}`)
+        return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (no authoritative retry condition)${inj}: ${outcome.detail}`, role)
       }
       if (outcome.retryAfterSeconds > policy.retryAfterCapSeconds) {
         return hold(
           'HOLD_CAPACITY',
           `${role} RATE_LIMITED (retry_after=${outcome.retryAfterSeconds}s exceeds configured maximum wait ${policy.retryAfterCapSeconds}s; will not retry early)${inj}: ${outcome.detail}`,
+          role,
         )
       }
       if (lane.retryCount < policy.maxProviderRetries) {
@@ -148,7 +157,7 @@ function routeProviderFailure(
           note: `${role} RATE_LIMITED with exact retry_after=${outcome.retryAfterSeconds}s; bounded retry ${lane.retryCount + 1}/${policy.maxProviderRetries}`,
         }
       }
-      return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (retry bound exhausted)${inj}: ${outcome.detail}`)
+      return hold('HOLD_CAPACITY', `${role} RATE_LIMITED (retry bound exhausted)${inj}: ${outcome.detail}`, role)
     }
     case 'PROVIDER_UNAVAILABLE': {
       if (lane.retryCount < policy.maxProviderRetries) {
@@ -160,7 +169,7 @@ function routeProviderFailure(
           note: `${role} PROVIDER_UNAVAILABLE; bounded retry ${lane.retryCount + 1}/${policy.maxProviderRetries}`,
         }
       }
-      return hold('HOLD_CAPACITY', `${role} PROVIDER_UNAVAILABLE beyond retry bound${inj}: ${outcome.detail}`)
+      return hold('HOLD_CAPACITY', `${role} PROVIDER_UNAVAILABLE beyond retry bound${inj}: ${outcome.detail}`, role)
     }
     case 'PROCESS_CRASHED': {
       if (lane.retryCount < policy.maxProviderRetries) {
@@ -172,7 +181,7 @@ function routeProviderFailure(
           note: `${role} PROCESS_CRASHED; bounded retry ${lane.retryCount + 1}/${policy.maxProviderRetries}`,
         }
       }
-      return hold('HOLD_UNKNOWN', `${role} PROCESS_CRASHED beyond retry bound${inj}: ${outcome.detail}`)
+      return hold('HOLD_UNKNOWN', `${role} PROCESS_CRASHED beyond retry bound${inj}: ${outcome.detail}`, role)
     }
     case 'FAILED_WORK':
       if (role === 'actor' && lane.attempt < policy.maxRepairRounds) {
@@ -183,9 +192,9 @@ function routeProviderFailure(
           note: `${role} FAILED_WORK; bounded same-lane repair`,
         }
       }
-      return hold('HOLD_UNKNOWN', `${role} FAILED_WORK${role === 'actor' ? ' beyond repair bound' : ''}${inj}: ${outcome.detail}`)
+      return hold('HOLD_UNKNOWN', `${role} FAILED_WORK${role === 'actor' ? ' beyond repair bound' : ''}${inj}: ${outcome.detail}`, role)
     case 'UNKNOWN':
-      return hold('HOLD_UNKNOWN', `${role} UNKNOWN result${inj}: ${outcome.detail}`)
+      return hold('HOLD_UNKNOWN', `${role} UNKNOWN result${inj}: ${outcome.detail}`, role)
     case 'COMPLETE':
       throw new Error('routeProviderFailure called with COMPLETE')
   }
@@ -198,10 +207,23 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
   }
   if (event.type === 'HUMAN_RESUME') {
     if (lane.status === 'HOLD_CAPACITY' || lane.status === 'HOLD_UNKNOWN' || lane.status === 'HUMAN_DIRECTION_WAIT') {
-      // Resume at the safest equivalent point: re-validate whatever is in the
-      // worktree; validation + freeze + review re-establish every guarantee.
-      const status: LaneStatus = lane.worktree === '' ? 'PENDING' : 'VALIDATING'
-      return { status, actions: [], resetsProviderRetry: true, note: 'human resume; re-entering via validation' }
+      if (lane.worktree === '') {
+        return { status: 'PENDING', actions: [], resetsProviderRetry: true, note: 'human resume; re-admitting (no worktree yet)' }
+      }
+      // Reviewer-side capacity hold: the worker's candidate was complete and
+      // frozen; re-establish validation/freeze, then the reviewer.
+      if (lane.holdProvenance === 'reviewer') {
+        return { status: 'VALIDATING', actions: [], resetsProviderRetry: true, note: 'human resume (reviewer-side hold); re-entering via validation' }
+      }
+      // Actor-side or unknown provenance: FAIL CLOSED. The worker may have
+      // died mid-work; partial pre-resume state alone must never become a
+      // review candidate, so the same worker role is resumed first.
+      return {
+        status: 'ACTOR_INTERRUPTED',
+        actions: ['INVOKE_ACTOR'],
+        resetsProviderRetry: true,
+        note: 'human resume (actor-side/unknown hold); resuming the worker in the same lane before any validation/freeze/review',
+      }
     }
     return { status: lane.status, actions: [], note: 'resume ignored; lane not held' }
   }
@@ -265,7 +287,7 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
             note: 'actor reports landed contract insufficient; routing to human direction (missing contract must not be invented)',
           }
         }
-        return hold('HOLD_UNKNOWN', 'actor exited cleanly but produced no typed signal; success is not assumed')
+        return hold('HOLD_UNKNOWN', 'actor exited cleanly but produced no typed signal; success is not assumed', 'actor')
       }
       break
 
@@ -281,7 +303,7 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
             note: `validation failed (implementation problem, not design): ${event.detail}`,
           }
         }
-        return hold('HOLD_UNKNOWN', `validation failed beyond repair bound: ${event.detail}`)
+        return hold('HOLD_UNKNOWN', `validation failed beyond repair bound: ${event.detail}`, 'actor')
       }
       break
 
@@ -299,7 +321,20 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
             note: 'no committed work beyond base; routing bounded repair instead of reviewing an empty candidate',
           }
         }
-        return hold('HOLD_UNKNOWN', 'no committed work beyond base and repair bound exhausted')
+        return hold('HOLD_UNKNOWN', 'no committed work beyond base and repair bound exhausted', 'actor')
+      }
+      if (event.type === 'CANDIDATE_BASE_UNPROVEN') {
+        // The recorded base is NOT an ancestor of HEAD (e.g. the worker
+        // skipped a requested rebase). A falsely bound candidate is never
+        // frozen, pushed, or reviewed.
+        if (lane.attempt < policy.maxRepairRounds) {
+          return {
+            status: 'REPAIR_PENDING',
+            actions: ['POST_RECEIPT'],
+            note: 'recorded base is not an ancestor of HEAD; candidate binding unproven; routing bounded repair',
+          }
+        }
+        return hold('HOLD_UNKNOWN', 'base-ancestry proof failed and repair bound exhausted', 'actor')
       }
       break
 
@@ -353,7 +388,7 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           }
           return hold('HOLD_UNKNOWN', 'REQUEST_CHANGES beyond repair bound; human attention required')
         }
-        return hold('HOLD_UNKNOWN', 'reviewer exited cleanly but produced no typed verdict; success is not assumed')
+        return hold('HOLD_UNKNOWN', 'reviewer exited cleanly but produced no typed verdict; success is not assumed', 'reviewer')
       }
       break
 

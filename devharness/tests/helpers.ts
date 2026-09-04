@@ -21,6 +21,7 @@ export class FakeGit implements GitPort {
   private seq = 0
   baseSha = 'base'.padEnd(40, '0')
   ancestorResult = true
+  ancestorFn?: (ancestor: string, descendant: string) => boolean
   onPush?: (branch: string, sha: string) => void
 
   newSha(prefix = 'sha'): string {
@@ -46,7 +47,7 @@ export class FakeGit implements GitPort {
   }
   isAncestorInBase(ancestor: string, descendant: string): boolean {
     this.ancestorCalls.push({ ancestor, descendant })
-    return this.ancestorResult
+    return this.ancestorFn !== undefined ? this.ancestorFn(ancestor, descendant) : this.ancestorResult
   }
 }
 

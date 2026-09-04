@@ -148,6 +148,9 @@ export async function main(argv: string[]): Promise<number> {
       const decision = decide(lane, event, config.retry)
       lane.status = decision.status
       lane.holdReason = decision.holdReason
+      lane.holdProvenance = decision.status === 'HOLD_CAPACITY' || decision.status === 'HOLD_UNKNOWN'
+        ? decision.provenance ?? lane.holdProvenance
+        : undefined
       if (decision.resetsProviderRetry === true) lane.retryCount = 0
       store.upsertLane(lane)
       store.log({ human: cmd, laneId, note: decision.note })

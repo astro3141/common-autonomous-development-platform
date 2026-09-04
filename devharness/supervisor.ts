@@ -143,6 +143,9 @@ export class Supervisor {
     if (decision.resetsProviderRetry === true) lane.retryCount = 0
     if (decision.countsRepairRound === true) lane.attempt += 1
     lane.holdReason = decision.holdReason
+    lane.holdProvenance = decision.status === 'HOLD_CAPACITY' || decision.status === 'HOLD_UNKNOWN'
+      ? decision.provenance ?? lane.holdProvenance
+      : undefined
     lane.status = decision.status
     this.d.store.upsertLane(lane)
 
@@ -340,6 +343,17 @@ export class Supervisor {
             'The branch contains no committed work beyond the base SHA. Complete the issue and commit the result on this branch.',
           ]
           await this.step2(lane, { type: 'CANDIDATE_EMPTY' })
+          return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+        }
+        // R2: the candidate identity is only real if the recorded base is
+        // actually in the branch history. A worker that skipped a requested
+        // rebase is caught here, before any freeze/push/review.
+        if (!this.d.git.isAncestorInBase(lane.baseSha, headSha)) {
+          lane.reviewerFindings = [
+            `Recorded base ${lane.baseSha} is NOT an ancestor of branch HEAD ${headSha} — the requested rebase was not performed or not completed. ` +
+            `Run: git fetch origin && git rebase ${lane.baseSha}, resolve conflicts keeping the work intact, rerun validation, and commit.`,
+          ]
+          await this.step2(lane, { type: 'CANDIDATE_BASE_UNPROVEN' })
           return TERMINALLY_YIELDED.includes(this.statusOf(lane))
         }
         lane.candidate = {

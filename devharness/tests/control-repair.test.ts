@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { makeWorld, REPO } from './helpers.ts'
+import { decide } from '../transitions.ts'
+import { makeWorld, REPO, type World } from './helpers.ts'
 import type { Lane } from '../types.ts'
+
+/** Human resume exactly as the CLI applies it. */
+function humanResume(w: World, lane: Lane): void {
+  const d = decide(lane, { type: 'HUMAN_RESUME' }, w.cfg.retry)
+  lane.status = d.status
+  lane.holdReason = d.holdReason
+  lane.holdProvenance = undefined
+  if (d.resetsProviderRetry === true) lane.retryCount = 0
+  w.store.upsertLane(lane)
+}
 
 // Control pre-review gate repairs (PR #110, issuecomment-5535154804).
 
@@ -30,7 +41,7 @@ test('B1: after design merge advances main, dependent execution refreshes baseSh
   const wt = w.git.addWorktreeCalls.find((c) => c.branch === 'harness/exec-i71')
   assert.equal(wt?.baseSha, newMain)
   // ...and the design merge commit was proven contained in that base.
-  assert.deepEqual(w.git.ancestorCalls.at(-1), { ancestor: newMain, descendant: newMain })
+  assert.ok(w.git.ancestorCalls.some((c) => c.ancestor === newMain && c.descendant === newMain))
   // The frozen execution candidate is bound to the post-design base.
   assert.equal(exec.candidate?.baseSha, newMain)
 })
@@ -148,6 +159,113 @@ test('empty candidate (head == base) routes bounded repair, never review', async
   assert.equal(w.reviewer.invocations.length, 1)
   assert.notEqual(w.reviewer.invocations[0]?.headSha, lane.baseSha)
   assert.ok(w.git.pushes.every((p) => p.sha !== lane.baseSha))
+})
+
+// R1: resume from an actor-capacity hold must resume the ACTOR, never route
+// partial pre-resume state into validation/freeze/review.
+test('R1: actor-capacity hold resume re-invokes the actor before validation/freeze/review', async () => {
+  const w = makeWorld()
+  w.github.addIssue(80, 'work', 'body')
+  const partialSha = 'partialwork'.padEnd(40, '0')
+  w.actor.script = [(req) => {
+    w.git.heads.set(req.worktree, partialSha) // partial committed state
+    return { outcome: { kind: 'RESOURCE_EXHAUSTED', detail: 'usage limit reached' } }
+  }]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i80')
+  assert.equal(lane?.status, 'HOLD_CAPACITY')
+  assert.equal(lane.holdProvenance, 'actor')
+
+  humanResume(w, lane)
+  assert.equal(lane.status, 'ACTOR_INTERRUPTED') // NOT validating
+
+  await w.sup.run([])
+  // The actor was resumed in the same worktree before anything else.
+  assert.equal(w.actor.invocations.length, 2)
+  assert.equal(w.actor.invocations[1]?.taskKind, 'interrupted-resume')
+  // Partial pre-resume state never became the review candidate.
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+  assert.equal(w.reviewer.invocations.length, 1)
+  assert.notEqual(w.reviewer.invocations[0]?.headSha, partialSha)
+  assert.ok(w.git.pushes.every((p) => p.sha !== partialSha))
+})
+
+test('R1b: reviewer-capacity hold resume keeps the frozen candidate path; actor untouched', async () => {
+  const w = makeWorld()
+  w.github.addIssue(81, 'work', 'body')
+  w.reviewer.script = [() => ({ outcome: { kind: 'RESOURCE_EXHAUSTED', detail: 'quota' } })]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i81')
+  assert.equal(lane?.status, 'HOLD_CAPACITY')
+  assert.equal(lane.holdProvenance, 'reviewer')
+  const frozen = lane.candidate?.headSha
+  assert.ok(frozen)
+
+  humanResume(w, lane)
+  assert.equal(lane.status, 'VALIDATING') // reviewer-side: validation/freeze path
+
+  await w.sup.run([])
+  assert.equal(w.actor.invocations.length, 1) // actor NOT re-invoked
+  assert.equal(w.reviewer.invocations.length, 2)
+  assert.equal(w.reviewer.invocations[1]?.headSha, frozen) // same frozen candidate
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+})
+
+// R2: the recorded base must be machine-proven an ancestor of HEAD before any
+// freeze/push/review.
+test('R2: unrebased repair after base drift never freezes; caught by ancestry proof and repaired', async () => {
+  const w = makeWorld()
+  w.github.addIssue(82, 'work', 'body')
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i82')
+  assert.equal(lane?.status, 'HUMAN_MERGE_WAIT')
+
+  // Main advances; the required rebase will be skipped by the first repair.
+  const advanced = 'advancedmain2'.padEnd(40, '0')
+  w.github.mainHead = advanced
+  let rebased = false
+  w.git.ancestorFn = (anc) => (anc === advanced ? rebased : true)
+  w.actor.script = [
+    (req) => { // repair 1: commits but does NOT rebase
+      w.git.heads.set(req.worktree, w.git.newSha('norebase'))
+      return { outcome: { kind: 'COMPLETE', detail: 'claims rebased' }, actorSignal: 'COMPLETE' }
+    },
+    (req) => { // repair 2: actually rebases
+      rebased = true
+      w.git.heads.set(req.worktree, w.git.newSha('rebased'))
+      return { outcome: { kind: 'COMPLETE', detail: 'rebased for real' }, actorSignal: 'COMPLETE' }
+    },
+  ]
+  await w.sup.run([])
+
+  // The falsely bound candidate was never frozen, pushed, or reviewed.
+  const badPush = w.git.pushes.find((p) => p.sha.startsWith('norebase'))
+  assert.equal(badPush, undefined)
+  assert.ok(w.reviewer.invocations.every((r) => !r.headSha.startsWith('norebase')))
+  // The second repair round fixed it and re-review GO'd on the proven binding.
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+  assert.equal(lane.candidate?.baseSha, advanced)
+  assert.ok(lane.reviewedHeadSha?.startsWith('rebased'))
+  assert.match(
+    w.actor.invocations.at(-1)?.findings?.[0] ?? '',
+    /NOT an ancestor of branch HEAD/,
+  )
+})
+
+test('R2b: persistent ancestry failure exhausts the repair bound and holds', async () => {
+  const w = makeWorld()
+  w.github.addIssue(83, 'work', 'body')
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i83')
+  assert.equal(lane?.status, 'HUMAN_MERGE_WAIT')
+  const advanced = 'advancedmain3'.padEnd(40, '0')
+  w.github.mainHead = advanced
+  w.git.ancestorFn = (anc) => anc !== advanced // rebase never happens
+  await w.sup.run([])
+  assert.equal(lane.status, 'HOLD_UNKNOWN')
+  assert.match(lane.holdReason ?? '', /base-ancestry proof failed|base branch advanced/)
+  // Only the original (valid) candidate was ever reviewed.
+  assert.equal(w.reviewer.invocations.length, 1)
 })
 
 // B3: provider retry_after is never shortened by the local cap.

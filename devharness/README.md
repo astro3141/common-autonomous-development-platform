@@ -48,6 +48,16 @@ Invariants enforced:
   dependent execution lane refreshes its base to the exact post-merge base
   branch SHA and proves the design merge commit is contained in it before any
   worktree is created.
+- Candidate-binding proof: before ANY freeze/push/review, the recorded base
+  SHA is machine-proven (`git merge-base --is-ancestor`) to be an ancestor of
+  the candidate HEAD; a worker that skips a requested rebase is caught and
+  routed to bounded repair — a falsely bound candidate is never reviewed.
+- Provenance-aware resume: holds record which role failed. Resuming an
+  actor-side (or unknown-provenance) hold re-invokes the worker in the same
+  worktree BEFORE any validation/freeze/review — partial pre-resume output
+  alone can never become a review candidate. Only reviewer-side holds resume
+  through the validation → freeze → review path, since their candidate was
+  already complete and frozen.
 - Worktree ownership: one lane per worktree, registry-enforced.
 - Design must land (human merge) before dependent execution admits.
 - Resource exhaustion / UNKNOWN → durable HOLD receipts; partial output never

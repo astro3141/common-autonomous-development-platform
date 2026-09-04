@@ -80,6 +80,8 @@ export type Lane = {
   currentHeadSha: string
   ownerRole: OwnerRole
   status: LaneStatus
+  /** Which role's failure produced the current hold; drives resume routing. */
+  holdProvenance?: 'actor' | 'reviewer'
   candidate?: Candidate
   reviews: ReviewRecord[]
   reviewedHeadSha?: string
