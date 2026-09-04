@@ -12,6 +12,7 @@
 ## 0. Frozen current basis
 
 ```text
+main (candidate rebase base, past PR #112):     b30c623de50296b4ca1a8c99c463f4d219698654
 main (landed through PR #110 merge):            2a49d909c5962eeb507a7a5c62882e14393b8824
 TECHNICAL_DESIGN_cadp_v0_4_generation.md blob:  ca16fd9a324efa017fc7102e9e967477b4c00754   (TD v2.0 r7)
 Specification v0.4 blob:                        01ce0e787f7a6dcf283dc3e7bdacbced8c265201   (matches TD's declared Spec authority)
@@ -19,6 +20,11 @@ cadp/kernel/api.ts blob:                        6d3a8e42b0668168bf9994a00d4dd0e2
 cadp/kernel/reconciler.ts blob:                 f0f5318f9624310c364b61d56fc9c2ee6a8e3332   (measured reconcile evidence)
 issue-creation-time main (recorded):            8e63009fb3dd25fdeaf17ddf3023adcd8facb1ed
 ```
+
+Rebase note (repair round): the candidate was rebased from `2a49d90` onto `b30c623` per Review; the
+`2a49d90..b30c623` delta touches only `devharness/` bootstrap tooling and no-op commit pairs. All four
+frozen authority/evidence blobs above were re-verified byte-identical at `b30c623`, so every measured
+claim in this document remains valid against the rebased basis.
 
 Judgments fixed by the prior independent Review and Control disposition, preserved here unchanged:
 
