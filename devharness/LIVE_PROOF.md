@@ -191,6 +191,33 @@ detects head == base / empty diff and routes CANDIDATE_EMPTY → bounded repair
 (never freezing, pushing, or reviewing empty work). Proven live on the next
 resume (log above) and pinned by a deterministic test.
 
+## Control R1/R2 repair round — live spot proof (issuecomment-5535845790)
+
+One real run against the disposable repo covered both blockers end to end,
+using lane exec-i9 (the original actor-capacity FAULT_INJECTION hold, whose
+worktree still held preserved partial state):
+
+```
+R1: devharness resume exec-i9
+    → ACTOR_INTERRUPTED ("resuming the worker in the same lane before any
+      validation/freeze/review")
+    → real Fable invoked (interrupted-resume) in the preserved worktree
+    → the worker, not validation, decided the work's completion
+R2 (positive real path): at review pre-check, BASE_DRIFT fired (main had
+    advanced to 613d16118af9) → bounded rebase repair by the real worker
+    → FREEZING passed the real `git merge-base --is-ancestor` binding proof
+    → frozen 64df2f95da5a with candidate baseSha == 613d16118af9
+    → real Codex review → GO → HUMAN_MERGE_READY (PR #22)
+verified after the run: 613d16118af9 IS an ancestor of 64df2f95da5a
+```
+
+The R2 negative case (worker returns COMPLETE without rebasing → candidate
+must not freeze/review) is deterministically falsified by tests `R2`/`R2b`:
+the unproven head is never frozen, pushed, or reviewed, and persistent
+failure exhausts the repair bound into HOLD_UNKNOWN. R1's provenance split is
+pinned by tests `R1`/`R1b` (actor-side resume re-invokes the actor first;
+reviewer-side resume keeps the frozen-candidate path with the actor untouched).
+
 ## Deviations / operator notes
 
 - Proof-boundary merges performed: PR #16 (scenario E design). PRs
