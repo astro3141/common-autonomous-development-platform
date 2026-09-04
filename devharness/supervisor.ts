@@ -1,0 +1,483 @@
+import { execFile } from 'node:child_process'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+import * as realGit from './gitops.ts'
+import { decide, type Decision, type Event } from './transitions.ts'
+import type { Store } from './store.ts'
+import type { GitHubPort, ActorPort, ReviewerPort, IssueInfo } from './adapters/types.ts'
+import type { HarnessConfig, Lane, LaneKind } from './types.ts'
+
+const pexec = promisify(execFile)
+
+/** Local git port so deterministic tests can fake it. */
+export type GitPort = {
+  ensureBaseClone(): string
+  resolveRemoteSha(branch: string): string
+  addWorktree(worktree: string, branch: string, baseSha: string): void
+  worktreeExists(worktree: string): boolean
+  headSha(worktree: string): string
+  treeSha(worktree: string): string
+  checkpointCommit(worktree: string, message: string): void
+  changedFiles(worktree: string, baseSha: string): string[]
+  push(worktree: string, branch: string): void
+}
+
+export function realGitPort(cfg: HarnessConfig): GitPort {
+  let base = ''
+  return {
+    ensureBaseClone: () => (base = realGit.ensureBaseClone(cfg.stateDir, cfg.repo)),
+    resolveRemoteSha: (branch) => realGit.resolveRemoteSha(base, branch),
+    addWorktree: (w, b, sha) => realGit.addWorktree(base, w, b, sha),
+    worktreeExists: realGit.worktreeExists,
+    headSha: realGit.headSha,
+    treeSha: realGit.treeSha,
+    checkpointCommit: realGit.checkpointCommit,
+    changedFiles: realGit.changedFiles,
+    push: realGit.push,
+  }
+}
+
+export type ValidationRunner = (worktree: string, command: string) => Promise<{ pass: boolean; detail: string }>
+
+export const realValidationRunner: ValidationRunner = async (worktree, command) => {
+  try {
+    await pexec('sh', ['-c', command], { cwd: worktree, maxBuffer: 10 * 1024 * 1024 })
+    return { pass: true, detail: `\`${command}\` passed` }
+  } catch (err) {
+    const e = err as { code?: number; stdout?: string; stderr?: string }
+    const tail = `${e.stdout ?? ''}\n${e.stderr ?? ''}`.trim().slice(-1500)
+    return { pass: false, detail: `\`${command}\` failed (exit ${e.code}): ${tail}` }
+  }
+}
+
+export type SupervisorDeps = {
+  config: HarnessConfig
+  store: Store
+  github: GitHubPort
+  actor: ActorPort
+  reviewer: ReviewerPort
+  git: GitPort
+  runValidation: ValidationRunner
+  sleep: (seconds: number) => Promise<void>
+  log: (msg: string) => void
+}
+
+/** Parse harness routing markers from an issue body. Deterministic; no LLM. */
+export function classifyIssue(issue: IssueInfo): { kind: LaneKind; dependsOnDesignIssue?: number } {
+  const body = issue.body
+  const kind: LaneKind =
+    /^\s*HARNESS_LANE:\s*DESIGN\s*$/m.test(body) || issue.labels.includes('harness:design')
+      ? 'DESIGN'
+      : 'EXECUTION'
+  const dep = body.match(/^\s*HARNESS_DEPENDS_ON_DESIGN:\s*#?(\d+)\s*$/m)
+  return { kind, dependsOnDesignIssue: dep?.[1] !== undefined ? Number(dep[1]) : undefined }
+}
+
+export function laneIdFor(kind: LaneKind, issueNumber: number): string {
+  return `${kind === 'DESIGN' ? 'design' : 'exec'}-i${issueNumber}`
+}
+
+const TERMINALLY_YIELDED: Lane['status'][] = [
+  'HUMAN_MERGE_WAIT', 'HUMAN_DIRECTION_WAIT', 'HOLD_CAPACITY', 'HOLD_UNKNOWN', 'MERGED', 'BLOCKED_ON_DESIGN',
+]
+
+export class Supervisor {
+  readonly d: SupervisorDeps
+  constructor(deps: SupervisorDeps) {
+    this.d = deps
+  }
+
+  private receipt(kind: string, lane: Lane, extra: Record<string, unknown> = {}): string {
+    const payload = {
+      receipt: kind,
+      lane_id: lane.laneId,
+      lane_kind: lane.laneKind,
+      repo: lane.repo,
+      work_issue: lane.workIssue,
+      branch: lane.branch,
+      base_sha: lane.baseSha,
+      current_head_sha: lane.currentHeadSha,
+      status: lane.status,
+      attempt: lane.attempt,
+      ...extra,
+    }
+    return `devharness receipt: **${kind}**\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``
+  }
+
+  private async postReceipt(kind: string, lane: Lane, extra: Record<string, unknown> = {}): Promise<void> {
+    const body = this.receipt(kind, lane, extra)
+    if (this.d.config.dryRun) {
+      this.d.log(`[dry-run] would post receipt ${kind} on #${lane.workIssue}`)
+      return
+    }
+    try {
+      await this.d.github.comment(lane.repo, lane.workIssue, body)
+    } catch (err) {
+      // Receipts must not take down the lane; local journal still records it.
+      this.d.log(`WARN: receipt post failed: ${String(err)}`)
+    }
+    this.d.store.log({ receipt: kind, laneId: lane.laneId, ...extra })
+  }
+
+  /** Apply an engine decision to a lane: bookkeeping actions + persist. */
+  private async apply(lane: Lane, event: Event, decision: Decision): Promise<void> {
+    this.d.store.log({
+      transition: true, laneId: lane.laneId,
+      from: lane.status, event: event.type, to: decision.status, note: decision.note,
+    })
+    this.d.log(`[${lane.laneId}] ${lane.status} --${event.type}--> ${decision.status} (${decision.note})`)
+
+    if (decision.actions.includes('INVALIDATE_REVIEWS')) {
+      for (const r of lane.reviews) {
+        if (!r.invalidated) {
+          r.invalidated = true
+          r.invalidatedReason = decision.note
+        }
+      }
+      lane.reviewedHeadSha = undefined
+    }
+    if (decision.countsProviderRetry === true) lane.retryCount += 1
+    if (decision.resetsProviderRetry === true) lane.retryCount = 0
+    if (decision.countsRepairRound === true) lane.attempt += 1
+    lane.holdReason = decision.holdReason
+    lane.status = decision.status
+    this.d.store.upsertLane(lane)
+
+    if (decision.actions.includes('POST_HOLD_RECEIPT')) {
+      await this.postReceipt(decision.status, lane, { hold_reason: decision.holdReason })
+    } else if (decision.actions.includes('POST_RECEIPT')) {
+      await this.postReceipt(decision.status, lane, { note: decision.note })
+    }
+    if (decision.actions.includes('RETRY_AFTER_DELAY') && decision.retryDelaySeconds !== undefined) {
+      this.d.log(`[${lane.laneId}] bounded retry in ${decision.retryDelaySeconds}s`)
+      await this.d.sleep(decision.retryDelaySeconds)
+    }
+  }
+
+  private step2(lane: Lane, event: Event): Promise<void> {
+    return this.apply(lane, event, decide(lane, event, this.d.config.retry))
+  }
+
+  /** Re-read status after step2 mutation (defeats stale switch narrowing). */
+  private statusOf(lane: Lane): Lane['status'] {
+    return lane.status
+  }
+
+  /** Is the design dependency merged? null = no dependency. */
+  private async designDependencyMerged(lane: Lane): Promise<boolean | null> {
+    if (lane.dependsOnDesignIssue === undefined) return null
+    const designLaneId = laneIdFor('DESIGN', lane.dependsOnDesignIssue)
+    const local = this.d.store.getLane(designLaneId)
+    const branch = local?.branch ?? `harness/${designLaneId}`
+    if (local?.status === 'MERGED') return true
+    const pr = local?.prNumber !== undefined
+      ? await this.d.github.getPr(lane.repo, local.prNumber)
+      : await this.d.github.findPrForBranch(lane.repo, branch)
+    return pr?.merged === true
+  }
+
+  /**
+   * Advance one lane by one step. Returns true if the lane yielded (reached a
+   * human boundary / hold / blocked state) for this run.
+   */
+  async step(lane: Lane): Promise<boolean> {
+    const cfg = this.d.config
+    switch (lane.status) {
+      case 'PENDING': {
+        const dep = await this.designDependencyMerged(lane)
+        await this.step2(lane, { type: 'ADMIT', designDependencyMerged: dep })
+        return this.statusOf(lane) === 'BLOCKED_ON_DESIGN'
+      }
+
+      case 'BLOCKED_ON_DESIGN': {
+        const dep = await this.designDependencyMerged(lane)
+        await this.step2(lane, { type: dep === true ? 'DESIGN_DEP_MERGED' : 'DESIGN_DEP_STILL_UNMERGED' })
+        return this.statusOf(lane) === 'BLOCKED_ON_DESIGN'
+      }
+
+      case 'WORKTREE_SETUP': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would create worktree ${lane.worktree || '(new)'} branch ${lane.branch} from ${lane.baseSha.slice(0, 12)}`)
+          return true
+        }
+        const worktree = lane.worktree !== '' ? lane.worktree : join(cfg.stateDir, 'worktrees', lane.laneId)
+        try {
+          this.d.store.claimWorktree(worktree, lane.laneId) // throws if another lane owns it
+        } catch (err) {
+          await this.step2(lane, { type: 'WORKTREE_CONFLICT', reason: String(err) })
+          return true
+        }
+        if (!this.d.git.worktreeExists(worktree)) {
+          this.d.git.addWorktree(worktree, lane.branch, lane.baseSha)
+        }
+        lane.worktree = worktree
+        lane.currentHeadSha = this.d.git.headSha(worktree)
+        await this.step2(lane, { type: 'WORKTREE_READY' })
+        return false
+      }
+
+      case 'REPAIR_PENDING': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would start repair round ${lane.attempt + 1}`)
+          return true
+        }
+        await this.step2(lane, { type: 'WORKTREE_READY' })
+        return false
+      }
+
+      case 'ACTOR_RUNNING':
+      case 'ACTOR_INTERRUPTED': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would invoke ${lane.ownerRole} (${this.d.actor.providerName}) in ${lane.worktree}`)
+          return true
+        }
+        const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
+        const taskKind = lane.status === 'ACTOR_INTERRUPTED'
+          ? 'interrupted-resume'
+          : (lane.reviewerFindings !== undefined && lane.reviewerFindings.length > 0 ? 'repair' : 'fresh')
+        this.d.log(`[${lane.laneId}] invoking ${this.d.actor.providerName} (${taskKind})`)
+        const res = await this.d.actor.invoke({
+          lane, worktree: lane.worktree, taskKind, issue,
+          reviewerFindings: lane.reviewerFindings,
+          validationCommand: cfg.validationCommand,
+        })
+        lane.currentHeadSha = this.d.git.worktreeExists(lane.worktree) ? this.d.git.headSha(lane.worktree) : lane.currentHeadSha
+        if (res.outcome.kind === 'COMPLETE') lane.reviewerFindings = undefined
+        await this.step2(lane, { type: 'ACTOR_RESULT', outcome: res.outcome, actorSignal: res.actorSignal })
+        return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+      }
+
+      case 'VALIDATING': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would run validation`)
+          return true
+        }
+        const result = cfg.validationCommand !== undefined
+          ? await this.d.runValidation(lane.worktree, cfg.validationCommand)
+          : { pass: true, detail: 'no validation command configured' }
+        if (!result.pass) lane.reviewerFindings = [`Deterministic validation failed. ${result.detail}`]
+        await this.step2(lane, { type: 'VALIDATION_RESULT', pass: result.pass, detail: result.detail })
+        return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+      }
+
+      case 'FREEZING': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would freeze candidate + push + ensure PR`)
+          return true
+        }
+        this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
+        const headSha = this.d.git.headSha(lane.worktree)
+        lane.candidate = {
+          repo: lane.repo,
+          baseSha: lane.baseSha,
+          headSha,
+          treeSha: this.d.git.treeSha(lane.worktree),
+          changedFiles: this.d.git.changedFiles(lane.worktree, lane.baseSha),
+          frozenAt: new Date().toISOString(),
+        }
+        lane.currentHeadSha = headSha
+        this.d.git.push(lane.worktree, lane.branch)
+        if (lane.prNumber === undefined) {
+          const existing = await this.d.github.findPrForBranch(lane.repo, lane.branch)
+          lane.prNumber = existing !== undefined
+            ? existing.number
+            : await this.d.github.createPr(lane.repo, {
+                head: lane.branch,
+                base: lane.baseBranch,
+                title: `[harness ${lane.laneKind.toLowerCase()}] #${lane.workIssue}`,
+                body: `Candidate for #${lane.workIssue}. Managed by devharness lane \`${lane.laneId}\`. Human merge only.`,
+              })
+        }
+        this.d.store.upsertLane(lane)
+        await this.step2(lane, { type: 'CANDIDATE_FROZEN' })
+        await this.postReceipt('CANDIDATE_FROZEN', lane, {
+          candidate: lane.candidate, pr: lane.prNumber,
+        })
+        return false
+      }
+
+      case 'REVIEW_RUNNING':
+      case 'REVIEW_INTERRUPTED': {
+        if (cfg.dryRun) {
+          this.d.log(`[dry-run] [${lane.laneId}] would invoke reviewer (${this.d.reviewer.providerName}) on frozen candidate`)
+          return true
+        }
+        const cand = lane.candidate
+        if (cand === undefined) {
+          await this.step2(lane, { type: 'REVIEW_RESULT', outcome: { kind: 'UNKNOWN', detail: 'no frozen candidate' }, headShaAtReviewEnd: '' })
+          return true
+        }
+        const headBefore = this.d.git.headSha(lane.worktree)
+        if (headBefore !== cand.headSha) {
+          lane.currentHeadSha = headBefore
+          await this.step2(lane, { type: 'CANDIDATE_MUTATED', observedHeadSha: headBefore })
+          return false
+        }
+        const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
+        this.d.log(`[${lane.laneId}] invoking ${this.d.reviewer.providerName} on ${cand.headSha.slice(0, 12)}`)
+        const res = await this.d.reviewer.review({ lane, worktree: lane.worktree, issue, candidate: cand })
+        const headAfter = this.d.git.headSha(lane.worktree)
+        lane.currentHeadSha = headAfter
+        if (res.outcome.kind === 'COMPLETE' && res.verdict !== undefined && headAfter === cand.headSha) {
+          lane.reviews.push({
+            baseSha: cand.baseSha, headSha: cand.headSha,
+            verdict: res.verdict, summary: res.summary ?? '',
+            findings: res.findings ?? [], invalidated: false,
+            at: new Date().toISOString(),
+          })
+          if (res.verdict === 'GO') lane.reviewedHeadSha = cand.headSha
+          if (res.verdict === 'REQUEST_CHANGES') lane.reviewerFindings = res.findings ?? []
+          this.d.store.upsertLane(lane)
+        }
+        await this.step2(lane, {
+          type: 'REVIEW_RESULT', outcome: res.outcome, verdict: res.verdict, headShaAtReviewEnd: headAfter,
+        })
+        if (this.statusOf(lane) === 'HUMAN_MERGE_WAIT') {
+          await this.postReceipt('HUMAN_MERGE_READY', lane, {
+            reviewed_head_sha: lane.reviewedHeadSha, pr: lane.prNumber, verdict: 'GO',
+          })
+        } else if (this.statusOf(lane) === 'REPAIR_PENDING') {
+          await this.postReceipt('REVIEW_REQUEST_CHANGES', lane, {
+            reviewed_head_sha: cand.headSha, findings: res.findings, pr: lane.prNumber,
+          })
+        }
+        return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+      }
+
+      case 'HUMAN_MERGE_WAIT': {
+        // Detect post-GO mutation first: GO never carries to a new SHA.
+        if (!cfg.dryRun && lane.worktree !== '' && this.d.git.worktreeExists(lane.worktree)) {
+          const head = this.d.git.headSha(lane.worktree)
+          if (lane.reviewedHeadSha !== undefined && head !== lane.reviewedHeadSha) {
+            lane.currentHeadSha = head
+            await this.step2(lane, { type: 'CANDIDATE_MUTATED', observedHeadSha: head })
+            return false
+          }
+        }
+        if (lane.prNumber === undefined) return true
+        const pr = await this.d.github.getPr(lane.repo, lane.prNumber)
+        await this.step2(lane, { type: pr.merged ? 'OBSERVED_MERGED' : 'OBSERVED_PR_STILL_OPEN' })
+        return this.statusOf(lane) !== 'MERGED'
+      }
+
+      case 'HUMAN_DIRECTION_WAIT':
+      case 'HOLD_CAPACITY':
+      case 'HOLD_UNKNOWN':
+      case 'MERGED':
+        return true
+    }
+  }
+
+  /**
+   * Restart / startup reconciliation: rebuild a safe picture from the local
+   * registry + GitHub without any human state relay.
+   */
+  async reconcile(): Promise<void> {
+    for (const lane of this.d.store.lanes()) {
+      if (lane.status === 'ACTOR_RUNNING' || lane.status === 'REVIEW_RUNNING') {
+        await this.step2(lane, { type: 'RESTART_OBSERVED' })
+        continue
+      }
+      // Stale lane: mid-flight status but the worktree is gone.
+      const needsWorktree: Lane['status'][] = ['ACTOR_INTERRUPTED', 'VALIDATING', 'FREEZING', 'REVIEW_INTERRUPTED', 'REPAIR_PENDING']
+      if (needsWorktree.includes(lane.status) && lane.worktree !== '' && !this.d.git.worktreeExists(lane.worktree)) {
+        await this.step2(lane, { type: 'HUMAN_HOLD', reason: `stale lane: worktree ${lane.worktree} missing` })
+        continue
+      }
+      // Human may have merged while we were down.
+      if (lane.status === 'HUMAN_MERGE_WAIT' && lane.prNumber !== undefined && !this.d.config.dryRun) {
+        const pr = await this.d.github.getPr(lane.repo, lane.prNumber)
+        if (pr.merged) await this.step2(lane, { type: 'OBSERVED_MERGED' })
+      }
+    }
+  }
+
+  /** Admit new work from GitHub (label-discovered + explicitly requested). */
+  async admitWork(explicit: { issue: number; kind?: LaneKind; dependsOn?: number }[]): Promise<Lane[]> {
+    const cfg = this.d.config
+    const admitted: Lane[] = []
+    const discovered = cfg.workLabel !== ''
+      ? await this.d.github.listWorkIssues(cfg.repo, cfg.workLabel)
+      : []
+    const wanted = new Map<number, { kind?: LaneKind; dependsOn?: number }>()
+    for (const iss of discovered) wanted.set(iss.number, {})
+    for (const e of explicit) wanted.set(e.issue, { kind: e.kind, dependsOn: e.dependsOn })
+
+    for (const [num, hint] of [...wanted.entries()].sort((a, b) => a[0] - b[0])) {
+      const issue = await this.d.github.getIssue(cfg.repo, num)
+      if (issue.state !== 'open') continue
+      const cls = classifyIssue(issue)
+      const kind = hint.kind ?? cls.kind
+      const dependsOn = hint.dependsOn ?? cls.dependsOnDesignIssue
+      const laneId = laneIdFor(kind, num)
+      if (this.d.store.getLane(laneId) !== undefined) continue
+      const lane: Lane = {
+        laneId,
+        laneKind: kind,
+        repo: cfg.repo,
+        workIssue: num,
+        dependsOnDesignIssue: dependsOn,
+        baseBranch: cfg.baseBranch,
+        baseSha: cfg.dryRun ? '(dry-run: unresolved)' : this.d.git.resolveRemoteSha(cfg.baseBranch),
+        branch: `harness/${laneId}`,
+        worktree: '',
+        currentHeadSha: '',
+        ownerRole: kind === 'DESIGN' ? 'designer' : 'actor',
+        status: 'PENDING',
+        reviews: [],
+        attempt: 0,
+        retryCount: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }
+      if (!cfg.dryRun) {
+        this.d.store.upsertLane(lane)
+        await this.postReceipt('LANE_CREATED', lane, { depends_on_design: dependsOn ?? null })
+      } else {
+        this.d.store.state.lanes[laneId] = lane // ephemeral store in dry-run
+      }
+      admitted.push(lane)
+      this.d.log(`[${lane.laneId}] admitted (${kind}${dependsOn !== undefined ? `, after design #${dependsOn}` : ''})`)
+    }
+    return admitted
+  }
+
+  /**
+   * Drive all lanes until every lane is at a human boundary / hold, or the
+   * cycle bound is hit. Returns a summary line per lane.
+   */
+  async run(explicitWork: { issue: number; kind?: LaneKind; dependsOn?: number }[], maxSteps = 200): Promise<string[]> {
+    await this.reconcile()
+    await this.admitWork(explicitWork)
+    let steps = 0
+    let progress = true
+    while (progress && steps < maxSteps) {
+      progress = false
+      for (const lane of this.d.store.lanes()) {
+        if (TERMINALLY_YIELDED.includes(lane.status) && lane.status !== 'BLOCKED_ON_DESIGN' && lane.status !== 'HUMAN_MERGE_WAIT') continue
+        // One pass per lane per round; yielded lanes are revisited next round
+        // only if some other lane progressed (e.g. design merged unblocks).
+        const before = lane.status
+        const yielded = await this.step(lane)
+        steps += 1
+        if (!yielded || lane.status !== before) progress = true
+        if (steps >= maxSteps) break
+      }
+      // Second condition: if every lane is yielded at a boundary, stop.
+      const allYielded = this.d.store.lanes().every((l) => TERMINALLY_YIELDED.includes(l.status))
+      if (allYielded) break
+    }
+    return this.statusLines()
+  }
+
+  statusLines(): string[] {
+    return this.d.store.lanes().map((l) =>
+      `${l.laneId}  ${l.laneKind}  ${l.status}` +
+      `  issue=#${l.workIssue}  branch=${l.branch}` +
+      (l.prNumber !== undefined ? `  pr=#${l.prNumber}` : '') +
+      (l.candidate !== undefined ? `  frozen=${l.candidate.headSha.slice(0, 12)}` : '') +
+      (l.reviewedHeadSha !== undefined ? `  reviewedGO=${l.reviewedHeadSha.slice(0, 12)}` : '') +
+      (l.holdReason !== undefined ? `  hold="${l.holdReason.slice(0, 100)}"` : ''),
+    )
+  }
+}

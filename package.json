@@ -7,7 +7,8 @@
   "license": "MIT",
   "scripts": {
     "test": "node --test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "devharness": "node devharness/cli.ts"
   },
   "devDependencies": {
     "@temporalio/activity": "^1.23.0",
