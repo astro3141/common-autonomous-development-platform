@@ -14,6 +14,11 @@ import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { ScriptedIssues } from "./support/scriptedIssues.ts";
 import { GitHubIssuesAdapter } from "../kernel/adapters/githubIssues.ts";
+import { TemporalAdapter } from "../kernel/adapters/temporal.ts";
+import type { TemporalTransport } from "../kernel/adapters/temporal.ts";
+import { jcsDigest } from "../kernel/canonical.ts";
+import { resolveActivePolicy } from "../kernel/policyState.ts";
+import type { ResolvedAdmissionBundle } from "../kernel/evaluator.ts";
 import type { EvidenceEnvelopeV1, SubjectBinding } from "../kernel/records.ts";
 import {
   buildFindingClaim, submitFinding, submitResolution, buildProjectionMaterial,
@@ -77,12 +82,22 @@ const AUTHORITY_TEXT_RULE = {
   to_classification: "IMPLEMENTATION_GAP",
 };
 
-function submitAuthorityText(h: Harness): EvidenceEnvelopeV1 {
+/** Seal an authority-text observation. #107 S3: the envelope must name the exact predecessor
+ * Finding it clears; omit `finding` to build the (invalid) ambient form for negative controls. */
+function submitAuthorityText(h: Harness, finding?: EvidenceEnvelopeV1): EvidenceEnvelopeV1 {
   const completed_at = new Date(h.clock.now).toISOString();
   return h.ingress.submitEvidence(
     {
       evidence_kind: "VERIFICATION",
-      subject_bindings: [AUTHORITY_SUBJECT],
+      subject_bindings: [
+        AUTHORITY_SUBJECT,
+        ...(finding === undefined ? [] : [{
+          authority_ref: "cadp-store:k04",
+          namespace: "improvement-finding",
+          object_id: finding.evidence_id,
+          content_digest: finding.envelope_digest,
+        }]),
+      ],
       availability: "PRESENT",
       claim_schema: "cadp.authority-text-observation.v1",
       claim: { conclusion: "success", completed_at },
@@ -95,7 +110,9 @@ function submitAuthorityText(h: Harness): EvidenceEnvelopeV1 {
   );
 }
 
-function submitHumanDesignDecision(h: Harness, finding: EvidenceEnvelopeV1): EvidenceEnvelopeV1 {
+/** #107 S4: the PEP's recheck #5 requires a work_run-scoped decision to name the exact work run
+ * of the admitted request, so an admitting test must pass the run it will seal under. */
+function submitHumanDesignDecision(h: Harness, finding: EvidenceEnvelopeV1, decision = "APPROVE", work_run_ref?: string): EvidenceEnvelopeV1 {
   return h.ingress.submitEvidence(
     {
       evidence_kind: "HUMAN_DECISION",
@@ -108,8 +125,8 @@ function submitHumanDesignDecision(h: Harness, finding: EvidenceEnvelopeV1): Evi
       availability: "PRESENT",
       claim_schema: "cadp.human-design-decision.v1",
       claim: {
-        decision: "APPROVE",
-        scope: { work_run_ref: finding.evidence_id },
+        decision,
+        scope: { work_run_ref: work_run_ref ?? finding.evidence_id },
         statement: "the exact contract boundary has been decided",
       },
       producer_ref: "human:astro3141",
@@ -323,7 +340,7 @@ test("C11/C17: MODEL_PROPOSAL reclassification of CONTRACT_* (even citing author
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG1" });
     // F2 supersedes the CONTRACT_GAP, cites AUTHORITY_TEXT, but is MODEL_PROPOSAL → cannot clear (§3).
-    const authorityEnv = submitAuthorityText(h);
+    const authorityEnv = submitAuthorityText(h, c);
     const f2 = await makeReclass(h, c, {
       classification: "IMPLEMENTATION_GAP",
       derivation: { kind: "MODEL_PROPOSAL", method_ref: "prompt:reclass", method_digest: "pr", execution_or_run_ref: "run:9" },
@@ -377,7 +394,7 @@ test("#107 B18: authority basis digest mismatch or absent exact envelope fails c
   const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
   try {
     const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18-EXACT" });
-    const authority = submitAuthorityText(h);
+    const authority = submitAuthorityText(h, contractFinding);
 
     const mismatched = await makeReclass(h, contractFinding, {
       classification: "IMPLEMENTATION_GAP",
@@ -403,7 +420,7 @@ test("#107 B18 positive: exact policy-declared landed authority basis permits on
   const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
   try {
     const contractFinding = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "B18-POS" });
-    const authority = submitAuthorityText(h);
+    const authority = submitAuthorityText(h, contractFinding);
     const reclassified = await makeReclass(h, contractFinding, {
       classification: "IMPLEMENTATION_GAP",
       derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
@@ -438,6 +455,339 @@ test("#107 B18: PR_MERGE and POLICY_ACTIVATE remain denied while an authority ba
       assert.equal(result.outcome, "DENY", `${operation}: ${JSON.stringify(result)}`);
       assert.ok(result.reason_codes.includes("contract_barrier_nonindex_denied"), `${operation}: ${JSON.stringify(result.reason_codes)}`);
     }
+  } finally { h.close(); }
+});
+
+// ================================================================ #107 second round (PR #108 Review S1/S3/S4/S5)
+
+const HUMAN_RECLASS_DERIVATION = {
+  kind: "HUMAN_JUDGMENT" as const,
+  method_ref: "design:decision",
+  method_digest: "hd",
+  execution_or_run_ref: "human:astro3141",
+};
+
+function humanBasis(env: EvidenceEnvelopeV1, role: "AUTHORITY_TEXT" | "DIAGNOSTIC" = "AUTHORITY_TEXT") {
+  return [{ evidence_id: env.evidence_id, envelope_digest: env.envelope_digest.value, role }];
+}
+
+// ---------------------------------------------------------------- S1: decision semantics
+test("#107 S1: only APPROVE / EXCEPTION_ACCEPT Human decisions clear CONTRACT_*; REJECT/STOP/arbitrary keep the barrier", async () => {
+  const h = await makeHarness();
+  try {
+    for (const decision of ["REJECT", "STOP", "MAYBE", ""]) {
+      const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: `S1N-${decision || "EMPTY"}` });
+      const human = submitHumanDesignDecision(h, c, decision || "UNSPECIFIED");
+      const f = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(human) });
+      const r = await evalWorkStart(h, { finding: f, evidence: [f, c, human] });
+      assert.equal(r.outcome, "DENY", `decision ${decision}: ${JSON.stringify(r)}`);
+      assert.ok(r.reason_codes.includes("contract_barrier"), `decision ${decision}: ${JSON.stringify(r.reason_codes)}`);
+    }
+    for (const decision of ["APPROVE", "EXCEPTION_ACCEPT"]) {
+      const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: `S1P-${decision}` });
+      const human = submitHumanDesignDecision(h, c, decision);
+      const f = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(human) });
+      const r = await evalWorkStart(h, { finding: f, evidence: [f, c, human] });
+      assert.equal(r.outcome, "ALLOW", `decision ${decision}: ${JSON.stringify(r)}`);
+    }
+  } finally { h.close(); }
+});
+
+test("#107 S1: a decision cited under a non-authority role, or a non-decision envelope cited as authority, cannot clear", async () => {
+  const h = await makeHarness();
+  try {
+    // APPROVE decision exists and binds the exact predecessor, but the Finding cites it as DIAGNOSTIC.
+    const c1 = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S1-ROLE" });
+    const human = submitHumanDesignDecision(h, c1);
+    const wrongRole = await makeReclass(h, c1, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(human, "DIAGNOSTIC") });
+    const r1 = await evalWorkStart(h, { finding: wrongRole, evidence: [wrongRole, c1, human] });
+    assert.equal(r1.outcome, "DENY", JSON.stringify(r1));
+    assert.ok(r1.reason_codes.includes("contract_barrier"), JSON.stringify(r1.reason_codes));
+
+    // HUMAN_JUDGMENT citing an ordinary WORK_STEP self-report under AUTHORITY_TEXT.
+    const c2 = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S1-KIND" });
+    const ordinary = submitObservation(h, { authority_ref: "telemetry.example", namespace: "span", object_id: "not-a-decision", revision: "1" });
+    const wrongKind = await makeReclass(h, c2, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(ordinary) });
+    const r2 = await evalWorkStart(h, { finding: wrongKind, evidence: [wrongKind, c2, ordinary] });
+    assert.equal(r2.outcome, "DENY", JSON.stringify(r2));
+    assert.ok(r2.reason_codes.includes("contract_barrier"), JSON.stringify(r2.reason_codes));
+
+    // Kind guard bite: a NON-decision envelope that mimics every other predicate (claim.decision
+    // APPROVE, exact finding binding, authenticated integrity) — only evidence_kind stops it.
+    const c3 = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S1-MIMIC" });
+    const decisionShaped = h.ingress.submitEvidence(
+      {
+        evidence_kind: "WORK_STEP",
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "wr-s1-mimic" },
+          { authority_ref: "cadp-store:k04", namespace: "improvement-finding", object_id: c3.evidence_id, content_digest: c3.envelope_digest },
+        ],
+        availability: "PRESENT",
+        claim_schema: "cadp.work-step.v1",
+        claim: { step_ordinal: 1, summary: "smuggled decision", decision: "APPROVE" },
+        producer_ref: "workflow:cadp-work",
+        source_ref: "harness-observation",
+        source_relation: "SELF_REPORT",
+      },
+      PRINCIPALS.workflow,
+    );
+    const mimic = await makeReclass(h, c3, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(decisionShaped) });
+    const r3 = await evalWorkStart(h, { finding: mimic, evidence: [mimic, c3, decisionShaped] });
+    assert.equal(r3.outcome, "DENY", JSON.stringify(r3));
+    assert.ok(r3.reason_codes.includes("contract_barrier"), JSON.stringify(r3.reason_codes));
+  } finally { h.close(); }
+});
+
+// ---------------------------------------------------------------- S5: predecessor digest binding
+test("#107 S5: a supersedes ref with a mismatched predecessor digest never clears (Human and deterministic paths)", async () => {
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S5-PRED" });
+    const wrongPredecessor = [{ evidence_id: c.evidence_id, envelope_digest: "0".repeat(64) }];
+    // Human path: the decision itself binds the exact predecessor, only the supersedes digest lies.
+    const human = submitHumanDesignDecision(h, c);
+    const humanReclass = await makeFinding(h, {
+      classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION,
+      basis: humanBasis(human), supersedes: wrongPredecessor, correction_reason: "reclassification",
+    });
+    const r1 = await evalWorkStart(h, { finding: humanReclass, evidence: [humanReclass, c, human] });
+    assert.equal(r1.outcome, "DENY", JSON.stringify(r1));
+    assert.ok(r1.reason_codes.includes("contract_barrier"), JSON.stringify(r1.reason_codes));
+    // Deterministic path: valid landed authority for c, same lying supersedes digest.
+    const authority = submitAuthorityText(h, c);
+    const detReclass = await makeFinding(h, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authority), supersedes: wrongPredecessor, correction_reason: "reclassification",
+    });
+    const r2 = await evalWorkStart(h, { finding: detReclass, evidence: [detReclass, c, authority] });
+    assert.equal(r2.outcome, "DENY", JSON.stringify(r2));
+    assert.ok(r2.reason_codes.includes("contract_barrier"), JSON.stringify(r2.reason_codes));
+  } finally { h.close(); }
+});
+
+// ---------------------------------------------------------------- S3: exact finding-context binding
+test("#107 S3: deterministic authority evidence clears only the exact Finding it names — no ambient/transplanted clearance", async () => {
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
+  try {
+    const a = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S3-A" });
+    const b = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S3-B" });
+    const authorityForA = submitAuthorityText(h, a);
+
+    // Transplant: the sealed authority for A cited to clear B → DENY.
+    const reclassB = await makeReclass(h, b, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authorityForA),
+    });
+    const rB = await evalWorkStart(h, { finding: reclassB, evidence: [reclassB, b, authorityForA] });
+    assert.equal(rB.outcome, "DENY", JSON.stringify(rB));
+    assert.ok(rB.reason_codes.includes("contract_barrier"), JSON.stringify(rB.reason_codes));
+
+    // Ambient: an authority envelope naming no Finding at all → DENY.
+    const ambient = submitAuthorityText(h);
+    const reclassAmbient = await makeReclass(h, b, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(ambient),
+    });
+    const rAmbient = await evalWorkStart(h, { finding: reclassAmbient, evidence: [reclassAmbient, b, ambient] });
+    assert.equal(rAmbient.outcome, "DENY", JSON.stringify(rAmbient));
+
+    // Authority-digest guard bite: same producer/schema/finding binding but a DIFFERENT landed
+    // authority text digest than the rule's subject_binding — only the exact-digest check stops it.
+    const wrongTextAt = new Date(h.clock.now).toISOString();
+    const wrongText = h.ingress.submitEvidence(
+      {
+        evidence_kind: "VERIFICATION",
+        subject_bindings: [
+          { ...AUTHORITY_SUBJECT, content_digest: { ...AUTHORITY_SUBJECT.content_digest!, value: "1".repeat(64) } },
+          { authority_ref: "cadp-store:k04", namespace: "improvement-finding", object_id: b.evidence_id, content_digest: b.envelope_digest },
+        ],
+        availability: "PRESENT",
+        claim_schema: "cadp.authority-text-observation.v1",
+        claim: { conclusion: "success", completed_at: wrongTextAt },
+        produced_at: wrongTextAt,
+        producer_ref: "verifier:harness",
+        source_ref: "clean-checkout:spec-v0.4",
+        source_relation: "INDEPENDENT_OBSERVATION",
+      },
+      PRINCIPALS.verifier,
+    );
+    const reclassWrongText = await makeReclass(h, b, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(wrongText),
+    });
+    const rWrongText = await evalWorkStart(h, { finding: reclassWrongText, evidence: [reclassWrongText, b, wrongText] });
+    assert.equal(rWrongText.outcome, "DENY", JSON.stringify(rWrongText));
+
+    // Transition binding: the exact authority for A cannot carry a transition the rule does not declare.
+    const toBug = await makeReclass(h, a, {
+      classification: "BUG", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authorityForA),
+    });
+    const rBug = await evalWorkStart(h, { finding: toBug, evidence: [toBug, a, authorityForA] });
+    assert.equal(rBug.outcome, "DENY", JSON.stringify(rBug));
+
+    // From-classification binding: same rule, but the predecessor is CONTRACT_AMBIGUITY → DENY.
+    const amb = await makeFinding(h, { classification: "CONTRACT_AMBIGUITY", anomaly_code: "S3-FROM" });
+    const authorityForAmb = submitAuthorityText(h, amb);
+    const reclassAmb = await makeReclass(h, amb, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authorityForAmb),
+    });
+    const rFrom = await evalWorkStart(h, { finding: reclassAmb, evidence: [reclassAmb, amb, authorityForAmb] });
+    assert.equal(rFrom.outcome, "DENY", JSON.stringify(rFrom));
+
+    // The exact bound pair still clears: authority for A clearing A → ALLOW.
+    const reclassA = await makeReclass(h, a, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authorityForA),
+    });
+    const rA = await evalWorkStart(h, { finding: reclassA, evidence: [reclassA, a, authorityForA] });
+    assert.equal(rA.outcome, "ALLOW", JSON.stringify(rA));
+  } finally { h.close(); }
+});
+
+// ---------------------------------------------------------------- S5/E3: admission-path independence (raw rego layer)
+/** Seal a real intake WORK_START and return the pieces of a ResolvedAdmissionBundle so a test can
+ * evaluate the ACTIVE policy directly with falsified evidence that ingress cannot produce. */
+function sealWorkStartBundle(h: Harness, finding: EvidenceEnvelopeV1, evidence: EvidenceEnvelopeV1[]) {
+  const admission = buildFindingAdmission({ finding_ref: refOf(finding), purpose: "IMPLEMENTATION", conflict_complete: true });
+  const material = { finding_admission: admission, bounds: {} };
+  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
+  const effect_id = h.ingress.allocateEffectId({
+    schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
+    step_ordinal: (counter += 1), purpose: "work-start",
+  });
+  h.ingress.sealEffectRequest(
+    {
+      effect_id, requester_ref: "workflow:cadp-work",
+      work_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: `wr-${effect_id}` },
+        findingWorkBinding(refOf(finding)),
+      ],
+      target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: "cadp-v04" },
+      operation_kind: "WORK_START", material_schema: "cadp.work-start.v1", material_ref, prior_effect_refs: [],
+    },
+    PRINCIPALS.workflow,
+  );
+  const admission_input = h.ingress.assembleAdmissionInput(effect_id, evidence.map((e) => e.evidence_id));
+  return { admission_input, effect_request: h.store.effectRequest(effect_id)!, effect_material: material };
+}
+
+async function evaluateRaw(h: Harness, sealed: ReturnType<typeof sealWorkStartBundle>, evidence: EvidenceEnvelopeV1[]) {
+  const active = resolveActivePolicy(h.store, h.cas);
+  await h.evaluator.ensureLoaded(active);
+  const bundle: ResolvedAdmissionBundle = {
+    admission_input: sealed.admission_input,
+    effect_request: sealed.effect_request,
+    effect_material: sealed.effect_material,
+    evidence,
+    policy_ref: sealed.admission_input.policy_ref,
+    now: new Date(h.clock.now).toISOString(),
+  };
+  return h.evaluator.evaluate(bundle);
+}
+
+test("#107 S5/E3: the admission path itself fails closed on falsified authority integrity or schema", async () => {
+  const h = await makeHarness({ paramOverrides: { authority_text_rules: [AUTHORITY_TEXT_RULE] } });
+  try {
+    // Human path. Ingress hardcodes AUTHENTICATED_SOURCE, so an UNATTESTED decision can only be
+    // presented to policy directly — admission must still deny without producer-side help.
+    const c1 = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S5-RAW-H" });
+    const human = submitHumanDesignDecision(h, c1);
+    const f1 = await makeReclass(h, c1, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(human) });
+    const sealed1 = sealWorkStartBundle(h, f1, [f1, c1, human]);
+    const baseline1 = await evaluateRaw(h, sealed1, [f1, c1, human]);
+    assert.equal(baseline1.outcome, "ALLOW", JSON.stringify(baseline1));
+    const unattested = structuredClone(human) as { provenance: { integrity: string } };
+    unattested.provenance.integrity = "UNATTESTED";
+    const denied1 = await evaluateRaw(h, sealed1, [f1, c1, unattested as unknown as EvidenceEnvelopeV1]);
+    assert.equal(denied1.outcome, "DENY", JSON.stringify(denied1));
+
+    // Deterministic path: the resolved authority envelope's claim_schema must match the rule.
+    const c2 = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S5-RAW-D" });
+    const authority = submitAuthorityText(h, c2);
+    const f2 = await makeReclass(h, c2, {
+      classification: "IMPLEMENTATION_GAP", derivation: { kind: "DETERMINISTIC_DERIVATION", ...AUTHORITY_METHOD },
+      basis: humanBasis(authority),
+    });
+    const sealed2 = sealWorkStartBundle(h, f2, [f2, c2, authority]);
+    const baseline2 = await evaluateRaw(h, sealed2, [f2, c2, authority]);
+    assert.equal(baseline2.outcome, "ALLOW", JSON.stringify(baseline2));
+    const wrongSchema = structuredClone(authority) as { claim_schema: string };
+    wrongSchema.claim_schema = "cadp.work-step.v1";
+    const denied2 = await evaluateRaw(h, sealed2, [f2, c2, wrongSchema as unknown as EvidenceEnvelopeV1]);
+    assert.equal(denied2.outcome, "DENY", JSON.stringify(denied2));
+  } finally { h.close(); }
+});
+
+// ---------------------------------------------------------------- S4: real post-evaluation PEP path
+function scriptedTemporalTransport(): TemporalTransport {
+  const executions = new Map<string, { run_id: string; memo: Record<string, unknown>; status: string }>();
+  return {
+    async describeNamespace() {
+      return { namespace_id: "ns-scripted", retention_s: 3600 };
+    },
+    async start(input) {
+      if (executions.has(input.workflow_id)) return { kind: "already_started" };
+      executions.set(input.workflow_id, { run_id: `run-${executions.size + 1}`, memo: input.memo, status: "RUNNING" });
+      return { kind: "started", run_id: executions.get(input.workflow_id)!.run_id };
+    },
+    async describe(workflow_id) {
+      const found = executions.get(workflow_id);
+      return found === undefined ? { kind: "not_found" } : { kind: "found", ...found };
+    },
+  };
+}
+
+test("#107 S4: the sanctioned Human clearing path admits through the real PEP admitAndDispatch → COMMITTED", async () => {
+  let temporal!: TemporalAdapter;
+  const h = await makeHarness({
+    extraAdapterFactory: (_store, cas) => {
+      temporal = new TemporalAdapter(scriptedTemporalTransport(), cas, "cadp-v04", 3600);
+      return [temporal];
+    },
+  });
+  try {
+    const work_run = "wr-s4-implementation-run";
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S4" });
+    const human = submitHumanDesignDecision(h, c, "APPROVE", work_run);
+    const f = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", derivation: HUMAN_RECLASS_DERIVATION, basis: humanBasis(human) });
+
+    const args = { finding: f.evidence_id };
+    const args_cas_key = h.ingress.putBlob(Buffer.from(JSON.stringify(args), "utf8"));
+    const admission = buildFindingAdmission({ finding_ref: refOf(f), purpose: "IMPLEMENTATION", conflict_complete: true });
+    const effect_id = h.ingress.allocateEffectId({
+      schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
+      step_ordinal: (counter += 1), purpose: "work-start",
+    });
+    const material = {
+      finding_admission: admission, bounds: {},
+      workflow_id: `cadp-work-${effect_id}`, workflow_type: "cadpWork", task_queue: "cadp-worker",
+      args_cas_key, args_digest: jcsDigest(args).value,
+    };
+    const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
+    h.ingress.sealEffectRequest(
+      {
+        effect_id, requester_ref: "workflow:cadp-work",
+        work_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: work_run },
+          findingWorkBinding(refOf(f)),
+        ],
+        target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: "ns-scripted" },
+        operation_kind: "WORK_START", material_schema: "cadp.work-start.v1", material_ref, prior_effect_refs: [],
+      },
+      PRINCIPALS.workflow,
+    );
+    h.sealReach();
+    await h.pep.refreshTargetIdentity(temporal);
+    const inp = h.ingress.assembleAdmissionInput(effect_id, [f, c, human].map((e) => e.evidence_id));
+    const evaluated = await h.evaluate(inp.input_digest.value);
+    assert.equal(evaluated.kind, "DECISION");
+    if (evaluated.kind !== "DECISION") return;
+    assert.equal(evaluated.decision.outcome, "ALLOW", JSON.stringify(evaluated.decision));
+    const admitted = await h.pep.admitAndDispatch(effect_id, evaluated.decision.decision_id);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    assert.equal(admitted.kind === "ADMITTED" ? admitted.outcome.result : "", "COMMITTED", JSON.stringify(admitted));
   } finally { h.close(); }
 });
 

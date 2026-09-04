@@ -309,15 +309,18 @@ authority_resolution_names(cid) if {
 	e.claim.finding_tip_ref.envelope_digest == fc.envelope_digest.value
 }
 
-# A Human reclassification basis must resolve to a PRESENT, authenticated HUMAN_DECISION bound to
-# the exact predecessor Finding. This preserves the valid Human path without trusting a derivation
-# label or an absent/mismatched basis envelope.
+# A Human reclassification basis must resolve to a PRESENT, authenticated HUMAN_DECISION that is
+# cited under the authority role, bound to the exact predecessor Finding, and whose decision
+# semantics authorize the transition (#107 S1): only APPROVE / EXCEPTION_ACCEPT clear; REJECT,
+# STOP, or any other decision value keeps the barrier.
 human_reclassification_basis(e, fc) if {
 	some b in e.claim.basis
+	b.role == "AUTHORITY_TEXT"
 	authority := evidence_by_exact_ref(b)
 	authority.evidence_kind == "HUMAN_DECISION"
 	authority.availability == "PRESENT"
 	authority.provenance.integrity in {"AUTHENTICATED_SOURCE", "SIGNED_ATTESTATION"}
+	authority.claim.decision in {"APPROVE", "EXCEPTION_ACCEPT"}
 	some subject in authority.subject_bindings
 	subject.authority_ref == "cadp-store:k04"
 	subject.namespace == "improvement-finding"
@@ -327,7 +330,9 @@ human_reclassification_basis(e, fc) if {
 
 # A deterministic authority-text transition is an exact active-policy rule, not a claim-authored
 # role. The cited pair must resolve in this admission, and the resolved K2 envelope must match every
-# authority identity/provenance/method/transition field in one policy rule.
+# authority identity/provenance/method/transition field in one policy rule. The authority envelope
+# must additionally name the exact predecessor Finding it clears (#107 S3): one sealed authority
+# observation is never standing/ambient clearance across unrelated Findings, work runs, or time.
 deterministic_authority_basis(e, fc) if {
 	e.claim.derivation.kind == "DETERMINISTIC_DERIVATION"
 	some b in e.claim.basis
@@ -342,6 +347,11 @@ deterministic_authority_basis(e, fc) if {
 	authority.provenance.integrity == rule.integrity
 	some subject in authority.subject_bindings
 	subject == rule.subject_binding
+	some fb in authority.subject_bindings
+	fb.authority_ref == "cadp-store:k04"
+	fb.namespace == "improvement-finding"
+	fb.object_id == fc.evidence_id
+	fb.content_digest.value == fc.envelope_digest.value
 	e.claim.derivation.method_ref == rule.method_ref
 	e.claim.derivation.method_digest == rule.method_digest
 	fc.claim.classification == rule.from_classification
