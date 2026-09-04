@@ -67,6 +67,17 @@ export type ReviewRecord = {
 
 export type OwnerRole = 'actor' | 'designer'
 
+/**
+ * Durable record of a worker's STOP_DESIGN_REQUIRED report. This is
+ * worker-REPORTED information only — never Human/Design authority.
+ */
+export type PendingDirection = {
+  actorSignal: 'STOP_DESIGN_REQUIRED'
+  directionSummary: string
+  sourceRole: OwnerRole
+  at: string
+}
+
 export type Lane = {
   laneId: string
   laneKind: LaneKind
@@ -82,6 +93,8 @@ export type Lane = {
   status: LaneStatus
   /** Which role's failure produced the current hold; drives resume routing. */
   holdProvenance?: 'actor' | 'reviewer'
+  /** Exact worker-reported reason while at HUMAN_DIRECTION_WAIT (worker report, not authority). */
+  pendingDirection?: PendingDirection
   candidate?: Candidate
   reviews: ReviewRecord[]
   reviewedHeadSha?: string
