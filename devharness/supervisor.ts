@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import * as realGit from './gitops.ts'
+import { isTrackedDebris, isExplicitlyRequiredByIssue, isReviewerFlaggedDebris } from './debris.ts'
 import { decide, type Decision, type Event } from './transitions.ts'
 import type { Store } from './store.ts'
 import type { GitHubPort, ActorPort, ReviewerPort, IssueInfo } from './adapters/types.ts'
@@ -19,6 +20,10 @@ export type GitPort = {
   treeSha(worktree: string): string
   checkpointCommit(worktree: string, message: string): void
   changedFiles(worktree: string, baseSha: string): string[]
+  /** Paths added (not merely modified) versus baseSha — debris-scan input (H3). */
+  addedFiles(worktree: string, baseSha: string): string[]
+  /** Bounded `git rm` scoped to the worktree and exact paths only (H2). */
+  removeTrackedPaths(worktree: string, paths: string[]): void
   push(worktree: string, branch: string): void
   /** Ancestor check in the base clone (design-artifact visibility proof). */
   isAncestorInBase(ancestor: string, descendant: string): boolean
@@ -35,6 +40,8 @@ export function realGitPort(cfg: HarnessConfig): GitPort {
     treeSha: realGit.treeSha,
     checkpointCommit: realGit.checkpointCommit,
     changedFiles: realGit.changedFiles,
+    addedFiles: realGit.addedFiles,
+    removeTrackedPaths: realGit.removeTrackedPaths,
     push: realGit.push,
     isAncestorInBase: (anc, desc) => realGit.isAncestor(base, anc, desc),
   }
@@ -144,6 +151,9 @@ export class Supervisor {
     } else if (decision.clearsPendingDirection === true) {
       lane.pendingDirection = undefined
     }
+    if (decision.rejectedCandidate !== undefined) {
+      lane.rejectedCandidate = decision.rejectedCandidate
+    }
     if (decision.countsProviderRetry === true) lane.retryCount += 1
     if (decision.resetsProviderRetry === true) lane.retryCount = 0
     if (decision.countsRepairRound === true) lane.attempt += 1
@@ -241,6 +251,7 @@ export class Supervisor {
         `Base branch ${lane.baseBranch} advanced to ${baseNow} after this candidate was based on ${lane.candidate.baseSha}. ` +
         `Rebase the branch onto the new base (git fetch origin && git rebase ${baseNow}), resolve any conflicts, keep the work intact, rerun validation, and commit.`,
       ]
+      lane.reviewerDebrisPaths = undefined
       lane.baseSha = baseNow
       await this.step2(lane, { type: 'BASE_DRIFT', observedBaseSha: baseNow })
       return true
@@ -326,7 +337,14 @@ export class Supervisor {
           validationCommand: cfg.validationCommand,
         })
         lane.currentHeadSha = this.d.git.worktreeExists(lane.worktree) ? this.d.git.headSha(lane.worktree) : lane.currentHeadSha
-        if (res.outcome.kind === 'COMPLETE') lane.reviewerFindings = undefined
+        if (res.outcome.kind === 'COMPLETE') {
+          // Retained past this clear for VALIDATING's reviewer-flagged debris
+          // check (H3) — see lastRepairFindings / lastRepairDebrisPaths.
+          lane.lastRepairFindings = lane.reviewerFindings
+          lane.reviewerFindings = undefined
+          lane.lastRepairDebrisPaths = lane.reviewerDebrisPaths
+          lane.reviewerDebrisPaths = undefined
+        }
         await this.step2(lane, {
           type: 'ACTOR_RESULT', outcome: res.outcome,
           actorSignal: res.actorSignal, actorSummary: res.summary,
@@ -339,10 +357,61 @@ export class Supervisor {
           this.d.log(`[dry-run] [${lane.laneId}] would run validation`)
           return true
         }
+        this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
+
+        // H2/H3: strip known tracked-debris patterns (bounded git rm, exact
+        // paths this lane itself added only) *before* deterministic
+        // validation runs, so the head/tree that passes validation is
+        // exactly the head/tree that later gets frozen, pushed, and
+        // reviewed — never a divergent post-validation cleanup commit.
+        // Scoped to `addedFiles` (not the full diff): a path already present
+        // at base, even if modified here, is real pre-existing payload, not
+        // lane-introduced scratch, and a path the lane has since deleted has
+        // nothing left to `git rm`. Ambiguous scratch shapes (e.g. a bare
+        // "repro" substring) are only debris when the Reviewer used the
+        // dedicated typed `debrisPaths` output field to designate the exact
+        // path (isReviewerFlaggedDebris) — never guessed from filename shape,
+        // and never inferred from occurrence inside free-text findings.
+        // lastRepairDebrisPaths (not reviewerDebrisPaths, already cleared
+        // above on this same COMPLETE) carries the designation that drove
+        // the round just completed.
+        const addedFiles = this.d.git.addedFiles(lane.worktree, lane.baseSha)
+        const addedDebrisCandidates = addedFiles.filter(
+          (p) => isTrackedDebris(p) || isReviewerFlaggedDebris(p, lane.lastRepairDebrisPaths),
+        )
+        if (addedDebrisCandidates.length > 0) {
+          const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
+          const debrisPaths = addedDebrisCandidates.filter((p) => !isExplicitlyRequiredByIssue(p, issue.body))
+          if (debrisPaths.length > 0) {
+            this.d.git.removeTrackedPaths(lane.worktree, debrisPaths)
+            this.d.git.checkpointCommit(lane.worktree, `harness: remove tracked debris for #${lane.workIssue} (${debrisPaths.join(', ')})`)
+          }
+        }
+
+        // H1: compare the committed, post-cleanup identity against the
+        // rejected candidate *before* deterministic validation can route the
+        // lane anywhere else. A repair round that produced no candidate
+        // delta is never a successful repair regardless of whether
+        // validation would pass or fail on the (unchanged) result — it must
+        // hold with the exact no-op reason, not fall through to a
+        // validation-failure repair loop or a validation-pass re-review.
+        if (lane.rejectedCandidate !== undefined) {
+          const headSha = this.d.git.headSha(lane.worktree)
+          const treeSha = this.d.git.treeSha(lane.worktree)
+          if (headSha === lane.rejectedCandidate.headSha && treeSha === lane.rejectedCandidate.treeSha) {
+            lane.currentHeadSha = headSha
+            await this.step2(lane, { type: 'CANDIDATE_UNCHANGED_AFTER_REJECTION' })
+            return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+          }
+        }
+
         const result = cfg.validationCommand !== undefined
           ? await this.d.runValidation(lane.worktree, cfg.validationCommand)
           : { pass: true, detail: 'no validation command configured' }
-        if (!result.pass) lane.reviewerFindings = [`Deterministic validation failed. ${result.detail}`]
+        if (!result.pass) {
+          lane.reviewerFindings = [`Deterministic validation failed. ${result.detail}`]
+          lane.reviewerDebrisPaths = undefined
+        }
         await this.step2(lane, { type: 'VALIDATION_RESULT', pass: result.pass, detail: result.detail })
         return TERMINALLY_YIELDED.includes(this.statusOf(lane))
       }
@@ -352,12 +421,19 @@ export class Supervisor {
           this.d.log(`[dry-run] [${lane.laneId}] would freeze candidate + push + ensure PR`)
           return true
         }
-        this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
+        // H1's identical-candidate check runs earlier, in VALIDATING,
+        // *before* deterministic validation — a repair that is a byte-for-
+        // byte no-op must hold with the exact no-op reason even when
+        // validation would otherwise fail on the unchanged result. By the
+        // time a lane reaches FREEZING, that comparison has already passed
+        // (rejectedCandidate is either unset or provably different here).
         const headSha = this.d.git.headSha(lane.worktree)
+
         if (headSha === lane.baseSha || this.d.git.changedFiles(lane.worktree, lane.baseSha).length === 0) {
           lane.reviewerFindings = [
             'The branch contains no committed work beyond the base SHA. Complete the issue and commit the result on this branch.',
           ]
+          lane.reviewerDebrisPaths = undefined
           await this.step2(lane, { type: 'CANDIDATE_EMPTY' })
           return TERMINALLY_YIELDED.includes(this.statusOf(lane))
         }
@@ -369,6 +445,7 @@ export class Supervisor {
             `Recorded base ${lane.baseSha} is NOT an ancestor of branch HEAD ${headSha} — the requested rebase was not performed or not completed. ` +
             `Run: git fetch origin && git rebase ${lane.baseSha}, resolve conflicts keeping the work intact, rerun validation, and commit.`,
           ]
+          lane.reviewerDebrisPaths = undefined
           await this.step2(lane, { type: 'CANDIDATE_BASE_UNPROVEN' })
           return TERMINALLY_YIELDED.includes(this.statusOf(lane))
         }
@@ -436,11 +513,14 @@ export class Supervisor {
           lane.reviews.push({
             baseSha: cand.baseSha, headSha: cand.headSha,
             verdict: res.verdict, summary: res.summary ?? '',
-            findings: res.findings ?? [], invalidated: false,
+            findings: res.findings ?? [], debrisPaths: res.debrisPaths ?? [], invalidated: false,
             at: new Date().toISOString(),
           })
           if (res.verdict === 'GO') lane.reviewedHeadSha = cand.headSha
-          if (res.verdict === 'REQUEST_CHANGES') lane.reviewerFindings = res.findings ?? []
+          if (res.verdict === 'REQUEST_CHANGES') {
+            lane.reviewerFindings = res.findings ?? []
+            lane.reviewerDebrisPaths = res.debrisPaths ?? []
+          }
           this.d.store.upsertLane(lane)
         }
         await this.step2(lane, {
@@ -452,7 +532,7 @@ export class Supervisor {
           })
         } else if (this.statusOf(lane) === 'REPAIR_PENDING') {
           await this.postReceipt('REVIEW_REQUEST_CHANGES', lane, {
-            reviewed_head_sha: cand.headSha, findings: res.findings, pr: lane.prNumber,
+            reviewed_head_sha: cand.headSha, findings: res.findings, debris_paths: res.debrisPaths, pr: lane.prNumber,
           })
         }
         return TERMINALLY_YIELDED.includes(this.statusOf(lane))

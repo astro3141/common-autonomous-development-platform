@@ -81,7 +81,9 @@ ${req.issue.body}
 Verdict rules:
 - GO only if the candidate correctly and completely satisfies the issue with no defects worth blocking on.
 - Otherwise REQUEST_CHANGES with a concrete, actionable finding list (each finding self-contained: file, problem, why it matters).
-- Judge only the candidate against the issue and repository conventions; do not demand out-of-scope work.`
+- Judge only the candidate against the issue and repository conventions; do not demand out-of-scope work.
+
+Debris designation (separate from findings): if, and only if, a tracked file in the diff is disposable scratch/debris that must be DELETED rather than fixed (e.g. a permission/write-probe file, a temporary scratch config, a leftover pre-repair reproduction file, a commit-message draft) — not a real product file that merely needs a code change — list its exact repository-relative path in \`debrisPaths\`. Do not put a path in \`debrisPaths\` for a file you want edited; that belongs in \`findings\` instead. Leave \`debrisPaths\` empty (\`[]\`) if nothing needs deleting.`
 }
 
 export const REVIEWER_OUTPUT_SCHEMA = {
@@ -90,7 +92,8 @@ export const REVIEWER_OUTPUT_SCHEMA = {
     verdict: { type: 'string', enum: ['GO', 'REQUEST_CHANGES'] },
     summary: { type: 'string' },
     findings: { type: 'array', items: { type: 'string' } },
+    debrisPaths: { type: 'array', items: { type: 'string' } },
   },
-  required: ['verdict', 'summary', 'findings'],
+  required: ['verdict', 'summary', 'findings', 'debrisPaths'],
   additionalProperties: false,
 } as const

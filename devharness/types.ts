@@ -60,6 +60,13 @@ export type ReviewRecord = {
   verdict: ReviewVerdict
   summary: string
   findings: string[]
+  /**
+   * Explicit, typed list of tracked paths the Reviewer designated for
+   * deletion (not modification) before resubmission — issue #119 round-3
+   * finding 1. Decoupled from free-text `findings`: a basename merely
+   * mentioned in prose is never a debris designation.
+   */
+  debrisPaths: string[]
   invalidated: boolean
   invalidatedReason?: string
   at: string
@@ -96,11 +103,38 @@ export type Lane = {
   /** Exact worker-reported reason while at HUMAN_DIRECTION_WAIT (worker report, not authority). */
   pendingDirection?: PendingDirection
   candidate?: Candidate
+  /**
+   * Exact identity of the most recent Reviewer-rejected candidate (REQUEST_CHANGES).
+   * Persisted across repair rounds and holds/resumes so a repair that produces
+   * a byte-identical head/tree can be detected and never silently re-reviewed
+   * (issue #119 H1).
+   */
+  rejectedCandidate?: Candidate
   reviews: ReviewRecord[]
   reviewedHeadSha?: string
   prNumber?: number
   holdReason?: string
   reviewerFindings?: string[] // pending findings for the next repair round
+  /**
+   * The findings that drove the repair round which just completed, retained
+   * past the point `reviewerFindings` is cleared on Actor COMPLETE so that
+   * VALIDATING's reviewer-flagged debris check (H3) can still see which
+   * exact files the Reviewer named for removal in that round.
+   */
+  lastRepairFindings?: string[]
+  /**
+   * Explicit, typed debris designation pending for the next repair round —
+   * paths the Reviewer's `debrisPaths` output field named for deletion, kept
+   * separate from `reviewerFindings` prose (issue #119 round-3 finding 1).
+   */
+  reviewerDebrisPaths?: string[]
+  /**
+   * The typed debris designation that drove the repair round which just
+   * completed, retained past the point `reviewerDebrisPaths` is cleared on
+   * Actor COMPLETE so that VALIDATING's reviewer-flagged debris check (H3)
+   * can still see which exact files the Reviewer designated in that round.
+   */
+  lastRepairDebrisPaths?: string[]
   attempt: number    // repair rounds consumed
   retryCount: number // provider retries consumed within the current step
   createdAt: string

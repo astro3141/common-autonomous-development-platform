@@ -56,8 +56,33 @@ export function checkpointCommit(worktree: string, message: string): void {
   }
 }
 
+/**
+ * Bounded tracked-file removal (issue #119 H2). Operates only inside
+ * `worktree` (via `git -C`) and only on the exact paths given — no glob
+ * expansion, no traversal outside the worktree, no push, no GitHub call.
+ * Callers must pass paths already confirmed to be in the lane's own diff.
+ */
+export function removeTrackedPaths(worktree: string, paths: string[]): void {
+  if (paths.length === 0) return
+  git(worktree, ['rm', '-f', '--', ...paths])
+}
+
 export function changedFiles(worktree: string, baseSha: string): string[] {
   const out = git(worktree, ['diff', '--name-only', `${baseSha}...HEAD`])
+  return out === '' ? [] : out.split('\n')
+}
+
+/**
+ * Paths newly *added* by this lane versus `baseSha` (issue #119 H2/H3).
+ * Deliberately narrower than `changedFiles`: a path that already existed at
+ * base (even if modified) is never a candidate for the debris scan — only a
+ * path the lane itself introduced can be "temporary repair/checkpoint
+ * scratch". A path the lane has since deleted is also excluded (nothing left
+ * to `git rm`). `--no-renames` keeps this exact instead of guessing at a
+ * rename source.
+ */
+export function addedFiles(worktree: string, baseSha: string): string[] {
+  const out = git(worktree, ['diff', '--no-renames', '--diff-filter=A', '--name-only', `${baseSha}...HEAD`])
   return out === '' ? [] : out.split('\n')
 }
 

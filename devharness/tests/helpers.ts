@@ -18,6 +18,9 @@ export class FakeGit implements GitPort {
   addWorktreeCalls: { worktree: string; branch: string; baseSha: string }[] = []
   ancestorCalls: { ancestor: string; descendant: string }[] = []
   changed = new Map<string, string[]>()
+  /** Optional override of `addedFiles`; defaults to `changed` when unset (H3). */
+  added = new Map<string, string[]>()
+  removedPaths: { worktree: string; paths: string[] }[] = []
   private seq = 0
   baseSha = 'base'.padEnd(40, '0')
   ancestorResult = true
@@ -40,6 +43,17 @@ export class FakeGit implements GitPort {
   treeSha(worktree: string): string { return `tree-${this.headSha(worktree)}`.slice(0, 40).padEnd(40, '0') }
   checkpointCommit(): void {}
   changedFiles(worktree: string): string[] { return this.changed.get(worktree) ?? ['src/x.ts'] }
+  addedFiles(worktree: string): string[] { return this.added.get(worktree) ?? this.changedFiles(worktree) }
+  /** Simulates `git rm` + the harness's follow-up checkpoint commit in one step. */
+  removeTrackedPaths(worktree: string, paths: string[]): void {
+    this.removedPaths.push({ worktree, paths: [...paths] })
+    const remaining = this.changedFiles(worktree).filter((f) => !paths.includes(f))
+    this.changed.set(worktree, remaining)
+    if (this.added.has(worktree)) {
+      this.added.set(worktree, this.added.get(worktree)!.filter((f) => !paths.includes(f)))
+    }
+    this.heads.set(worktree, this.newSha('debris-cleaned'))
+  }
   push(worktree: string, branch: string): void {
     const sha = this.headSha(worktree)
     this.pushes.push({ worktree, branch, sha })
@@ -164,7 +178,11 @@ export type World = {
   stateDir: string
 }
 
-export function makeWorld(overrides: Partial<HarnessConfig> = {}, stateDir?: string): World {
+export function makeWorld(
+  overrides: Partial<HarnessConfig> = {},
+  stateDir?: string,
+  depsOverrides: Partial<SupervisorDeps> = {},
+): World {
   const dir = stateDir ?? mkdtempSync(join(tmpdir(), 'devharness-test-'))
   const cfg: HarnessConfig = {
     repo: REPO,
@@ -200,6 +218,7 @@ export function makeWorld(overrides: Partial<HarnessConfig> = {}, stateDir?: str
     runValidation: async () => ({ pass: true, detail: 'fake validation pass' }),
     sleep: async (s) => { sleeps.push(s) },
     log: () => {},
+    ...depsOverrides,
   }
   return { sup: new Supervisor(deps), store, git, github, actor, reviewer, sleeps, cfg, stateDir: dir }
 }

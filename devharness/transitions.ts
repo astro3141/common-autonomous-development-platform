@@ -1,5 +1,5 @@
 import type {
-  ActorSignal, Lane, LaneStatus, Outcome, PendingDirection, RetryPolicy, ReviewVerdict,
+  ActorSignal, Candidate, Lane, LaneStatus, Outcome, PendingDirection, RetryPolicy, ReviewVerdict,
 } from './types.ts'
 
 /**
@@ -22,6 +22,7 @@ export type Event =
   | { type: 'CANDIDATE_FROZEN' }
   | { type: 'CANDIDATE_EMPTY' }         // no committed work beyond base; not reviewable
   | { type: 'CANDIDATE_BASE_UNPROVEN' } // recorded baseSha is not an ancestor of HEAD
+  | { type: 'CANDIDATE_UNCHANGED_AFTER_REJECTION' } // repair produced no delta vs the rejected candidate (H1)
   | { type: 'REVIEW_RESULT'; outcome: Outcome; verdict?: ReviewVerdict; headShaAtReviewEnd: string }
   | { type: 'CANDIDATE_MUTATED'; observedHeadSha: string }
   | { type: 'REMOTE_HEAD_DRIFT'; observedRemoteHead: string } // foreign push to the lane branch
@@ -67,6 +68,8 @@ export type Decision = {
   pendingDirection?: Omit<PendingDirection, 'at'>
   /** a successful worker completion supersedes any stale direction request */
   clearsPendingDirection?: boolean
+  /** persist the exact identity of a just-rejected candidate (drives H1 no-op detection) */
+  rejectedCandidate?: Candidate
   note: string
 }
 
@@ -310,6 +313,22 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
       break
 
     case 'VALIDATING':
+      if (event.type === 'CANDIDATE_UNCHANGED_AFTER_REJECTION') {
+        // H1: the Actor reported COMPLETE, but the committed (post-cleanup)
+        // candidate is byte-identical (head + tree) to the candidate the
+        // Reviewer already rejected. Checked before deterministic validation
+        // runs, so a validation failure on the unchanged result can never
+        // mask this and route the lane into another repair round instead of
+        // the required exact no-op hold. Never re-review a no-op.
+        const rej = lane.rejectedCandidate
+        return {
+          status: 'HOLD_UNKNOWN',
+          actions: ['POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
+          holdReason: `repair round produced no candidate delta: head ${rej?.headSha.slice(0, 12)} / tree ${rej?.treeSha.slice(0, 12)} unchanged from the previously reviewed-and-rejected candidate; reviewer not re-invoked`,
+          provenance: 'actor',
+          note: 'no-op repair: committed candidate is byte-identical to the reviewer-rejected candidate; holding without re-review',
+        }
+      }
       if (event.type === 'VALIDATION_RESULT') {
         if (event.pass) {
           return { status: 'FREEZING', actions: ['FREEZE_CANDIDATE'], note: 'validation passed; freezing exact candidate' }
@@ -396,15 +415,19 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           }
         }
         if (event.verdict === 'REQUEST_CHANGES') {
+          // H1: persist the exact rejected identity regardless of whether the
+          // repair proceeds now or only after a later human resume — a repair
+          // attempt must always be checkable against what was actually rejected.
           if (lane.attempt < policy.maxRepairRounds) {
             return {
               status: 'REPAIR_PENDING',
               actions: ['POST_RECEIPT'],
               resetsProviderRetry: true,
+              rejectedCandidate: lane.candidate,
               note: 'REQUEST_CHANGES; routing bounded same-lane repair',
             }
           }
-          return hold('HOLD_UNKNOWN', 'REQUEST_CHANGES beyond repair bound; human attention required')
+          return { ...hold('HOLD_UNKNOWN', 'REQUEST_CHANGES beyond repair bound; human attention required'), rejectedCandidate: lane.candidate }
         }
         return hold('HOLD_UNKNOWN', 'reviewer exited cleanly but produced no typed verdict; success is not assumed', 'reviewer')
       }
