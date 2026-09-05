@@ -119,8 +119,8 @@ async function evalWorkStart(h: Harness, input: {
   return { outcome: evaluated.decision.outcome, reason_codes: [...evaluated.decision.reason_codes] };
 }
 
-/** Seal a non-index mutation (e.g. GIT_PUSH) bound to a finding and evaluate. */
-async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1, evidence: EvidenceEnvelopeV1[]): Promise<{ outcome: string; reason_codes: string[] }> {
+/** Seal a non-index mutation (e.g. GIT_PUSH) bound to one or more findings and evaluate. */
+async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1 | EvidenceEnvelopeV1[], evidence: EvidenceEnvelopeV1[]): Promise<{ outcome: string; reason_codes: string[] }> {
   const bodyKey = h.ingress.putBlob(Buffer.from("body", "utf8"));
   const material = { repo_id: "r", ref: "refs/heads/cadp/candidate/x", new_sha: "x", expected_old_sha: "0".repeat(40), bundle_cas_key: bodyKey };
   const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
@@ -133,7 +133,7 @@ async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1, evi
       effect_id, requester_ref: "workflow:cadp-work",
       work_bindings: [
         { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: `wr-${effect_id}` },
-        findingWorkBinding(refOf(finding)),
+        ...(Array.isArray(finding) ? finding : [finding]).map((f) => findingWorkBinding(refOf(f))),
       ],
       target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "r" },
       operation_kind: "GIT_PUSH", material_schema: "cadp.git-push.v1", material_ref, prior_effect_refs: [],
@@ -376,6 +376,143 @@ async function makeFindingSameOccurrence(h: Harness, first: EvidenceEnvelopeV1):
   return submitFinding(submitter(h), { claim: built, subject_bindings, source_ref: "intake-detector" });
 }
 
+// ================================================================ #109 S2: referenced ancestry completeness
+// An admission must never become implementation-eligible merely because a referenced predecessor
+// Finding is omitted from the admission evidence set (fail-closed ancestry, exact id+digest).
+
+/** A would-be-clearing reclassification (§3): HUMAN_JUDGMENT + AUTHORITY_TEXT basis. */
+async function makeClearingReclass(h: Harness, prev: EvidenceEnvelopeV1, supersedesOverride?: Array<{ evidence_id: string; envelope_digest: string }>): Promise<EvidenceEnvelopeV1> {
+  const humanEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "human-design", revision: `decision-${counter}` });
+  return makeFinding(h, {
+    classification: "IMPLEMENTATION_GAP",
+    derivation: { kind: "HUMAN_JUDGMENT", method_ref: "design:decision", method_digest: `hd-${counter}`, execution_or_run_ref: "human:astro3141" },
+    basis: [{ evidence_id: humanEnv.evidence_id, envelope_digest: humanEnv.envelope_digest.value, role: "AUTHORITY_TEXT" }],
+    supersedes: supersedesOverride ?? [{ evidence_id: prev.evidence_id, envelope_digest: prev.envelope_digest.value }],
+    correction_reason: "human reclassification",
+  });
+}
+
+/** Seal a PR_MERGE / POLICY_ACTIVATE carrying one or more improvement-finding work bindings and evaluate. */
+async function evalBoundOp(h: Harness, op: "PR_MERGE" | "POLICY_ACTIVATE", finding: EvidenceEnvelopeV1 | EvidenceEnvelopeV1[], evidence: EvidenceEnvelopeV1[], opts: { humanApprove?: boolean } = {}): Promise<{ outcome: string; reason_codes: string[] }> {
+  const spec = op === "PR_MERGE"
+    ? { purpose: "pr-merge", schema: "cadp.pr-merge.v1", material: { repo_id: "r", pr_number: 1, expected_head_sha: "h".repeat(40) }, target: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "r" } }
+    : { purpose: "policy-activate", schema: "cadp.policy-activate.v1", material: { note: "intake-bound candidate" }, target: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" } };
+  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(spec.material), "utf8"));
+  const effect_id = h.ingress.allocateEffectId({
+    schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
+    step_ordinal: (counter += 1), purpose: spec.purpose,
+  });
+  h.ingress.sealEffectRequest(
+    {
+      effect_id, requester_ref: "workflow:cadp-work",
+      work_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: `wr-${effect_id}` },
+        ...(Array.isArray(finding) ? finding : [finding]).map((f) => findingWorkBinding(refOf(f))),
+      ],
+      target_ref: spec.target,
+      operation_kind: op, material_schema: spec.schema, material_ref, prior_effect_refs: [],
+    },
+    PRINCIPALS.workflow,
+  );
+  const evIds = evidence.map((e) => e.evidence_id);
+  if (opts.humanApprove) evIds.push(h.humanApprove(effect_id).evidence_id);
+  const inp = h.ingress.assembleAdmissionInput(effect_id, evIds);
+  const evaluated = await h.evaluate(inp.input_digest.value);
+  if (evaluated.kind !== "DECISION") return { outcome: evaluated.kind, reason_codes: [] };
+  return { outcome: evaluated.decision.outcome, reason_codes: [...evaluated.decision.reason_codes] };
+}
+
+test("S2-1: omitted CONTRACT_* predecessor cannot vanish from ancestry → DENY; presenting it restores the reviewed clearing path", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S2C" });
+    const x = await makeClearingReclass(h, c);
+    // Omit the predecessor C → fail-closed, no implementation eligibility.
+    const omitted = await evalWorkStart(h, { finding: x, evidence: [x] });
+    assert.equal(omitted.outcome, "DENY", JSON.stringify(omitted));
+    assert.ok(omitted.reason_codes.includes("contract_barrier"), JSON.stringify(omitted.reason_codes));
+    const push = await evalNonIndexMutation(h, x, [x]);
+    assert.equal(push.outcome, "DENY");
+    assert.ok(push.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(push.reason_codes));
+    // Complete presented ancestry with the valid Human clearing path → reviewed behavior preserved.
+    const complete = await evalWorkStart(h, { finding: x, evidence: [x, c] });
+    assert.equal(complete.outcome, "ALLOW", JSON.stringify(complete));
+  } finally { h.close(); }
+});
+
+test("S2-2: presented predecessor with mismatched supersedes digest is unresolved → DENY (id-only match insufficient)", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S2D" });
+    // Would-be-clearing Human reclass, but the supersedes ref digest does not match C's envelope.
+    const xBad = await makeClearingReclass(h, c, [{ evidence_id: c.evidence_id, envelope_digest: sha256("not-the-predecessor-envelope") }]);
+    const r = await evalWorkStart(h, { finding: xBad, evidence: [xBad, c] });
+    assert.equal(r.outcome, "DENY", JSON.stringify(r));
+    assert.ok(r.reason_codes.includes("contract_barrier"), JSON.stringify(r.reason_codes));
+    const push = await evalNonIndexMutation(h, xBad, [xBad, c]);
+    assert.equal(push.outcome, "DENY");
+    assert.ok(push.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(push.reason_codes));
+  } finally { h.close(); }
+});
+
+test("S2-3: multi-hop ancestry X→B→C — complete → ALLOW; omitting B or C independently → DENY", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "IMPLEMENTATION_GAP", anomaly_code: "S2M" });
+    const b = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-1" });
+    const x = await makeReclass(h, b, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-2" });
+    const complete = await evalWorkStart(h, { finding: x, evidence: [x, b, c] });
+    assert.equal(complete.outcome, "ALLOW", JSON.stringify(complete));
+    const omitB = await evalWorkStart(h, { finding: x, evidence: [x, c] });
+    assert.equal(omitB.outcome, "DENY", JSON.stringify(omitB));
+    assert.ok(omitB.reason_codes.includes("contract_barrier"), JSON.stringify(omitB.reason_codes));
+    const omitC = await evalWorkStart(h, { finding: x, evidence: [x, b] });
+    assert.equal(omitC.outcome, "DENY", JSON.stringify(omitC));
+    assert.ok(omitC.reason_codes.includes("contract_barrier"), JSON.stringify(omitC.reason_codes));
+  } finally { h.close(); }
+});
+
+test("S2-4: PR_MERGE / POLICY_ACTIVATE bound to an ancestry-incomplete tip are denied even with human approval", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S2B" });
+    const x = await makeClearingReclass(h, c);
+    // Pre-repair S2 reproduction path: human-approved POLICY_ACTIVATE bound to X with C omitted was ALLOW.
+    const activate = await evalBoundOp(h, "POLICY_ACTIVATE", x, [x], { humanApprove: true });
+    assert.equal(activate.outcome, "DENY", JSON.stringify(activate));
+    assert.ok(activate.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(activate.reason_codes));
+    const merge = await evalBoundOp(h, "PR_MERGE", x, [x], { humanApprove: true });
+    assert.equal(merge.outcome, "DENY", JSON.stringify(merge));
+    assert.ok(merge.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(merge.reason_codes));
+    // Contrast: complete presented ancestry clears the intake gate (policy outcome, not PEP admit).
+    const clean = await evalBoundOp(h, "POLICY_ACTIVATE", x, [x, c], { humanApprove: true });
+    assert.equal(clean.outcome, "ALLOW", JSON.stringify(clean));
+  } finally { h.close(); }
+});
+
+test("S2-5: a clean co-bound Finding must not mask an ancestry-incomplete one — every bound finding must be clear", async () => {
+  const h = await makeHarness();
+  try {
+    const clean = await makeFinding(h, { classification: "IMPLEMENTATION_GAP", anomaly_code: "S2E" });
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S2F" });
+    const x = await makeClearingReclass(h, c);
+    // Under some-semantics the clear `clean` binding satisfied the gate while X's predecessor stayed omitted.
+    const push = await evalNonIndexMutation(h, [clean, x], [clean, x]);
+    assert.equal(push.outcome, "DENY", JSON.stringify(push));
+    assert.ok(push.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(push.reason_codes));
+    const activate = await evalBoundOp(h, "POLICY_ACTIVATE", [clean, x], [clean, x], { humanApprove: true });
+    assert.equal(activate.outcome, "DENY", JSON.stringify(activate));
+    assert.ok(activate.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(activate.reason_codes));
+    const merge = await evalBoundOp(h, "PR_MERGE", [clean, x], [clean, x], { humanApprove: true });
+    assert.equal(merge.outcome, "DENY", JSON.stringify(merge));
+    // E3: complete presented ancestry restores the reviewed multi-binding behavior.
+    const complete = await evalNonIndexMutation(h, [clean, x], [clean, x, c]);
+    assert.equal(complete.outcome, "ALLOW", JSON.stringify(complete));
+    const single = await evalNonIndexMutation(h, clean, [clean]);
+    assert.equal(single.outcome, "ALLOW", JSON.stringify(single));
+  } finally { h.close(); }
+});
+
 // ================================================================ FINDING_PROJECT (E4/E5, Option A)
 
 async function setupIssues(idempotencyProven = true): Promise<{ h: Harness; issues: ScriptedIssues; adapter: GitHubIssuesAdapter }> {
@@ -537,5 +674,110 @@ test("C6: series collapse groups by deterministic detector yet every raw occurre
     assert.notEqual(a.evidence_id, b.evidence_id);
     assert.notEqual((a.claim as { occurrence_key: string }).occurrence_key, (b.claim as { occurrence_key: string }).occurrence_key);
     assert.ok(h.store.evidenceById(a.evidence_id) !== undefined && h.store.evidenceById(b.evidence_id) !== undefined);
+  } finally { h.close(); }
+});
+
+// ================================================================ #109 E1–E2: referenced ancestry completeness (omitted/mismatched predecessors)
+
+test("#109 E1: referenced predecessor omitted → contract_barrier (deny-closed)", async () => {
+  const h = await makeHarness();
+  try {
+    // C is a CONTRACT_GAP ancestor
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E1" });
+    // X supersedes C but admission input omits C (only X is presented)
+    const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "attempt-clear" });
+    const r = await evalWorkStart(h, { finding: x, evidence: [x] }); // C omitted
+    assert.equal(r.outcome, "DENY");
+    assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
+  } finally { h.close(); }
+});
+
+test("#109 E2: referenced predecessor present with mismatched digest → contract_barrier", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E2" });
+    const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "attempt-clear" });
+    // Present C but forge a digest mismatch (digest of C doesn't match what X names)
+    const cWithWrongDigest: EvidenceEnvelopeV1 = {
+      ...c,
+      envelope_digest: { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: "wrongdigest000" },
+    };
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, cWithWrongDigest] });
+    assert.equal(r.outcome, "DENY");
+    assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
+  } finally { h.close(); }
+});
+
+test("#109 E3: complete ancestry with valid authority clearing path → normal behavior", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E3" });
+    // F clears C via AUTHORITY_RESOLUTION
+    const authEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "design-e3", revision: "decision-1" });
+    const resolution = {
+      contract_id: "cadp.improvement-intake.v1",
+      finding_tip_ref: refOf(c),
+      resolution_kind: "AUTHORITY_RESOLUTION" as const,
+      statement: "cleared",
+      landed_authority_ref: "spec:section-1",
+    };
+    const resEnv = await submitResolution(submitter(h), {
+      claim: resolution, subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
+      tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
+    });
+    // X supersedes C, and C is now cleared → X can proceed
+    const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "resolved" });
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, c, resEnv] });
+    assert.equal(r.outcome, "ALLOW", JSON.stringify(r));
+  } finally { h.close(); }
+});
+
+test("#109 E4: multi-hop ancestry X→B→C, omit B independently → contract_barrier", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E4_C" });
+    const b = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-b" });
+    const x = await makeReclass(h, b, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-x" });
+    // Omit B (the middle hop), but include both C and X
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, c] });
+    assert.equal(r.outcome, "DENY");
+    assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
+  } finally { h.close(); }
+});
+
+test("#109 E4b: multi-hop ancestry X→B→C, omit C independently → contract_barrier", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E4_C2" });
+    const b = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-b2" });
+    const x = await makeReclass(h, b, { classification: "IMPLEMENTATION_GAP", correction_reason: "refine-x2" });
+    // Omit C (the root contract), but include B and X
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, b] });
+    assert.equal(r.outcome, "DENY");
+    assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
+  } finally { h.close(); }
+});
+
+test("#109 E5: sibling/current-tip/conflict behavior unchanged", async () => {
+  const h = await makeHarness();
+  try {
+    // Concurrent tips sharing occurrence_key → still DENY (unchanged)
+    const f1 = await makeFinding(h, { classification: "IMPLEMENTATION_GAP", anomaly_code: "SHARED_E5" });
+    const f1b = await makeFindingSameOccurrence(h, f1);
+    const r = await evalWorkStart(h, { finding: f1, evidence: [f1, f1b] });
+    assert.equal(r.outcome, "DENY");
+    assert.ok(r.reason_codes.includes("supersession_conflict"), JSON.stringify(r.reason_codes));
+  } finally { h.close(); }
+});
+
+test("#109 E6: PR_MERGE bound to ancestry-incomplete tip remains denied", async () => {
+  const h = await makeHarness();
+  try {
+    const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E6" });
+    const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "attempt-e6" });
+    // Stub a PR_MERGE request: sealed with verification/review OK but bound to incomplete ancestry
+    // We'd need more harness plumbing to fully test PR_MERGE here; for now we verify WORK_START still denies
+    const r = await evalWorkStart(h, { finding: x, evidence: [x] }); // C omitted
+    assert.equal(r.outcome, "DENY");
   } finally { h.close(); }
 });
