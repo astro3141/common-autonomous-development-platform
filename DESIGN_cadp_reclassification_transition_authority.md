@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | **DESIGN CANDIDATE — TD_DESIGN_READY** (round-8 repair, fresh lane); authority only after Control scope check, Independent Design Review, and Human merge of the protected TD delta. The earlier merge of PR #118 was reverted by recovery PR #124 and carries no authority (§0.5) |
+| Status | **DESIGN CANDIDATE — TD_DESIGN_READY** (round-9 repair); authority only after Control scope check, Independent Design Review, and Human merge of the protected TD delta. The earlier merge of PR #118 was reverted by recovery PR #124 and carries no authority (§0.5) |
 | Design issue | #117 |
 | Source execution | #107 (`exec-i107`, held; PR #115 non-admitted evidence only) |
 | Source review | #107 `issuecomment-5548393749` (round-3 findings F1/F2/F3) |
 | Source measured STOP | #107 `issuecomment-5548451029` (`STOP_CONTRACT_GAP`) |
 | Control disposition | #107 `issuecomment-5548740528` (`CONTRACT_GAP_CONFIRMED_BY_IMPLEMENTATION_ATTEMPT`) |
-| Repairs | round-4 findings R1–R4 against 2c432b3 (§0.1); round-5 findings R5-1–R5-3 against 5ca3285 (§0.2); round-6 findings R6-1–R6-2 against bc3a097 (§0.3); round-7 **self-measured** R7-1 against 5ea7bae (§0.4); round-8 findings R8-1–R8-2 against 8017bf0 — the round-7 review findings, recovered from the devharness lane state (§0.5 — provenance stated there exactly) |
+| Repairs | round-4 findings R1–R4 against 2c432b3 (§0.1); round-5 findings R5-1–R5-3 against 5ca3285 (§0.2); round-6 findings R6-1–R6-2 against bc3a097 (§0.3); round-7 **self-measured** R7-1 against 5ea7bae (§0.4); round-8 findings R8-1–R8-2 against 8017bf0 — the round-7 review findings, recovered from the devharness lane state (§0.5 — provenance stated there exactly); round-9 finding R9-1 against d53954a (§0.6 — writer-generation stability of `governed_transition` and invariant U) |
 | Architecture authority | Spec v0.4 > landed v0.4-generation TD v2.0 (r7) > #98 landed product contract `issuecomment-5526957311` |
 | Frozen design basis | main `1b051f29635c14461ce08b354d554355e3856d57` (#109/#116 landed: exact-digest `supersedes` resolution and fail-closed omitted-ancestry) — `cadp/deployment/referencePolicy.ts`, `cadp/product/improvement/contracts.ts`, `cadp/kernel/ingress.ts`, `cadp/kernel/pep.ts` (recheck #5), TD §2.6/§3.2/§4.4/§6.2/§6.4/§9.1–§9.3/§12, Spec §2/K3/§5.2/§5.3, #98 §1–§10 |
 | Implementation | **HOLD** — this document authorizes no code change |
@@ -295,6 +295,48 @@ produced_at_source: NONE for Human decisions — did touch a non-load-bearing as
 document; that aside is corrected to state the registry precondition explicitly. No load-bearing
 element of this design rests on any mechanism those findings falsified.
 
+### 0.6 Round-9 repair disposition
+
+One finding against d53954a, accepted in full:
+
+```text
+R9-1  §5.2 made the governed writer registry-controlled and revocable, while §6.2's
+      governed_transition recognized a Finding by "the writer registered in the ACTIVE policy"
+      and invariant U / the §3.2 unique indexes keyed on producer_ref. Removing or replacing
+      the registry entry therefore either (i) made an already-cleared edge stop clearing at
+      later admissions — contradicting §6.3 ("a validly cleared edge stays cleared") and D4's
+      immutable-completed-transition boundary — or (ii), if a replacement writer used a
+      different producer_ref, permitted a second governed edge for the same predecessor —
+      contradicting the claimed all-time uniqueness. Remedies offered: stable historical
+      validation of the writer/effect under the seal-time policy with cross-generation edge
+      uniqueness, or one immutable producer identity as a permanent contract invariant,
+      reconciled with the stated revocation behaviour.
+      RESOLVED BY BOTH REMEDIES AT ONCE, because they converge on one repair (§5.2, §6.2,
+      §6.6, §8, FC19):
+      (a) PERMANENT PRODUCER IDENTITY (invariant P, §5.2). producer_ref
+          "governed:reclassification" is a permanent constant of product contract v1.1 —
+          reserved, never re-registered under another string; a registry conformance rule
+          makes a bundle that grants governed-edge power to any other producer_ref
+          DENY at POLICY_ACTIVATE. What rotates on compromise/retirement is the WORKLOAD
+          CREDENTIAL bound to the constant in the identity registry — every writer generation
+          maps to the one constant, so the (producer_ref, source_ref) and (producer_ref, T(F))
+          keys are generation-independent and invariant U holds across every generation by
+          construction. The prior text conflated credential and producer identity; §3's
+          "writer" entry is corrected.
+      (b) STABLE HISTORICAL VALIDATION (§6.2). governed_transition compares producer_ref
+          against the CONTRACT CONSTANT and reads only kernel-stamped immutable envelope
+          facts — never the currently-active registry. The seal-time gate under the seal-time
+          active policy is what stamped those facts; consuming the gate's product afterwards
+          is the design's own stated trust pattern (§6.2), now applied consistently to the
+          writer check. Revocation is therefore PROSPECTIVE ONLY: it stops future seals and
+          never un-clears a completed edge (K2 — nothing can mutate the stamp). Retroactive
+          distrust of a seal made by a compromised writer routes FORWARD — incident + I4
+          re-raise (a fresh CONTRACT_* finding with a fresh key T(C₂)) — never through
+          history-dependent re-evaluation of active policy.
+      FC19 falsifies both failure modes: revoke-after-clear must not un-clear, and a
+      successor-generation second seal for the same predecessor must hit the same edge key.
+```
+
 ## 1. What was measured, restated exactly
 
 The #107 round-3 attempt measured that the landed contract cannot express the Review's required
@@ -346,8 +388,9 @@ A3  Circularity is dissolved by identifying the descendant BEFORE it exists via 
 
 A4  At every later admission the barrier is recomputed honestly from presented Findings only.
     The clearing predicate recognizes a descendant as authorized iff it was sealed by the
-    governed writer identity (kernel-stamped producer_ref — the same trust base as all
-    evidence). No HUMAN_DECISION envelope appears at later admissions at all.
+    governed writer (kernel-stamped producer_ref equal to the permanent invariant-P contract
+    constant — the same trust base as all evidence; never a lookup in the currently-active
+    registry, round-9 R9-1). No HUMAN_DECISION envelope appears at later admissions at all.
 
 A5  Two governed transition families, one gate, one authority shape. RECLASSIFICATION crosses
     CONTRACT_* → non-CONTRACT_* and preserves the exact normalized primary subject binding;
@@ -400,7 +443,12 @@ T(F)         the governed-edge key `(F.evidence_id, F.envelope_digest)` — deri
              uniqueness key (§5.3 rule (b), §6.6). NOT an idempotency key and NOT the dispatch
              `source_ref` (round-8 R8-1): the dispatch `source_ref` carries the landed replay
              key `cadp-v04:<effect_id>`
-writer       the governed workload identity `governed:reclassification` (§5)
+writer       two distinct things, named separately from round 9 on (R9-1): the PRODUCER
+             IDENTITY `governed:reclassification` — a permanent product-contract constant
+             (invariant P, §5.2), the value the ingress stamps as `producer_ref` and the value
+             every uniqueness key and clearing predicate uses — and the WORKLOAD CREDENTIAL
+             currently bound to that constant in the identity registry, which is the rotatable/
+             revocable part (§5.2). "The writer" unqualified means the producer identity
 ```
 
 ## 4. D1 — Exact transition-authorization representation
@@ -575,8 +623,39 @@ The adapter registry (policy content, §9.1) gains
 source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" },
 replay_idempotency: "SOURCE_REF_UNIQUE", governed_edge: "SUPERSEDES_SINGLETON" }` (§5.3, the two
 declarations of the two separated mechanisms — round-8 R8-1); the identity registry gains the
-workload identity. Registry content is Human-gated policy content — compromise or retirement of
-the writer identity is revocable by `POLICY_ACTIVATE` (§8).
+workload credential bound to that producer_ref.
+
+**Invariant P — permanent producer identity (round-9 R9-1).** The string
+`governed:reclassification` is a **permanent constant of product contract v1.1**, not mutable
+registry content: it is fixed by the contract itself (like an `evidence_kind` value), and every
+mechanism that keys or trusts governed output uses the constant — the §5.3 rule keys, the §3.2
+unique indexes, the §5.1 reconcile predicates, and §6.2's `governed_transition`. Two rules make
+it permanent:
+
+1. **What rotates is the credential, never the identity.** Compromise or retirement of the
+   workload credential is handled by `POLICY_ACTIVATE` on the *identity registry binding*:
+   the old credential is unbound (no future dispatch can authenticate as the writer) and any
+   successor credential is bound to the **same** constant producer_ref. Every writer
+   generation therefore lands on the same `(producer_ref, source_ref)` and
+   `(producer_ref, T(F))` key rows — invariant U (§6.6) holds across all generations by
+   construction, and no "replacement producer_ref" can ever exist to open a second edge for a
+   served predecessor.
+2. **The constant is reserved (registry conformance rule, defence-in-depth).** A policy bundle
+   whose adapter registry contains any entry declaring `governed_edge: SUPERSEDES_SINGLETON`
+   for `IMPROVEMENT_FINDING` under a producer_ref other than the reserved constant fails
+   registry conformance and the `POLICY_ACTIVATE` is DENIED. (Even without this rule such an
+   entry would be inert for authority purposes — §6.2 compares against the constant, so its
+   envelopes could never clear or delegate — but the rule keeps invariant U literally true
+   rather than merely true-for-everything-that-matters.)
+
+Revocation is therefore **prospective only**: unbinding a credential stops future sealing and
+changes nothing about any envelope already sealed — `producer_ref` is a kernel-stamped immutable
+fact (K2), and §6.2 reads only such facts. A seal made by a compromised credential *before*
+revocation is distrusted **forward**, by the landed correction path — incident + I4 re-raise
+into CONTRACT_* (fresh key `T(C₂)`, §6.6) — never by re-evaluating history against the current
+registry. Removing the adapter-registry row itself (retiring the capability entirely) is
+likewise prospective: no further `FINDING_SEAL` can dispatch, while every completed edge remains
+a completed immutable transition (§8).
 
 ### 5.3 TD §9.1 — two registry-declared ingress rules (round-5 R5-1, round-6 R6-1, round-8 R8-1)
 
@@ -617,7 +696,7 @@ rule (b) GOVERNED-EDGE UNIQUENESS — key (producer_ref, T(F)), where the STORE 
 ```
 
 Neither key is caller-chosen: `source_ref` is set by the PEP-owned dispatch path from the sealed
-material (no other principal holds the writer identity, §5.1/FC5), and the edge key is computed
+material (no other principal holds the writer credential, §5.1/FC5), and the edge key is computed
 by the store from the draft's own sealed content. Two consequences, both load-bearing:
 
 1. **Replay idempotency (R5-1; re-keyed by R8-1).** Every dispatch of one admitted effect
@@ -647,8 +726,9 @@ step_ordinal)` backstops `insertWorkStep` (C33).
 
 **The §5 delta is exhaustive** (round-8 R8-2 — the prior "nothing else changes" claim is
 withdrawn): TD §6.4 one adapter operation row (§5.1); TD §9.2 one producer row + two registry
-fields (§5.2); TD §9.1 the two ingress rules above; TD §3.2 the two unique partial indexes; TD
-§2.6 one incident kind (§5.4). Nothing else: no recheck delta (recheck #14 applies as landed and
+fields (§5.2); TD §9.1 the two ingress rules above plus the invariant-P reserved-constant
+registry conformance rule (§5.2 rule 2 — a `POLICY_ACTIVATE`-time registry validity check,
+round-9 R9-1); TD §3.2 the two unique partial indexes; TD §2.6 one incident kind (§5.4). Nothing else: no recheck delta (recheck #14 applies as landed and
 is vacuous for a no-mutable-subject operation), no Human-decision delta, no new K-record, no
 API-shape change (the seal path is the landed `submit_evidence` signature — `source_ref` is an
 existing caller-supplied draft field; only the replay/uniqueness behaviour for registry-opted
@@ -729,16 +809,25 @@ distinguished by kernel-stamped facts:
 ```text
 governed_transition(D) iff
   D.evidence_kind == "IMPROVEMENT_FINDING", availability PRESENT
-  D.producer_ref == the registered governed writer (exact string from active policy content)
+  D.producer_ref == "governed:reclassification"          (the PERMANENT contract constant —
+    invariant P, §5.2; part of product contract v1.1 itself, NOT read from active policy
+    content — round-9 R9-1)
   D.provenance.integrity == "AUTHENTICATED_SOURCE"
   D.claim.derivation.kind ∈ {HUMAN_JUDGMENT, DETERMINISTIC_DERIVATION}   (defence-in-depth;
     MODEL_PROPOSAL is already unsealable through the gate — §6.4)
 ```
 
-`producer_ref` is stamped by the landed ingress from the authenticated workload identity; no
-adapter, worker, or model can produce it (§9.1; FC5). An envelope with this producer exists only
-if a `FINDING_SEAL` admission passed the full constitutional gate — including the transition
-rules of §6.4 — under a Human-gated policy.
+Every conjunct reads a **kernel-stamped immutable fact of the envelope**; none reads the
+currently-active registry (round-9 R9-1). `producer_ref` is stamped by the landed ingress from
+the workload credential authenticated at seal time — the credential the *seal-time* active
+policy bound to the constant (§5.2) — and no adapter, worker, or model can produce it (§9.1;
+FC5). An envelope with this producer exists only if a `FINDING_SEAL` admission passed the full
+constitutional gate — including the transition rules of §6.4 — under the Human-gated policy
+active at that admission. Which credential generation held the identity then is an audit fact
+(the effect's K-records name it), not a validity input: later revocation or rotation of the
+credential can therefore never make `governed_transition` flip on a sealed envelope, which is
+exactly what §6.3's "a validly cleared edge stays cleared" and D4's completed-transition
+boundary require (FC19a).
 
 **Audit pointer (round-8 R8-1 consequence — the round-6 detour is gone).** `source_ref` carries
 `cadp-v04:<effect_id>`, so the sealed artifact names its authorizing effect directly; K3/K5/K6
@@ -996,7 +1085,8 @@ envelope remains presentation metadata (B18; FC9d).
 
 ```text
 INVARIANT U:  for every Finding F, the store contains AT MOST ONE envelope with
-              producer_ref == the governed writer whose claim.supersedes names F —
+              producer_ref == "governed:reclassification" (the permanent contract constant,
+              invariant P §5.2 — round-9 R9-1) whose claim.supersedes names F —
               key T(F) = (F.evidence_id, F.envelope_digest), derived by the store from the
               sealed draft's OWN singleton supersedes entry (round-8 R8-1: a store uniqueness
               constraint, §5.3 rule (b) — deliberately NOT the idempotency key, which is the
@@ -1026,6 +1116,14 @@ Properties, stated precisely:
 - **Scope.** U is keyed on the *predecessor*, so it also blocks a second Human-authorized edge
   from the same F, and it blocks mixing families (one F cannot have both a RECLASSIFICATION and a
   SUBJECT_TRANSFER descendant). One CONTRACT_* node has one governed successor or none.
+- **Generation-independence (round-9 R9-1).** The producer_ref component of both key rows is the
+  invariant-P constant, so credential rotation, revocation, or any succession of writer
+  generations lands every governed seal — past and future — on the same index rows: a
+  successor-generation seal for an already-served F hits the occupied edge T(F) exactly as a
+  same-generation retry would (`GOVERNED_SEAL_CONFLICT`, FC19b), and the §5.2 reserved-constant
+  conformance rule ensures no governed-edge-capable producer_ref other than the constant can ever
+  activate. "For all time" in consequence 2 of §5.3 spans writer generations, not one
+  registration's lifetime.
 - **Not a lock on legitimate work.** Ordinary intake supersessions of F are untouched (different
   producer, no `replay_idempotency` entry, no clearing power). Correcting a *wrong* governed
   outcome is the I4 forward path: re-raise into CONTRACT_* as C₂, whose `T(C₂)` is a fresh key.
@@ -1044,8 +1142,9 @@ Properties, stated precisely:
   reconcile proof) rather than hanging UNKNOWN.
 - **Residual, declared.** U is enforced by the ingress of the deployment that owns the store. A
   deployment that federated governed writers across two independent stores would hold U only per
-  store; the reference deployment has exactly one primary store and one governed writer identity
-  (§5.1), and federation is out of scope for this design. Recorded as a boundary, not a claim.
+  store; the reference deployment has exactly one primary store and one governed producer
+  identity (invariant P, §5.1/§5.2), and federation is out of scope for this design. Recorded as
+  a boundary, not a claim.
 
 ## 7. D3 — Supersession subject/work-run context invariants
 
@@ -1129,6 +1228,13 @@ Context transfers authority boundary: from_subject AND to_subject inside digest(
                   an obligation moves only where an authority named both ends (§4.1, round-6 R6-2)
 Cleared edges     graph boundary : an immutable completed transition; path-scoped (§6.3);
                   reversible only forward, by I4 re-raise supersession
+Writer            identity boundary (round-9 R9-1): producer_ref is the permanent invariant-P
+generations       constant; only the workload credential rotates. Revocation by POLICY_ACTIVATE
+                  bounds FUTURE sealing (no dispatch can authenticate) and touches no sealed
+                  envelope — governed_transition reads kernel-stamped facts only (§6.2), so a
+                  completed edge survives every rotation/retirement; a wrongly sealed edge is
+                  corrected forward by I4 re-raise, never by registry re-evaluation. Uniqueness
+                  keys carry the constant, so invariant U spans all generations (§6.6)
 Resolving         predecessor boundary: a descendant resolves the ONE predecessor its authority
 descendants       named and no other — `sole_predecessor` over the sealed envelope's own
                   supersedes list (I6, §6.3, round-7 R7-1)
@@ -1177,8 +1283,10 @@ runs, and time are each closed by an exact content/kernel/policy/graph boundary.
 - **Residual honesty:** a G sealed under an earlier, weaker active policy would be trusted by
   its producer stamp. This is the generic in-flight/policy-history property of every landed fact
   (Spec §9.3), bounded here because policy content is Human-gated from genesis and the writer
-  identity itself is registry-revocable; a wrongly sealed G is correctable forward by I4
-  re-raise. Recorded as a property, not a gap.
+  *credential* is registry-revocable — prospectively only (invariant P, §5.2/round-9 R9-1: the
+  producer identity is a permanent contract constant, and revocation never re-evaluates sealed
+  history); a wrongly sealed G is correctable forward by I4 re-raise. Recorded as a property,
+  not a gap.
 
 ## 10. Product contract delta — `cadp.improvement-intake.v1` → v1.1 (bounded)
 
@@ -1327,8 +1435,9 @@ runs, and time are each closed by an exact content/kernel/policy/graph boundary.
 | FC13 | unresolvable ancestor (absent envelope or digest mismatch anywhere in reach(tip)) | fail closed (landed behavior retained) |
 | FC14 | guard-bite meta-control: individually remove each new predicate — digest matching in supersedes/tip refs, `sole_predecessor` (§6.3, in each of the three resolved-entry forms) and the §6.4 singleton shape rule, producer/integrity checks, I1 equality, each §6.4 per-kind rule, ambiguity rule, each delegation form, each `authority_applicable` element (§6.5), each `valid_authority_resolution` conjunct incl. entry `finding_ref` equality (§10.4), §5.3 rule (a), §5.3 rule (b) incl. its shape guard, the §5.4 scope-hold bindings | the corresponding exploit reproduces (delta 1); a control whose removal changes nothing is reported as defence-in-depth (FC6 is expected to land there after FC15; FC7 documents the measured redundancy of rule (a) for the retry case) |
 | FC15 | **round-6 R6-1, the omission attack, load-bearing.** Seal G₁ from F (deterministic route, observation A). Then assemble a SECOND FINDING_SEAL for the same F with a different descendant draft (different basis/run/class-target), presenting the same A and deliberately **omitting G₁ from `input.evidence`** so the §6.4 conflict rule cannot see it. Run it through the real `admitAndDispatch`. Repeat with the Human route (a fresh H on the second effect) and with a different work run and a different principal | the admission may reach ALLOW (policy is blind by construction — that is the point of the control), and the **dispatch is refused at the store** by §5.3 rule (b): `GOVERNED_SEAL_CONFLICT` incident sealed with the exact §5.4 subject bindings, no second governed envelope whose supersedes names F exists, store count for edge T(F) == 1, effect resolves `NO_EFFECT_CONFIRMED(governed_seal_conflict)` via the `REJECTED_NO_EFFECT` proof. **Scope-hold bite (R8-2):** a third FINDING_SEAL effect naming F in `work_bindings` is refused admission while the incident stands, and admissible again only after a root-signed BREAK_GLASS whose `release_incident_refs` names it; ordinary admissions merely presenting F as evidence are NOT held. Downstream, no graph containing two governed descendants of F is constructible. Guard-bite: remove the §5.3 rule-(b) branch → the second envelope appears and each branch clears separately (reproduces R6-1 exactly) |
-| FC18 | **round-8 R8-1, the separated-keys control.** (a) two admitted effects E₁ ≠ E₂ dispatch byte-identical drafts for the same F (legitimate cross-effect restatement); (b) a dispatch forged with `source_ref` ≠ the material's `idempotency_key` (adapter conformance); (c) a draft for this producer whose `supersedes` has two entries or zero entries reaches `submit_evidence` directly (bypassing §6.4 — e.g. a compromised workflow composing its own dispatch through the writer identity is out of reach by FC5, so this is exercised via the adapter conformance suite with a synthetic ingress call) | (a) rule (a) finds no envelope for E₂'s key, rule (b) converges on the identical payload → ONE envelope, store count for T(F) == 1, both effects COMMITTED with the same receipt, no incident, no new privilege; (b) refused pre-dispatch by the adapter (§5.1) — never reaches the target; (c) rejected outright by the rule-(b) shape guard — the edge key cannot even be derived; guard-bite: with the shape guard removed, (c) still cannot clear downstream (`sole_predecessor` fails, FC17b) — reported as the intended defence-in-depth layering |
+| FC18 | **round-8 R8-1, the separated-keys control.** (a) two admitted effects E₁ ≠ E₂ dispatch byte-identical drafts for the same F (legitimate cross-effect restatement); (b) a dispatch forged with `source_ref` ≠ the material's `idempotency_key` (adapter conformance); (c) a draft for this producer whose `supersedes` has two entries or zero entries reaches `submit_evidence` directly (bypassing §6.4 — e.g. a compromised workflow composing its own dispatch through the writer credential is out of reach by FC5, so this is exercised via the adapter conformance suite with a synthetic ingress call) | (a) rule (a) finds no envelope for E₂'s key, rule (b) converges on the identical payload → ONE envelope, store count for T(F) == 1, both effects COMMITTED with the same receipt, no incident, no new privilege; (b) refused pre-dispatch by the adapter (§5.1) — never reaches the target; (c) rejected outright by the rule-(b) shape guard — the edge key cannot even be derived; guard-bite: with the shape guard removed, (c) still cannot clear downstream (`sole_predecessor` fails, FC17b) — reported as the intended defence-in-depth layering |
 | FC16 | **round-6 R6-2, context transfer.** (a) positive: governed SUBJECT_TRANSFER `C_old/S1 → C_new/S2` with H₁ rendering both subjects → delegation holds → the §11 variant chain clears; (b) the R6-2 exploit: ordinary intake subject-changing correction `C_old/S1 → C_new/S2`, then a fully valid governed clearing of `C_new/S2` → **C_old's barrier still stands** for every tip through it (authority for S2 never discharges S1); (c) SUBJECT_TRANSFER material with `to_subject` ≠ the descendant draft's primary subject, or `from_subject` ≠ F's → DENY; (d) SUBJECT_TRANSFER that also changes classification (transfer + clear in one step) → DENY `transition_shape_invalid`; (e) deterministic transfer whose observation's `applies_to.to_subject` names S3 while the draft moves to S2 → DENY; (f) H issued for a transfer `S1→S2` re-presented for a transfer `S1→S3` (new material, new effect) → recheck #5 / material_digest mismatch → refused | as stated; (b) is the finding's exact scenario and must fail closed; guard-bite: restore the round-5 rule (any intra-CONTRACT supersession delegates) → (b) clears, reproducing R6-2 |
+| FC19 | **round-9 R9-1, writer-generation stability, load-bearing.** (a) revoke-after-clear: seal a governed clearing edge G for F (either family), then `POLICY_ACTIVATE` a bundle that unbinds the writer credential (and a second variant that also removes the adapter-registry row); re-run every later admission of the §11 chain through the real PEP; (b) successor-generation second seal: bind a NEW credential to the constant producer_ref, then attempt a `FINDING_SEAL` for the already-served F with a different descendant draft, omitting G from `input.evidence` (the FC15 shape, now across generations); (c) reserved-constant attempt: a policy bundle registering `governed_edge: SUPERSEDES_SINGLETON` for `IMPROVEMENT_FINDING` under producer_ref `governed:reclassification2`, and a synthetic envelope carrying that producer_ref presented downstream | (a) `governed_transition(G)` still holds and every tip through G still clears — the predicate reads only G's kernel-stamped `producer_ref`/`integrity`, never the active registry; guard-bite: reintroduce the active-registry lookup into `governed_transition` → the cleared edge goes dark after revocation, reproducing R9-1(i) exactly; (b) refused at the store on the SAME occupied key T(F) — `GOVERNED_SEAL_CONFLICT`, store count for T(F) == 1: a new generation gains no fresh edge namespace (guard-bite: key the §3.2 indexes on the credential instead of the constant → (b) seals a second edge, reproducing R9-1(ii)); (c) `POLICY_ACTIVATE` DENY (registry conformance, §5.2 rule 2), and the synthetic envelope clears and delegates nothing (§6.2 constant mismatch — the FC5 no-clear polarity, proving the conformance rule is defence-in-depth, not the sole barrier) |
 | FC17 | **round-7 R7-1, the multi-predecessor attack, load-bearing.** (a) the exploit: two distinct CONTRACT_GAP findings F₁ and F₂ sharing one normalized primary subject; obtain a fully valid authorization for F₁ ONLY (H scoped to E over M with `predecessor_ref = F₁`, or a deterministic A whose `applies_to` names F₁); build the descendant draft with `supersedes = [F₁, F₂]`; (b) the same multi-predecessor shape reaching a later admission by any route (an intake-produced descendant listing both, or a synthetic envelope standing in for a pre-I6 artifact); (c) transfer variant: governed SUBJECT_TRANSFER material naming C_old with a draft superseding C_old and C_other; (d) merge-then-clear: intake merge `[C₁, C₂] → C₃`, then a fully valid governed clearing of C₃; (e) positive/no-regression: singleton `supersedes = [F₁]` | (a) seal DENIES `transition_shape_invalid` (§6.4 singleton rule) — the governed multi-predecessor artifact is unconstructible; (b) `sole_predecessor` fails for F₁ **and** for F₂ → no clearing_edge, no delegation, both barriers stand (this is the load-bearing control: it does not depend on the seal-time check); (c) DENY at seal, and no delegation downstream for either predecessor; (d) C₁ and C₂ barriers still stand for every tip through them — one authorization never answers two contract questions; (e) clears exactly as §11. Guard-bite: restore containment matching in `sole_predecessor` → (b) and (d) clear, reproducing R7-1 exactly; restore it in §6.4 only → (a) seals and then (b) clears |
 
 ## 13. Preserved paths and non-goals
@@ -1360,7 +1469,7 @@ clock; no automatic Human approval; no free-text authority; no production deploy
 | 5 | validity/reuse compatible with clock-free admission | §8 (incl. the target and context-transfer boundaries) |
 | 6 | polarity: only explicit authorization clears | §4 rule 1, §6.4, FC1 |
 | 7 | exact id+digest basis resolution; no self-declared AUTHORITY_TEXT | §6.3–§6.5, §10, FC9/FC13 |
-| 8 | falsification controls incl. cross-run/subject/descendant reuse and invalid Human paths | §12, notably FC15 (descendant/evidence-omission reuse + scope-hold/release), FC16 (cross-subject), FC17 (cross-predecessor reuse of one authorization), FC18 (separated replay/edge keys) |
+| 8 | falsification controls incl. cross-run/subject/descendant reuse and invalid Human paths | §12, notably FC15 (descendant/evidence-omission reuse + scope-hold/release), FC16 (cross-subject), FC17 (cross-predecessor reuse of one authorization), FC18 (separated replay/edge keys), FC19 (writer-generation stability of cleared edges and edge uniqueness) |
 | 9 | real-PEP positive S4 path expressible | §11 |
 | 10 | DESIGN_DISPOSITION / NEXT_OWNER | header block, §15 |
 
