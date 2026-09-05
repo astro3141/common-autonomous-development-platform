@@ -422,6 +422,40 @@ async function evalBoundOp(h: Harness, op: "PR_MERGE" | "POLICY_ACTIVATE", findi
   return { outcome: evaluated.decision.outcome, reason_codes: [...evaluated.decision.reason_codes] };
 }
 
+/** Ordinary PR_MERGE clearance evidence (verification + independent review of the exact sha) —
+ * independent of ancestry, so a PR_MERGE proof can isolate the ancestry barrier as the cause. */
+function mergeOrdinaryEvidence(h: Harness, sha: string): { verification: EvidenceEnvelopeV1; review: EvidenceEnvelopeV1 } {
+  const completedAt = new Date(h.clock.fn()).toISOString();
+  const verification = h.ingress.submitEvidence(
+    {
+      evidence_kind: "VERIFICATION",
+      subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: sha }],
+      availability: "PRESENT",
+      claim_schema: "cadp.verification.harness.v1",
+      claim: { head_sha: sha, clone_head: sha, porcelain_empty: true, conclusion: "success", runner: "node --test", started_at: completedAt, completed_at: completedAt, output_digest: "0".repeat(64) },
+      produced_at: completedAt,
+      producer_ref: "verifier:harness",
+      source_ref: "test",
+      source_relation: "INDEPENDENT_OBSERVATION",
+    },
+    PRINCIPALS.verifier,
+  );
+  const review = h.ingress.submitEvidence(
+    {
+      evidence_kind: "REVIEW",
+      subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: sha }],
+      availability: "PRESENT",
+      claim_schema: "cadp.review.v1",
+      claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+      producer_ref: "reviewer:claude-code",
+      source_ref: "test",
+      source_relation: "INDEPENDENT_OBSERVATION",
+    },
+    PRINCIPALS.reviewer,
+  );
+  return { verification, review };
+}
+
 test("S2-1: omitted CONTRACT_* predecessor cannot vanish from ancestry → DENY; presenting it restores the reviewed clearing path", async () => {
   const h = await makeHarness();
   try {
@@ -487,6 +521,18 @@ test("S2-4: PR_MERGE / POLICY_ACTIVATE bound to an ancestry-incomplete tip are d
     // Contrast: complete presented ancestry clears the intake gate (policy outcome, not PEP admit).
     const clean = await evalBoundOp(h, "POLICY_ACTIVATE", x, [x, c], { humanApprove: true });
     assert.equal(clean.outcome, "ALLOW", JSON.stringify(clean));
+
+    // Isolate causation: with every ordinary PR_MERGE predicate (verification + independent
+    // review of the exact merge sha) satisfied, the barrier — not merge_base_ok — is what denies.
+    const { verification, review } = mergeOrdinaryEvidence(h, "h".repeat(40));
+    const mergeOrdinaryOk = await evalBoundOp(h, "PR_MERGE", x, [x, verification, review], { humanApprove: true });
+    assert.equal(mergeOrdinaryOk.outcome, "DENY", JSON.stringify(mergeOrdinaryOk));
+    assert.ok(mergeOrdinaryOk.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(mergeOrdinaryOk.reason_codes));
+    assert.ok(!mergeOrdinaryOk.reason_codes.includes("verification_missing_or_unbound"), JSON.stringify(mergeOrdinaryOk.reason_codes));
+    assert.ok(!mergeOrdinaryOk.reason_codes.includes("review_missing_or_wrong_subject"), JSON.stringify(mergeOrdinaryOk.reason_codes));
+    // Positive control: same ordinary predicates plus the complete presented ancestry → ALLOW.
+    const mergeComplete = await evalBoundOp(h, "PR_MERGE", x, [x, c, verification, review], { humanApprove: true });
+    assert.equal(mergeComplete.outcome, "ALLOW", JSON.stringify(mergeComplete));
   } finally { h.close(); }
 });
 
@@ -714,15 +760,9 @@ test("#109 E3: complete ancestry with valid authority clearing path → normal b
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E3" });
     // F clears C via AUTHORITY_RESOLUTION
     const authEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "design-e3", revision: "decision-1" });
-    const resolution = {
-      contract_id: "cadp.improvement-intake.v1",
-      finding_tip_ref: refOf(c),
-      resolution_kind: "AUTHORITY_RESOLUTION" as const,
-      statement: "cleared",
-      landed_authority_ref: "spec:section-1",
-    };
     const resEnv = await submitResolution(submitter(h), {
-      claim: resolution, subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
+      claim: resolution("AUTHORITY_RESOLUTION", { finding_tip_ref: refOf(c), landed_authority_ref: "spec:section-1" }),
+      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
       tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
     });
     // X supersedes C, and C is now cleared → X can proceed
