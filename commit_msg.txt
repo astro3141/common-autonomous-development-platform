@@ -1,0 +1,15 @@
+fix(#109): enforce exact digest in superseded_ids leaf detection and add regression test
+
+- Finding 1: Change superseded_ids to only include resolved references (exact id+digest match).
+  Previously, superseded_ids accepted any reference by ID alone, causing siblings with
+  mismatched digest references to incorrectly disappear from occurrence_conflict detection.
+  Now maintain separate all_referenced_predecessor_ids for ancestry materialization, while
+  superseded_ids requires supersedes_ref_resolved(s) to enforce E2 exact digest preservation.
+
+- Finding 2: Clear typecheck.scratch.tsconfig.json (never stage it). This developer-specific
+  scratch config with hardcoded cache paths is unrelated to the product repair.
+
+- Add #109 E2-conflict-regression test: verifies that a sibling with mismatched digest reference
+  in an unrelated Finding stays correctly identified as a leaf, allowing conflict detection to work.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
