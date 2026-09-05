@@ -25,6 +25,7 @@ import type {
 } from "../../kernel/adapters/types.ts";
 import type { EvidenceEnvelopeV1, SubjectBinding, TargetRef } from "../../kernel/records.ts";
 import { StorePolicyAdapter } from "../../kernel/adapters/storePolicy.ts";
+import { FindingSealAdapter } from "../../kernel/adapters/findingSeal.ts";
 import { rawDigest, jcsDigest } from "../../kernel/canonical.ts";
 import { buildReferenceBundle, buildReferenceKernelConfig } from "../../deployment/referencePolicy.ts";
 import type { ReferencePolicyInput } from "../../deployment/referencePolicy.ts";
@@ -40,6 +41,8 @@ export const PRINCIPALS = {
   human: { principal: "sso:a.t.laplace@gmail.com" },
   depctlProbe: { principal: "cadp-depctl-probe" },
   depctlTarget: { principal: "cadp-depctl-target" },
+  intake: { principal: "cadp-improvement-intake" },
+  governed: { principal: "cadp-governed-reclassification" },
 } satisfies Record<string, Principal>;
 
 /** A scripted governed target: dispatch/reconcile behaviours are injected per test. */
@@ -152,6 +155,8 @@ export interface Harness {
   reconciler: Reconciler;
   evaluator: OpaEvaluator;
   target: ScriptedTarget;
+  /** The PEP-held governed transition writer (#117 §5.1); no other principal holds its credential. */
+  findingSeal: FindingSealAdapter;
   root: ReturnType<typeof generateRootKey>;
   policyInput: ReferencePolicyInput;
   clock: { now: number; fn: () => number };
@@ -168,7 +173,11 @@ let sharedEvaluator: OpaEvaluator | undefined;
 export interface HarnessOptions {
   paramOverrides?: Record<string, unknown>;
   configOverrides?: ReferencePolicyInput["configOverrides"];
+  identityRegistry?: ReferencePolicyInput["identity_registry"];
+  adapterRegistry?: ReferencePolicyInput["adapter_registry"];
   disabledChecks?: ReadonlySet<string>;
+  /** TEST-ONLY: disable a registry-declared ingress rule to prove it is load-bearing (FC15/FC18). */
+  disabledIngressRules?: ReadonlySet<string>;
   extraAdapters?: TargetAdapterV1[];
   /** Build adapters that need the harness store/cas (e.g. a GitHub Issues adapter reading blobs). */
   extraAdapterFactory?: (store: ConstitutionalStore, cas: Cas) => TargetAdapterV1[];
@@ -185,7 +194,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
   const tick = () => (clockBox.now = Math.max(clockBox.now + 1, Date.now()));
   const clock = () => tick();
   const cas = new Cas(store, clock);
-  const ingress = new Ingress(store, cas, PEP_REF, clock);
+  const ingress = new Ingress(store, cas, PEP_REF, clock, options.disabledIngressRules ?? new Set());
   const root = generateRootKey();
   const policyInput: ReferencePolicyInput = {
     policy_id: "cadp-v04:policy:root",
@@ -194,6 +203,8 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
       { key_id: root.key_id, alg: "Ed25519", public_key: root.public_key_base64, valid_from: "2026-01-01T00:00:00.000Z" },
       ...(options.extraRootPublicKeys ?? []),
     ],
+    ...(options.identityRegistry !== undefined ? { identity_registry: options.identityRegistry } : {}),
+    ...(options.adapterRegistry !== undefined ? { adapter_registry: options.adapterRegistry } : {}),
     paramOverrides: { extra_plain_allow_operations: ["SCRIPTED_WRITE", "SCRIPTED_KEYED_WRITE", "SCRIPTED_GUARDED_WRITE"], ...options.paramOverrides },
     configOverrides: options.configOverrides,
     rego: options.rego,
@@ -216,12 +227,13 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
 
   const target = new ScriptedTarget();
   const storePolicyAdapter = new StorePolicyAdapter(store, cas, ingress, clock);
-  const registry = makeAdapterRegistry([target, storePolicyAdapter, ...(options.extraAdapters ?? []), ...(options.extraAdapterFactory?.(store, cas) ?? [])]);
+  const findingSealAdapter = new FindingSealAdapter(ingress, store);
+  const registry = makeAdapterRegistry([target, storePolicyAdapter, findingSealAdapter, ...(options.extraAdapters ?? []), ...(options.extraAdapterFactory?.(store, cas) ?? [])]);
   const pep = new Pep(store, cas, ingress, registry, PEP_REF, clock, options.disabledChecks ?? new Set());
   const reconciler = new Reconciler(store, cas, ingress, pep, registry, clock);
 
   const harness: Harness = {
-    dir, store, cas, ingress, pep, reconciler, evaluator, target, root, policyInput,
+    dir, store, cas, ingress, pep, reconciler, evaluator, target, findingSeal: findingSealAdapter, root, policyInput,
     clock: { get now() { return clockBox.now; }, set now(v: number) { clockBox.now = v; }, fn: clock } as Harness["clock"],
     evaluate: (input_digest: string) => evaluateAndSeal(store, cas, ingress, evaluator, input_digest, clock),
     sealReach(alternate = false) {
@@ -247,6 +259,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
     async sealTargetIdentity() {
       await pep.refreshTargetIdentity(target);
       await pep.refreshTargetIdentity(storePolicyAdapter);
+      await pep.refreshTargetIdentity(findingSealAdapter);
     },
     humanApprove(effect_id: string): EvidenceEnvelopeV1 {
       const request = store.effectRequest(effect_id);

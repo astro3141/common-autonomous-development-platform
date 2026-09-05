@@ -7,6 +7,39 @@
 import { buildPolicyBundle } from "../kernel/policyBundle.ts";
 import type { KernelConfig } from "../kernel/policyBundle.ts";
 
+/**
+ * RFC 8785 (cadp-jcs-1) string serialization as a Rego rule. OPA's own `json.marshal` is NOT
+ * JCS: it HTML-escapes `<`, `>` and `&` and emits `\\u0008`/`\\u000c` where RFC 8785 uses `\\b`
+ * and `\\f`. The v1.1 derivation closure recomputes the landed `occurrence_key`, so the evaluator
+ * needs the exact serializer — an ALLOW on the deterministic path must entail a sealable Finding
+ * (#117 §10 item 2a site 20). The escape chain is generated so it cannot drift from
+ * `JSON.stringify`, which implements exactly the RFC 8785 escape set.
+ *
+ * Order is load-bearing: the backslash is escaped first, so the backslashes introduced by every
+ * later replacement are never re-escaped, and no later target can occur in text already emitted.
+ */
+const JCS_ESCAPES: ReadonlyArray<readonly [string, string]> = (() => {
+  const pairs: Array<[string, string]> = [["\\", "\\\\"], ['"', '\\"']];
+  for (let code = 0; code < 0x20; code += 1) {
+    const ch = String.fromCharCode(code);
+    pairs.push([ch, JSON.stringify(ch).slice(1, -1)]);
+  }
+  return pairs;
+})();
+
+const JCS_STRING_RULE: string = (() => {
+  const quote = JSON.stringify('"');
+  const lines = JCS_ESCAPES.map(
+    ([raw, escaped], i) => `\te${i + 1} := replace(e${i}, ${JSON.stringify(raw)}, ${JSON.stringify(escaped)})`,
+  );
+  return [
+    `jcs_string(s) := concat("", [${quote}, e${JCS_ESCAPES.length}, ${quote}]) if {`,
+    "\te0 := s",
+    ...lines,
+    "}",
+  ].join("\n");
+})();
+
 export const REFERENCE_REGO = `package cadp.admission
 
 revision_echo := data.system.bundles["cadp"].manifest.revision
@@ -134,7 +167,12 @@ outcome := "ALLOW" if {
 	intake_workstart_ok
 }
 
-outcome := "ALLOW" if op in params.extra_plain_allow_operations
+# FINDING_SEAL is the governed transition gate and is NEVER plain-allowed, whatever a deployment
+# puts in extra_plain_allow_operations (#117 §6.4 containment).
+outcome := "ALLOW" if {
+	op in params.extra_plain_allow_operations
+	op != "FINDING_SEAL"
+}
 
 pr_create_ok if {
 	op == "PR_CREATE"
@@ -179,9 +217,19 @@ outcome := "REQUIRE_EVIDENCE" if {
 	not intake_nonindex_denied
 }
 
-# cadp.improvement-intake.v1 index-only projection (Option A, §6): the SOLE exception to the
-# unresolved-CONTRACT_* mutation prohibition.
+# cadp.improvement-intake.v1 index-only projection (Option A, §6): the FIRST of the two exceptions
+# to the unresolved-CONTRACT_* mutation prohibition.
 outcome := "ALLOW" if finding_project_ok
+
+# v1.1 governed transition sealing (#117 §6.4): the second and last exception. The two families
+# are disjoint by the draft's single derivation kind, so ALLOW and REQUIRE_EVIDENCE never collide.
+outcome := "ALLOW" if finding_seal_ok
+
+outcome := "REQUIRE_EVIDENCE" if {
+	finding_seal_base_ok
+	seal_derivation_kind == "HUMAN_JUDGMENT"
+	not human_ok
+}
 
 # ---------------------------------------------------------------- reasons
 
@@ -260,6 +308,64 @@ contract_classes := {"CONTRACT_GAP", "CONTRACT_AMBIGUITY", "CONTRACT_CONTRADICTI
 
 is_contract_class(c) if c in contract_classes
 
+# Landed closed sets, read as-is and never extended (cadp/product/improvement/contracts.ts).
+classifications := {
+	"BUG", "IMPLEMENTATION_GAP", "BACKEND_GAP", "OPERABILITY_GAP",
+	"CONTRACT_GAP", "CONTRACT_AMBIGUITY", "CONTRACT_CONTRADICTION", "NON_BLOCKING_NIT",
+}
+
+subject_kinds := {"WORK_RUN", "EFFECT", "EVIDENCE", "BACKEND", "TARGET", "PRODUCT_CONFORMANCE_PROOF"}
+
+immutable_subject_kinds := {"EVIDENCE"}
+
+transition_kinds := {"RECLASSIFICATION", "SUBJECT_TRANSFER"}
+
+# Invariant P (#117 §5.2): a permanent constant of product contract v1.1, NOT registry content.
+# Only the workload credential bound to it rotates, so every clearing predicate and uniqueness key
+# is generation-independent and revocation is prospective only.
+governed_producer_ref := "governed:reclassification"
+
+intake_producer_ref := "intake:cadp-improvement"
+
+nonempty_string(x) if {
+	is_string(x)
+	x != ""
+}
+
+# The normalized primary subject tuple both governed families bind (§4): exactly the five landed
+# SubjectBinding fields, absent ones omitted.
+subject_tuple(b) := object.filter(b, ["authority_ref", "namespace", "object_id", "revision_or_version", "content_digest"])
+
+primary_binding(e) := b if {
+	b := e.subject_bindings[e.claim.subject.binding_index]
+}
+
+# ---- evaluator-private v1.1 policy content (#117 §5, round-12 A1) ----
+# Both tables are read ONLY by this evaluator, never by the Kernel Service, so they live outside
+# the kernel-owned closed data.cadp schema, in the landed rego-private namespace. Absent
+# namespace, absent table or non-array ⇒ the EMPTY set, which is also the default: fail closed.
+
+default improvement_transition := {}
+
+improvement_transition := t if {
+	t := params.improvement_transition
+	is_object(t)
+}
+
+default authority_text_rules := []
+
+authority_text_rules := r if {
+	r := improvement_transition.authority_text_rules
+	is_array(r)
+}
+
+default landed_authority_resolutions := []
+
+landed_authority_resolutions := r if {
+	r := improvement_transition.landed_authority_resolutions
+	is_array(r)
+}
+
 # every PRESENT IMPROVEMENT_FINDING in this admission input
 improvement_findings contains e if {
 	some e in input.evidence
@@ -312,15 +418,6 @@ finding_graph[pid] := ns if {
 
 ancestry(tip_id) := graph.reachable(finding_graph, {tip_id})
 
-# a valid AUTHORITY_RESOLUTION naming exactly this tip clears its contract class
-authority_resolution_names(cid) if {
-	some e in input.evidence
-	e.evidence_kind == "IMPROVEMENT_FINDING_RESOLUTION"
-	e.availability == "PRESENT"
-	e.claim.resolution_kind == "AUTHORITY_RESOLUTION"
-	e.claim.finding_tip_ref.evidence_id == cid
-}
-
 # #109 S2 (E2): a supersedes reference is resolved only by the exact presented predecessor
 # envelope — id AND digest. An id-only match is unresolved.
 supersedes_ref_resolved(s) if {
@@ -329,39 +426,136 @@ supersedes_ref_resolved(s) if {
 	e.envelope_digest.value == s.envelope_digest
 }
 
-# §3 reclassification: a non-CONTRACT_* descendant that supersedes C via HUMAN_JUDGMENT, or via
-# DETERMINISTIC_DERIVATION whose basis binds AUTHORITY_TEXT. MODEL_PROPOSAL can NEVER clear.
-# A clearing reference must bind the exact predecessor envelope (#109 E2).
-reclassified_clear(cid) if {
-	some e in improvement_findings
-	some s in object.get(e.claim, "supersedes", [])
-	s.evidence_id == cid
-	supersedes_ref_resolved(s)
-	not is_contract_class(e.claim.classification)
-	e.claim.derivation.kind == "HUMAN_JUDGMENT"
+# ---------------------------------------------------------------- v1.1 §10.4 AUTHORITY_RESOLUTION
+# Bare-digest membership and the Human-decision variant are REMOVED (round-4 R4, round-5 R5-3):
+# an untyped digest set let any intake-produced resolution clear ANY CONTRACT_* tip. The ACTIVE
+# policy instead carries applicability-bearing entries, each Human-landed by POLICY_ACTIVATE and
+# authorizing resolution of exactly ONE finding tip by exactly ONE landed content.
+
+well_formed_resolution_entry(e) if {
+	object.keys(e) == {"finding_ref", "authority_content_digest"}
+	object.keys(e.finding_ref) == {"evidence_id", "envelope_digest"}
+	nonempty_string(e.finding_ref.evidence_id)
+	nonempty_string(e.finding_ref.envelope_digest)
+	nonempty_string(e.authority_content_digest)
 }
 
-reclassified_clear(cid) if {
-	some e in improvement_findings
-	some s in object.get(e.claim, "supersedes", [])
-	s.evidence_id == cid
-	supersedes_ref_resolved(s)
-	not is_contract_class(e.claim.classification)
-	e.claim.derivation.kind == "DETERMINISTIC_DERIVATION"
-	some b in e.claim.basis
-	b.role == "AUTHORITY_TEXT"
-}
-
-cleared(cid) if authority_resolution_names(cid)
-cleared(cid) if reclassified_clear(cid)
-
-# contract_barrier(F): an uncleared CONTRACT_* ancestor, OR an ancestor we cannot even resolve
-# (inability to prove the complete ancestry is fail-closed).
-contract_barrier(tip_id) if {
-	some cid in ancestry(tip_id)
+valid_authority_resolution(cid) if {
 	fc := finding_by_id(cid)
+	some entry in landed_authority_resolutions
+	well_formed_resolution_entry(entry)
+	entry.finding_ref.evidence_id == cid
+	entry.finding_ref.envelope_digest == fc.envelope_digest.value
+	some r in input.evidence
+	r.evidence_kind == "IMPROVEMENT_FINDING_RESOLUTION"
+	r.availability == "PRESENT"
+	r.producer_ref == intake_producer_ref
+	r.claim.resolution_kind == "AUTHORITY_RESOLUTION"
+	r.claim.finding_tip_ref.evidence_id == cid
+	r.claim.finding_tip_ref.envelope_digest == fc.envelope_digest.value
+	r.claim.landed_authority_ref.authority_content_digest == entry.authority_content_digest
+}
+
+# ---------------------------------------------------------------- v1.1 §6.2 the durable clearing artifact
+# What later admissions consume is an ordinary immutable IMPROVEMENT_FINDING envelope distinguished
+# by KERNEL-STAMPED facts only — never by a lookup in the currently-active registry (round-9 R9-1),
+# so revocation or rotation of the writer credential can never un-clear a completed edge. The
+# landed v1.0 shape (a claim-authored AUTHORITY_TEXT basis role, or a bare intake HUMAN_JUDGMENT
+# descendant) clears NOTHING in v1.1: that was Review B18.
+governed_transition(d) if {
+	d.evidence_kind == "IMPROVEMENT_FINDING"
+	d.availability == "PRESENT"
+	d.producer_ref == governed_producer_ref
+	d.provenance.integrity == "AUTHENTICATED_SOURCE"
+	d.claim.derivation.kind in {"HUMAN_JUDGMENT", "DETERMINISTIC_DERIVATION"}
+}
+
+# ---------------------------------------------------------------- v1.1 §6.3 edge/path-scoped barrier
+# I6 (round-7 R7-1): a descendant resolves an entry only when its supersedes list is EXACTLY the
+# single entry naming that predecessor. Containment matching let ONE authorized seal resolve every
+# other CONTRACT_* finding the draft happened to list. This predicate reads the SEALED envelope's
+# own list, so it holds at every later admission regardless of any seal-time check.
+sole_predecessor(cid, d) if {
+	ss := object.get(d.claim, "supersedes", [])
+	count(ss) == 1
+	ss[0].evidence_id == cid
+	supersedes_ref_resolved(ss[0])
+}
+
+clearing_edge(cid, d) if {
+	fc := finding_by_id(cid)
+	sole_predecessor(cid, d)
 	is_contract_class(fc.claim.classification)
-	not cleared(cid)
+	not is_contract_class(d.claim.classification)
+	subject_tuple(primary_binding(d)) == subject_tuple(primary_binding(fc))
+	governed_transition(d)
+}
+
+# Delegation form (a) CONTEXT_PRESERVING: ordinary intake, NO authority required — no context
+# crosses, and whatever later clears the successor is bound to the same exact subject.
+delegation_edge(cid, d) if {
+	fc := finding_by_id(cid)
+	sole_predecessor(cid, d)
+	is_contract_class(fc.claim.classification)
+	is_contract_class(d.claim.classification)
+	subject_tuple(primary_binding(d)) == subject_tuple(primary_binding(fc))
+}
+
+# Delegation form (b) CONTEXT TRANSFER: a governed SUBJECT_TRANSFER whose authority named BOTH
+# contexts. An UNAUTHORISED subject-changing supersession stays legal at intake and simply
+# delegates nothing — the predecessor's obligation stands (round-6 R6-2).
+delegation_edge(cid, d) if context_transfer_edge(cid, d)
+
+context_transfer_edge(cid, d) if {
+	fc := finding_by_id(cid)
+	sole_predecessor(cid, d)
+	is_contract_class(fc.claim.classification)
+	is_contract_class(d.claim.classification)
+	subject_tuple(primary_binding(d)) != subject_tuple(primary_binding(fc))
+	governed_transition(d)
+}
+
+resolved_entry(cid, d) if clearing_edge(cid, d)
+
+resolved_entry(cid, d) if delegation_edge(cid, d)
+
+governed_resolver(cid, d) if clearing_edge(cid, d)
+
+governed_resolver(cid, d) if context_transfer_edge(cid, d)
+
+# Ambiguity (fail closed, defence-in-depth): §6.6's target-authoritative uniqueness makes this
+# state unreachable for governed edges; it is retained as a graph-level backstop, NOT as the
+# exclusivity mechanism (round-6 R6-1).
+reclassification_ambiguous(cid) if {
+	some d1 in improvement_findings
+	some d2 in improvement_findings
+	d1.evidence_id < d2.evidence_id
+	governed_resolver(cid, d1)
+	governed_resolver(cid, d2)
+}
+
+entry_resolved(cid, d) if {
+	resolved_entry(cid, d)
+	not reclassification_ambiguous(cid)
+}
+
+# contract_barrier(tip): (i) an unresolved supersession entry into a CONTRACT_* predecessor
+# anywhere in the chain; (ii) the tip itself CONTRACT_*; (iii) ancestry that cannot even be
+# resolved (fail closed, #109 E1/E2 retained verbatim).
+contract_barrier(tip_id) if {
+	some did in ancestry(tip_id)
+	d := finding_by_id(did)
+	some s in object.get(d.claim, "supersedes", [])
+	fc := finding_by_id(s.evidence_id)
+	is_contract_class(fc.claim.classification)
+	not entry_resolved(s.evidence_id, d)
+	not valid_authority_resolution(s.evidence_id)
+}
+
+contract_barrier(tip_id) if {
+	tip := finding_by_id(tip_id)
+	is_contract_class(tip.claim.classification)
+	not valid_authority_resolution(tip_id)
 }
 
 contract_barrier(tip_id) if {
@@ -482,7 +676,7 @@ intake_nonindex_denied if {
 unresolved_contract(id) if {
 	fc := finding_by_id(id)
 	is_contract_class(fc.claim.classification)
-	not authority_resolution_names(id)
+	not valid_authority_resolution(id)
 }
 
 projection_purpose_ok if mat.purpose in {"CREATE_INDEX", "APPEND_OCCURRENCE"}
@@ -500,6 +694,352 @@ finding_project_ok if {
 	not occurrence_conflict(mat.finding_ref.evidence_id)
 	projection_purpose_ok
 }
+
+# ================================================================ v1.1 FINDING_SEAL (#117 §6.4–§6.6)
+# The ONE governed transition gate. Sealing the boundary-crossing (or context-transferring)
+# descendant is itself an admitted effect: its K3 material is the exact typed transition payload,
+# the Human authorization is an ordinary landed effect-scoped HUMAN_DECISION over digest(M), and
+# the deterministic authorization is an ACTIVE-policy rule plus a context-bound observation whose
+# applicability names the exact predecessor, both subjects, the method and the work run.
+#
+# FINDING_SEAL is admissible while the barrier is up — it IS the resolution path — and is NEVER in
+# any plain-allow set (the second and last exception to the unresolved-CONTRACT_* mutation DENY;
+# the first is the Option-A index-only projection, unchanged).
+
+is_finding_seal if op == "FINDING_SEAL"
+
+seal_draft := mat.descendant_draft
+
+seal_draft_primary := b if {
+	b := seal_draft.subject_bindings[seal_draft.claim.subject.binding_index]
+}
+
+seal_supersedes := object.get(seal_draft.claim, "supersedes", [])
+
+# E1: F resolves from input.evidence by EXACT id + envelope digest; absent or mismatched → DENY.
+seal_predecessor := f if {
+	is_finding_seal
+	some f in improvement_findings
+	f.evidence_id == mat.predecessor_ref.evidence_id
+	f.envelope_digest.value == mat.predecessor_ref.envelope_digest
+}
+
+seal_predecessor_present if seal_predecessor.evidence_id
+
+transition_kind_ok if mat.transition_kind in transition_kinds
+
+work_run_binding_ids := [wb.object_id |
+	some wb in req.work_bindings
+	wb.namespace == "work-run"
+]
+
+# Round-10 R10-2: zero work-run bindings would make the deterministic run equality vacuous and two
+# would turn it into a caller-selected disjunction. Checked for BOTH families.
+#
+# The predecessor's evidence binding is equally mandatory (§5.1): it is what makes the §5.4
+# GOVERNED_SEAL_CONFLICT scope hold freeze further governed sealing against F. Enforcing it here —
+# not only in the composing adapter — is what stops a caller from escaping that hold by omitting it.
+transition_run_context_ok if {
+	count(work_run_binding_ids) == 1
+	some wb in req.work_bindings
+	wb.namespace == "evidence"
+	wb.object_id == mat.predecessor_ref.evidence_id
+}
+
+transition_shape_ok if {
+	mat.contract_id == "cadp.improvement-intake.v1"
+	seal_draft.evidence_kind == "IMPROVEMENT_FINDING"
+	count(seal_supersedes) == 1
+	seal_supersedes[0].evidence_id == mat.predecessor_ref.evidence_id
+	seal_supersedes[0].envelope_digest == mat.predecessor_ref.envelope_digest
+	mat.from_classification == seal_predecessor.claim.classification
+	is_contract_class(mat.from_classification)
+	mat.to_classification == seal_draft.claim.classification
+	mat.from_subject == subject_tuple(primary_binding(seal_predecessor))
+	mat.to_subject == subject_tuple(seal_draft_primary)
+	nonempty_string(object.get(seal_draft.claim, "correction_reason", ""))
+	transition_per_kind_ok
+}
+
+transition_per_kind_ok if {
+	mat.transition_kind == "RECLASSIFICATION"
+	not is_contract_class(mat.to_classification)
+	mat.to_subject == mat.from_subject
+}
+
+transition_per_kind_ok if {
+	mat.transition_kind == "SUBJECT_TRANSFER"
+	mat.to_classification == mat.from_classification
+	mat.to_subject != mat.from_subject
+}
+
+# Defence-in-depth ONLY: this reads the caller-selected evidence list and is therefore NOT the
+# exclusivity mechanism — the store's invariant U on T(F) is (round-6 R6-1).
+transition_conflict if {
+	some d in improvement_findings
+	governed_resolver(mat.predecessor_ref.evidence_id, d)
+}
+
+finding_seal_base_ok if {
+	is_finding_seal
+	seal_predecessor_present
+	transition_kind_ok
+	transition_shape_ok
+	transition_run_context_ok
+	not transition_conflict
+}
+
+seal_derivation_kind := seal_draft.claim.derivation.kind
+
+finding_seal_ok if {
+	finding_seal_base_ok
+	seal_derivation_kind == "HUMAN_JUDGMENT"
+	human_ok
+}
+
+finding_seal_ok if {
+	finding_seal_base_ok
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	deterministic_authority_ok
+}
+
+# ---- §6.5 deterministic family: context-bound observation + the derivation closure ----
+
+# (1) Resolve the observation UNIQUELY, never by disjunction: a multi-entry basis would make
+# "some AUTHORITY_TEXT entry" a caller-selected choice of validator.
+observation := a if {
+	count(seal_basis) == 1
+	seal_basis[0].role == "AUTHORITY_TEXT"
+	some a in input.evidence
+	a.evidence_id == seal_basis[0].evidence_id
+	a.envelope_digest.value == seal_basis[0].envelope_digest
+	a.availability == "PRESENT"
+}
+
+seal_basis := seal_draft.claim.basis
+
+observation_resolved if observation.evidence_id
+
+applies_to := observation.claim.applies_to
+
+# (2) Select the rule keyed off the OBSERVATION, never off the presented draft: the draft is the
+# object under validation and may not choose its own validator. Two matches DENY.
+matching_rules := [r |
+	some r in authority_text_rules
+	r.transition_kind == applies_to.transition_kind
+	r.from == applies_to.from_classification
+	r.to == applies_to.to_classification
+	r.method == applies_to.method
+]
+
+selected_rule := r if {
+	count(matching_rules) == 1
+	r := matching_rules[0]
+}
+
+# (2b) Well-formedness of the SELECTED rule, checked AFTER selection and never as a pre-filter
+# (round-12 A1(c)): filtering malformed entries out first would silently skip a malformed twin and
+# let the survivor win by evaluation order. Typed over the WHOLE rule (round-12 F1): an empty
+# method component is reachable and produces a draft the landed validator rejects.
+well_formed_rule(r) if {
+	object.keys(r) == {
+		"transition_kind", "from", "to", "method", "producer_ref", "evidence_kind",
+		"claim_schema", "provenance", "authority_content_digest", "derived_anomaly_code",
+		"derived_statement", "derived_correction_reason",
+	}
+	r.transition_kind in transition_kinds
+	r.from in classifications
+	r.to in classifications
+	object.keys(r.method) == {"method_ref", "method_digest"}
+	nonempty_string(r.method.method_ref)
+	nonempty_string(r.method.method_digest)
+	nonempty_string(r.producer_ref)
+	nonempty_string(r.evidence_kind)
+	nonempty_string(r.claim_schema)
+	nonempty_string(r.authority_content_digest)
+	r.provenance in {"AUTHENTICATED_SOURCE", "SIGNED_ATTESTATION"}
+	nonempty_string(r.derived_anomaly_code)
+	object.keys(r.derived_statement) == {"summary"}
+	nonempty_string(r.derived_statement.summary)
+	nonempty_string(r.derived_correction_reason)
+}
+
+# (3) The observation's shape against the selected rule. The authority CONTENT is bound by digest
+# on A's own subject binding — ambient/latest authority text, display URLs and labels confer nothing.
+observation_shape_ok if {
+	observation.producer_ref == selected_rule.producer_ref
+	observation.evidence_kind == selected_rule.evidence_kind
+	observation.claim_schema == selected_rule.claim_schema
+	observation.provenance.integrity == selected_rule.provenance
+	some b in observation.subject_bindings
+	b.content_digest.value == selected_rule.authority_content_digest
+}
+
+applies_to_well_formed if {
+	object.keys(applies_to) == {
+		"transition_kind", "predecessor_ref", "from_classification", "to_classification",
+		"from_subject", "to_subject", "to_subject_kind", "method", "work_run_ref",
+	}
+	object.keys(applies_to.predecessor_ref) == {"evidence_id", "envelope_digest"}
+	nonempty_string(applies_to.predecessor_ref.evidence_id)
+	nonempty_string(applies_to.predecessor_ref.envelope_digest)
+	object.keys(applies_to.method) == {"method_ref", "method_digest"}
+	nonempty_string(applies_to.method.method_ref)
+	nonempty_string(applies_to.method.method_digest)
+	nonempty_string(applies_to.work_run_ref)
+}
+
+# Round-11 S11-1: the landed mutable-subject rule carried into the closure. A RECLASSIFICATION
+# reuses F's own (kind, binding) pair — F was validated against exactly that pair — while a
+# SUBJECT_TRANSFER introduces a binding F never carried, so the rule is checked directly.
+subject_kind_conformance if {
+	applies_to.to_subject_kind in subject_kinds
+	mat.transition_kind == "RECLASSIFICATION"
+	applies_to.to_subject_kind == seal_predecessor.claim.subject.kind
+}
+
+subject_kind_conformance if {
+	applies_to.to_subject_kind in subject_kinds
+	mat.transition_kind == "SUBJECT_TRANSFER"
+	immutable_subject_kinds[applies_to.to_subject_kind]
+}
+
+subject_kind_conformance if {
+	applies_to.to_subject_kind in subject_kinds
+	mat.transition_kind == "SUBJECT_TRANSFER"
+	not immutable_subject_kinds[applies_to.to_subject_kind]
+	subject_exactness(applies_to.to_subject)
+}
+
+subject_exactness(s) if nonempty_string(s.revision_or_version)
+
+subject_exactness(s) if s.content_digest
+
+digest_object_exact(d) if {
+	object.keys(d) == {"algorithm", "canonicalization", "value"}
+	nonempty_string(d.algorithm)
+	nonempty_string(d.canonicalization)
+	nonempty_string(d.value)
+}
+
+to_subject_digest_ok if not applies_to.to_subject.content_digest
+
+to_subject_digest_ok if digest_object_exact(applies_to.to_subject.content_digest)
+
+# (4) authority_applicable — every element exact, none of it optional or rule-suppressible. One
+# observation therefore authorizes at most ONE transition, with exactly one admissible content.
+authority_applicable if {
+	applies_to_well_formed
+	to_subject_digest_ok
+	applies_to.transition_kind == mat.transition_kind
+	applies_to.predecessor_ref.evidence_id == seal_predecessor.evidence_id
+	applies_to.predecessor_ref.envelope_digest == seal_predecessor.envelope_digest.value
+	applies_to.from_classification == mat.from_classification
+	applies_to.to_classification == mat.to_classification
+	applies_to.from_subject == mat.from_subject
+	applies_to.to_subject == mat.to_subject
+	applies_to.to_subject_kind == seal_draft.claim.subject.kind
+	subject_kind_conformance
+	applies_to.method == selected_rule.method
+	applies_to.method.method_ref == seal_draft.claim.derivation.method_ref
+	applies_to.method.method_digest == seal_draft.claim.derivation.method_digest
+	applies_to.work_run_ref == work_run_binding_ids[0]
+	seal_draft == derived_draft
+}
+
+deterministic_authority_ok if {
+	observation_resolved
+	well_formed_rule(selected_rule)
+	observation_shape_ok
+	authority_applicable
+}
+
+# ---- the derivation closure (round-10 R10-1): the draft is COMPUTED, never composed ----
+# derived_draft(F, A, r) is a total function of the resolved predecessor envelope, the resolved
+# observation and the uniquely matched well-formed active rule. Every field is derived, fixed by
+# the operation, or required ABSENT; an extra, missing, differing or reordered field fails the
+# equality, so there is no partial-coverage residue.
+
+derived_draft := {
+	"evidence_kind": "IMPROVEMENT_FINDING",
+	"subject_bindings": derived_subject_bindings,
+	"claim": derived_claim,
+}
+
+# Exactly one element changes; secondary bindings are carried through unchanged — they cannot be
+# added, dropped or reordered.
+derived_subject_bindings := json.patch(
+	seal_predecessor.subject_bindings,
+	[{
+		"op": "replace",
+		"path": [format_int(seal_predecessor.claim.subject.binding_index, 10)],
+		"value": applies_to.to_subject,
+	}],
+)
+
+derived_claim := {
+	"contract_id": "cadp.improvement-intake.v1",
+	"classification": applies_to.to_classification,
+	"subject": {"kind": applies_to.to_subject_kind, "binding_index": seal_predecessor.claim.subject.binding_index},
+	"basis": [{
+		"evidence_id": observation.evidence_id,
+		"envelope_digest": observation.envelope_digest.value,
+		"role": "AUTHORITY_TEXT",
+	}],
+	"derivation": {
+		"kind": "DETERMINISTIC_DERIVATION",
+		"method_ref": selected_rule.method.method_ref,
+		"method_digest": selected_rule.method.method_digest,
+	},
+	"anomaly_code": selected_rule.derived_anomaly_code,
+	"occurrence_key": derived_occurrence_key,
+	"statement": {"summary": selected_rule.derived_statement.summary},
+	"supersedes": [applies_to.predecessor_ref],
+	"correction_reason": selected_rule.derived_correction_reason,
+}
+
+# The landed §4 occurrence_key derivation (cadp-jcs-1 over the exact primary binding, anomaly
+# code, sorted basis refs and method), recomputed here so the closure is total against the landed
+# VALIDATOR and an ALLOWed deterministic transition is always sealable. The basis is the I6-style
+# singleton, so the landed sort is the identity.
+derived_occurrence_key := crypto.sha256(occurrence_payload)
+
+occurrence_payload := concat("", [
+	"{\\"anomaly_code\\":", jcs_string(selected_rule.derived_anomaly_code),
+	",\\"contract_id\\":\\"cadp.improvement-intake.v1\\"",
+	",\\"exact_primary_subject_binding\\":", jcs_binding(applies_to.to_subject),
+	",\\"method_digest\\":", jcs_string(selected_rule.method.method_digest),
+	",\\"method_ref\\":", jcs_string(selected_rule.method.method_ref),
+	",\\"sorted_exact_basis_refs\\":[{\\"envelope_digest\\":", jcs_string(observation.envelope_digest.value),
+	",\\"evidence_id\\":", jcs_string(observation.evidence_id),
+	",\\"role\\":\\"AUTHORITY_TEXT\\"}]}",
+])
+
+jcs_binding(b) := concat("", ["{", concat(",", binding_members(b)), "}"])
+
+binding_members(b) := m if {
+	m0 := [concat("", ["\\"authority_ref\\":", jcs_string(b.authority_ref)])]
+	m1 := array.concat(m0, binding_digest_member(b))
+	m2 := array.concat(m1, [concat("", ["\\"namespace\\":", jcs_string(b.namespace)])])
+	m3 := array.concat(m2, [concat("", ["\\"object_id\\":", jcs_string(b.object_id)])])
+	m := array.concat(m3, binding_revision_member(b))
+}
+
+binding_digest_member(b) := [concat("", ["\\"content_digest\\":", jcs_digest_object(b.content_digest)])] if b.content_digest
+
+binding_digest_member(b) := [] if not b.content_digest
+
+binding_revision_member(b) := [concat("", ["\\"revision_or_version\\":", jcs_string(b.revision_or_version)])] if b.revision_or_version
+
+binding_revision_member(b) := [] if not b.revision_or_version
+
+jcs_digest_object(d) := concat("", [
+	"{\\"algorithm\\":", jcs_string(d.algorithm),
+	",\\"canonicalization\\":", jcs_string(d.canonicalization),
+	",\\"value\\":", jcs_string(d.value), "}",
+])
+
+${JCS_STRING_RULE}
 
 # ---- reason codes ----
 
@@ -546,6 +1086,117 @@ reason_codes contains "append_resolution_before_authority" if {
 	mat.purpose == "APPEND_RESOLUTION"
 	unresolved_contract(mat.finding_ref.evidence_id)
 }
+
+# ---- v1.1 FINDING_SEAL reason codes (#117 §10 item 6) ----
+
+reason_codes contains "finding_unresolvable" if {
+	is_finding_seal
+	not seal_predecessor_present
+}
+
+reason_codes contains "transition_kind_invalid" if {
+	is_finding_seal
+	not transition_kind_ok
+}
+
+reason_codes contains "transition_shape_invalid" if {
+	is_finding_seal
+	seal_predecessor_present
+	transition_kind_ok
+	not transition_shape_ok
+}
+
+reason_codes contains "transition_subject_mismatch" if {
+	is_finding_seal
+	seal_predecessor_present
+	mat.transition_kind == "RECLASSIFICATION"
+	mat.to_subject != mat.from_subject
+}
+
+reason_codes contains "transition_run_context_invalid" if {
+	is_finding_seal
+	not transition_run_context_ok
+}
+
+reason_codes contains "reclassification_ambiguous" if {
+	is_finding_seal
+	transition_conflict
+}
+
+reason_codes contains "transition_derivation_forbidden" if {
+	is_finding_seal
+	seal_derivation_kind == "MODEL_PROPOSAL"
+}
+
+# REQUIRE_EVIDENCE(HUMAN_DECISION, transition_unauthorized{predecessor_ref, digest(M)}): the exact
+# refs are the sealed K3 request's own predecessor_ref and material_digest.
+reason_codes contains "transition_unauthorized" if {
+	finding_seal_base_ok
+	seal_derivation_kind == "HUMAN_JUDGMENT"
+	not human_ok
+}
+
+reason_codes contains "HUMAN_DECISION" if {
+	finding_seal_base_ok
+	seal_derivation_kind == "HUMAN_JUDGMENT"
+	not human_ok
+}
+
+reason_codes contains "transition_draft_underived" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	not observation_resolved
+}
+
+reason_codes contains "transition_rule_ambiguous" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	count(matching_rules) > 1
+}
+
+reason_codes contains "transition_authority_absent" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	count(matching_rules) == 0
+}
+
+reason_codes contains "transition_rule_malformed" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	count(matching_rules) == 1
+	not well_formed_rule(matching_rules[0])
+}
+
+reason_codes contains "transition_subject_kind_invalid" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	well_formed_rule(selected_rule)
+	applies_to_well_formed
+	not subject_kind_conformance
+}
+
+reason_codes contains "transition_draft_underived" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	well_formed_rule(selected_rule)
+	observation_shape_ok
+	applies_to_well_formed
+	subject_kind_conformance
+	seal_draft != derived_draft
+}
+
+reason_codes contains "transition_unauthorized" if {
+	is_finding_seal
+	seal_derivation_kind == "DETERMINISTIC_DERIVATION"
+	observation_resolved
+	well_formed_rule(selected_rule)
+	not authority_applicable
+}
 `;
 
 export interface ReferenceIdentity {
@@ -577,6 +1228,10 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // cadp.improvement-intake.v1 (#104): the sole registered producer of IMPROVEMENT_FINDING /
   // IMPROVEMENT_FINDING_RESOLUTION. The product adapter validates the claim contract before submit.
   { principal: "cadp-improvement-intake", producer_ref: "intake:cadp-improvement", identity_class: { vendor: "cadp", product: "improvement-intake", account: "cadp-v04", process_class: "evidence-adapter" } },
+  // v1.1 governed transition writer (#117 §5.2). `producer_ref` is the permanent invariant-P
+  // contract constant; THIS row is the rotatable/revocable part — the workload credential bound
+  // to it. Only the PEP-held FINDING_SEAL adapter authenticates as this principal (FC5).
+  { principal: "cadp-governed-reclassification", producer_ref: "governed:reclassification", identity_class: { vendor: "cadp", product: "governed-transition", account: "cadp-v04", process_class: "evidence-adapter" } },
 ];
 
 export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
@@ -588,6 +1243,14 @@ export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "deployment-control-probe", evidence_kinds: ["CREDENTIAL_REACH_ATTESTATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "deployment-control-target", evidence_kinds: ["TARGET_IMMUTABILITY_ATTESTATION"], source_relation: "TARGET_AUTHORITY_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "intake:cadp-improvement", evidence_kinds: ["IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
+  // v1.1 (#117 §5.2/§5.3): the two separated mechanisms declared explicitly — replay idempotency
+  // on the effect-bound source_ref (what makes the adapter's NATIVE_KEY true at the target) and
+  // governed-edge uniqueness on the sealed draft's own supersedes singleton (invariant U).
+  {
+    producer_ref: "governed:reclassification", evidence_kinds: ["IMPROVEMENT_FINDING"],
+    source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" },
+    replay_idempotency: "SOURCE_REF_UNIQUE", governed_edge: "SUPERSEDES_SINGLETON",
+  },
 ];
 
 export function buildReferenceKernelConfig(input: ReferencePolicyInput): KernelConfig {
@@ -602,7 +1265,7 @@ export function buildReferenceKernelConfig(input: ReferencePolicyInput): KernelC
     attestation_keys: [],
     identity_registry: input.identity_registry ?? REFERENCE_IDENTITIES,
     adapter_registry: input.adapter_registry ?? REFERENCE_ADAPTERS,
-    allocation_purposes: ["work-start", "git-push", "pr-create", "pr-merge", "record-write", "policy-activate", "finding-project"],
+    allocation_purposes: ["work-start", "git-push", "pr-create", "pr-merge", "record-write", "policy-activate", "finding-project", "finding-seal"],
     decision_ttl_s: 1800,
     dispatch_window_s: 120,
     identity_probe_max_age_s: 600,

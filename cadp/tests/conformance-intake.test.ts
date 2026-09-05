@@ -22,6 +22,7 @@ import {
 import type { FindingBuildInput, EvidenceDraftLike } from "../product/improvement/intakeAdapter.ts";
 import { validateFindingClaim, validateResolutionClaim } from "../product/improvement/contracts.ts";
 import type { Classification, ImprovementFindingResolutionClaimV1 } from "../product/improvement/contracts.ts";
+import { activateResolutionEntries, governedHumanClearing, submitAuthorityResolution } from "./support/transition.ts";
 
 after(() => stopSharedOpa());
 
@@ -255,7 +256,9 @@ test("C11/C17: MODEL_PROPOSAL reclassification of CONTRACT_* (even citing author
     const r = await evalWorkStart(h, { finding: f2, evidence: [f2, c] });
     assert.equal(r.outcome, "DENY");
     assert.ok(r.reason_codes.includes("contract_barrier"), JSON.stringify(r.reason_codes));
-    // Contrast: HUMAN_JUDGMENT reclassification clears the barrier → ALLOW.
+    // v1.1 (#117, Review B18): the landed bare HUMAN_JUDGMENT intake shape no longer clears
+    // either — a role string on an intake-sealed descendant is presentation metadata, never
+    // authority. Only a governed FINDING_SEAL descendant carries clearing power.
     const humanEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "human-design", revision: "decision-1" });
     const f3 = await makeReclass(h, c, {
       classification: "IMPLEMENTATION_GAP",
@@ -263,7 +266,12 @@ test("C11/C17: MODEL_PROPOSAL reclassification of CONTRACT_* (even citing author
       basis: [{ evidence_id: humanEnv.evidence_id, envelope_digest: humanEnv.envelope_digest.value, role: "AUTHORITY_TEXT" }],
     });
     const r3 = await evalWorkStart(h, { finding: f3, evidence: [f3, c] });
-    assert.equal(r3.outcome, "ALLOW", JSON.stringify(r3));
+    assert.equal(r3.outcome, "DENY", JSON.stringify(r3));
+    assert.ok(r3.reason_codes.includes("contract_barrier"), JSON.stringify(r3.reason_codes));
+    // Contrast: the governed transition seal clears exactly this predecessor → ALLOW.
+    const governed = await governedHumanClearing(h, { predecessor: c });
+    const r4 = await evalWorkStart(h, { finding: governed.sealed, evidence: [governed.sealed, c] });
+    assert.equal(r4.outcome, "ALLOW", JSON.stringify(r4));
   } finally { h.close(); }
 });
 
@@ -310,14 +318,18 @@ test("C13: tracker-derived work bytes without exact revision/observation → DEN
 // ---------------------------------------------------------------- control 14 / 18
 test("C14/C18: resolution-kind partition is symmetric (adapter rejects the wrong kind)", async () => {
   // AUTHORITY_RESOLUTION on a BUG tip → reject.
-  const rBug = validateResolutionClaim(resolution("AUTHORITY_RESOLUTION", { landed_authority_ref: "spec" }), { classification: "BUG" });
+  const rBug = validateResolutionClaim(resolution("AUTHORITY_RESOLUTION", { landed_authority_ref: { authority_content_digest: "spec" } }), { classification: "BUG" });
   assert.ok(!rBug.ok && rBug.errors.some((e) => e.includes("AUTHORITY_RESOLUTION is invalid")), JSON.stringify(rBug.errors));
   // VERIFIED_REPAIR on a CONTRACT_GAP tip → reject.
   const rCg = validateResolutionClaim(resolution("VERIFIED_REPAIR", { resolving_work_run_refs: ["w"], verification_refs: ["v"], regression_ref: "r" }), { classification: "CONTRACT_GAP" });
   assert.ok(!rCg.ok && rCg.errors.some((e) => e.includes("VERIFIED_REPAIR is invalid")), JSON.stringify(rCg.errors));
   // Matching kinds validate.
   assert.ok(validateResolutionClaim(resolution("VERIFIED_REPAIR", { resolving_work_run_refs: ["w"], verification_refs: ["v"], regression_ref: "r" }), { classification: "BUG" }).ok);
-  assert.ok(validateResolutionClaim(resolution("AUTHORITY_RESOLUTION", { landed_authority_ref: "spec" }), { classification: "CONTRACT_GAP" }).ok);
+  assert.ok(validateResolutionClaim(resolution("AUTHORITY_RESOLUTION", { landed_authority_ref: { authority_content_digest: "spec" } }), { classification: "CONTRACT_GAP" }).ok);
+  // v1.1 §10.4: landed_authority_ref is the TYPED { authority_content_digest }. A bare string —
+  // and in particular a Human-decision envelope ref — is not landed authority (round-4 R4).
+  const untyped = validateResolutionClaim(resolution("AUTHORITY_RESOLUTION", { landed_authority_ref: "cadp-v04:evidence:decision" as never }), { classification: "CONTRACT_GAP" });
+  assert.ok(!untyped.ok && untyped.errors.some((e) => e.includes("landed_authority_ref")), JSON.stringify(untyped.errors));
 });
 
 test("intake positive: VERIFIED_REPAIR submits for a BUG tip and reconstructs from refs", async () => {
@@ -380,8 +392,18 @@ async function makeFindingSameOccurrence(h: Harness, first: EvidenceEnvelopeV1):
 // An admission must never become implementation-eligible merely because a referenced predecessor
 // Finding is omitted from the admission evidence set (fail-closed ancestry, exact id+digest).
 
-/** A would-be-clearing reclassification (§3): HUMAN_JUDGMENT + AUTHORITY_TEXT basis. */
-async function makeClearingReclass(h: Harness, prev: EvidenceEnvelopeV1, supersedesOverride?: Array<{ evidence_id: string; envelope_digest: string }>): Promise<EvidenceEnvelopeV1> {
+/**
+ * A genuinely clearing descendant under v1.1 (#117): the governed FINDING_SEAL path, authorized by
+ * an ordinary effect-scoped HUMAN_DECISION over the exact transition digest. The pre-v1.1 shape
+ * (an intake-sealed HUMAN_JUDGMENT descendant with an AUTHORITY_TEXT basis role) clears nothing —
+ * that is Review B18 — so the #109 ancestry controls below use the real clearing path.
+ */
+async function makeClearingReclass(h: Harness, prev: EvidenceEnvelopeV1): Promise<EvidenceEnvelopeV1> {
+  return (await governedHumanClearing(h, { predecessor: prev })).sealed;
+}
+
+/** The pre-v1.1 shape, kept for the controls that must prove it clears nothing. */
+async function makeIntakeReclass(h: Harness, prev: EvidenceEnvelopeV1, supersedesOverride?: Array<{ evidence_id: string; envelope_digest: string }>): Promise<EvidenceEnvelopeV1> {
   const humanEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "human-design", revision: `decision-${counter}` });
   return makeFinding(h, {
     classification: "IMPLEMENTATION_GAP",
@@ -478,14 +500,20 @@ test("S2-2: presented predecessor with mismatched supersedes digest is unresolve
   const h = await makeHarness();
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "S2D" });
-    // Would-be-clearing Human reclass, but the supersedes ref digest does not match C's envelope.
-    const xBad = await makeClearingReclass(h, c, [{ evidence_id: c.evidence_id, envelope_digest: sha256("not-the-predecessor-envelope") }]);
-    const r = await evalWorkStart(h, { finding: xBad, evidence: [xBad, c] });
+    // Isolation: C is genuinely cleared by the governed path, so the DENY below is attributable to
+    // the digest mismatch on X's own supersedes reference and to nothing else.
+    const g = await makeClearingReclass(h, c);
+    const xBad = await makeIntakeReclass(h, g, [{ evidence_id: g.evidence_id, envelope_digest: sha256("not-the-predecessor-envelope") }]);
+    const r = await evalWorkStart(h, { finding: xBad, evidence: [xBad, g, c] });
     assert.equal(r.outcome, "DENY", JSON.stringify(r));
     assert.ok(r.reason_codes.includes("contract_barrier"), JSON.stringify(r.reason_codes));
-    const push = await evalNonIndexMutation(h, xBad, [xBad, c]);
+    const push = await evalNonIndexMutation(h, xBad, [xBad, g, c]);
     assert.equal(push.outcome, "DENY");
     assert.ok(push.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(push.reason_codes));
+    // The exact same chain with the correct digest resolves and is implementation-eligible.
+    const xGood = await makeIntakeReclass(h, g);
+    const ok = await evalWorkStart(h, { finding: xGood, evidence: [xGood, g, c] });
+    assert.equal(ok.outcome, "ALLOW", JSON.stringify(ok));
   } finally { h.close(); }
 });
 
@@ -742,23 +770,19 @@ test("#109 E2: X's sealed supersedes reference names C by id but with a mismatch
   const h = await makeHarness();
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E2" });
-    // C is cleared via a valid AUTHORITY_RESOLUTION, so a DENY below is isolated to digest
+    // C is genuinely cleared by the v1.1 governed path, so a DENY below is isolated to digest
     // enforcement on X's own supersedes reference — not an uncleared CONTRACT_* classification
-    // (the #109 E3 test proves this exact clearing path ALLOWs when the digest is correct).
-    const resEnv = await submitResolution(submitter(h), {
-      claim: resolution("AUTHORITY_RESOLUTION", { finding_tip_ref: refOf(c), landed_authority_ref: "spec:section-1" }),
-      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
-      tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
-    });
-    // X's sealed claim names C's evidence_id but a forged envelope_digest → unresolved (#109 E2);
-    // `evalWorkStart` reloads C's real canonical envelope from evidence ids, so the mismatch must
-    // live in X's own claim, not in a mutated in-memory copy of the presented C envelope.
+    // (the #109 E3 test proves this exact chain ALLOWs when the digest is correct).
+    const g = await makeClearingReclass(h, c);
+    // X's sealed claim names G's evidence_id but a forged envelope_digest → unresolved (#109 E2);
+    // `evalWorkStart` reloads the real canonical envelopes from evidence ids, so the mismatch must
+    // live in X's own claim, not in a mutated in-memory copy of a presented envelope.
     const x = await makeFinding(h, {
       classification: "IMPLEMENTATION_GAP",
-      supersedes: [{ evidence_id: c.evidence_id, envelope_digest: "wrongdigest000" }],
+      supersedes: [{ evidence_id: g.evidence_id, envelope_digest: "wrongdigest000" }],
       correction_reason: "attempt-clear-wrong-digest",
     });
-    const r = await evalWorkStart(h, { finding: x, evidence: [x, c, resEnv] });
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, g, c] });
     assert.equal(r.outcome, "DENY");
     assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
   } finally { h.close(); }
@@ -768,15 +792,17 @@ test("#109 E3: complete ancestry with valid authority clearing path → normal b
   const h = await makeHarness();
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E3" });
-    // F clears C via AUTHORITY_RESOLUTION
-    const authEnv = submitObservation(h, { authority_ref: "authority:design", namespace: "authority", object_id: "design-e3", revision: "decision-1" });
-    const resEnv = await submitResolution(submitter(h), {
-      claim: resolution("AUTHORITY_RESOLUTION", { finding_tip_ref: refOf(c), landed_authority_ref: "spec:section-1" }),
-      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
-      tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
-    });
-    // X supersedes C, and C is now cleared → X can proceed
+    // v1.1 §10.4: an AUTHORITY_RESOLUTION clears C only when the ACTIVE policy also carries a
+    // Human-landed entry binding this exact landed content to this exact tip. Without the entry
+    // the resolution is an ordinary record and confers nothing.
+    const landed = sha256("landed spec section 1");
+    const resEnv = await submitAuthorityResolution(h, c, landed);
     const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "resolved" });
+    const before = await evalWorkStart(h, { finding: x, evidence: [x, c, resEnv] });
+    assert.equal(before.outcome, "DENY", JSON.stringify(before));
+
+    const admitted = await activateResolutionEntries(h, 2, [{ finding_ref: refOf(c), authority_content_digest: landed }]);
+    assert.equal((admitted as { outcome?: { result?: string } }).outcome?.result, "COMMITTED", JSON.stringify(admitted));
     const r = await evalWorkStart(h, { finding: x, evidence: [x, c, resEnv] });
     assert.equal(r.outcome, "ALLOW", JSON.stringify(r));
   } finally { h.close(); }

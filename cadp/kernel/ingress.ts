@@ -29,6 +29,21 @@ export interface Principal {
   readonly principal: string;
 }
 
+/**
+ * The governed-edge key T(F) (#117 §5.3 rule (b)): derived by the STORE from the submitted
+ * draft's OWN `supersedes` singleton, never from a dispatch-chosen value. The Kernel reads two
+ * exact ref fields here and interprets no product semantics (TD §9.1) — the same shape the
+ * WORK_STEP replay rule reads `step_ordinal` from.
+ */
+function governedEdgeKeyOf(claim: unknown): { evidence_id: string; envelope_digest: string } | undefined {
+  const supersedes = (claim as { supersedes?: unknown } | undefined)?.supersedes;
+  if (!Array.isArray(supersedes) || supersedes.length !== 1) return undefined;
+  const only = supersedes[0] as { evidence_id?: unknown; envelope_digest?: unknown };
+  if (typeof only?.evidence_id !== "string" || only.evidence_id.length === 0) return undefined;
+  if (typeof only.envelope_digest !== "string" || only.envelope_digest.length === 0) return undefined;
+  return { evidence_id: only.evidence_id, envelope_digest: only.envelope_digest };
+}
+
 export type IncidentKind =
   | "REQUEST_DIGEST_CONFLICT"
   | "ADMISSIONLESS_COMMIT_OBSERVED"
@@ -39,6 +54,15 @@ export type IncidentKind =
   | "EVALUATOR_INTEGRITY_FAILURE"
   | "UNSUPPORTED_CONSTRAINT"
   | "WORK_STEP_CONFLICT"
+  /**
+   * v1.1 governed sealing (#117 §5.4, a declared TD §2.6 delta). Raised when a registry-opted
+   * governed writer's submission collides on either §5.3 key. Its subject bindings put the
+   * landed §2.6 scope hold on the predecessor's evidence binding, so an open conflict freezes
+   * all further governed sealing against that predecessor until a root-signed BREAK_GLASS
+   * releases it. Reuse of WORK_STEP_CONFLICT was rejected: its contract names a work-run/step
+   * replay key and would hold the wrong scope.
+   */
+  | "GOVERNED_SEAL_CONFLICT"
   | "BREAK_GLASS_REJECTED";
 
 export interface EvidenceDraft {
@@ -78,12 +102,25 @@ export class Ingress {
   readonly cas: Cas;
   readonly pep_ref: string;
   readonly clock: () => number;
+  /**
+   * TEST-ONLY guard-bite harness knob (TD §13.1), the same shape the PEP already carries: the
+   * production composition never passes it, and the conformance suite proves each §5.3 rule is
+   * load-bearing by disabling it and observing the prohibited effect (a second governed edge).
+   */
+  readonly disabledRules: ReadonlySet<string>;
 
-  constructor(store: ConstitutionalStore, cas: Cas, pep_ref: string, clock: () => number = Date.now) {
+  constructor(
+    store: ConstitutionalStore,
+    cas: Cas,
+    pep_ref: string,
+    clock: () => number = Date.now,
+    disabledRules: ReadonlySet<string> = new Set(),
+  ) {
     this.store = store;
     this.cas = cas;
     this.pep_ref = pep_ref;
     this.clock = clock;
+    this.disabledRules = disabledRules;
   }
 
   private active(): ActivePolicy {
@@ -261,6 +298,9 @@ export class Ingress {
     if (draft.evidence_kind === "WORK_STEP") {
       return this.insertWorkStep(envelope, received_at);
     }
+    if (adapter.replay_idempotency !== undefined || adapter.governed_edge !== undefined) {
+      return this.insertGovernedEvidence(envelope, received_at, adapter);
+    }
     this.store.withImmediate(() => this.store.insertEvidence(envelope, received_at));
     return envelope;
   }
@@ -341,6 +381,103 @@ export class Ingress {
       throw new IngressRejection("WORK_STEP_CONFLICT");
     }
     return outcome.row;
+  }
+
+  /**
+   * Registry-declared governed-writer ingress rules (#117 §5.3 — a TD §9.1 delta), the landed
+   * WORK_STEP lookup-before-allocate pattern applied to two keys inside ONE store transaction,
+   * with the identical three-way outcome shape and the identical semantic-equality set.
+   *
+   * rule (a) REPLAY — key (producer_ref, source_ref = cadp-v04:<effect_id>). Deterministically
+   *          effect-bound as Spec K3 requires; this is what makes the adapter's NATIVE_KEY
+   *          declaration true at the target.
+   * rule (b) GOVERNED-EDGE UNIQUENESS (invariant U) — key (producer_ref, T(F)) where the STORE
+   *          derives T(F) from the submitted draft's OWN claim.supersedes singleton. Deliberately
+   *          NOT an idempotency key: different effects intentionally share it.
+   *
+   * Neither key is caller-chosen and the check reads only the store's own contents, so omitting
+   * an already-sealed governed descendant from a later admission's evidence list cannot reach it.
+   */
+  private insertGovernedEvidence(
+    envelope: EvidenceEnvelopeV1,
+    received_at: string,
+    adapter: { replay_idempotency?: string; governed_edge?: string },
+  ): EvidenceEnvelopeV1 {
+    const semantic = (e: EvidenceEnvelopeV1) =>
+      jcs({
+        subject_bindings: e.subject_bindings,
+        claim_schema: e.claim_schema,
+        claim: e.claim,
+        availability: e.availability,
+        unknown_reason: e.unknown_reason,
+      });
+
+    // Shape guard (defence-in-depth to the §6.4 admission DENY): for a governed-edge producer a
+    // draft whose supersedes is not exactly one exact ref cannot even be keyed, so the
+    // multi-predecessor governed artifact is unconstructible (invariant I6, second enforcement).
+    let edge: { evidence_id: string; envelope_digest: string } | undefined;
+    if (adapter.governed_edge === "SUPERSEDES_SINGLETON" && this.#ruleEnabled("governed_edge_unique")) {
+      edge = governedEdgeKeyOf(envelope.claim);
+      if (edge === undefined) {
+        throw new IngressRejection("GOVERNED_DRAFT_SHAPE_INVALID", "claim.supersedes must be exactly one exact { evidence_id, envelope_digest }");
+      }
+    }
+
+    type Outcome =
+      | { kind: "row"; row: EvidenceEnvelopeV1 }
+      | { kind: "conflict"; rule: "replay" | "edge"; existing: EvidenceEnvelopeV1 };
+    const outcome = this.store.withImmediate((): Outcome => {
+      if (adapter.replay_idempotency === "SOURCE_REF_UNIQUE" && this.#ruleEnabled("governed_replay")) {
+        const existing = this.store.evidenceByProducerSourceRef(envelope.producer_ref, envelope.source_ref);
+        if (existing !== undefined) {
+          if (semantic(existing) === semantic(envelope)) return { kind: "row", row: existing };
+          return { kind: "conflict", rule: "replay", existing };
+        }
+      }
+      if (edge !== undefined) {
+        const held = this.store.evidenceByGovernedEdge(envelope.producer_ref, edge.evidence_id, edge.envelope_digest);
+        if (held !== undefined) {
+          // Identical payload ⇒ one artifact, one edge, two audit trails (cross-effect restatement).
+          if (semantic(held) === semantic(envelope)) return { kind: "row", row: held };
+          return { kind: "conflict", rule: "edge", existing: held };
+        }
+      }
+      this.store.insertEvidence(envelope, received_at, undefined, undefined, edge);
+      return { kind: "row", row: envelope };
+    });
+    if (outcome.kind === "conflict") {
+      // The incident must survive the rejected write: sealed in its OWN transaction. Its subject
+      // bindings are the §5.4 set the ingress can derive at this seam — the refused effect (the
+      // source_ref IS cadp-v04:<effect_id>), the envelope that holds the edge, and the
+      // predecessor F, which is the binding that makes the scope hold bite on further sealing.
+      const refusedEffect = envelope.source_ref.startsWith("cadp-v04:") ? envelope.source_ref.slice("cadp-v04:".length) : envelope.source_ref;
+      const bindings: SubjectBinding[] = [
+        { authority_ref: "cadp-store:k04", namespace: "effect", object_id: refusedEffect },
+        { authority_ref: "cadp-store:k04", namespace: "evidence", object_id: outcome.existing.evidence_id },
+      ];
+      const dispatching = this.store.admissionsByEffect(refusedEffect).at(-1);
+      if (dispatching !== undefined) {
+        bindings.push({ authority_ref: "cadp-store:k04", namespace: "admission", object_id: dispatching.admission_digest.value });
+      }
+      if (edge !== undefined) bindings.push({ authority_ref: "cadp-store:k04", namespace: "evidence", object_id: edge.evidence_id });
+      // §5.4 detail: which rule refused, the conflicting key value, and the digest of the refused
+      // draft's semantic payload — enough to audit the collision without re-reading the store.
+      const key = outcome.rule === "replay"
+        ? `${envelope.producer_ref}|${envelope.source_ref}`
+        : `${envelope.producer_ref}|${edge!.evidence_id}|${edge!.envelope_digest}`;
+      this.sealIncident(
+        "GOVERNED_SEAL_CONFLICT",
+        `${outcome.rule} key ${key} is held by ${outcome.existing.evidence_id} with a different payload (refused payload digest ${sha256Hex(semantic(envelope))})`,
+        bindings,
+        [refusedEffect, outcome.existing.evidence_id, ...(edge === undefined ? [] : [edge.evidence_id])],
+      );
+      throw new IngressRejection("GOVERNED_SEAL_CONFLICT", outcome.rule);
+    }
+    return outcome.row;
+  }
+
+  #ruleEnabled(rule: string): boolean {
+    return !this.disabledRules.has(rule);
   }
 
   private assertBackendObservedLocators(claim: unknown): void {
