@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | **DESIGN CANDIDATE — TD_DESIGN_READY** (round-10 repair); authority only after Control scope check, Independent Design Review, and Human merge of the protected TD delta. The earlier merge of PR #118 was reverted by recovery PR #124 and carries no authority (§0.5) |
+| Status | **DESIGN CANDIDATE — TD_DESIGN_READY** (round-11 self-audit repair); authority only after Control scope check, Independent Design Review, and Human merge of the protected TD delta. The earlier merge of PR #118 was reverted by recovery PR #124 and carries no authority (§0.5) |
 | Design issue | #117 |
 | Source execution | #107 (`exec-i107`, held; PR #115 non-admitted evidence only) |
 | Source review | #107 `issuecomment-5548393749` (round-3 findings F1/F2/F3) |
 | Source measured STOP | #107 `issuecomment-5548451029` (`STOP_CONTRACT_GAP`) |
 | Control disposition | #107 `issuecomment-5548740528` (`CONTRACT_GAP_CONFIRMED_BY_IMPLEMENTATION_ATTEMPT`) |
-| Repairs | round-4 findings R1–R4 against 2c432b3 (§0.1); round-5 findings R5-1–R5-3 against 5ca3285 (§0.2); round-6 findings R6-1–R6-2 against bc3a097 (§0.3); round-7 **self-measured** R7-1 against 5ea7bae (§0.4); round-8 findings R8-1–R8-2 against 8017bf0 — the round-7 review findings, recovered from the devharness lane state (§0.5 — provenance stated there exactly); round-9 finding R9-1 against d53954a (§0.6 — writer-generation stability of `governed_transition` and invariant U); round-10 findings R10-1–R10-2 against 12d6c89 (§0.7 — the deterministic family's unbound descendant draft and its optional work-run applicability) |
+| Repairs | round-4 findings R1–R4 against 2c432b3 (§0.1); round-5 findings R5-1–R5-3 against 5ca3285 (§0.2); round-6 findings R6-1–R6-2 against bc3a097 (§0.3); round-7 **self-measured** R7-1 against 5ea7bae (§0.4); round-8 findings R8-1–R8-2 against 8017bf0 — the round-7 review findings, recovered from the devharness lane state (§0.5 — provenance stated there exactly); round-9 finding R9-1 against d53954a (§0.6 — writer-generation stability of `governed_transition` and invariant U); round-10 findings R10-1–R10-2 against 12d6c89 (§0.7 — the deterministic family's unbound descendant draft and its optional work-run applicability); round-11 **self-measured** S11-1–S11-2 against d2e875b (§0.8 — the closure was total over the landed *shape* but not over the landed *validator*, and the "no race left" claim held per observation rather than per predecessor) |
 | Architecture authority | Spec v0.4 > landed v0.4-generation TD v2.0 (r7) > #98 landed product contract `issuecomment-5526957311` |
 | Frozen design basis | main `1b051f29635c14461ce08b354d554355e3856d57` (#109/#116 landed: exact-digest `supersedes` resolution and fail-closed omitted-ancestry) — `cadp/deployment/referencePolicy.ts`, `cadp/product/improvement/contracts.ts`, `cadp/kernel/ingress.ts`, `cadp/kernel/pep.ts` (recheck #5), TD §2.6/§3.2/§4.4/§6.2/§6.4/§9.1–§9.3/§12, Spec §2/K3/§5.2/§5.3, #98 §1–§10 |
 | Implementation | **HOLD** — this document authorizes no code change |
@@ -29,7 +29,9 @@ PRODUCT_CONTRACT     YES  (cadp.improvement-intake.v1 → v1.1 — governed tran
                            edge/path-scoped barrier whose delegation is either context-preserving
                            or governed context transfer, one-predecessor-per-resolving-descendant
                            (I6, §0.4), a total deterministic derivation closure over the whole
-                           descendant draft with mandatory work-run applicability (§0.7),
+                           descendant draft with mandatory work-run applicability (§0.7) —
+                           total against the LANDED VALIDATOR, not merely the landed shape, by
+                           rule well-formedness and subject-kind conformance (§0.8) —
                            typed AUTHORITY_RESOLUTION — §10)
 KERNEL_PRIMITIVE     NO CHANGE (K1–K7 untouched; no new record kind, no API-shape change, no
                      recheck change; the sole kernel-service behavioural delta is the §5.3
@@ -385,9 +387,13 @@ R10-1  THE AUTHORITY DID NOT BIND THE DRAFT. `A.claim.applies_to` bound predeces
            — two matches DENY `transition_rule_ambiguous` — so `derived_draft` is a function of
            (F, A, active policy), not a relation.
        Consequence: under one active policy generation there is EXACTLY ONE admissible draft for
-       a given (F, A). Competing first admissions therefore carry byte-identical drafts, §5.3
-       rule (b) converges them to one envelope, and both effects COMMIT with the same receipt —
-       the race has no observable outcome to win. The finding's FIRST remedy is satisfied at the
+       a given (F, A). Competing first admissions **under the same observation** therefore carry
+       byte-identical drafts, §5.3 rule (b) converges them to one envelope, and both effects
+       COMMIT with the same receipt — that race has no observable outcome to win. (Two DISTINCT
+       observations about one F race in the ordinary loud way instead, and the winner's content
+       is still authorized by its own observation — narrowed and declared in §0.8 S11-2, which
+       corrects the over-general claim this paragraph originally made.)
+       The finding's FIRST remedy is satisfied at the
        same time and non-circularly: the exact transition-material commitment is
        `digest(derived_draft(F, A, r))`, COMPUTED by the evaluator from immutable inputs rather
        than carried inside A (which would be circular, §6.6). New control FC20; FC9 and FC14
@@ -424,6 +430,113 @@ contract v1.1 admission predicates. **The §5 TD delta is unchanged** — no new
 producer row, ingress rule, index, or incident kind; `work_bindings` and the `work-run` namespace
 are landed (`cadp/kernel/ingress.ts:153`, `cadp/kernel/pep.ts:350`, and `req.work_bindings` is
 already read by the landed reference policy at `referencePolicy.ts:427`). SPEC_CHANGE stays NO.
+
+### 0.8 Round-11 repair disposition (self-measured — provenance stated exactly)
+
+**Provenance, stated plainly so Control and Review can weigh it.** No independent review of the
+round-10 head has been published. The devharness lane `design-i117` went `HOLD_CAPACITY` (actor
+`RATE_LIMITED`) immediately after issuing the round-10 findings, which this candidate answers in
+§0.7; no `REVIEW_REQUEST_CHANGES` receipt exists for the round-10 repair. This round therefore
+does **not** claim to answer any review. It is a self-audit of the round-10 candidate along the
+five attack lines the published reviews have actually used — (1) authority scoped to one context
+clearing another, (2) exclusivity resting on caller-selected inputs, (3) declared semantics the
+landed closed sets/contracts do not contain, (4) predicates mixing mutable policy state into
+immutable historical validation, (5) bounding the outcome COUNT while leaving the outcome CONTENT
+unauthorized. It found two real defects — one on line (3), one on line (5) — and repairs both.
+As in §0.4, a self-audit is not a substitute for review: a fresh review may name defects other
+than these two.
+
+```text
+S11-1  THE CLOSURE WAS TOTAL OVER THE LANDED SHAPE, NOT OVER THE LANDED VALIDATOR (line 3).
+       §6.5 enumerates every field of `ImprovementFindingClaimV1` and every `EvidenceDraft`
+       field, so `derived_draft` is a total function INTO the landed shape — that part stands.
+       §10 item 2a then claimed more: "every value the closure produces satisfies the landed
+       validator by construction". Measured against the landed `validateFindingClaim`
+       (`cadp/product/improvement/contracts.ts:166–239`), that is false in two places, both of
+       them exactly where FREE content enters the closure:
+       (a) EMPTY RULE STRINGS. `anomaly_code = r.derived_anomaly_code`,
+           `statement.summary = r.derived_statement.summary` and
+           `correction_reason = r.derived_correction_reason` were typed only as "exact string".
+           The landed validator rejects each when empty — `anomaly_code missing` (:214),
+           `statement.summary missing` (:215), `correction_reason is mandatory when superseding`
+           (:224). A rule carrying an empty string is activatable and produces an invalid draft.
+       (b) FREE SUBJECT KIND. `subject.kind = A.applies_to.to_subject_kind` was any
+           `SUBJECT_KINDS` member. The landed validator (:176–181) rejects any kind outside
+           `IMMUTABLE_SUBJECT_KINDS` (= `["EVIDENCE"]`, :36) whose primary binding carries
+           neither `revision_or_version` nor `content_digest`. For a RECLASSIFICATION the binding
+           IS F's own — already validated under F's OWN kind — but nothing required the
+           observation to name that same kind, so an observation could pair a mutable kind with a
+           binding that carries neither field.
+       Consequence, measured honestly rather than minimised: this is fail-closed, NOT an
+       authority hole — the §5.1 adapter runs `validateFindingClaim` before dispatch and refuses
+       (`MATERIAL_INCOMPLETE` class), so no invalid Finding can seal and no barrier can drop.
+       What it breaks is the TOTALITY CLAIM: an admission could reach ALLOW for a transition that
+       can never seal, leaving the effect terminally refused at dispatch and the barrier up with
+       no `GOVERNED_SEAL_CONFLICT` and no policy-level reason. A closure that is total over a
+       TypeScript shape but partial over the contract that shape belongs to is precisely the
+       "declared semantics the landed contracts do not contain" line, and the fix is cheap.
+       RESOLVED BY CLOSING BOTH ENTRY POINTS — no new mechanism in either case (§6.5, §10 2a):
+       (i) RULE WELL-FORMEDNESS at `POLICY_ACTIVATE`, on the §5.2 rule-2 registry-conformance
+           precedent (the same activation-time validity check, extended to the rule table):
+           `derived_anomaly_code`, `derived_statement.summary` and `derived_correction_reason`
+           MUST be non-empty strings, and `derived_statement.detail` MUST be absent. A bundle
+           violating this is DENIED at activation, so no ACTIVE rule can emit an invalid string.
+       (ii) SUBJECT-KIND CONFORMANCE as a new `authority_applicable` conjunct (new DENY reason
+           `transition_subject_kind_invalid`): RECLASSIFICATION requires
+           `applies_to.to_subject_kind == F.claim.subject.kind` — the binding is F's own and F was
+           itself validated against that exact (kind, binding) pair, so the landed mutable-kind
+           rule carries over by construction; SUBJECT_TRANSFER requires
+           `to_subject_kind ∈ SUBJECT_KINDS` and, when it is not `EVIDENCE`, that `to_subject`
+           carries `revision_or_version` or `content_digest`.
+       §10 2a is rewritten to state exactly which landed validator conditions hold by
+       construction and which are made to hold by (i)/(ii); `validateFindingClaim` returns to
+       being adapter-side defence-in-depth rather than the thing the claim rested on. New control
+       FC21; FC14 extended with both bites.
+
+S11-2  "THE RACE HAS NO OUTCOME TO WIN" HELD PER OBSERVATION, NOT PER PREDECESSOR (line 5).
+       The round-10 closure proves: for a given (F, A, active policy) there is EXACTLY ONE
+       admissible draft. §0.7 and A10 then generalised that to "competing first admissions carry
+       byte-identical drafts — the race has no observable outcome to win", and FC20(a) tested
+       only the same-A case. Two DISTINCT valid observations A₁ ≠ A₂ about the same F in the same
+       work run are not excluded by anything in the design: each is a separate envelope, each
+       carries its own complete `applies_to`, each matches the same rule. Their derived drafts
+       differ — `basis` is the singleton `[A_i]`, so `occurrence_key` differs too — and both
+       reach ALLOW. §5.3 rule (b) then admits one and refuses the other with a
+       `GOVERNED_SEAL_CONFLICT` incident whose scope hold freezes further governed sealing
+       against F until a root-signed `BREAK_GLASS`. So the round-10 property itself survives —
+       whichever draft lands, its content was derived from and authorized by ITS OWN observation,
+       which is what R10-1 required — but the stated claim was stronger than the design supports,
+       and the operational consequence (an honest double-observation costs a BREAK_GLASS) was
+       undeclared.
+       RESOLVED BY EXACT RESTATEMENT + CONTROL, not by a new mechanism, because the residual is
+       genuinely benign and closing it would cost the design its own principles: any predicate
+       "no other observation for this F" would read the CALLER-ASSEMBLED evidence list — attack
+       line 2, the exact defect round-6 R6-1 measured — so it would be worse than the residual.
+       (a) §0.7's and A10's claims are narrowed to their true scope (per (F, A), which is what
+           the closure proves) and the multi-observation case is declared beside the
+           already-declared cross-generation case (§6.5), which it exactly parallels.
+       (b) The residual is bounded tighter than the cross-generation one, and this is stated:
+           every valid A must carry `content_digest == r.authority_content_digest` (§6.5 step 3),
+           so A₁ and A₂ carry the SAME authority content and differ only in which observation
+           envelope the winner cites. No authority-content difference can be decided by the race.
+       (c) New control FC20f, and the operational rule is stated rather than left to be
+           discovered: an authority producer seals at most ONE observation per (F, work run); a
+           second is a producer defect, and the platform's answer to it is the loud fail-closed
+           one (incident + scope hold), not silent selection.
+       Also stated (§6.5): nothing requires A to be SEALED in the run its `applies_to.work_run_ref`
+       names — the producer may name a run that starts later. This is bounded and not a
+       standing-authority hole: the observation still applies to exactly ONE (predecessor, run)
+       pair, and invariant U still caps F at one governed edge across all runs and all time.
+       Recorded as a property so a reviewer need not re-derive it.
+```
+
+**Scope of the round-11 delta, stated exactly.** Both repairs stay inside policy content
+(`data.cadp.authority_text_rules` well-formedness, checked by the existing §5.2 activation-time
+registry-conformance mechanism) and product contract v1.1 admission predicates (one new
+`authority_applicable` conjunct, one new DENY reason). **The §5 TD delta is unchanged** — no new
+adapter operation, producer row, ingress rule, index, or incident kind. `SUBJECT_KINDS` and
+`IMMUTABLE_SUBJECT_KINDS` are landed closed sets read as-is
+(`cadp/product/improvement/contracts.ts:33–36`); no set is extended. SPEC_CHANGE stays NO.
 
 ## 1. What was measured, restated exactly
 
@@ -517,9 +630,12 @@ A7  All non-Human clearing authority lives in ACTIVE policy content, landed via 
 A10 The deterministic family authorizes CONTENT, not just a transition slot (round-10 R10-1):
     the descendant draft is not composed by a caller but COMPUTED — `derived_draft(F, A, r)` is a
     total function of the predecessor envelope, the observation, and the uniquely-matched active
-    rule, and `authority_applicable` requires the material's draft to equal it exactly. Exactly
-    one draft is admissible per (F, A, active policy), so competing first admissions are
-    byte-identical and converge; nothing is left for a store race to decide. Run applicability is
+    rule — total against the landed VALIDATOR, not merely the landed shape (§0.8 S11-1) — and
+    `authority_applicable` requires the material's draft to equal it exactly. Exactly one draft is
+    admissible per (F, A, active policy), so competing first admissions under one observation are
+    byte-identical and converge; two distinct observations about one F race in the ordinary loud
+    way, and either winner's content is authorized by its own observation (§0.8 S11-2). Run
+    applicability is
     mandatory in both families and rule-suppressible in neither (round-10 R10-2): every
     FINDING_SEAL effect carries exactly one work-run binding, the Human decision is confined to
     it by recheck #5, and the deterministic observation must name it exactly.
@@ -707,8 +823,11 @@ with the stamped `producer_ref` and the derived `source_ref`, this means the mat
 `descendant_draft` is the *only* caller-influenced part of the submitted draft — which is what
 makes the §6.5 derivation closure total rather than merely broad (round-10 R10-1).
 E's `work_bindings` MUST carry the predecessor's evidence binding (namespace `evidence`,
-object_id `F.evidence_id`) **and exactly one work-run binding** (namespace `work-run`; round-10
-R10-2, enforced at admission by §6.4) — the first is what lets the §5.4
+object_id `F.evidence_id` — the landed namespace for naming an evidence envelope as a subject,
+`cadp/kernel/rootListener.ts:147`; deliberately NOT `improvement-finding`, which the landed
+reference policy reads as the intake tip binding — `referencePolicy.ts:428/452/460` — and which
+would collide with the intake WORK_START gates) **and exactly one work-run binding** (namespace
+`work-run`; round-10 R10-2, enforced at admission by §6.4) — the first is what lets the §5.4
 incident scope hold bite on further sealing against F, the second is the exact run context every
 deterministic application is checked against. The adapter validates the product
 contract (§4 rule 3) before send and refuses a draft that does
@@ -843,7 +962,9 @@ step_ordinal)` backstops `insertWorkStep` (C33).
 withdrawn): TD §6.4 one adapter operation row (§5.1); TD §9.2 one producer row + two registry
 fields (§5.2); TD §9.1 the two ingress rules above plus the invariant-P reserved-constant
 registry conformance rule (§5.2 rule 2 — a `POLICY_ACTIVATE`-time registry validity check,
-round-9 R9-1); TD §3.2 the two unique partial indexes; TD §2.6 one incident kind (§5.4). Nothing else: no recheck delta (recheck #14 applies as landed and
+round-9 R9-1; round-11 S11-1 adds one further **condition** to that same activation-time bundle
+check — well-formedness of the v1.1-introduced `data.cadp.authority_text_rules` entries, §6.5 —
+and no further mechanism); TD §3.2 the two unique partial indexes; TD §2.6 one incident kind (§5.4). Nothing else: no recheck delta (recheck #14 applies as landed and
 is vacuous for a no-mutable-subject operation), no Human-decision delta, no new K-record, no
 API-shape change (the seal path is the landed `submit_evidence` signature — `source_ref` is an
 existing caller-supplied draft field; only the replay/uniqueness behaviour for registry-opted
@@ -1126,7 +1247,7 @@ needs an H scoped to its own effect and material digest (which renders `S1 → S
 under `DETERMINISTIC_DERIVATION` needs a rule + an observation whose `applies_to` names both
 subjects (§6.5). Nothing about a transfer is cheaper than a clearing.
 
-### 6.5 Deterministic family — context-bound authority observations and the derivation closure (round-4 R3, round-5 R5-2, round-6 R6-1, round-10 R10-1/R10-2)
+### 6.5 Deterministic family — context-bound authority observations and the derivation closure (round-4 R3, round-5 R5-2, round-6 R6-1, round-10 R10-1/R10-2, round-11 S11-1/S11-2)
 
 A deterministic reclassification is sealed through the **same** governed effect. At E's
 admission, instead of H, policy requires:
@@ -1167,11 +1288,25 @@ r = {
   transition_kind, from, to, method { method_ref, method_digest }        (the matching key)
   producer_ref, evidence_kind, claim_schema, provenance,
   authority_content_digest                                              (A's required shape)
-  derived_anomaly_code      : exact string                              (round-10 R10-1)
-  derived_statement         : { summary: exact string }                  — `detail` MUST be absent
-  derived_correction_reason : exact string
+  derived_anomaly_code      : exact NON-EMPTY string                    (round-10 R10-1)
+  derived_statement         : { summary: exact NON-EMPTY string }        — `detail` MUST be absent
+  derived_correction_reason : exact NON-EMPTY string
 }
 ```
+
+**Rule well-formedness is checked at `POLICY_ACTIVATE`, not at use (round-11 S11-1).** The three
+`derived_*` strings are the only free content in the closure, and the landed
+`validateFindingClaim` rejects each of them when empty (`anomaly_code missing` :214,
+`statement.summary missing` :215, `correction_reason is mandatory when superseding` :224). A
+bundle whose `data.cadp.authority_text_rules` contains an entry with an empty `derived_*` string,
+a present `derived_statement.detail`, or a missing one of these fields therefore fails registry
+conformance and the `POLICY_ACTIVATE` is **DENIED** — the same activation-time validity mechanism
+invariant P already uses for the reserved producer constant (§5.2 rule 2), extended to the rule
+table rather than a new mechanism. Consequence: no ACTIVE rule can derive a draft the landed
+validator would reject on these fields, so the closure is total against the landed *contract* and
+not merely against the landed *shape*. The Human who activates a rule is thereby also the person
+who wrote the exact `anomaly_code`, `statement.summary` and `correction_reason` of every Finding
+that rule can ever produce, which is the property the closure trades on (FC21a).
 
 **The observation itself is context-bound.** A's claim MUST carry a typed applicability object
 (part of the registered claim schema; a claim without it never satisfies the predicate — there is
@@ -1188,9 +1323,12 @@ A.claim.applies_to = {
                                                               RECLASSIFICATION; the corrected
                                                               subject for SUBJECT_TRANSFER)
   to_subject_kind     : exact SUBJECT_KINDS member           (round-10 R10-1: the product-level
-                                                              subject kind of the descendant;
-                                                              == F.claim.subject.kind for
-                                                              RECLASSIFICATION)
+                                                              subject kind of the descendant.
+                                                              Round-11 S11-1 makes the
+                                                              RECLASSIFICATION equality to
+                                                              F.claim.subject.kind a CHECKED
+                                                              conjunct rather than a parenthetical
+                                                              — see subject-kind conformance below)
   method              : { method_ref, method_digest }
   work_run_ref        : exact work-run ref                   (MANDATORY — round-10 R10-2; there
                                                               is no opt-out and no rule flag
@@ -1200,7 +1338,12 @@ A.claim.applies_to = {
 
 **The derivation closure (round-10 R10-1).** For the deterministic family the descendant draft is
 not composed by the caller at all — it is *computed*. `derived_draft(F, A, r)` is a **total**
-function whose enumeration below is **exhaustive over the landed shapes**: the three
+function in two distinct senses, and round-11 S11-1 exists because only the first was originally
+established: (1) total over the landed **shape** — the enumeration below is exhaustive, every
+field is derived or required-absent; and (2) total over the landed **contract** — every draft it
+produces satisfies `validateFindingClaim` (`contracts.ts:166–239`), which is guaranteed by the
+activation-time rule well-formedness above and the subject-kind conformance conjunct below, not
+by the adapter's later check. Its enumeration is **exhaustive over the landed shapes**: the three
 `EvidenceDraft` fields the material carries and every field of `ImprovementFindingClaimV1`
 (`cadp/product/improvement/contracts.ts` lines 57–74) appear exactly once, as derived or as
 required-absent. The rest of the landed `EvidenceDraft` (`cadp/kernel/ingress.ts:44–56`) is not
@@ -1248,9 +1391,10 @@ derived_draft(F, A, r) = {
                        method_ref, method_digest)                       (the landed §4 derivation,
                        contracts.ts:111–129 — unchanged, and now a derived value rather than a
                        caller-supplied one that is merely re-checked)
-    series_key       ABSENT                                             (presentation-only
-                       grouping, contracts.ts:136; nothing in the clearing path reads it, and an
-                       optional free value would break totality)
+    series_key       ABSENT                                             (optional in the landed
+                       claim, contracts.ts:70; presentation-only grouping by its own landed
+                       contract note, contracts.ts:130–133. Nothing in the clearing path reads
+                       it, and an optional free value would break totality)
     statement        = { summary: r.derived_statement.summary }         `detail` ABSENT
                        (statement is non-authoritative either way (E2); it is pinned here only so
                         the draft is a function)
@@ -1269,6 +1413,18 @@ authority_applicable(r, A, F, M, E) iff
   A.claim.applies_to.from_subject        == M.from_subject == F's normalized primary subject
   A.claim.applies_to.to_subject          == M.to_subject   == descendant_draft's primary subject
   A.claim.applies_to.to_subject_kind     == M.descendant_draft.claim.subject.kind
+  SUBJECT-KIND CONFORMANCE (round-11 S11-1 — else DENY transition_subject_kind_invalid):
+    A.claim.applies_to.to_subject_kind ∈ SUBJECT_KINDS      (the landed closed set,
+                                                             contracts.ts:33, read as-is)
+    RECLASSIFICATION : to_subject_kind == F.claim.subject.kind
+                       — the descendant's primary binding IS F's own (the closure copies it), and
+                         F was itself validated against that exact (kind, binding) pair, so the
+                         landed mutable-subject rule (contracts.ts:176–181, mutable kinds require
+                         revision_or_version or content_digest) carries over by construction
+    SUBJECT_TRANSFER : to_subject_kind ∉ IMMUTABLE_SUBJECT_KINDS (= ["EVIDENCE"],
+                       contracts.ts:36) ⇒ to_subject carries revision_or_version or
+                       content_digest — the same landed rule, checked directly, because a
+                       transfer introduces a binding F never carried
   A.claim.applies_to.method              == r.method == descendant_draft.claim.derivation's
   A.claim.applies_to.work_run_ref        == the object_id of E's SINGLE `work-run` work binding
                                             (round-10 R10-2 — mandatory in every application; E
@@ -1305,14 +1461,17 @@ closure:
 - a different predecessor, subject, subject kind, classification pair, kind, method, or **work
   run** → `authority_applicable` fails structurally (FC9f, FC9i) — not "re-admitted",
   **unsatisfiable**;
-- a second, DIFFERENT descendant draft for the SAME F **under the same active policy**: now
-  impossible *at admission*, not merely at the store. `derived_draft` is a function, so a draft
-  differing in any field — basis, anomaly_code, correction_reason, statement, secondary subject
-  bindings, subject kind, method digest, an added `execution_or_run_ref`, an added `series_key`,
-  or any unknown key — fails the equality and DENYs `transition_draft_underived` (FC20b). Two
-  admissions that both reach ALLOW therefore carry **byte-identical** drafts; §5.3 rule (b)
-  converges them to one envelope and both effects COMMIT with the same receipt (FC20a). The
-  store race that round-10 R10-1 measured has no outcome left to decide;
+- a second, DIFFERENT descendant draft for the SAME F **under the same active policy and the same
+  observation**: now impossible *at admission*, not merely at the store. `derived_draft` is a
+  function, so a draft differing in any field — basis, anomaly_code, correction_reason, statement,
+  secondary subject bindings, subject kind, method digest, an added `execution_or_run_ref`, an
+  added `series_key`, or any unknown key — fails the equality and DENYs
+  `transition_draft_underived` (FC20b). Two admissions under one A that both reach ALLOW
+  therefore carry **byte-identical** drafts; §5.3 rule (b) converges them to one envelope and
+  both effects COMMIT with the same receipt (FC20a). The store race that round-10 R10-1 measured
+  — one authority, two unequal contents, the winner unauthorized — has no outcome left to decide.
+  (The scope qualifier is exact, not decorative: for two DIFFERENT observations the drafts do
+  differ; that case is the declared residual two bullets below — round-11 S11-2);
 - a second, different draft **across an active-policy change** (r amended between the two
   admissions): each draft was derived under, and authorized by, the policy active at its own
   admission — so the winning draft is authorized either way, which is the property the finding
@@ -1322,11 +1481,35 @@ closure:
   governed sealing against F until root-signed BREAK_GLASS (§5.4), and the refused effect
   resolves terminally. Declared as a residual, with FC20d as its control: it is ordinary
   policy-generation non-determinism (Spec §9.3), not unauthorized content;
+- a second, different draft **from a second, different observation** A₂ about the same F in the
+  same run and under the same rule (round-11 S11-2, declared residual): each A_i is a separate
+  envelope with its own complete `applies_to`, so both derive — and both are *authorized by their
+  own observation*, which is the property R10-1 required. The drafts differ only in `basis`
+  (the singleton `[A_i]`) and the `occurrence_key` derived over it: A₁ and A₂ must both carry
+  `content_digest == r.authority_content_digest` (step (3)), so **no authority-content difference
+  is ever decided by the race**. §5.3 rule (b) admits one and refuses the other loudly —
+  `GOVERNED_SEAL_CONFLICT`, scope hold on F until root-signed BREAK_GLASS (§5.4), refused effect
+  terminal. The design does **not** close this with a "no other observation for this F" predicate:
+  such a predicate would read the caller-assembled evidence list, which is the exact defect
+  round-6 R6-1 measured, and would be strictly worse than the residual. The operational rule,
+  stated rather than left to be discovered: an authority producer seals at most ONE observation
+  per (predecessor, work run); a second is a producer defect and gets the loud fail-closed answer
+  (FC20f);
+- an observation whose `applies_to.work_run_ref` names a run other than the one A was *sealed*
+  in — permitted, and bounded (round-11 S11-2): nothing requires the two to coincide, so a
+  producer may name a run that starts later. This buys nothing standing: the observation still
+  applies to exactly ONE (predecessor, run) pair, `authority_applicable` still demands equality
+  with the sealing effect's single work-run binding, and invariant U still caps F at one governed
+  edge across all runs and all time. Recorded as a property so it need not be re-derived;
 - re-raise after clearing (I4: G superseded by C₂) → C₂ has a different id+digest → the same A
   never matches C₂, and `T(C₂) ≠ T(F)` so the store key is fresh; a new observation about C₂ and a
   new authorization are required (FC9g);
 - `applies_to` absent, partial, or carrying an unknown field → the predicate is unsatisfied →
-  DENY (FC9h).
+  DENY (FC9h);
+- a rule whose `derived_*` strings are empty or whose `derived_statement.detail` is present →
+  the bundle never activates (rule well-formedness above), so the closure cannot emit a draft the
+  landed validator rejects; a `to_subject_kind` inconsistent with the binding it will be paired
+  with → DENY `transition_subject_kind_invalid` (round-11 S11-1, FC21).
 
 **Division of labour between rule and observation (why this satisfies D2):** the *rule* is law —
 universal over its exact predicate, and legitimately so: it is Human-gated policy content
@@ -1504,7 +1687,8 @@ Human family      kernel boundary : one effect (landed §4.4 #5 — unchanged, n
 Deterministic     policy-content boundary: rules live in the active bundle; POLICY_ACTIVATE
 family            revokes/amends them for every subsequent FINDING_SEAL admission (Spec §9.3
                   in-flight rules unchanged); exactly one rule may match a transition key, else
-                  DENY (round-10 R10-1)
+                  DENY (round-10 R10-1); and a rule whose derived_* content would violate the
+                  landed finding validator never activates at all (round-11 S11-1)
                   observation boundary: applies_to binds each observation to one exact
                   predecessor/subject/subject-kind/method — at most one edge ever (§6.5)
                   run boundary    : applies_to.work_run_ref is MANDATORY and must equal the
@@ -1513,7 +1697,12 @@ family            revokes/amends them for every subsequent FINDING_SEAL admissio
                   content boundary: M.descendant_draft == derived_draft(F, A, r) — the whole
                   draft is a total function of immutable inputs, so one (F, A, active policy)
                   admits exactly one content and the authorized content is the only one that can
-                  ever be sealed (round-10 R10-1)
+                  ever be sealed (round-10 R10-1); total against the landed VALIDATOR, so an
+                  ALLOWed deterministic transition is always sealable (round-11 S11-1)
+                  residual, declared: two DISTINCT observations about one F derive two drafts
+                  differing only in which observation they cite; both are authorized by their own
+                  observation, the authority CONTENT is identical by r.authority_content_digest,
+                  and the loser is refused loudly (round-11 S11-2, FC20f)
 Resolutions       policy-content boundary: per-finding {finding_ref, authority_content_digest}
                   entries (§10.4), same revocation
 Governed edges    target boundary : invariant U — at most one governed outgoing edge per
@@ -1585,6 +1774,15 @@ and, from round 10, none of those closures is optional or rule-suppressible in e
   `ImprovementFindingClaimV1`/`deriveOccurrenceKey` shapes — and they only ever REFUSE admissions
   that the prior text would have allowed. No K-record, recheck, adapter operation, producer row,
   ingress rule, index, or incident kind changes.
+- **Round-11 additions likewise touch neither Spec nor TD (§0.8).** Rule well-formedness is a
+  `POLICY_ACTIVATE`-time registry-conformance check on the same path invariant P already uses
+  (§5.2 rule 2, already declared under the §5 TD delta — round-11 adds a rule to that check, not
+  a new check); subject-kind conformance is one more `authority_applicable` conjunct over the
+  landed closed sets `SUBJECT_KINDS`/`IMMUTABLE_SUBJECT_KINDS` (`contracts.ts:33–36`), read
+  as-is and neither extended nor reinterpreted; and one DENY reason is added. Both only ever
+  REFUSE what the round-10 text would have allowed, and neither reads mutable policy state at
+  clearing time — `governed_transition` and the barrier predicates are untouched, so the
+  round-9 R9-1 boundary (no active-policy lookup in historical validation) holds unchanged.
 - **Residual honesty:** a G sealed under an earlier, weaker active policy would be trusted by
   its producer stamp. This is the generic in-flight/policy-history property of every landed fact
   (Spec §9.3), bounded here because policy content is Human-gated from genesis and the writer
@@ -1621,10 +1819,32 @@ and, from round 10, none of those closures is optional or rule-suppressible in e
    `M.descendant_draft == derived_draft(F, A, r)` (§6.5), the matched active rule must be unique,
    the observation's `applies_to` must be complete including the mandatory `work_run_ref`, and
    every `FINDING_SEAL` effect must carry exactly one `work-run` binding. `validateFindingClaim`
-   (`contracts.ts:166`) is unchanged and remains the adapter-side structural gate; the closure is
-   an admission predicate layered above it, and every value the closure produces satisfies the
-   landed validator by construction (non-empty basis, mandatory `correction_reason` when
-   superseding, no `execution_or_run_ref` on a deterministic derivation, exact `occurrence_key`).
+   (`contracts.ts:166–239`) is unchanged and remains the adapter-side structural gate; the closure
+   is an admission predicate layered above it. **Round-11 S11-1 restates the conformance claim
+   exactly**, because the round-10 wording ("every value satisfies the landed validator by
+   construction") was true of four conditions and false of two:
+
+   ```text
+   hold by construction of the closure itself
+     contract_id constant; classification ∈ CLASSIFICATIONS (checked on M, §6.4)
+     basis non-empty              — the singleton [A] (:186–187)
+     correction_reason PRESENT    — supersedes is always the I6 singleton (:219–224)
+     no execution_or_run_ref on a DETERMINISTIC_DERIVATION (:209–211)
+     occurrence_key exact         — derived by the landed deriveOccurrenceKey (:111–129, :227–237)
+     subject.binding_index resolves — copied from F, whose bindings the closure copies (:171–175)
+   made to hold, round-11 S11-1, because the closure's free content reaches them
+     anomaly_code / statement.summary / correction_reason NON-EMPTY (:214, :215, :224)
+       → activation-time rule well-formedness (§6.5): a bundle with an empty derived_* string
+         never activates
+     subject.kind ∈ SUBJECT_KINDS, and a mutable kind requires an exact revision_or_version or
+     content_digest on the primary binding (:176–181)
+       → the subject-kind conformance conjunct of authority_applicable (§6.5), DENY
+         transition_subject_kind_invalid
+   ```
+
+   The distinction matters: without these two the adapter would still refuse the invalid draft
+   pre-dispatch, so nothing unauthorized could seal — but an admission could ALLOW a transition
+   that can never commit, which is a false totality claim, not a safe one.
 3. **Intake producer scope:** the registered intake adapter remains the producer of ordinary
    Findings, corrections (I2(a)), re-raises (I4), and resolutions; boundary-crossing or
    subject-changing descendants it seals are non-clearing, non-delegating proposals (FC3, FC16b).
@@ -1672,7 +1892,10 @@ and, from round 10, none of those closures is optional or rule-suppressible in e
    (rendered by the SSO surface), `transition_subject_mismatch`, `transition_shape_invalid`,
    `transition_kind_invalid`, `transition_derivation_forbidden`, `reclassification_ambiguous`,
    `finding_unresolvable`, and — round-10 — `transition_rule_ambiguous`,
-   `transition_draft_underived`, `transition_run_context_invalid`; and the target-side
+   `transition_draft_underived`, `transition_run_context_invalid`; and — round-11 —
+   `transition_subject_kind_invalid` (§6.5), plus the activation-time registry-conformance
+   refusal of a malformed `authority_text_rules` entry, which is a `POLICY_ACTIVATE` DENY on the
+   §5.2 rule-2 path and not a `FINDING_SEAL` reason code; and the target-side
    `GOVERNED_SEAL_CONFLICT` ingress rejection +
    incident (§5.3/§5.4 — a declared TD §2.6 incident kind), which is a kernel-service reason
    code, not a policy one.
@@ -1726,8 +1949,12 @@ Human step.**
  2″. In R, the registered authority producer seals the observation A about F: subject binding
      carrying content_digest == r.authority_content_digest, and a complete
      `applies_to` = {transition_kind, predecessor_ref = {F.id, F.digest}, from/to classification,
-     from_subject = to_subject = F's subject, to_subject_kind, method, work_run_ref = R}.
-     Nothing here names the descendant — it does not exist yet (non-circular, §6.5).
+     from_subject = to_subject = F's subject, to_subject_kind = F.claim.subject.kind (round-11
+     S11-1: for a RECLASSIFICATION this equality is checked, not assumed), method,
+     work_run_ref = R}.
+     Nothing here names the descendant — it does not exist yet (non-circular, §6.5). The producer
+     seals exactly ONE observation for (F, R); a second is a producer defect and is answered
+     loudly rather than silently selected (§0.8 S11-2, FC20f).
  3″. The run COMPUTES the draft rather than composing one: descendant_draft :=
      derived_draft(F, A, r) (§6.5). There is no field left to choose — basis is [A],
      anomaly_code / statement.summary / correction_reason come from the landed rule,
@@ -1791,12 +2018,13 @@ Human step.**
 | FC11 | authorization-shaped text in any `statement` field; no valid H/rule | never read; no clear (grep-level guard: policy references no statement field) |
 | FC12 | AUTHORITY_RESOLUTION (round-4 R4, round-5 R5-3): (a) no entry whose `finding_ref` equals the tip's exact id+digest (incl. id-match-only and digest-match-only); (b) entry exists for tip C₁ but the resolution targets a different CONTRACT_* tip C₂ with the same `authority_content_digest` (cross-finding reuse of a landed digest); (c) entry's digest ≠ resolution's `landed_authority_ref` digest; (d) entry later removed by POLICY_ACTIVATE; (e) `landed_authority_ref` shaped as a decision-envelope ref; (f) superseded tip: entry bound to old digest, resolution names corrected tip | no clear in every case; (b) is the ambient-authority control; (d) proves the policy-content boundary; positive control: entry + matching resolution → clears, and a second resolution of the SAME tip under the same entry is an idempotent restatement (no new privilege) |
 | FC13 | unresolvable ancestor (absent envelope or digest mismatch anywhere in reach(tip)) | fail closed (landed behavior retained) |
-| FC14 | guard-bite meta-control: individually remove each new predicate — digest matching in supersedes/tip refs, `sole_predecessor` (§6.3, in each of the three resolved-entry forms) and the §6.4 singleton shape rule, producer/integrity checks, I1 equality, each §6.4 per-kind rule, ambiguity rule, each delegation form, each `authority_applicable` element (§6.5) **including the mandatory `work_run_ref` equality and the `derived_draft` equality**, **each individual field of the §6.5 derivation closure** (drop it from the derived object and let the material supply it freely — one control per field: subject_bindings, subject.kind, subject.binding_index, basis singleton, derivation, anomaly_code, occurrence_key, series_key absence, statement, supersedes, correction_reason) and, separately, **each operation-fixed draft field of §5.1** (availability, unknown_reason, claim_schema, source_relation, envelope-level execution_or_run_ref) let through from the material instead, **the unique-rule-match requirement**, **the observation-keyed rule selection** (re-key it off the presented draft's method), **the §6.4 exactly-one-work-run rule**, each `valid_authority_resolution` conjunct incl. entry `finding_ref` equality (§10.4), §5.3 rule (a), §5.3 rule (b) incl. its shape guard, the §5.4 scope-hold bindings | the corresponding exploit reproduces (delta 1); a control whose removal changes nothing is reported as defence-in-depth (FC6 is expected to land there after FC15; FC7 documents the measured redundancy of rule (a) for the retry case; the per-field closure bites are expected to split — dropping the `basis` singleton, `anomaly_code`, `correction_reason`, `statement`, or `subject_bindings` reproduces R10-1 directly, while dropping `occurrence_key` or any operation-fixed field is expected to be caught downstream by the landed validator or the landed ingress checks and is then reported as layered defence, not as an unused control) |
+| FC14 | guard-bite meta-control: individually remove each new predicate — digest matching in supersedes/tip refs, `sole_predecessor` (§6.3, in each of the three resolved-entry forms) and the §6.4 singleton shape rule, producer/integrity checks, I1 equality, each §6.4 per-kind rule, ambiguity rule, each delegation form, each `authority_applicable` element (§6.5) **including the mandatory `work_run_ref` equality and the `derived_draft` equality**, **each individual field of the §6.5 derivation closure** (drop it from the derived object and let the material supply it freely — one control per field: subject_bindings, subject.kind, subject.binding_index, basis singleton, derivation, anomaly_code, occurrence_key, series_key absence, statement, supersedes, correction_reason) and, separately, **each operation-fixed draft field of §5.1** (availability, unknown_reason, claim_schema, source_relation, envelope-level execution_or_run_ref) let through from the material instead, **the unique-rule-match requirement**, **the observation-keyed rule selection** (re-key it off the presented draft's method), **the §6.4 exactly-one-work-run rule**, **the round-11 subject-kind conformance conjunct and the activation-time rule well-formedness rule (each separately — FC21)**, each `valid_authority_resolution` conjunct incl. entry `finding_ref` equality (§10.4), §5.3 rule (a), §5.3 rule (b) incl. its shape guard, the §5.4 scope-hold bindings | the corresponding exploit reproduces (delta 1); a control whose removal changes nothing is reported as defence-in-depth (FC6 is expected to land there after FC15; FC7 documents the measured redundancy of rule (a) for the retry case; the per-field closure bites are expected to split — dropping the `basis` singleton, `anomaly_code`, `correction_reason`, `statement`, or `subject_bindings` reproduces R10-1 directly, while dropping `occurrence_key` or any operation-fixed field is expected to be caught downstream by the landed validator or the landed ingress checks and is then reported as layered defence, not as an unused control) |
 | FC15 | **round-6 R6-1, the omission attack, load-bearing.** Seal G₁ from F (deterministic route, observation A). Then assemble a SECOND FINDING_SEAL for the same F with a different descendant draft (different basis/run/class-target), presenting the same A and deliberately **omitting G₁ from `input.evidence`** so the §6.4 conflict rule cannot see it. Run it through the real `admitAndDispatch`. Repeat with the Human route (a fresh H on the second effect) and with a different work run and a different principal | the admission may reach ALLOW (policy is blind by construction — that is the point of the control), and the **dispatch is refused at the store** by §5.3 rule (b): `GOVERNED_SEAL_CONFLICT` incident sealed with the exact §5.4 subject bindings, no second governed envelope whose supersedes names F exists, store count for edge T(F) == 1, effect resolves `NO_EFFECT_CONFIRMED(governed_seal_conflict)` via the `REJECTED_NO_EFFECT` proof. **Scope-hold bite (R8-2):** a third FINDING_SEAL effect naming F in `work_bindings` is refused admission while the incident stands, and admissible again only after a root-signed BREAK_GLASS whose `release_incident_refs` names it; ordinary admissions merely presenting F as evidence are NOT held. Downstream, no graph containing two governed descendants of F is constructible. Guard-bite: remove the §5.3 rule-(b) branch → the second envelope appears and each branch clears separately (reproduces R6-1 exactly) |
 | FC18 | **round-8 R8-1, the separated-keys control.** (a) two admitted effects E₁ ≠ E₂ dispatch byte-identical drafts for the same F (legitimate cross-effect restatement); (b) a dispatch forged with `source_ref` ≠ the material's `idempotency_key` (adapter conformance); (c) a draft for this producer whose `supersedes` has two entries or zero entries reaches `submit_evidence` directly (bypassing §6.4 — e.g. a compromised workflow composing its own dispatch through the writer credential is out of reach by FC5, so this is exercised via the adapter conformance suite with a synthetic ingress call) | (a) rule (a) finds no envelope for E₂'s key, rule (b) converges on the identical payload → ONE envelope, store count for T(F) == 1, both effects COMMITTED with the same receipt, no incident, no new privilege; (b) refused pre-dispatch by the adapter (§5.1) — never reaches the target; (c) rejected outright by the rule-(b) shape guard — the edge key cannot even be derived; guard-bite: with the shape guard removed, (c) still cannot clear downstream (`sole_predecessor` fails, FC17b) — reported as the intended defence-in-depth layering |
 | FC16 | **round-6 R6-2, context transfer.** (a) positive: governed SUBJECT_TRANSFER `C_old/S1 → C_new/S2` with H₁ rendering both subjects → delegation holds → the §11 variant chain clears; (b) the R6-2 exploit: ordinary intake subject-changing correction `C_old/S1 → C_new/S2`, then a fully valid governed clearing of `C_new/S2` → **C_old's barrier still stands** for every tip through it (authority for S2 never discharges S1); (c) SUBJECT_TRANSFER material with `to_subject` ≠ the descendant draft's primary subject, or `from_subject` ≠ F's → DENY; (d) SUBJECT_TRANSFER that also changes classification (transfer + clear in one step) → DENY `transition_shape_invalid`; (e) deterministic transfer whose observation's `applies_to.to_subject` names S3 while the draft moves to S2 → DENY; (f) H issued for a transfer `S1→S2` re-presented for a transfer `S1→S3` (new material, new effect) → recheck #5 / material_digest mismatch → refused | as stated; (b) is the finding's exact scenario and must fail closed; guard-bite: restore the round-5 rule (any intra-CONTRACT supersession delegates) → (b) clears, reproducing R6-2 |
 | FC19 | **round-9 R9-1, writer-generation stability, load-bearing.** (a) revoke-after-clear: seal a governed clearing edge G for F (either family), then `POLICY_ACTIVATE` a bundle that unbinds the writer credential (and a second variant that also removes the adapter-registry row); re-run every later admission of the §11 chain through the real PEP; (b) successor-generation second seal: bind a NEW credential to the constant producer_ref, then attempt a `FINDING_SEAL` for the already-served F with a different descendant draft, omitting G from `input.evidence` (the FC15 shape, now across generations); (c) reserved-constant attempt: a policy bundle registering `governed_edge: SUPERSEDES_SINGLETON` for `IMPROVEMENT_FINDING` under producer_ref `governed:reclassification2`, and a synthetic envelope carrying that producer_ref presented downstream | (a) `governed_transition(G)` still holds and every tip through G still clears — the predicate reads only G's kernel-stamped `producer_ref`/`integrity`, never the active registry; guard-bite: reintroduce the active-registry lookup into `governed_transition` → the cleared edge goes dark after revocation, reproducing R9-1(i) exactly; (b) refused at the store on the SAME occupied key T(F) — `GOVERNED_SEAL_CONFLICT`, store count for T(F) == 1: a new generation gains no fresh edge namespace (guard-bite: key the §3.2 indexes on the credential instead of the constant → (b) seals a second edge, reproducing R9-1(ii)); (c) `POLICY_ACTIVATE` DENY (registry conformance, §5.2 rule 2), and the synthetic envelope clears and delegates nothing (§6.2 constant mismatch — the FC5 no-clear polarity, proving the conformance rule is defence-in-depth, not the sole barrier) |
-| FC20 | **round-10 R10-1/R10-2, competing first admissions and the derivation closure, load-bearing.** (a) *the race, positive*: two work runs cannot both apply one A (R10-2 forbids it), so the concurrency case is two effects E_a, E_b in the SAME run R under the same A and the same active rule; each independently composes M and dispatches. Both drafts must equal `derived_draft(F, A, r)`, so they are byte-identical; dispatch them concurrently against the real ingress; (b) *the exploit R10-1 measured*: E_b's draft differs from the derived one in exactly one field, one control per field — an extra `basis` entry (an unrelated DIAGNOSTIC ref), a second AUTHORITY_TEXT entry, a different `anomaly_code`, a different `correction_reason`, a different `statement.summary`, an added `statement.detail`, an added `series_key`, an added `execution_or_run_ref`, an added secondary `subject_binding`, a reordered `subject_bindings` array, a different `subject.kind`, a different `subject.binding_index`, a recomputed-but-consistent `occurrence_key` over the altered basis, and an unknown extra claim key; (c) *rule ambiguity*: activate two rules matching the same `(transition_kind, from, to, method)` whose `derived_anomaly_code` differs, then seal; (d) *cross-generation race*: E_a admitted under rule r₁, then `POLICY_ACTIVATE` amends the rule to r₂ (different `derived_correction_reason`), then E_b is admitted under r₂; dispatch both concurrently; (e) *cross-run re-observation after a completed edge*: seal G in run R, then in run R₂ observe A₂ (identical authority content, `work_run_ref = R₂`) and attempt the derived seal | (a) both admissions ALLOW, both dispatch, §5.3 rule (b) converges on the identical payload → **exactly one** envelope, store count for T(F) == 1, both effects COMMITTED with the **same** receipt, no incident — the race has no outcome to win, which is the property R10-1 asked for; (b) **DENY `transition_draft_underived` at admission in every variant** — E_b never reaches dispatch, so the store never sees a competing payload and the winner's content is provably the authorized one; (c) DENY `transition_rule_ambiguous` — no seal, and neither rule silently wins; (d) each draft is authorized by the policy active at its own admission (the property required); the first dispatch commits, the second is refused with `GOVERNED_SEAL_CONFLICT` + the §5.4 scope hold and resolves `NO_EFFECT_CONFIRMED` — declared residual, no unauthorized content lands; (e) refused on the occupied key T(F) with `GOVERNED_SEAL_CONFLICT` (§11 step 6″). **Guard-bite:** remove the `M.descendant_draft == derived_draft(F, A, r)` conjunct → every (b) variant reaches ALLOW, both dispatches race, and whichever wins carries content no authority ever bound — reproducing R10-1 exactly; separately remove only the unique-rule-match requirement → (c) seals whichever rule the evaluation order happens to pick |
+| FC20 | **round-10 R10-1/R10-2, competing first admissions and the derivation closure, load-bearing.** (a) *the race, positive*: two work runs cannot both apply one A (R10-2 forbids it), so the concurrency case is two effects E_a, E_b in the SAME run R under the same A and the same active rule; each independently composes M and dispatches. Both drafts must equal `derived_draft(F, A, r)`, so they are byte-identical; dispatch them concurrently against the real ingress; (b) *the exploit R10-1 measured*: E_b's draft differs from the derived one in exactly one field, one control per field — an extra `basis` entry (an unrelated DIAGNOSTIC ref), a second AUTHORITY_TEXT entry, a different `anomaly_code`, a different `correction_reason`, a different `statement.summary`, an added `statement.detail`, an added `series_key`, an added `execution_or_run_ref`, an added secondary `subject_binding`, a reordered `subject_bindings` array, a different `subject.kind`, a different `subject.binding_index`, a recomputed-but-consistent `occurrence_key` over the altered basis, and an unknown extra claim key; (c) *rule ambiguity*: activate two rules matching the same `(transition_kind, from, to, method)` whose `derived_anomaly_code` differs, then seal; (d) *cross-generation race*: E_a admitted under rule r₁, then `POLICY_ACTIVATE` amends the rule to r₂ (different `derived_correction_reason`), then E_b is admitted under r₂; dispatch both concurrently; (e) *cross-run re-observation after a completed edge*: seal G in run R, then in run R₂ observe A₂ (identical authority content, `work_run_ref = R₂`) and attempt the derived seal; (f) **round-11 S11-2, the multi-observation race**: in ONE run R, the authority producer seals TWO observations A₁ ≠ A₂ about the same F (necessarily the same authority content — both must carry `content_digest == r.authority_content_digest`); derive and admit both seals, dispatch concurrently | (a) both admissions ALLOW, both dispatch, §5.3 rule (b) converges on the identical payload → **exactly one** envelope, store count for T(F) == 1, both effects COMMITTED with the **same** receipt, no incident — the race has no outcome to win, which is the property R10-1 asked for; (b) **DENY `transition_draft_underived` at admission in every variant** — E_b never reaches dispatch, so the store never sees a competing payload and the winner's content is provably the authorized one; (c) DENY `transition_rule_ambiguous` — no seal, and neither rule silently wins; (d) each draft is authorized by the policy active at its own admission (the property required); the first dispatch commits, the second is refused with `GOVERNED_SEAL_CONFLICT` + the §5.4 scope hold and resolves `NO_EFFECT_CONFIRMED` — declared residual, no unauthorized content lands; (e) refused on the occupied key T(F) with `GOVERNED_SEAL_CONFLICT` (§11 step 6″); (f) **both drafts derive and both admissions ALLOW — this is the declared residual, and the control's job is to measure it, not to falsify it**: the two drafts differ ONLY in `basis` (`[A₁]` vs `[A₂]`) and the `occurrence_key` derived over it, both carry the identical authority content digest, §5.3 rule (b) admits the first and refuses the second with `GOVERNED_SEAL_CONFLICT` + the §5.4 scope hold, store count for T(F) == 1, and the landed envelope's `basis` singleton resolves to an observation whose `applies_to` names exactly (F, R) — i.e. the winner's content is authorized by its own observation. Assert additionally that NO variant of (f) can differ in authority content, classification, subject, method, or `supersedes`: those are pinned by `applies_to`/`r` and the closure. **Guard-bite:** remove the `M.descendant_draft == derived_draft(F, A, r)` conjunct → every (b) variant reaches ALLOW, both dispatches race, and whichever wins carries content no authority ever bound — reproducing R10-1 exactly; separately remove only the unique-rule-match requirement → (c) seals whichever rule the evaluation order happens to pick |
+| FC21 | **round-11 S11-1, validator totality of the closure, load-bearing.** (a) *activation bites*: attempt `POLICY_ACTIVATE` on a bundle whose `authority_text_rules` entry has, one control per case, an empty `derived_anomaly_code`, an empty `derived_statement.summary`, an empty `derived_correction_reason`, a present `derived_statement.detail`, or any of the three fields missing; (b) *subject-kind conformance, RECLASSIFICATION*: an otherwise-valid A whose `applies_to.to_subject_kind` differs from `F.claim.subject.kind` — run both the benign variant (F's kind is `EVIDENCE`, A names `TARGET`) and the pathological one (A names a mutable kind while F's primary binding carries neither `revision_or_version` nor `content_digest`); (c) *subject-kind conformance, SUBJECT_TRANSFER*: `to_subject_kind` a non-`EVIDENCE` member while `to_subject` carries neither `revision_or_version` nor `content_digest`; (d) *kind outside the landed set*: `to_subject_kind` a string not in `SUBJECT_KINDS`; (e) *positive/no-regression*: a well-formed rule and a conformant observation seal exactly as §11 variant 1″–6″ | (a) `POLICY_ACTIVATE` DENIED in every case, no rule activates, and the previously-active bundle is untouched; (b)/(c)/(d) DENY `transition_subject_kind_invalid` at the `FINDING_SEAL` admission — the effect never reaches dispatch; (e) COMMITTED. **Guard-bite:** remove the activation well-formedness rule → (a)'s empty-string bundles activate, the admission reaches ALLOW, and the dispatch is then refused by the landed `validateFindingClaim` inside the adapter (`anomaly_code missing` / `statement.summary missing` / `correction_reason is mandatory when superseding`) — the effect terminates with the barrier still up and no policy-level reason, which is the exact S11-1 defect: fail-closed but with the totality claim false. Separately remove the subject-kind conjunct → (b)'s pathological variant and (c) reach ALLOW and fail the same way downstream; (b)'s benign variant seals a Finding whose `subject.kind` no authority-relevant predicate reads, and is reported as measured (the conjunct's value there is contract truthfulness, not exploit prevention) |
 | FC17 | **round-7 R7-1, the multi-predecessor attack, load-bearing.** (a) the exploit: two distinct CONTRACT_GAP findings F₁ and F₂ sharing one normalized primary subject; obtain a fully valid authorization for F₁ ONLY (H scoped to E over M with `predecessor_ref = F₁`, or a deterministic A whose `applies_to` names F₁); build the descendant draft with `supersedes = [F₁, F₂]`; (b) the same multi-predecessor shape reaching a later admission by any route (an intake-produced descendant listing both, or a synthetic envelope standing in for a pre-I6 artifact); (c) transfer variant: governed SUBJECT_TRANSFER material naming C_old with a draft superseding C_old and C_other; (d) merge-then-clear: intake merge `[C₁, C₂] → C₃`, then a fully valid governed clearing of C₃; (e) positive/no-regression: singleton `supersedes = [F₁]` | (a) seal DENIES `transition_shape_invalid` (§6.4 singleton rule) — the governed multi-predecessor artifact is unconstructible; (b) `sole_predecessor` fails for F₁ **and** for F₂ → no clearing_edge, no delegation, both barriers stand (this is the load-bearing control: it does not depend on the seal-time check); (c) DENY at seal, and no delegation downstream for either predecessor; (d) C₁ and C₂ barriers still stand for every tip through them — one authorization never answers two contract questions; (e) clears exactly as §11. Guard-bite: restore containment matching in `sole_predecessor` → (b) and (d) clear, reproducing R7-1 exactly; restore it in §6.4 only → (a) seals and then (b) clears |
 
 ## 13. Preserved paths and non-goals
@@ -1813,7 +2041,12 @@ intake and simply resolves nothing (round-7 R7-1, I6). The round-10 derivation c
 mandatory run applicability likewise bind only the governed `FINDING_SEAL` path: ordinary intake
 Findings — deterministic or otherwise — compose their own basis, statement, anomaly_code and
 correction_reason exactly as today, and are unaffected in every respect except the clearing power
-they never had.
+they never had. The round-11 additions are narrower still: rule well-formedness constrains only
+entries in `data.cadp.authority_text_rules` (a table that does not exist before this contract
+lands, default empty), and the subject-kind conformance conjunct is evaluated only inside
+`authority_applicable` — the landed `validateFindingClaim`, `SUBJECT_KINDS` and
+`IMMUTABLE_SUBJECT_KINDS` are read as-is and every ordinary intake Finding keeps exactly the
+subject-kind freedom it has today.
 
 Non-goals honored: no #107 implementation here; no #109 ancestry-completeness changes (#109 has
 now landed at the frozen basis — exact-digest `supersedes` resolution and fail-closed omitted
@@ -1827,12 +2060,12 @@ clock; no automatic Human approval; no free-text authority; no production deploy
 |---|---|---|
 | 1 | SPEC_CHANGE / TD_CHANGE classified | header block, §5, §9 |
 | 2 | exact Human transition-authorization representation **or proof no new representation is needed** | §4, §4.1 (landed decision suffices for both families; the typed artifact is the K3 material) |
-| 3 | exact non-circular applicability/context binding | §6.1–§6.2, §6.5 (`authority_applicable` — predecessor, both subjects, subject kind, method, **mandatory work run**, and the **derivation closure** binding the exact draft content; the commitment `digest(derived_draft(F, A, r))` is computed, not stored inside A, so it is exact without circularity), §6.6 (invariant U + why descendant-binding inside A is the circular option), §6.3 (`sole_predecessor` — the authorized predecessor is the only one resolved), §10.4 (per-finding entries) |
+| 3 | exact non-circular applicability/context binding | §6.1–§6.2, §6.5 (`authority_applicable` — predecessor, both subjects, subject kind **with landed-validator conformance** (§0.8 S11-1), method, **mandatory work run**, and the **derivation closure** binding the exact draft content; the commitment `digest(derived_draft(F, A, r))` is computed, not stored inside A, so it is exact without circularity; the one declared residual — two observations, same authority content — is stated in §0.8 S11-2 with FC20f), §6.6 (invariant U + why descendant-binding inside A is the circular option), §6.3 (`sole_predecessor` — the authorized predecessor is the only one resolved), §10.4 (per-finding entries) |
 | 4 | supersession subject/work-run invariants | §7 (I1–I6, incl. I5's two distinct exact answers to the work-run question), §4.1 (typed context transfer), §6.3 (two delegation forms), §6.4 (exactly one work-run binding per governed effect) |
 | 5 | validity/reuse compatible with clock-free admission | §8 (incl. the target, context-transfer, run, and draft-content boundaries — all non-temporal) |
 | 6 | polarity: only explicit authorization clears | §4 rule 1, §6.4, FC1 |
 | 7 | exact id+digest basis resolution; no self-declared AUTHORITY_TEXT | §6.3–§6.5, §10, FC9/FC13 |
-| 8 | falsification controls incl. cross-run/subject/descendant reuse and invalid Human paths | §12, notably FC9i (**cross-run reuse, now unconditional for every rule** — round-10 R10-2), FC15 (descendant/evidence-omission reuse + scope-hold/release), FC16 (cross-subject), FC17 (cross-predecessor reuse of one authorization), FC18 (separated replay/edge keys), FC19 (writer-generation stability of cleared edges and edge uniqueness), FC20 (**competing first admissions and per-field derivation closure** — round-10 R10-1) |
+| 8 | falsification controls incl. cross-run/subject/descendant reuse and invalid Human paths | §12, notably FC9i (**cross-run reuse, now unconditional for every rule** — round-10 R10-2), FC15 (descendant/evidence-omission reuse + scope-hold/release), FC16 (cross-subject), FC17 (cross-predecessor reuse of one authorization), FC18 (separated replay/edge keys), FC19 (writer-generation stability of cleared edges and edge uniqueness), FC20 (**competing first admissions and per-field derivation closure** — round-10 R10-1, incl. FC20f's multi-observation race), FC21 (**validator totality of the closure: activation-time rule well-formedness and subject-kind conformance** — round-11 S11-1) |
 | 9 | real-PEP positive S4 path expressible | §11 (Human path steps 1–7; the deterministic S3-permitted path as its own end-to-end variant, steps 1″–6″) |
 | 10 | DESIGN_DISPOSITION / NEXT_OWNER | header block, §15 |
 
@@ -1840,10 +2073,17 @@ clock; no automatic Human approval; no free-text authority; no production deploy
 
 ```text
 DESIGN_DISPOSITION   TD_DESIGN_READY
-ROUND                10 — R10-1 (deterministic draft unbound by the authority) and R10-2
-                     (rule-suppressible work-run applicability) are answered in §0.7/§6.5;
-                     the round-10 delta is confined to policy content and product contract v1.1,
-                     so the §5 protected TD delta is unchanged from round 9 (§9, last bullet)
+ROUND                11 — SELF-MEASURED. No review of the round-10 head was published (the lane
+                     went HOLD_CAPACITY / actor RATE_LIMITED after issuing the round-10
+                     findings), so §0.8 is a self-audit, not an answer to a review, and a fresh
+                     review may name defects other than S11-1/S11-2 (§0.4 precedent).
+                     Round 10: R10-1 (deterministic draft unbound by the authority) and R10-2
+                     (rule-suppressible work-run applicability) are answered in §0.7/§6.5.
+                     Round 11: S11-1 (the closure was total over the landed shape but not over
+                     the landed validator) and S11-2 (the "no race left" claim held per
+                     observation, not per predecessor) are answered in §0.8/§6.5/§10 2a.
+                     Both rounds are confined to policy content and product contract v1.1, so
+                     the §5 protected TD delta is unchanged from round 9 (§9, last two bullets)
 NEXT_OWNER           Control — scope/authority check. The §0.4 provenance question is CLOSED:
                      the round-7 review findings were recovered from the devharness lane state,
                      measured against 8017bf0 (their line references match it exactly), and are
