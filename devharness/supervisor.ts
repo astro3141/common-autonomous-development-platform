@@ -251,6 +251,7 @@ export class Supervisor {
         `Base branch ${lane.baseBranch} advanced to ${baseNow} after this candidate was based on ${lane.candidate.baseSha}. ` +
         `Rebase the branch onto the new base (git fetch origin && git rebase ${baseNow}), resolve any conflicts, keep the work intact, rerun validation, and commit.`,
       ]
+      lane.reviewerDebrisPaths = undefined
       lane.baseSha = baseNow
       await this.step2(lane, { type: 'BASE_DRIFT', observedBaseSha: baseNow })
       return true
@@ -338,9 +339,11 @@ export class Supervisor {
         lane.currentHeadSha = this.d.git.worktreeExists(lane.worktree) ? this.d.git.headSha(lane.worktree) : lane.currentHeadSha
         if (res.outcome.kind === 'COMPLETE') {
           // Retained past this clear for VALIDATING's reviewer-flagged debris
-          // check (H3) — see lastRepairFindings.
+          // check (H3) — see lastRepairFindings / lastRepairDebrisPaths.
           lane.lastRepairFindings = lane.reviewerFindings
           lane.reviewerFindings = undefined
+          lane.lastRepairDebrisPaths = lane.reviewerDebrisPaths
+          lane.reviewerDebrisPaths = undefined
         }
         await this.step2(lane, {
           type: 'ACTOR_RESULT', outcome: res.outcome,
@@ -365,15 +368,16 @@ export class Supervisor {
         // at base, even if modified here, is real pre-existing payload, not
         // lane-introduced scratch, and a path the lane has since deleted has
         // nothing left to `git rm`. Ambiguous scratch shapes (e.g. a bare
-        // "repro" substring) are only debris when the Reviewer's own
-        // REQUEST_CHANGES findings name the exact basename
-        // (isReviewerFlaggedDebris) — never guessed from filename shape
-        // alone. lastRepairFindings (not reviewerFindings, already cleared
-        // above on this same COMPLETE) carries the findings that drove the
-        // round just completed.
+        // "repro" substring) are only debris when the Reviewer used the
+        // dedicated typed `debrisPaths` output field to designate the exact
+        // path (isReviewerFlaggedDebris) — never guessed from filename shape,
+        // and never inferred from occurrence inside free-text findings.
+        // lastRepairDebrisPaths (not reviewerDebrisPaths, already cleared
+        // above on this same COMPLETE) carries the designation that drove
+        // the round just completed.
         const addedFiles = this.d.git.addedFiles(lane.worktree, lane.baseSha)
         const addedDebrisCandidates = addedFiles.filter(
-          (p) => isTrackedDebris(p) || isReviewerFlaggedDebris(p, lane.lastRepairFindings),
+          (p) => isTrackedDebris(p) || isReviewerFlaggedDebris(p, lane.lastRepairDebrisPaths),
         )
         if (addedDebrisCandidates.length > 0) {
           const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
@@ -404,7 +408,10 @@ export class Supervisor {
         const result = cfg.validationCommand !== undefined
           ? await this.d.runValidation(lane.worktree, cfg.validationCommand)
           : { pass: true, detail: 'no validation command configured' }
-        if (!result.pass) lane.reviewerFindings = [`Deterministic validation failed. ${result.detail}`]
+        if (!result.pass) {
+          lane.reviewerFindings = [`Deterministic validation failed. ${result.detail}`]
+          lane.reviewerDebrisPaths = undefined
+        }
         await this.step2(lane, { type: 'VALIDATION_RESULT', pass: result.pass, detail: result.detail })
         return TERMINALLY_YIELDED.includes(this.statusOf(lane))
       }
@@ -426,6 +433,7 @@ export class Supervisor {
           lane.reviewerFindings = [
             'The branch contains no committed work beyond the base SHA. Complete the issue and commit the result on this branch.',
           ]
+          lane.reviewerDebrisPaths = undefined
           await this.step2(lane, { type: 'CANDIDATE_EMPTY' })
           return TERMINALLY_YIELDED.includes(this.statusOf(lane))
         }
@@ -437,6 +445,7 @@ export class Supervisor {
             `Recorded base ${lane.baseSha} is NOT an ancestor of branch HEAD ${headSha} — the requested rebase was not performed or not completed. ` +
             `Run: git fetch origin && git rebase ${lane.baseSha}, resolve conflicts keeping the work intact, rerun validation, and commit.`,
           ]
+          lane.reviewerDebrisPaths = undefined
           await this.step2(lane, { type: 'CANDIDATE_BASE_UNPROVEN' })
           return TERMINALLY_YIELDED.includes(this.statusOf(lane))
         }
@@ -504,11 +513,14 @@ export class Supervisor {
           lane.reviews.push({
             baseSha: cand.baseSha, headSha: cand.headSha,
             verdict: res.verdict, summary: res.summary ?? '',
-            findings: res.findings ?? [], invalidated: false,
+            findings: res.findings ?? [], debrisPaths: res.debrisPaths ?? [], invalidated: false,
             at: new Date().toISOString(),
           })
           if (res.verdict === 'GO') lane.reviewedHeadSha = cand.headSha
-          if (res.verdict === 'REQUEST_CHANGES') lane.reviewerFindings = res.findings ?? []
+          if (res.verdict === 'REQUEST_CHANGES') {
+            lane.reviewerFindings = res.findings ?? []
+            lane.reviewerDebrisPaths = res.debrisPaths ?? []
+          }
           this.d.store.upsertLane(lane)
         }
         await this.step2(lane, {
@@ -520,7 +532,7 @@ export class Supervisor {
           })
         } else if (this.statusOf(lane) === 'REPAIR_PENDING') {
           await this.postReceipt('REVIEW_REQUEST_CHANGES', lane, {
-            reviewed_head_sha: cand.headSha, findings: res.findings, pr: lane.prNumber,
+            reviewed_head_sha: cand.headSha, findings: res.findings, debris_paths: res.debrisPaths, pr: lane.prNumber,
           })
         }
         return TERMINALLY_YIELDED.includes(this.statusOf(lane))

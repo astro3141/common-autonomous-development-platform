@@ -73,6 +73,13 @@ export type ReviewResult = {
   verdict?: ReviewVerdict
   summary?: string
   findings?: string[]
+  /**
+   * Explicit, typed list of tracked paths the Reviewer requires deleted (not
+   * modified) before resubmission — issue #119 H1/H3 debris designation.
+   * Never inferred from `findings` prose; a basename merely mentioned there
+   * is not a deletion instruction.
+   */
+  debrisPaths?: string[]
 }
 
 /** Independent reviewer port (Codex). Read-only; never the same invocation as the actor. */

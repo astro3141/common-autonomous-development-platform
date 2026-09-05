@@ -13,6 +13,11 @@ test('119-H3: isTrackedDebris recognizes the unambiguous scratch categories and 
   assert.equal(isTrackedDebris('tsconfig.typecheck-scratch.json'), true)
   assert.equal(isTrackedDebris('COMMIT_MSG_I109.txt'), true)
   assert.equal(isTrackedDebris('nested/dir/COMMIT_MSG_I109.txt'), true)
+  // Round-3 review finding 2: the Harness-specific pre/post-repair scratch
+  // reproduction naming convention must be caught automatically, before the
+  // first freeze — not only after a Reviewer names it.
+  assert.equal(isTrackedDebris('s2_prerepair_repro.ts'), true)
+  assert.equal(isTrackedDebris('nested/dir/s2_postrepair_repro.tsx'), true)
   // Real product/config files are never mistaken for debris.
   assert.equal(isTrackedDebris('tsconfig.json'), false)
   assert.equal(isTrackedDebris('src/reproduction-model.ts'), false) // "repro" not a standalone token
@@ -32,17 +37,25 @@ test('119-finding3: automatic detection never matches plausible product payload 
   assert.equal(isTrackedDebris('commit-msg-template.md'), false)
 })
 
-// Round-2 review finding 3 — "repro"-style scratch names are too ambiguous
-// to auto-detect by pattern; they are debris only when the Reviewer's own
-// findings name the exact basename.
-test('119-finding3: isReviewerFlaggedDebris matches only a basename literally named in Reviewer findings', () => {
-  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['delete the scratch file s2_prerepair_repro.ts']), true)
-  assert.equal(isReviewerFlaggedDebris('nested/s2_prerepair_repro.ts', ['delete s2_prerepair_repro.ts']), true)
+// Round-3 review finding 1 — matching any Reviewer finding whose free-text
+// prose merely *mentions* a basename is unsound (a normal finding like
+// "src/widget.ts: add a null check" would wrongly flag legitimate payload).
+// isReviewerFlaggedDebris must only ever consult the dedicated, typed
+// `debrisPaths` designation, never occurrence inside findings prose.
+test('119-round3-finding1: isReviewerFlaggedDebris matches only an explicit, typed debris-path designation', () => {
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['s2_prerepair_repro.ts']), true)
+  assert.equal(isReviewerFlaggedDebris('nested/s2_prerepair_repro.ts', ['s2_prerepair_repro.ts']), true)
   assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', undefined), false)
   assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', []), false)
+  // Mere mention inside prose (not a typed designation) never counts.
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['delete the scratch file s2_prerepair_repro.ts']), false)
   assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['looks good overall']), false)
-  // A lookalike permanent regression test the Reviewer never named is left alone.
+  // A lookalike permanent regression test the Reviewer never designated is left alone.
   assert.equal(isReviewerFlaggedDebris('bug123-repro-regression.test.ts', ['fix the off-by-one in the loop']), false)
+  // The exact false-positive risk the round-3 review named: an ordinary
+  // code-change finding that happens to mention a real file's basename must
+  // never be read as a deletion designation.
+  assert.equal(isReviewerFlaggedDebris('src/widget.ts', undefined), false)
 })
 
 test('119-H3: a candidate diff containing unambiguous debris is auto-stripped (bounded git rm) before it is ever frozen or reviewed', async () => {
@@ -52,6 +65,7 @@ test('119-H3: a candidate diff containing unambiguous debris is auto-stripped (b
     '.write-probe-design-i122',
     'tsconfig.i122.json',
     'COMMIT_MSG_I122.txt',
+    's2_prerepair_repro.ts', // round-3 finding 2: caught automatically, before any Reviewer round
   ]
   w.actor.script = [(req) => {
     w.git.heads.set(req.worktree, w.git.newSha('withdebris'))
@@ -104,28 +118,30 @@ test('119-finding3: a newly added file with a lookalike-but-legitimate name is n
   )
 })
 
-// A repro-style scratch file the Reviewer explicitly names in REQUEST_CHANGES
-// findings is removed in the following repair round.
-test('119-finding3: a repro-style scratch file the Reviewer explicitly names is removed on repair', async () => {
+// A freeform-named scratch file the Reviewer explicitly designates via the
+// typed `debrisPaths` output field (never inferred from prose) is removed in
+// the following repair round.
+test('119-round3-finding1: a freeform scratch file the Reviewer designates via the typed debrisPaths field is removed on repair', async () => {
   const w = makeWorld()
   w.github.addIssue(128, 'work', 'body')
   w.reviewer.script = [
     () => ({
       outcome: { kind: 'COMPLETE', detail: 'reviewed' },
       verdict: 'REQUEST_CHANGES',
-      summary: 'drop the scratch repro file',
-      findings: ['Remove the tracked scratch file s2_prerepair_repro.ts before resubmitting.'],
+      summary: 'drop the scratch file',
+      findings: ['Also address an unrelated real issue in src/real.ts.'],
+      debrisPaths: ['leftover_scratch_notes.md'],
     }),
   ]
   w.actor.script = [
     (req) => {
       w.git.heads.set(req.worktree, w.git.newSha('fresh'))
-      w.git.changed.set(req.worktree, ['src/real.ts', 's2_prerepair_repro.ts'])
+      w.git.changed.set(req.worktree, ['src/real.ts', 'leftover_scratch_notes.md'])
       return { outcome: { kind: 'COMPLETE', detail: 'done' }, actorSignal: 'COMPLETE' }
     },
     (req) => {
       // Repair round: the Actor leaves the file tracked; the Harness itself
-      // strips it because the Reviewer named it explicitly.
+      // strips it because the Reviewer designated it via debrisPaths.
       w.git.heads.set(req.worktree, w.git.newSha('repaired'))
       return { outcome: { kind: 'COMPLETE', detail: 'addressed the finding' }, actorSignal: 'COMPLETE' }
     },
@@ -134,15 +150,61 @@ test('119-finding3: a repro-style scratch file the Reviewer explicitly names is 
   const lane = w.store.getLane('exec-i128')
   assert.ok(lane)
   assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
-  assert.deepEqual(w.git.removedPaths.at(-1)?.paths, ['s2_prerepair_repro.ts'])
+  assert.deepEqual(w.git.removedPaths.at(-1)?.paths, ['leftover_scratch_notes.md'])
   assert.ok(lane.candidate)
   assert.deepEqual(lane.candidate.changedFiles, ['src/real.ts'])
+})
+
+// Round-3 review finding 1 — a Reviewer finding that merely *mentions* a
+// legitimate new file's basename in ordinary code-review prose (e.g. "add a
+// null check") must never cause that file to be `git rm`'d, even though the
+// finding text contains the exact basename.
+test('119-round3-finding1: a normal code-change finding that mentions a legitimate file basename never triggers removal', async () => {
+  const w = makeWorld()
+  w.github.addIssue(129, 'work', 'body')
+  w.reviewer.script = [
+    () => ({
+      outcome: { kind: 'COMPLETE', detail: 'reviewed' },
+      verdict: 'REQUEST_CHANGES',
+      summary: 'one small fix needed',
+      findings: ['src/widget.ts: add a null check before dereferencing the config object.'],
+      debrisPaths: [],
+    }),
+  ]
+  w.actor.script = [
+    (req) => {
+      w.git.heads.set(req.worktree, w.git.newSha('fresh'))
+      w.git.changed.set(req.worktree, ['src/widget.ts'])
+      return { outcome: { kind: 'COMPLETE', detail: 'done' }, actorSignal: 'COMPLETE' }
+    },
+    (req) => {
+      w.git.heads.set(req.worktree, w.git.newSha('repaired'))
+      w.git.changed.set(req.worktree, ['src/widget.ts'])
+      return { outcome: { kind: 'COMPLETE', detail: 'added the null check' }, actorSignal: 'COMPLETE' }
+    },
+  ]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i129')
+  assert.ok(lane)
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+  assert.equal(w.git.removedPaths.length, 0)
+  assert.ok(lane.candidate)
+  assert.deepEqual(lane.candidate.changedFiles, ['src/widget.ts'])
 })
 
 test('119-H3: isExplicitlyRequiredByIssue matches only on the literal basename in the issue body', () => {
   assert.equal(isExplicitlyRequiredByIssue('tsconfig.i123.json', 'Add tsconfig.i123.json to the repo.'), true)
   assert.equal(isExplicitlyRequiredByIssue('nested/tsconfig.i123.json', 'Add tsconfig.i123.json to the repo.'), true)
   assert.equal(isExplicitlyRequiredByIssue('tsconfig.i123.json', 'No mention of any scratch config here.'), false)
+})
+
+// Round-3 review finding 3 — mere textual mention of a basename must not be
+// read as a requirement to keep it: an issue instructing removal of a debris
+// file must not exempt that same file from cleanup.
+test('119-round3-finding3: an issue instructing removal of a file is never read as a requirement to keep it', () => {
+  assert.equal(isExplicitlyRequiredByIssue('COMMIT_MSG_I109.txt', 'Please remove COMMIT_MSG_I109.txt before resubmitting.'), false)
+  assert.equal(isExplicitlyRequiredByIssue('COMMIT_MSG_I109.txt', 'Delete the stray COMMIT_MSG_I109.txt scratch file.'), false)
+  assert.equal(isExplicitlyRequiredByIssue('s2_prerepair_repro.ts', 'Drop s2_prerepair_repro.ts, it was left behind by mistake.'), false)
 })
 
 // Review round-2 finding 3 — a file that already existed at base and was

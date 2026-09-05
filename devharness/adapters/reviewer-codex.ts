@@ -56,7 +56,7 @@ export function createCodexReviewerAdapter(opts: {
       if (raw.exitCode === 0 && existsSync(lastMsgFile)) {
         try {
           const j = JSON.parse(readFileSync(lastMsgFile, 'utf8')) as {
-            verdict?: string; summary?: string; findings?: string[]
+            verdict?: string; summary?: string; findings?: string[]; debrisPaths?: string[]
           }
           if (j.verdict === 'GO' || j.verdict === 'REQUEST_CHANGES') {
             return {
@@ -64,6 +64,7 @@ export function createCodexReviewerAdapter(opts: {
               verdict: j.verdict,
               summary: j.summary,
               findings: j.findings ?? [],
+              debrisPaths: j.debrisPaths ?? [],
             }
           }
           return { outcome: { kind: 'UNKNOWN', detail: `clean exit but no typed verdict: ${JSON.stringify(j).slice(0, 400)}` } }
