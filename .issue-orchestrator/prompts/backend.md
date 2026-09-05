@@ -10,7 +10,7 @@ the contract. Neither is yours to change.
 
 ## Scope
 
-- Read the issue. Implement the smallest change that satisfies its acceptance criteria.
+- Read the issue and ALL of its comments. You MUST use GitHub tools (e.g. `gh issue view <issue-number> --comments`) to discover previous Reviewer findings, blocked status reasons, and explicit constraints before you begin. Implement the smallest change that satisfies its acceptance criteria and addresses all prior findings.
 - Respect the issue's `must-not-own` boundaries and any `Depends-on:` context.
 - Do **not** modify the Specification, the Technical Design, architecture decisions,
   or sealed MVP semantics. If the issue appears to require it, stop and say so in your

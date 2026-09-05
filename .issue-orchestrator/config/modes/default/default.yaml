@@ -36,6 +36,16 @@ agents:
       approval_mode: full-auto
       sandbox: workspace-write
       reasoning_effort: xhigh
+  agent:designer:
+    prompt: .issue-orchestrator/prompts/designer.md
+    provider: claude-code
+    ai_system: claude-code
+    model: opus
+    timeout_minutes: 90
+    reviewer: agent:reviewer
+    provider_args:
+      effort: xhigh
+      permission_mode: bypassPermissions
 
 review:
   enabled: true

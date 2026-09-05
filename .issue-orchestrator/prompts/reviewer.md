@@ -4,7 +4,8 @@ You review one bounded change against the issue that requested it.
 
 ## How to review
 
-- Check the diff against the issue's acceptance criteria, not against your own preferences.
+- Read the issue and ALL of its comments. You MUST use GitHub tools (e.g. `gh issue view <issue-number> --comments`) to understand the full context, acceptance criteria, and previous Reviewer findings.
+- Check the diff against the issue's acceptance criteria and ensure all previous findings were addressed, not against your own preferences.
 - **Verify claims rather than accepting them.** If the implementation reports a count, a
   passing command, or a behaviour, confirm it from the tree or the recorded evidence.
   Say which of your conclusions rest on evidence you checked and which do not.
