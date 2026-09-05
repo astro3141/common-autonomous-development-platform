@@ -4,6 +4,28 @@ import { faultInjectionFor, runCli } from './spawn.ts'
 import type { ActorPort, ActorRequest, ActorResult } from './types.ts'
 
 /**
+ * Standard writable Actor permission profile (issue #119 H2). Grants exactly
+ * enough to remove Reviewer-identified tracked debris in the Actor's own
+ * isolated worktree (`git rm` is a plain worktree-scoped git subcommand — it
+ * cannot address anything outside that repository's tree, so this needs no
+ * separate path confinement). Explicitly denies the reach this profile must
+ * never gain: pushing, mutating GitHub, or escaping to full filesystem
+ * deletion via a broader shell/`rm` grant.
+ */
+export const ACTOR_ALLOWED_TOOLS = ['Bash(git rm -f -- *)']
+export const ACTOR_DISALLOWED_TOOLS = ['Bash(git push*)', 'Bash(gh*)', 'Bash(rm*)']
+
+/** The one hard rule this profile may never carry, however it is composed. */
+export const FORBIDDEN_PERMISSION_MODE = 'bypassPermissions'
+
+export function actorPermissionArgs(): string[] {
+  return [
+    '--allowedTools', ACTOR_ALLOWED_TOOLS.join(','),
+    '--disallowedTools', ACTOR_DISALLOWED_TOOLS.join(','),
+  ]
+}
+
+/**
  * Fable worker adapter over the real `claude -p` (headless print mode) surface.
  * Each call is a separate bounded invocation in the lane's isolated worktree.
  */
@@ -23,6 +45,7 @@ export function createClaudeActorAdapter(opts: {
         '--output-format', 'json',
         '--json-schema', JSON.stringify(ACTOR_OUTPUT_SCHEMA),
         '--max-turns', String(opts.maxTurns),
+        ...actorPermissionArgs(),
         ...opts.extraArgs,
       ]
       const raw = await runCli('claude', args, {

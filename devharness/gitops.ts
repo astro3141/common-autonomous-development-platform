@@ -72,6 +72,20 @@ export function changedFiles(worktree: string, baseSha: string): string[] {
   return out === '' ? [] : out.split('\n')
 }
 
+/**
+ * Paths newly *added* by this lane versus `baseSha` (issue #119 H2/H3).
+ * Deliberately narrower than `changedFiles`: a path that already existed at
+ * base (even if modified) is never a candidate for the debris scan — only a
+ * path the lane itself introduced can be "temporary repair/checkpoint
+ * scratch". A path the lane has since deleted is also excluded (nothing left
+ * to `git rm`). `--no-renames` keeps this exact instead of guessing at a
+ * rename source.
+ */
+export function addedFiles(worktree: string, baseSha: string): string[] {
+  const out = git(worktree, ['diff', '--no-renames', '--diff-filter=A', '--name-only', `${baseSha}...HEAD`])
+  return out === '' ? [] : out.split('\n')
+}
+
 export function push(worktree: string, branch: string): void {
   // force-with-lease: a rebase repair rewrites lane-branch history. The lane
   // exclusively owns its branch (foreign pushes hold the lane), and the lease

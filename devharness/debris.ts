@@ -18,3 +18,14 @@ export function isTrackedDebris(path: string): boolean {
   const base = path.split('/').pop() ?? path
   return DEBRIS_PATTERNS.some((re) => re.test(base))
 }
+
+/**
+ * H3 carve-out: a path a debris pattern matches is still real payload, never
+ * removed, if the governing issue's own body explicitly names it. Matched on
+ * the literal basename in the issue text — never inferred from Actor prose,
+ * only from the issue the Harness already trusts as the governing contract.
+ */
+export function isExplicitlyRequiredByIssue(path: string, issueBody: string): boolean {
+  const base = path.split('/').pop() ?? path
+  return issueBody.includes(base)
+}

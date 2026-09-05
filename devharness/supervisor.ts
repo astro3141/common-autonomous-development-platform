@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import * as realGit from './gitops.ts'
-import { isTrackedDebris } from './debris.ts'
+import { isTrackedDebris, isExplicitlyRequiredByIssue } from './debris.ts'
 import { decide, type Decision, type Event } from './transitions.ts'
 import type { Store } from './store.ts'
 import type { GitHubPort, ActorPort, ReviewerPort, IssueInfo } from './adapters/types.ts'
@@ -20,6 +20,8 @@ export type GitPort = {
   treeSha(worktree: string): string
   checkpointCommit(worktree: string, message: string): void
   changedFiles(worktree: string, baseSha: string): string[]
+  /** Paths added (not merely modified) versus baseSha — debris-scan input (H3). */
+  addedFiles(worktree: string, baseSha: string): string[]
   /** Bounded `git rm` scoped to the worktree and exact paths only (H2). */
   removeTrackedPaths(worktree: string, paths: string[]): void
   push(worktree: string, branch: string): void
@@ -38,6 +40,7 @@ export function realGitPort(cfg: HarnessConfig): GitPort {
     treeSha: realGit.treeSha,
     checkpointCommit: realGit.checkpointCommit,
     changedFiles: realGit.changedFiles,
+    addedFiles: realGit.addedFiles,
     removeTrackedPaths: realGit.removeTrackedPaths,
     push: realGit.push,
     isAncestorInBase: (anc, desc) => realGit.isAncestor(base, anc, desc),
@@ -346,6 +349,27 @@ export class Supervisor {
           this.d.log(`[dry-run] [${lane.laneId}] would run validation`)
           return true
         }
+        this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
+
+        // H2/H3: strip known tracked-debris patterns (bounded git rm, exact
+        // paths this lane itself added only) *before* deterministic
+        // validation runs, so the head/tree that passes validation is
+        // exactly the head/tree that later gets frozen, pushed, and
+        // reviewed — never a divergent post-validation cleanup commit.
+        // Scoped to `addedFiles` (not the full diff): a path already present
+        // at base, even if modified here, is real pre-existing payload, not
+        // lane-introduced scratch, and a path the lane has since deleted has
+        // nothing left to `git rm`.
+        const addedDebrisCandidates = this.d.git.addedFiles(lane.worktree, lane.baseSha).filter(isTrackedDebris)
+        if (addedDebrisCandidates.length > 0) {
+          const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
+          const debrisPaths = addedDebrisCandidates.filter((p) => !isExplicitlyRequiredByIssue(p, issue.body))
+          if (debrisPaths.length > 0) {
+            this.d.git.removeTrackedPaths(lane.worktree, debrisPaths)
+            this.d.git.checkpointCommit(lane.worktree, `harness: remove tracked debris for #${lane.workIssue} (${debrisPaths.join(', ')})`)
+          }
+        }
+
         const result = cfg.validationCommand !== undefined
           ? await this.d.runValidation(lane.worktree, cfg.validationCommand)
           : { pass: true, detail: 'no validation command configured' }
@@ -359,19 +383,7 @@ export class Supervisor {
           this.d.log(`[dry-run] [${lane.laneId}] would freeze candidate + push + ensure PR`)
           return true
         }
-        this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
-        let headSha = this.d.git.headSha(lane.worktree)
-
-        // H2/H3: strip known tracked-debris patterns (bounded git rm, exact
-        // paths from this lane's own diff only) before any candidate is ever
-        // frozen, pushed, or reviewed. A candidate must never carry probe or
-        // scratch files regardless of what produced them.
-        const debrisPaths = this.d.git.changedFiles(lane.worktree, lane.baseSha).filter(isTrackedDebris)
-        if (debrisPaths.length > 0) {
-          this.d.git.removeTrackedPaths(lane.worktree, debrisPaths)
-          this.d.git.checkpointCommit(lane.worktree, `harness: remove tracked debris for #${lane.workIssue} (${debrisPaths.join(', ')})`)
-          headSha = this.d.git.headSha(lane.worktree)
-        }
+        const headSha = this.d.git.headSha(lane.worktree)
 
         // H1: an Actor repair round that reports COMPLETE but produced a
         // candidate byte-identical (head + tree) to the one the Reviewer
