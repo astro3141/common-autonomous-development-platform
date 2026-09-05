@@ -738,17 +738,27 @@ test("#109 E1: referenced predecessor omitted → contract_barrier (deny-closed)
   } finally { h.close(); }
 });
 
-test("#109 E2: referenced predecessor present with mismatched digest → contract_barrier", async () => {
+test("#109 E2: X's sealed supersedes reference names C by id but with a mismatched digest → contract_barrier", async () => {
   const h = await makeHarness();
   try {
     const c = await makeFinding(h, { classification: "CONTRACT_GAP", anomaly_code: "CG_E2" });
-    const x = await makeReclass(h, c, { classification: "IMPLEMENTATION_GAP", correction_reason: "attempt-clear" });
-    // Present C but forge a digest mismatch (digest of C doesn't match what X names)
-    const cWithWrongDigest: EvidenceEnvelopeV1 = {
-      ...c,
-      envelope_digest: { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: "wrongdigest000" },
-    };
-    const r = await evalWorkStart(h, { finding: x, evidence: [x, cWithWrongDigest] });
+    // C is cleared via a valid AUTHORITY_RESOLUTION, so a DENY below is isolated to digest
+    // enforcement on X's own supersedes reference — not an uncleared CONTRACT_* classification
+    // (the #109 E3 test proves this exact clearing path ALLOWs when the digest is correct).
+    const resEnv = await submitResolution(submitter(h), {
+      claim: resolution("AUTHORITY_RESOLUTION", { finding_tip_ref: refOf(c), landed_authority_ref: "spec:section-1" }),
+      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: c.evidence_id }],
+      tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
+    });
+    // X's sealed claim names C's evidence_id but a forged envelope_digest → unresolved (#109 E2);
+    // `evalWorkStart` reloads C's real canonical envelope from evidence ids, so the mismatch must
+    // live in X's own claim, not in a mutated in-memory copy of the presented C envelope.
+    const x = await makeFinding(h, {
+      classification: "IMPLEMENTATION_GAP",
+      supersedes: [{ evidence_id: c.evidence_id, envelope_digest: "wrongdigest000" }],
+      correction_reason: "attempt-clear-wrong-digest",
+    });
+    const r = await evalWorkStart(h, { finding: x, evidence: [x, c, resEnv] });
     assert.equal(r.outcome, "DENY");
     assert.ok(r.reason_codes.includes("contract_barrier"), `expected contract_barrier, got: ${JSON.stringify(r.reason_codes)}`);
   } finally { h.close(); }

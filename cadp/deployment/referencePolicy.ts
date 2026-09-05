@@ -272,10 +272,23 @@ finding_by_id(id) := e if {
 	e.evidence_id == id
 }
 
-# a finding id is superseded if some provided finding names it in supersedes[]
+# every predecessor id referenced by any presented finding's supersedes[], resolved or not — used
+# only to materialize missing ancestry graph nodes so an unresolved/omitted predecessor can never
+# vanish from ancestry() (#109 E1). This is NOT authority to treat the predecessor as superseded.
+all_referenced_predecessor_ids contains pid if {
+	some e in improvement_findings
+	some s in object.get(e.claim, "supersedes", [])
+	pid := s.evidence_id
+}
+
+# a finding id is superseded only if some provided finding presents a *resolved* reference to it
+# (exact id+digest match, #109 E2). An id-only reference with a mismatched digest does not
+# supersede anything: the referenced predecessor must remain a leaf so occurrence_conflict still
+# sees it (review repair finding 1).
 superseded_ids contains pid if {
 	some e in improvement_findings
 	some s in object.get(e.claim, "supersedes", [])
+	supersedes_ref_resolved(s)
 	pid := s.evidence_id
 }
 
@@ -292,7 +305,7 @@ finding_graph[fid] := ns if {
 # (graph.reachable drops non-key neighbours). Materialize it as an empty node so ancestry()
 # reaches it and the unresolvable-ancestor fail-closed clause below fires.
 finding_graph[pid] := ns if {
-	superseded_ids[pid]
+	all_referenced_predecessor_ids[pid]
 	not finding_by_id(pid)
 	ns := set()
 }
