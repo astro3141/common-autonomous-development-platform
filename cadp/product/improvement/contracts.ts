@@ -33,7 +33,7 @@ export function isContractClass(c: Classification): boolean {
 export const SUBJECT_KINDS = ["WORK_RUN", "EFFECT", "EVIDENCE", "BACKEND", "TARGET", "PRODUCT_CONFORMANCE_PROOF"] as const;
 export type SubjectKind = (typeof SUBJECT_KINDS)[number];
 /** Immutable subject kinds need no revision/digest; every other kind does (§2.2). */
-const IMMUTABLE_SUBJECT_KINDS: readonly SubjectKind[] = ["EVIDENCE"];
+export const IMMUTABLE_SUBJECT_KINDS: readonly SubjectKind[] = ["EVIDENCE"];
 
 export const BASIS_ROLES = ["OBSERVATION", "REPRODUCTION", "DIAGNOSTIC", "CONFORMANCE_PROOF", "AUTHORITY_TEXT"] as const;
 export type BasisRole = (typeof BASIS_ROLES)[number];
@@ -84,7 +84,13 @@ export interface ImprovementFindingResolutionClaimV1 {
   readonly original_failure_ref?: string;
   readonly original_scenario_replay_ref?: string;
   readonly regression_ref?: string;
-  readonly landed_authority_ref?: string;
+  /**
+   * v1.1 (§10.4): the typed digest of the LANDED authority content that answers this finding's
+   * question. The Human-decision variant is removed — a decision envelope is never a landed
+   * authority ref — and bare-digest membership confers nothing: the active policy must also
+   * carry a `landed_authority_resolutions` entry binding this exact digest to this exact tip.
+   */
+  readonly landed_authority_ref?: { readonly authority_content_digest: string };
   readonly statement: string;
 }
 
@@ -274,8 +280,15 @@ export function validateResolutionClaim(
         errors.push("original_failure_ref present but original_scenario_replay_ref missing (replay is mandatory when reproducible)");
       }
     }
-    if (claim.resolution_kind === "AUTHORITY_RESOLUTION" && (claim.landed_authority_ref === undefined || claim.landed_authority_ref.length === 0)) {
-      errors.push("AUTHORITY_RESOLUTION requires the exact landed authority (Spec/TD/product-authority) or Human Design decision ref");
+    if (claim.resolution_kind === "AUTHORITY_RESOLUTION") {
+      // v1.1 (§10.4): typed { authority_content_digest } only. A decision-envelope ref, a display
+      // URL, or a bare string is not landed authority (round-4 R4).
+      const ref = claim.landed_authority_ref as { authority_content_digest?: unknown } | undefined;
+      const keys = ref === undefined || typeof ref !== "object" ? [] : Object.keys(ref);
+      if (typeof ref?.authority_content_digest !== "string" || ref.authority_content_digest.length === 0 ||
+          keys.length !== 1) {
+        errors.push("AUTHORITY_RESOLUTION requires landed_authority_ref = { authority_content_digest } naming the exact landed authority content");
+      }
     }
   }
   if (typeof claim.statement !== "string" || claim.statement.length === 0) errors.push("statement missing");

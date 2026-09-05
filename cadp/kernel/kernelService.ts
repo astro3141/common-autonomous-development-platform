@@ -20,6 +20,7 @@ import { resolveActivePolicy } from "./policyState.ts";
 import { ConstitutionalStore } from "./store.ts";
 import { makeAdapterRegistry } from "./adapters/types.ts";
 import type { TargetAdapterV1 } from "./adapters/types.ts";
+import { FindingSealAdapter } from "./adapters/findingSeal.ts";
 import { GitHubAdapter } from "./adapters/github.ts";
 import { GitHubIssuesAdapter } from "./adapters/githubIssues.ts";
 import { LiveGitHubTransport } from "./adapters/githubLive.ts";
@@ -54,13 +55,24 @@ export interface KernelService {
   close(): void;
 }
 
-export async function startKernelService(config: KernelServiceConfig): Promise<KernelService> {
-  const store = new ConstitutionalStore(config.db_path);
-  const cas = new Cas(store);
-  const ingress = new Ingress(store, cas, config.pep_ref);
-  const evaluator = new OpaEvaluator(config.opa_dir);
-
-  const adapters: TargetAdapterV1[] = [new StorePolicyAdapter(store, cas, ingress)];
+/**
+ * The deployable target-adapter list (TD §6.4). Extracted from `startKernelService` so the
+ * production composition — not a test-harness stand-in — is what conformance asserts over.
+ *
+ * Always-on adapters target the deployment's OWN store and so need no external configuration:
+ * `StorePolicyAdapter` (constitutional writes) and `FindingSealAdapter` (#117 §5.1 `FINDING_SEAL`,
+ * the one governed operation that can produce a clearing or delegating Finding). The remaining
+ * rows are gated on the external credentials they carry.
+ */
+export function composeTargetAdapters(
+  config: KernelServiceConfig,
+  deps: { store: ConstitutionalStore; cas: Cas; ingress: Ingress },
+): TargetAdapterV1[] {
+  const { store, cas, ingress } = deps;
+  const adapters: TargetAdapterV1[] = [
+    new StorePolicyAdapter(store, cas, ingress),
+    new FindingSealAdapter(ingress, store),
+  ];
   if (config.github !== undefined) {
     const token = readFileSync(config.github.token_file, "utf8").trim();
     const transport = new LiveGitHubTransport(token, config.github.repo_full_name);
@@ -93,6 +105,16 @@ export async function startKernelService(config: KernelServiceConfig): Promise<K
     const recordKey = config.record.api_key_file !== undefined ? readFileSync(config.record.api_key_file, "utf8").trim() : undefined;
     adapters.push(new RecordServiceAdapter(config.record.base_url, cas, "cadp-disposable", recordKey));
   }
+  return adapters;
+}
+
+export async function startKernelService(config: KernelServiceConfig): Promise<KernelService> {
+  const store = new ConstitutionalStore(config.db_path);
+  const cas = new Cas(store);
+  const ingress = new Ingress(store, cas, config.pep_ref);
+  const evaluator = new OpaEvaluator(config.opa_dir);
+
+  const adapters = composeTargetAdapters(config, { store, cas, ingress });
 
   const registry = makeAdapterRegistry(adapters);
   const pep = new Pep(store, cas, ingress, registry, config.pep_ref);

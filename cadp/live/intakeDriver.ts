@@ -227,28 +227,36 @@ async function contractNegative(): Promise<void> {
   const wsModel = await evalImplementationWorkStart(modelReclass, [modelReclass.evidence_id, cg.evidence_id]);
   receipt["model_reclass_workstart"] = { outcome: wsModel.outcome, reason_codes: wsModel.reason_codes };
 
-  // (5) Valid Human authority resolution names the exact tip → allows a later HUMAN_JUDGMENT reclassification to implement.
-  const humanAuthority = await client("sso:a.t.laplace@gmail.com").submitEvidence({
-    evidence_kind: "HUMAN_DECISION", subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: cg.evidence_id }],
-    availability: "PRESENT", claim_schema: "cadp.human-decision.v1",
-    claim: { principal: "sso:a.t.laplace@gmail.com", decision: "APPROVE", scope: { work_run_ref: cg.evidence_id, finding: cg.evidence_id }, statement: "authority boundary decided", issued_at: new Date().toISOString() },
-    producer_ref: "human:astro3141", source_ref: "design-decision", source_relation: "INDEPENDENT_OBSERVATION",
-  } as never);
+  // (5) v1.1 (#117 §10.4): an AUTHORITY_RESOLUTION names the exact LANDED authority CONTENT by
+  // digest. A Human-decision envelope ref is no longer a landed authority ref, and the resolution
+  // clears the tip only when the ACTIVE policy also carries the Human-landed
+  // `landed_authority_resolutions` entry binding that content to that exact tip.
+  const landedAuthorityDigest = createHash("sha256").update(`landed-authority:${m.base_sha}`).digest("hex");
   const authorityRes = await submitResolution(submitVia(intake), {
-    claim: { contract_id: "cadp.improvement-intake.v1", finding_tip_ref: refOf(cg), resolution_kind: "AUTHORITY_RESOLUTION", landed_authority_ref: humanAuthority.evidence_id, statement: "authority boundary resolved by Design decision" },
-    subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: cg.evidence_id }],
+    claim: {
+      contract_id: "cadp.improvement-intake.v1", finding_tip_ref: refOf(cg), resolution_kind: "AUTHORITY_RESOLUTION",
+      landed_authority_ref: { authority_content_digest: landedAuthorityDigest },
+      statement: "authority boundary resolved by landed Design authority",
+    },
+    subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "evidence", object_id: cg.evidence_id }],
     tip: { classification: "CONTRACT_GAP" }, source_ref: "intake",
   });
   receipt["authority_resolution"] = authorityRes.evidence_id;
+  receipt["authority_resolution_entry_required"] = {
+    finding_ref: refOf(cg), authority_content_digest: landedAuthorityDigest,
+    note: "activate this entry at data.policy_params.improvement_transition.landed_authority_resolutions to clear the tip",
+  };
 
-  // A NEW actionable finding via HUMAN_JUDGMENT reclassification now clears the barrier → implementation ALLOW.
+  // (6) v1.1 (Review B18): an intake-sealed HUMAN_JUDGMENT reclassification citing authority text
+  // no longer clears anything — only a governed FINDING_SEAL descendant does. The clearing path
+  // and its falsification controls live in cadp/tests/conformance-transition.test.ts.
   const humanReclass = await submitFindingEnv({
-    classification: "IMPLEMENTATION_GAP", anomaly_code: "CG_UNDEFINED_BOUNDARY", summary: "authority-derived: now implementable",
+    classification: "IMPLEMENTATION_GAP", anomaly_code: "CG_UNDEFINED_BOUNDARY", summary: "intake human judgment: NOT authority under v1.1",
     basis: diag, basisRole: "DIAGNOSTIC", derivationKind: "HUMAN_JUDGMENT", execution_or_run_ref: "human:astro3141",
-    supersedes: [cg], extraBasis: [{ env: humanAuthority, role: "AUTHORITY_TEXT" }],
+    supersedes: [cg], extraBasis: [{ env: authorityText, role: "AUTHORITY_TEXT" }],
   });
   const wsHuman = await evalImplementationWorkStart(humanReclass, [humanReclass.evidence_id, cg.evidence_id, authorityRes.evidence_id]);
-  receipt["human_reclass_workstart"] = { outcome: wsHuman.outcome, reason_codes: wsHuman.reason_codes };
+  receipt["intake_human_reclass_workstart"] = { outcome: wsHuman.outcome, reason_codes: wsHuman.reason_codes, expected: "DENY" };
 
   console.log(JSON.stringify({ scenario: "CONTRACT_* Option-A negative", receipt }, null, 2));
 }

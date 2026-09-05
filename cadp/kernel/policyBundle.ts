@@ -170,6 +170,14 @@ export interface KernelConfig {
     evidence_kinds: readonly string[];
     source_relation: string;
     produced_at_source: { kind: "SOURCE"; claim_pointer: string } | { kind: "NONE" };
+    /**
+     * v1.1 governed-writer opt-ins (#117 §5.2/§5.3). Absent for every pre-existing producer, so
+     * their ingress behaviour is unchanged. `SOURCE_REF_UNIQUE` makes the declared NATIVE_KEY
+     * replay idempotency true at the target; `SUPERSEDES_SINGLETON` is the separate governed-edge
+     * uniqueness constraint (invariant U) — never an idempotency key.
+     */
+    replay_idempotency?: "SOURCE_REF_UNIQUE";
+    governed_edge?: "SUPERSEDES_SINGLETON";
   }>;
   readonly allocation_purposes: readonly string[];
   readonly decision_ttl_s: number;
@@ -206,6 +214,15 @@ const ALLOWED_KEYS = new Set<string>([
 ]);
 
 export class KernelConfigInvalid extends Error {}
+
+/**
+ * Invariant P (#117 §5.2): the reserved governed-writer producer identity. It is a permanent
+ * constant of product contract v1.1 — the value every uniqueness key, store index and clearing
+ * predicate uses — so the registry conformance rule below must know it literally. What rotates
+ * on compromise or retirement is the workload CREDENTIAL bound to it in the identity registry,
+ * never the identity, which keeps invariant U true across every writer generation.
+ */
+const GOVERNED_PRODUCER_CONSTANT = "governed:reclassification";
 
 /**
  * Closed-schema validation (TD §5.4, C31): unknown keys rejected, bounds inclusive,
@@ -270,6 +287,24 @@ export function validateKernelConfig(dataCadp: unknown): KernelConfig {
     }
     if (pas["kind"] === "SOURCE" && (typeof pas["claim_pointer"] !== "string" || !(pas["claim_pointer"] as string).startsWith("/"))) {
       throw new KernelConfigInvalid("produced_at_source SOURCE requires an RFC6901 claim_pointer");
+    }
+    // v1.1 governed-writer opt-ins: closed vocabularies, plus invariant P's reserved-constant
+    // conformance rule (#117 §5.2 rule 2) — a bundle that grants governed-edge power to any
+    // producer_ref other than the permanent contract constant is refused at POLICY_ACTIVATE.
+    const replay = entry["replay_idempotency"];
+    if (replay !== undefined && replay !== "SOURCE_REF_UNIQUE") {
+      throw new KernelConfigInvalid("adapter_registry replay_idempotency must be SOURCE_REF_UNIQUE when present");
+    }
+    const governed = entry["governed_edge"];
+    if (governed !== undefined) {
+      if (governed !== "SUPERSEDES_SINGLETON") {
+        throw new KernelConfigInvalid("adapter_registry governed_edge must be SUPERSEDES_SINGLETON when present");
+      }
+      if (producer !== GOVERNED_PRODUCER_CONSTANT) {
+        throw new KernelConfigInvalid(
+          `governed_edge is reserved for ${GOVERNED_PRODUCER_CONSTANT} (invariant P); ${String(producer)} may not declare it`,
+        );
+      }
     }
   }
 

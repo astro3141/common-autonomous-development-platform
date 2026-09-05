@@ -13,7 +13,7 @@ import { jcs } from "./canonical.ts";
 import type { Digest } from "./canonical.ts";
 import type { AdmissionInputV1, EffectAdmissionV1, EffectOutcomeV1, EffectRequestV1, EvidenceEnvelopeV1, PolicyDecisionV1, PolicyRefV1 } from "./records.ts";
 
-const DDL = `
+const BASE_DDL = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS evidence_envelope (
   envelope_json TEXT NOT NULL,
   work_run_ref TEXT,
   step_ordinal INTEGER,
+  producer_ref TEXT,
+  source_ref TEXT,
+  edge_evidence_id TEXT,
+  edge_envelope_digest TEXT,
   received_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS evidence_kind_idx ON evidence_envelope (evidence_kind);
@@ -121,6 +125,22 @@ CREATE TABLE IF NOT EXISTS cas_blob (
 );
 `;
 
+/**
+ * v1.1 governed-writer constraints (TD §3.2 delta, #117 §5.3): the constraint-level backstop to the
+ * two transactional lookups, exactly as `work_step_unique` backstops `insertWorkStep` (C33).
+ * (a) replay idempotency on the effect-bound `source_ref`; (b) at most ONE governed outgoing edge
+ * per predecessor, for all time — the invariant no admission-time evidence list can bypass. Both
+ * are partial indexes scoped to the reserved governed producer constant (invariant P), so every
+ * other producer's rows are unconstrained exactly as before.
+ */
+const GOVERNED_DDL = `
+CREATE UNIQUE INDEX IF NOT EXISTS governed_replay_unique
+  ON evidence_envelope (producer_ref, source_ref) WHERE producer_ref = 'governed:reclassification';
+CREATE UNIQUE INDEX IF NOT EXISTS governed_edge_unique
+  ON evidence_envelope (producer_ref, edge_evidence_id, edge_envelope_digest)
+  WHERE producer_ref = 'governed:reclassification' AND edge_evidence_id IS NOT NULL;
+`;
+
 export interface ActivationRow {
   readonly seq: number;
   readonly expected_prev_seq: number;
@@ -171,7 +191,17 @@ export class ConstitutionalStore {
     this.path = path;
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 10000;");
-    this.db.exec(DDL);
+    this.db.exec(BASE_DDL);
+    // `CREATE TABLE IF NOT EXISTS` leaves a pre-v1.1 evidence_envelope untouched, so the governed
+    // columns are added idempotently before the indexes that key on them. Append-only: no existing
+    // row is rewritten and every added column is nullable (§2.4 — no UPDATE/DELETE anywhere).
+    const columns = new Set(
+      (this.db.prepare("SELECT name FROM pragma_table_info('evidence_envelope')").all() as Array<{ name: string }>).map((r) => r.name),
+    );
+    for (const column of ["producer_ref", "source_ref", "edge_evidence_id", "edge_envelope_digest"]) {
+      if (!columns.has(column)) this.db.exec(`ALTER TABLE evidence_envelope ADD COLUMN ${column} TEXT`);
+    }
+    this.db.exec(GOVERNED_DDL);
   }
 
   close(): void {
@@ -231,19 +261,54 @@ export class ConstitutionalStore {
 
   // -------------------------------------------------------------- evidence
 
-  insertEvidence(envelope: EvidenceEnvelopeV1, received_at: string, work_run_ref?: string, step_ordinal?: number): void {
+  insertEvidence(
+    envelope: EvidenceEnvelopeV1,
+    received_at: string,
+    work_run_ref?: string,
+    step_ordinal?: number,
+    /** The v1.1 governed-edge key T(F), derived by the STORE from the draft's own supersedes singleton. */
+    governed_edge?: { evidence_id: string; envelope_digest: string },
+  ): void {
     mapSqliteError(() => {
       this.db
         .prepare(
-          `INSERT INTO evidence_envelope (evidence_id, envelope_digest, evidence_kind, envelope_json, work_run_ref, step_ordinal, received_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO evidence_envelope (evidence_id, envelope_digest, evidence_kind, envelope_json, work_run_ref, step_ordinal, producer_ref, source_ref, edge_evidence_id, edge_envelope_digest, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(envelope.evidence_id, envelope.envelope_digest.value, envelope.evidence_kind, jcs(envelope), work_run_ref ?? null, step_ordinal ?? null, received_at);
+        .run(
+          envelope.evidence_id, envelope.envelope_digest.value, envelope.evidence_kind, jcs(envelope),
+          work_run_ref ?? null, step_ordinal ?? null, envelope.producer_ref, envelope.source_ref,
+          governed_edge?.evidence_id ?? null, governed_edge?.envelope_digest ?? null, received_at,
+        );
       const subject = this.db.prepare("INSERT INTO evidence_subject (evidence_id, subject_key) VALUES (?, ?)");
       for (const b of envelope.subject_bindings) {
         subject.run(envelope.evidence_id, `${b.authority_ref}|${b.namespace}|${b.object_id}`);
       }
     });
+  }
+
+  /** §5.3 rule (a): the registry-opted replay key (producer_ref, source_ref = cadp-v04:<effect_id>). */
+  evidenceByProducerSourceRef(producer_ref: string, source_ref: string): EvidenceEnvelopeV1 | undefined {
+    const row = this.db
+      .prepare("SELECT envelope_json FROM evidence_envelope WHERE producer_ref = ? AND source_ref = ?")
+      .get(producer_ref, source_ref) as { envelope_json: string } | undefined;
+    return row === undefined ? undefined : (JSON.parse(row.envelope_json) as EvidenceEnvelopeV1);
+  }
+
+  /** §5.3 rule (b) / invariant U: the single governed outgoing edge of a predecessor, if any. */
+  evidenceByGovernedEdge(producer_ref: string, edge_evidence_id: string, edge_envelope_digest: string): EvidenceEnvelopeV1 | undefined {
+    const row = this.db
+      .prepare("SELECT envelope_json FROM evidence_envelope WHERE producer_ref = ? AND edge_evidence_id = ? AND edge_envelope_digest = ?")
+      .get(producer_ref, edge_evidence_id, edge_envelope_digest) as { envelope_json: string } | undefined;
+    return row === undefined ? undefined : (JSON.parse(row.envelope_json) as EvidenceEnvelopeV1);
+  }
+
+  /** Every governed envelope naming this predecessor — the invariant-U count control (FC15). */
+  governedEdgeCount(producer_ref: string, edge_evidence_id: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM evidence_envelope WHERE producer_ref = ? AND edge_evidence_id = ?")
+      .get(producer_ref, edge_evidence_id) as { n: number } | undefined;
+    return row?.n ?? 0;
   }
 
   evidenceById(evidence_id: string): EvidenceEnvelopeV1 | undefined {
