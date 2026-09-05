@@ -18,6 +18,7 @@ export class FakeGit implements GitPort {
   addWorktreeCalls: { worktree: string; branch: string; baseSha: string }[] = []
   ancestorCalls: { ancestor: string; descendant: string }[] = []
   changed = new Map<string, string[]>()
+  removedPaths: { worktree: string; paths: string[] }[] = []
   private seq = 0
   baseSha = 'base'.padEnd(40, '0')
   ancestorResult = true
@@ -40,6 +41,13 @@ export class FakeGit implements GitPort {
   treeSha(worktree: string): string { return `tree-${this.headSha(worktree)}`.slice(0, 40).padEnd(40, '0') }
   checkpointCommit(): void {}
   changedFiles(worktree: string): string[] { return this.changed.get(worktree) ?? ['src/x.ts'] }
+  /** Simulates `git rm` + the harness's follow-up checkpoint commit in one step. */
+  removeTrackedPaths(worktree: string, paths: string[]): void {
+    this.removedPaths.push({ worktree, paths: [...paths] })
+    const remaining = this.changedFiles(worktree).filter((f) => !paths.includes(f))
+    this.changed.set(worktree, remaining)
+    this.heads.set(worktree, this.newSha('debris-cleaned'))
+  }
   push(worktree: string, branch: string): void {
     const sha = this.headSha(worktree)
     this.pushes.push({ worktree, branch, sha })

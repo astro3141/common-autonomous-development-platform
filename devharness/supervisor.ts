@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import * as realGit from './gitops.ts'
+import { isTrackedDebris } from './debris.ts'
 import { decide, type Decision, type Event } from './transitions.ts'
 import type { Store } from './store.ts'
 import type { GitHubPort, ActorPort, ReviewerPort, IssueInfo } from './adapters/types.ts'
@@ -19,6 +20,8 @@ export type GitPort = {
   treeSha(worktree: string): string
   checkpointCommit(worktree: string, message: string): void
   changedFiles(worktree: string, baseSha: string): string[]
+  /** Bounded `git rm` scoped to the worktree and exact paths only (H2). */
+  removeTrackedPaths(worktree: string, paths: string[]): void
   push(worktree: string, branch: string): void
   /** Ancestor check in the base clone (design-artifact visibility proof). */
   isAncestorInBase(ancestor: string, descendant: string): boolean
@@ -35,6 +38,7 @@ export function realGitPort(cfg: HarnessConfig): GitPort {
     treeSha: realGit.treeSha,
     checkpointCommit: realGit.checkpointCommit,
     changedFiles: realGit.changedFiles,
+    removeTrackedPaths: realGit.removeTrackedPaths,
     push: realGit.push,
     isAncestorInBase: (anc, desc) => realGit.isAncestor(base, anc, desc),
   }
@@ -143,6 +147,9 @@ export class Supervisor {
       lane.pendingDirection = { ...decision.pendingDirection, at: new Date().toISOString() }
     } else if (decision.clearsPendingDirection === true) {
       lane.pendingDirection = undefined
+    }
+    if (decision.rejectedCandidate !== undefined) {
+      lane.rejectedCandidate = decision.rejectedCandidate
     }
     if (decision.countsProviderRetry === true) lane.retryCount += 1
     if (decision.resetsProviderRetry === true) lane.retryCount = 0
@@ -353,7 +360,32 @@ export class Supervisor {
           return true
         }
         this.d.git.checkpointCommit(lane.worktree, `harness: checkpoint worker output for #${lane.workIssue}`)
-        const headSha = this.d.git.headSha(lane.worktree)
+        let headSha = this.d.git.headSha(lane.worktree)
+
+        // H2/H3: strip known tracked-debris patterns (bounded git rm, exact
+        // paths from this lane's own diff only) before any candidate is ever
+        // frozen, pushed, or reviewed. A candidate must never carry probe or
+        // scratch files regardless of what produced them.
+        const debrisPaths = this.d.git.changedFiles(lane.worktree, lane.baseSha).filter(isTrackedDebris)
+        if (debrisPaths.length > 0) {
+          this.d.git.removeTrackedPaths(lane.worktree, debrisPaths)
+          this.d.git.checkpointCommit(lane.worktree, `harness: remove tracked debris for #${lane.workIssue} (${debrisPaths.join(', ')})`)
+          headSha = this.d.git.headSha(lane.worktree)
+        }
+
+        // H1: an Actor repair round that reports COMPLETE but produced a
+        // candidate byte-identical (head + tree) to the one the Reviewer
+        // already rejected is never a successful repair. Hold durably with
+        // the exact no-op reason; never invoke the Reviewer on it.
+        if (lane.rejectedCandidate !== undefined) {
+          const treeSha = this.d.git.treeSha(lane.worktree)
+          if (headSha === lane.rejectedCandidate.headSha && treeSha === lane.rejectedCandidate.treeSha) {
+            lane.currentHeadSha = headSha
+            await this.step2(lane, { type: 'CANDIDATE_UNCHANGED_AFTER_REJECTION' })
+            return TERMINALLY_YIELDED.includes(this.statusOf(lane))
+          }
+        }
+
         if (headSha === lane.baseSha || this.d.git.changedFiles(lane.worktree, lane.baseSha).length === 0) {
           lane.reviewerFindings = [
             'The branch contains no committed work beyond the base SHA. Complete the issue and commit the result on this branch.',

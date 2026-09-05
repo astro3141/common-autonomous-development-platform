@@ -96,6 +96,13 @@ export type Lane = {
   /** Exact worker-reported reason while at HUMAN_DIRECTION_WAIT (worker report, not authority). */
   pendingDirection?: PendingDirection
   candidate?: Candidate
+  /**
+   * Exact identity of the most recent Reviewer-rejected candidate (REQUEST_CHANGES).
+   * Persisted across repair rounds and holds/resumes so a repair that produces
+   * a byte-identical head/tree can be detected and never silently re-reviewed
+   * (issue #119 H1).
+   */
+  rejectedCandidate?: Candidate
   reviews: ReviewRecord[]
   reviewedHeadSha?: string
   prNumber?: number

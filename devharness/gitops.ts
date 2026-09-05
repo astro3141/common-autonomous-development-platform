@@ -56,6 +56,17 @@ export function checkpointCommit(worktree: string, message: string): void {
   }
 }
 
+/**
+ * Bounded tracked-file removal (issue #119 H2). Operates only inside
+ * `worktree` (via `git -C`) and only on the exact paths given — no glob
+ * expansion, no traversal outside the worktree, no push, no GitHub call.
+ * Callers must pass paths already confirmed to be in the lane's own diff.
+ */
+export function removeTrackedPaths(worktree: string, paths: string[]): void {
+  if (paths.length === 0) return
+  git(worktree, ['rm', '-f', '--', ...paths])
+}
+
 export function changedFiles(worktree: string, baseSha: string): string[] {
   const out = git(worktree, ['diff', '--name-only', `${baseSha}...HEAD`])
   return out === '' ? [] : out.split('\n')
