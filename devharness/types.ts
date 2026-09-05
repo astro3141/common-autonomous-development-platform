@@ -108,6 +108,13 @@ export type Lane = {
   prNumber?: number
   holdReason?: string
   reviewerFindings?: string[] // pending findings for the next repair round
+  /**
+   * The findings that drove the repair round which just completed, retained
+   * past the point `reviewerFindings` is cleared on Actor COMPLETE so that
+   * VALIDATING's reviewer-flagged debris check (H3) can still see which
+   * exact files the Reviewer named for removal in that round.
+   */
+  lastRepairFindings?: string[]
   attempt: number    // repair rounds consumed
   retryCount: number // provider retries consumed within the current step
   createdAt: string

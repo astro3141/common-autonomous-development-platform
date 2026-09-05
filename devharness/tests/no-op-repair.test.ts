@@ -59,6 +59,32 @@ test('119-H1-2: repair that changes head/tree proceeds through validate/freeze/r
   assert.notEqual(lane.reviewedHeadSha, lane.rejectedCandidate?.headSha)
 })
 
+// Round-2 review finding: the H1 no-op check must be decided before
+// deterministic validation runs, not after — a validation failure on the
+// unchanged candidate must never be allowed to mask the no-op and route the
+// lane into another repair round instead of the required exact hold.
+test('119-H1-3: repair COMPLETE with identical head/tree holds on the no-op reason even when validation would fail', async () => {
+  const w = makeWorld({}, undefined, {
+    runValidation: async () => ({ pass: false, detail: 'lint failed' }),
+  })
+  w.github.addIssue(122, 'work', 'body')
+  w.reviewer.script = [REQUEST_CHANGES_ONCE]
+  w.actor.script = [
+    w.actor.defaultBehavior, // fresh: commits a real candidate
+    () => ({ outcome: { kind: 'COMPLETE', detail: 'nothing to change' }, actorSignal: 'COMPLETE' }),
+  ]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i122')
+  assert.ok(lane)
+  assert.equal(lane.status, 'HOLD_UNKNOWN')
+  assert.equal(lane.holdProvenance, 'actor')
+  assert.match(lane.holdReason ?? '', /no candidate delta/)
+  // Never routed into another repair round on account of the (irrelevant)
+  // validation failure, and never re-reviewed.
+  assert.equal(w.reviewer.invocations.length, 1)
+  assert.equal(w.actor.invocations.length, 2)
+})
+
 // Acceptance 4: restart preserves the rejected-candidate identity needed for H1.
 test('119-H1-4: restart preserves the rejected-candidate identity across a fresh Store load', async () => {
   const w = makeWorld()

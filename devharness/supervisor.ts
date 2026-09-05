@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import * as realGit from './gitops.ts'
-import { isTrackedDebris, isExplicitlyRequiredByIssue } from './debris.ts'
+import { isTrackedDebris, isExplicitlyRequiredByIssue, isReviewerFlaggedDebris } from './debris.ts'
 import { decide, type Decision, type Event } from './transitions.ts'
 import type { Store } from './store.ts'
 import type { GitHubPort, ActorPort, ReviewerPort, IssueInfo } from './adapters/types.ts'
@@ -336,7 +336,12 @@ export class Supervisor {
           validationCommand: cfg.validationCommand,
         })
         lane.currentHeadSha = this.d.git.worktreeExists(lane.worktree) ? this.d.git.headSha(lane.worktree) : lane.currentHeadSha
-        if (res.outcome.kind === 'COMPLETE') lane.reviewerFindings = undefined
+        if (res.outcome.kind === 'COMPLETE') {
+          // Retained past this clear for VALIDATING's reviewer-flagged debris
+          // check (H3) — see lastRepairFindings.
+          lane.lastRepairFindings = lane.reviewerFindings
+          lane.reviewerFindings = undefined
+        }
         await this.step2(lane, {
           type: 'ACTOR_RESULT', outcome: res.outcome,
           actorSignal: res.actorSignal, actorSummary: res.summary,
@@ -359,14 +364,40 @@ export class Supervisor {
         // Scoped to `addedFiles` (not the full diff): a path already present
         // at base, even if modified here, is real pre-existing payload, not
         // lane-introduced scratch, and a path the lane has since deleted has
-        // nothing left to `git rm`.
-        const addedDebrisCandidates = this.d.git.addedFiles(lane.worktree, lane.baseSha).filter(isTrackedDebris)
+        // nothing left to `git rm`. Ambiguous scratch shapes (e.g. a bare
+        // "repro" substring) are only debris when the Reviewer's own
+        // REQUEST_CHANGES findings name the exact basename
+        // (isReviewerFlaggedDebris) — never guessed from filename shape
+        // alone. lastRepairFindings (not reviewerFindings, already cleared
+        // above on this same COMPLETE) carries the findings that drove the
+        // round just completed.
+        const addedFiles = this.d.git.addedFiles(lane.worktree, lane.baseSha)
+        const addedDebrisCandidates = addedFiles.filter(
+          (p) => isTrackedDebris(p) || isReviewerFlaggedDebris(p, lane.lastRepairFindings),
+        )
         if (addedDebrisCandidates.length > 0) {
           const issue = await this.d.github.getIssue(lane.repo, lane.workIssue)
           const debrisPaths = addedDebrisCandidates.filter((p) => !isExplicitlyRequiredByIssue(p, issue.body))
           if (debrisPaths.length > 0) {
             this.d.git.removeTrackedPaths(lane.worktree, debrisPaths)
             this.d.git.checkpointCommit(lane.worktree, `harness: remove tracked debris for #${lane.workIssue} (${debrisPaths.join(', ')})`)
+          }
+        }
+
+        // H1: compare the committed, post-cleanup identity against the
+        // rejected candidate *before* deterministic validation can route the
+        // lane anywhere else. A repair round that produced no candidate
+        // delta is never a successful repair regardless of whether
+        // validation would pass or fail on the (unchanged) result — it must
+        // hold with the exact no-op reason, not fall through to a
+        // validation-failure repair loop or a validation-pass re-review.
+        if (lane.rejectedCandidate !== undefined) {
+          const headSha = this.d.git.headSha(lane.worktree)
+          const treeSha = this.d.git.treeSha(lane.worktree)
+          if (headSha === lane.rejectedCandidate.headSha && treeSha === lane.rejectedCandidate.treeSha) {
+            lane.currentHeadSha = headSha
+            await this.step2(lane, { type: 'CANDIDATE_UNCHANGED_AFTER_REJECTION' })
+            return TERMINALLY_YIELDED.includes(this.statusOf(lane))
           }
         }
 
@@ -383,20 +414,13 @@ export class Supervisor {
           this.d.log(`[dry-run] [${lane.laneId}] would freeze candidate + push + ensure PR`)
           return true
         }
+        // H1's identical-candidate check runs earlier, in VALIDATING,
+        // *before* deterministic validation — a repair that is a byte-for-
+        // byte no-op must hold with the exact no-op reason even when
+        // validation would otherwise fail on the unchanged result. By the
+        // time a lane reaches FREEZING, that comparison has already passed
+        // (rejectedCandidate is either unset or provably different here).
         const headSha = this.d.git.headSha(lane.worktree)
-
-        // H1: an Actor repair round that reports COMPLETE but produced a
-        // candidate byte-identical (head + tree) to the one the Reviewer
-        // already rejected is never a successful repair. Hold durably with
-        // the exact no-op reason; never invoke the Reviewer on it.
-        if (lane.rejectedCandidate !== undefined) {
-          const treeSha = this.d.git.treeSha(lane.worktree)
-          if (headSha === lane.rejectedCandidate.headSha && treeSha === lane.rejectedCandidate.treeSha) {
-            lane.currentHeadSha = headSha
-            await this.step2(lane, { type: 'CANDIDATE_UNCHANGED_AFTER_REJECTION' })
-            return TERMINALLY_YIELDED.includes(this.statusOf(lane))
-          }
-        }
 
         if (headSha === lane.baseSha || this.d.git.changedFiles(lane.worktree, lane.baseSha).length === 0) {
           lane.reviewerFindings = [

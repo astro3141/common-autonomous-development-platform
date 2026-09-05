@@ -313,6 +313,22 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
       break
 
     case 'VALIDATING':
+      if (event.type === 'CANDIDATE_UNCHANGED_AFTER_REJECTION') {
+        // H1: the Actor reported COMPLETE, but the committed (post-cleanup)
+        // candidate is byte-identical (head + tree) to the candidate the
+        // Reviewer already rejected. Checked before deterministic validation
+        // runs, so a validation failure on the unchanged result can never
+        // mask this and route the lane into another repair round instead of
+        // the required exact no-op hold. Never re-review a no-op.
+        const rej = lane.rejectedCandidate
+        return {
+          status: 'HOLD_UNKNOWN',
+          actions: ['POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
+          holdReason: `repair round produced no candidate delta: head ${rej?.headSha.slice(0, 12)} / tree ${rej?.treeSha.slice(0, 12)} unchanged from the previously reviewed-and-rejected candidate; reviewer not re-invoked`,
+          provenance: 'actor',
+          note: 'no-op repair: committed candidate is byte-identical to the reviewer-rejected candidate; holding without re-review',
+        }
+      }
       if (event.type === 'VALIDATION_RESULT') {
         if (event.pass) {
           return { status: 'FREEZING', actions: ['FREEZE_CANDIDATE'], note: 'validation passed; freezing exact candidate' }
@@ -343,20 +359,6 @@ export function decide(lane: Lane, event: Event, policy: RetryPolicy): Decision 
           }
         }
         return hold('HOLD_UNKNOWN', 'no committed work beyond base and repair bound exhausted', 'actor')
-      }
-      if (event.type === 'CANDIDATE_UNCHANGED_AFTER_REJECTION') {
-        // H1: the Actor reported COMPLETE, but the committed candidate is
-        // byte-identical (head + tree) to the candidate the Reviewer already
-        // rejected. This is never a successful repair and must never be
-        // re-reviewed: hold durably with the exact no-op reason instead.
-        const rej = lane.rejectedCandidate
-        return {
-          status: 'HOLD_UNKNOWN',
-          actions: ['POST_HOLD_RECEIPT', 'STOP_LANE_PROCESSING'],
-          holdReason: `repair round produced no candidate delta: head ${rej?.headSha.slice(0, 12)} / tree ${rej?.treeSha.slice(0, 12)} unchanged from the previously reviewed-and-rejected candidate; reviewer not re-invoked`,
-          provenance: 'actor',
-          note: 'no-op repair: committed candidate is byte-identical to the reviewer-rejected candidate; holding without re-review',
-        }
       }
       if (event.type === 'CANDIDATE_BASE_UNPROVEN') {
         // The recorded base is NOT an ancestor of HEAD (e.g. the worker

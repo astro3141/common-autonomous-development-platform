@@ -26,6 +26,61 @@ export function actorPermissionArgs(): string[] {
 }
 
 /**
+ * CLI flags that would let operator-supplied `actorExtraArgs` re-declare or
+ * loosen the fixed permission profile above (e.g. re-adding `--permission-mode`
+ * so it can be paired with a later `bypassPermissions` token, or re-declaring
+ * `--allowedTools`/`--disallowedTools` with a broader list). These flags are
+ * never legitimate in `actorExtraArgs`: the profile is fixed and non-negotiable.
+ */
+const FORBIDDEN_ACTOR_EXTRA_ARG_FLAGS = new Set([
+  '--permission-mode',
+  '--allowedTools',
+  '--disallowedTools',
+  '--dangerously-skip-permissions',
+])
+
+/**
+ * Reject `actorExtraArgs` that could re-open the permission surface the fixed
+ * profile above closes, before the invocation is ever assembled. A flag check
+ * alone is not enough — the forbidden mode name itself is also rejected
+ * wherever it appears, so it cannot be smuggled in as a bare value token
+ * (e.g. `--actor-arg=--permission-mode --actor-arg=bypassPermissions`).
+ */
+export function assertSafeActorExtraArgs(extraArgs: string[]): void {
+  for (const arg of extraArgs) {
+    const flag = arg.split('=', 1)[0] ?? arg
+    if (FORBIDDEN_ACTOR_EXTRA_ARG_FLAGS.has(flag)) {
+      throw new Error(
+        `actorExtraArgs may not set ${flag}: the Actor permission profile is fixed and cannot be overridden`,
+      )
+    }
+    if (arg.includes(FORBIDDEN_PERMISSION_MODE)) {
+      throw new Error(`actorExtraArgs may not reference the forbidden permission mode "${FORBIDDEN_PERMISSION_MODE}"`)
+    }
+  }
+}
+
+/**
+ * Assembles the complete `claude` CLI invocation for one Actor call: prompt,
+ * output contract, the fixed permission profile, and any operator-supplied
+ * extra args — in that order, matching what is actually spawned. Exported so
+ * tests can validate the real assembled invocation (not just the permission
+ * profile in isolation). Throws if `extraArgs` attempts to reopen the
+ * permission surface the fixed profile closes.
+ */
+export function buildActorArgs(prompt: string, opts: { maxTurns: number; extraArgs: string[] }): string[] {
+  assertSafeActorExtraArgs(opts.extraArgs)
+  return [
+    '-p', prompt,
+    '--output-format', 'json',
+    '--json-schema', JSON.stringify(ACTOR_OUTPUT_SCHEMA),
+    '--max-turns', String(opts.maxTurns),
+    ...actorPermissionArgs(),
+    ...opts.extraArgs,
+  ]
+}
+
+/**
  * Fable worker adapter over the real `claude -p` (headless print mode) surface.
  * Each call is a separate bounded invocation in the lane's isolated worktree.
  */
@@ -40,14 +95,7 @@ export function createClaudeActorAdapter(opts: {
     async invoke(req: ActorRequest): Promise<ActorResult> {
       const injected = faultInjectionFor('actor')
       const prompt = actorPrompt(req)
-      const args = [
-        '-p', prompt,
-        '--output-format', 'json',
-        '--json-schema', JSON.stringify(ACTOR_OUTPUT_SCHEMA),
-        '--max-turns', String(opts.maxTurns),
-        ...actorPermissionArgs(),
-        ...opts.extraArgs,
-      ]
+      const args = buildActorArgs(prompt, opts)
       const raw = await runCli('claude', args, {
         cwd: req.worktree,
         timeoutMs: opts.timeoutMs ?? 45 * 60_000,

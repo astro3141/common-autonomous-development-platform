@@ -1,17 +1,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { isTrackedDebris, isExplicitlyRequiredByIssue } from '../debris.ts'
+import { isTrackedDebris, isExplicitlyRequiredByIssue, isReviewerFlaggedDebris } from '../debris.ts'
 import { makeWorld } from './helpers.ts'
 
 // Issue #119 H2/H3 — negative test: known tracked-debris patterns
 // (.write-probe-*, temporary tsconfig/repro files, commit-message scratch
 // files) must never remain tracked in a frozen candidate.
 
-test('119-H3: isTrackedDebris recognizes the known debris categories and nothing else', () => {
+test('119-H3: isTrackedDebris recognizes the unambiguous scratch categories and nothing else', () => {
   assert.equal(isTrackedDebris('.write-probe-design-i106'), true)
   assert.equal(isTrackedDebris('tsconfig.i109.json'), true)
   assert.equal(isTrackedDebris('tsconfig.typecheck-scratch.json'), true)
-  assert.equal(isTrackedDebris('s2_prerepair_repro.ts'), true)
   assert.equal(isTrackedDebris('COMMIT_MSG_I109.txt'), true)
   assert.equal(isTrackedDebris('nested/dir/COMMIT_MSG_I109.txt'), true)
   // Real product/config files are never mistaken for debris.
@@ -21,13 +20,37 @@ test('119-H3: isTrackedDebris recognizes the known debris categories and nothing
   assert.equal(isTrackedDebris('README.md'), false)
 })
 
-test('119-H3: a candidate diff containing debris is auto-stripped (bounded git rm) before it is ever frozen or reviewed', async () => {
+// Round-2 review finding 3 — a generic "any new tsconfig.*.json" / bare
+// "repro" or "commit-msg" substring match also catches plausible product
+// payload. Automatic detection must never match these.
+test('119-finding3: automatic detection never matches plausible product payload with a lookalike name', () => {
+  assert.equal(isTrackedDebris('tsconfig.build.json'), false)
+  assert.equal(isTrackedDebris('tsconfig.test.json'), false)
+  assert.equal(isTrackedDebris('tsconfig.node.json'), false)
+  assert.equal(isTrackedDebris('bug123-repro-regression.test.ts'), false) // a permanent regression test kept on purpose
+  assert.equal(isTrackedDebris('.githooks/commit-msg'), false) // the real git hook: must stay exactly this lowercase name to function
+  assert.equal(isTrackedDebris('commit-msg-template.md'), false)
+})
+
+// Round-2 review finding 3 — "repro"-style scratch names are too ambiguous
+// to auto-detect by pattern; they are debris only when the Reviewer's own
+// findings name the exact basename.
+test('119-finding3: isReviewerFlaggedDebris matches only a basename literally named in Reviewer findings', () => {
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['delete the scratch file s2_prerepair_repro.ts']), true)
+  assert.equal(isReviewerFlaggedDebris('nested/s2_prerepair_repro.ts', ['delete s2_prerepair_repro.ts']), true)
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', undefined), false)
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', []), false)
+  assert.equal(isReviewerFlaggedDebris('s2_prerepair_repro.ts', ['looks good overall']), false)
+  // A lookalike permanent regression test the Reviewer never named is left alone.
+  assert.equal(isReviewerFlaggedDebris('bug123-repro-regression.test.ts', ['fix the off-by-one in the loop']), false)
+})
+
+test('119-H3: a candidate diff containing unambiguous debris is auto-stripped (bounded git rm) before it is ever frozen or reviewed', async () => {
   const w = makeWorld()
   w.github.addIssue(122, 'work', 'body')
   const debrisPaths = [
     '.write-probe-design-i122',
     'tsconfig.i122.json',
-    's2_prerepair_repro.ts',
     'COMMIT_MSG_I122.txt',
   ]
   w.actor.script = [(req) => {
@@ -57,6 +80,63 @@ test('119-H3: a candidate diff containing debris is auto-stripped (bounded git r
   // GitHub-mutating call beyond the ordinary single PR-creation/receipt flow.
   assert.equal(w.git.pushes.length, 1)
   assert.equal(w.github.writeCalls.filter((c) => c.startsWith('createPr')).length, 1)
+})
+
+// Round-2 review finding 3 — a plausible product/config file with a lookalike
+// name (tsconfig.build.json) is never auto-stripped, even newly added.
+test('119-finding3: a newly added file with a lookalike-but-legitimate name is never auto-stripped', async () => {
+  const w = makeWorld()
+  w.github.addIssue(127, 'work', 'body')
+  w.actor.script = [(req) => {
+    w.git.heads.set(req.worktree, w.git.newSha('withlookalike'))
+    w.git.changed.set(req.worktree, ['src/real.ts', 'tsconfig.build.json', 'bug123-repro-regression.test.ts'])
+    return { outcome: { kind: 'COMPLETE', detail: 'done' }, actorSignal: 'COMPLETE' }
+  }]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i127')
+  assert.ok(lane)
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+  assert.equal(w.git.removedPaths.length, 0)
+  assert.ok(lane.candidate)
+  assert.deepEqual(
+    [...lane.candidate.changedFiles].sort(),
+    ['bug123-repro-regression.test.ts', 'src/real.ts', 'tsconfig.build.json'],
+  )
+})
+
+// A repro-style scratch file the Reviewer explicitly names in REQUEST_CHANGES
+// findings is removed in the following repair round.
+test('119-finding3: a repro-style scratch file the Reviewer explicitly names is removed on repair', async () => {
+  const w = makeWorld()
+  w.github.addIssue(128, 'work', 'body')
+  w.reviewer.script = [
+    () => ({
+      outcome: { kind: 'COMPLETE', detail: 'reviewed' },
+      verdict: 'REQUEST_CHANGES',
+      summary: 'drop the scratch repro file',
+      findings: ['Remove the tracked scratch file s2_prerepair_repro.ts before resubmitting.'],
+    }),
+  ]
+  w.actor.script = [
+    (req) => {
+      w.git.heads.set(req.worktree, w.git.newSha('fresh'))
+      w.git.changed.set(req.worktree, ['src/real.ts', 's2_prerepair_repro.ts'])
+      return { outcome: { kind: 'COMPLETE', detail: 'done' }, actorSignal: 'COMPLETE' }
+    },
+    (req) => {
+      // Repair round: the Actor leaves the file tracked; the Harness itself
+      // strips it because the Reviewer named it explicitly.
+      w.git.heads.set(req.worktree, w.git.newSha('repaired'))
+      return { outcome: { kind: 'COMPLETE', detail: 'addressed the finding' }, actorSignal: 'COMPLETE' }
+    },
+  ]
+  await w.sup.run([])
+  const lane = w.store.getLane('exec-i128')
+  assert.ok(lane)
+  assert.equal(lane.status, 'HUMAN_MERGE_WAIT')
+  assert.deepEqual(w.git.removedPaths.at(-1)?.paths, ['s2_prerepair_repro.ts'])
+  assert.ok(lane.candidate)
+  assert.deepEqual(lane.candidate.changedFiles, ['src/real.ts'])
 })
 
 test('119-H3: isExplicitlyRequiredByIssue matches only on the literal basename in the issue body', () => {
@@ -121,7 +201,7 @@ test('119-finding2: a repair round where the Actor itself deletes a previously t
     (req) => {
       // Fresh round: real work plus a tracked debris file.
       w.git.heads.set(req.worktree, w.git.newSha('fresh'))
-      w.git.changed.set(req.worktree, ['src/real.ts', 's2_prerepair_repro.ts'])
+      w.git.changed.set(req.worktree, ['src/real.ts', '.write-probe-i125'])
       return { outcome: { kind: 'COMPLETE', detail: 'done' }, actorSignal: 'COMPLETE' }
     },
     (req) => {
