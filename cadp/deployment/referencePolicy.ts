@@ -272,10 +272,23 @@ finding_by_id(id) := e if {
 	e.evidence_id == id
 }
 
-# a finding id is superseded if some provided finding names it in supersedes[]
+# every predecessor id referenced by any presented finding's supersedes[], resolved or not — used
+# only to materialize missing ancestry graph nodes so an unresolved/omitted predecessor can never
+# vanish from ancestry() (#109 E1). This is NOT authority to treat the predecessor as superseded.
+all_referenced_predecessor_ids contains pid if {
+	some e in improvement_findings
+	some s in object.get(e.claim, "supersedes", [])
+	pid := s.evidence_id
+}
+
+# a finding id is superseded only if some provided finding presents a *resolved* reference to it
+# (exact id+digest match, #109 E2). An id-only reference with a mismatched digest does not
+# supersede anything: the referenced predecessor must remain a leaf so occurrence_conflict still
+# sees it (review repair finding 1).
 superseded_ids contains pid if {
 	some e in improvement_findings
 	some s in object.get(e.claim, "supersedes", [])
+	supersedes_ref_resolved(s)
 	pid := s.evidence_id
 }
 
@@ -286,6 +299,15 @@ finding_graph[fid] := ns if {
 	some e in improvement_findings
 	fid := e.evidence_id
 	ns := {s.evidence_id | some s in object.get(e.claim, "supersedes", [])}
+}
+
+# #109 S2: a referenced predecessor absent from input.evidence must NOT vanish from the graph
+# (graph.reachable drops non-key neighbours). Materialize it as an empty node so ancestry()
+# reaches it and the unresolvable-ancestor fail-closed clause below fires.
+finding_graph[pid] := ns if {
+	all_referenced_predecessor_ids[pid]
+	not finding_by_id(pid)
+	ns := set()
 }
 
 ancestry(tip_id) := graph.reachable(finding_graph, {tip_id})
@@ -299,12 +321,22 @@ authority_resolution_names(cid) if {
 	e.claim.finding_tip_ref.evidence_id == cid
 }
 
+# #109 S2 (E2): a supersedes reference is resolved only by the exact presented predecessor
+# envelope — id AND digest. An id-only match is unresolved.
+supersedes_ref_resolved(s) if {
+	some e in improvement_findings
+	e.evidence_id == s.evidence_id
+	e.envelope_digest.value == s.envelope_digest
+}
+
 # §3 reclassification: a non-CONTRACT_* descendant that supersedes C via HUMAN_JUDGMENT, or via
 # DETERMINISTIC_DERIVATION whose basis binds AUTHORITY_TEXT. MODEL_PROPOSAL can NEVER clear.
+# A clearing reference must bind the exact predecessor envelope (#109 E2).
 reclassified_clear(cid) if {
 	some e in improvement_findings
 	some s in object.get(e.claim, "supersedes", [])
 	s.evidence_id == cid
+	supersedes_ref_resolved(s)
 	not is_contract_class(e.claim.classification)
 	e.claim.derivation.kind == "HUMAN_JUDGMENT"
 }
@@ -313,6 +345,7 @@ reclassified_clear(cid) if {
 	some e in improvement_findings
 	some s in object.get(e.claim, "supersedes", [])
 	s.evidence_id == cid
+	supersedes_ref_resolved(s)
 	not is_contract_class(e.claim.classification)
 	e.claim.derivation.kind == "DETERMINISTIC_DERIVATION"
 	some b in e.claim.basis
@@ -334,6 +367,15 @@ contract_barrier(tip_id) if {
 contract_barrier(tip_id) if {
 	some cid in ancestry(tip_id)
 	not finding_by_id(cid)
+}
+
+# #109 S2 (E1/E2): every supersedes reference anywhere in the ancestry must resolve to the exact
+# presented predecessor envelope; an unresolvable reference is fail-closed.
+contract_barrier(tip_id) if {
+	some cid in ancestry(tip_id)
+	e := finding_by_id(cid)
+	some s in object.get(e.claim, "supersedes", [])
+	not supersedes_ref_resolved(s)
 }
 
 # another current leaf shares this finding's occurrence_key => SUPERSESSION_CONFLICT (§4)
@@ -410,12 +452,23 @@ intake_binding_present if {
 	wb.namespace == "improvement-finding"
 }
 
-intake_binding_implementation_clear if {
-	some wb in req.work_bindings
+# A binding is clear only when it resolves to a presented envelope by exact
+# id+digest AND that finding is implementation-clear; non-finding bindings pass.
+finding_binding_clear(wb) if wb.namespace != "improvement-finding"
+
+finding_binding_clear(wb) if {
 	wb.namespace == "improvement-finding"
 	f := finding_by_id(wb.object_id)
 	f.envelope_digest.value == wb.content_digest.value
 	implementation_clear(wb.object_id)
+}
+
+# every bound improvement-finding must be clear — one clean co-bound Finding
+# must not mask an ancestry-incomplete or barred one (fail-closed, #109 E1).
+intake_binding_implementation_clear if {
+	every wb in req.work_bindings {
+		finding_binding_clear(wb)
+	}
 }
 
 intake_nonindex_denied if {
