@@ -94,13 +94,13 @@ test("O1: observer reach serves state, effects, evidence and summaries end-to-en
   }
 });
 
-test("O1 reach: worker cannot list a foreign run's effects; workflow and observer retain access", async () => {
+test("C29/\u00a712 reach: worker cannot list a foreign run's effects; workflow and observer retain access", async () => {
   const h = await makeHarness();
   try {
     h.sealReach();
     await h.sealTargetIdentity();
-    const runRef = "cadp-v04:effect:00000000-0000-7000-8000-00000000scope";
-    const { request } = sealScriptedRequest(h, { operation_kind: "SCRIPTED_KEYED_WRITE", work_run_ref: runRef });
+    const foreignRunRef = "cadp-v04:effect:00000000-0000-7000-8000-00000000scope";
+    const { request } = sealScriptedRequest(h, { operation_kind: "SCRIPTED_KEYED_WRITE", work_run_ref: foreignRunRef });
     const api = await startKernelApi(
       { store: h.store, cas: h.cas, ingress: h.ingress, pep: h.pep, reconciler: h.reconciler, evaluator: h.evaluator, tokens: TOKENS },
       0,
@@ -108,11 +108,11 @@ test("O1 reach: worker cannot list a foreign run's effects; workflow and observe
     try {
       const baseUrl = `http://127.0.0.1:${api.port}`;
       await assert.rejects(
-        () => new KernelClient(baseUrl, "tok-worker").listEffects(runRef),
+        () => new KernelClient(baseUrl, "tok-worker").listEffects(foreignRunRef),
         (e: unknown) => e instanceof KernelApiError && e.status === 403 && e.reason === "FORBIDDEN_FOR_PRINCIPAL",
       );
-      assert.deepEqual(await new KernelClient(baseUrl, "tok-wf").listEffects(runRef), { effect_ids: [request.effect_id] });
-      assert.deepEqual(await new KernelClient(baseUrl, "tok-obs").listEffects(runRef), { effect_ids: [request.effect_id] });
+      assert.deepEqual(await new KernelClient(baseUrl, "tok-wf").listEffects(foreignRunRef), { effect_ids: [request.effect_id] });
+      assert.deepEqual(await new KernelClient(baseUrl, "tok-obs").listEffects(foreignRunRef), { effect_ids: [request.effect_id] });
     } finally {
       api.close();
     }
