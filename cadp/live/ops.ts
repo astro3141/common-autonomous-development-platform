@@ -17,11 +17,13 @@ import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
 import { workerProfileDigest } from "../product/workerProfile.ts";
+import { assertReviewIndependence, resolveReviewProvider } from "../product/reviewProviders.ts";
+import { resolvePlanProvider } from "../product/planProviders.ts";
 import { imageIdentity } from "../product/isolation.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { parseWorkProposal } from "../product/planner.ts";
-import { resolveWorkerProvider } from "../product/workerProviders.ts";
+import { resolveWorkerProvider, WORKER_PROVIDERS } from "../product/workerProviders.ts";
 import type { WorkProposalV1 } from "../product/planner.ts";
 import { devEffectFloorViolation } from "../product/workBounds.ts";
 import { classifyRun, nextAction } from "../product/driver.ts";
@@ -57,17 +59,21 @@ export function temporalNamespaceId(m: LiveEnvManifest): string {
  * the typed proposal as WORK_PROPOSAL evidence with exact provenance. The proposal confers no
  * authority — each item still enters through the ordinary governed WORK_START.
  */
-export async function sealPlan(dir: string, intent: string): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
+export async function sealPlan(dir: string, intent: string, planProduct?: string): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
   const m = loadManifest(dir);
+  // plan_product select: fail closed on an unknown provider before any surface runs; omitted
+  // keeps the claude default. Each provider submits under its OWN principal (honest attribution).
+  const planProvider = resolvePlanProvider(planProduct !== undefined && planProduct !== "" ? planProduct : "claude");
+  const planPrincipal = planProvider === "claude" ? "cadp-planner" : `cadp-planner-${planProvider}`;
   // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
   const base_sha = resolveBaseSha(m.repo_full_name, "refs/heads/main");
   const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
-    { repo_full_name: m.repo_full_name, base_sha, intent },
+    { repo_full_name: m.repo_full_name, base_sha, intent, plan_product: planProvider },
     { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
   );
-  const envelope = await liveClient(dir, "cadp-planner").submitEvidence({
+  const envelope = await liveClient(dir, planPrincipal).submitEvidence({
     evidence_kind: "WORK_PROPOSAL",
     subject_bindings: [
       { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
@@ -76,7 +82,7 @@ export async function sealPlan(dir: string, intent: string): Promise<{ proposal_
     availability: "PRESENT",
     claim_schema: "cadp.work-proposal.v1",
     claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
-    producer_ref: "planner:claude-code",
+    producer_ref: planProvider === "claude" ? "planner:claude-code" : `planner:${planProvider}`,
     source_ref: `planner:${base_sha}:${sha256Hex(intent).slice(0, 16)}`,
     source_relation: "SELF_REPORT",
   });
@@ -142,6 +148,10 @@ export async function startWork(
   // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
   // an unknown provider at entry, before anything is sealed.
   const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
+  // review_product select (extra[5], optional; omitted keeps the claude default). §8.4 reviewer
+  // independence fails closed HERE, before anything is sealed or any surface spends compute.
+  const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
+  assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
   const args =
     vertical === "development"
       ? {
@@ -156,6 +166,7 @@ export async function startWork(
             base_sha: resolveBaseSha(m.repo_full_name, "refs/heads/main"),
             work_item: extra[0]!,
             worker_product: workerProduct,
+            review_product: reviewProduct,
             require_human_merge: true,
           },
         }

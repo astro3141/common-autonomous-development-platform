@@ -108,3 +108,26 @@ test("/plan rejects an unknown provider before creating its workspace", async ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------- grok planner (#149, measured)
+
+test("grok planner carries the MEASURED read-only argv and its own auth files", () => {
+  assert.deepEqual(planArgv("grok", "PROMPT"), [
+    "grok",
+    "-p",
+    "PROMPT",
+    "--permission-mode",
+    "plan",
+    "--disable-web-search",
+    "--tools",
+    "read_file,list_dir,grep",
+  ]);
+  assert.ok(!PLAN_PROVIDERS.grok.argv_template.includes("bypassPermissions"), "the planner must NEVER carry the worker's edit-approval bypass");
+  assert.deepEqual(PLAN_PROVIDERS.grok.auth_method, { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] });
+});
+
+test("grok planner identity product matches the policy registry", () => {
+  const entry = REFERENCE_IDENTITIES.find((i) => i.producer_ref === "planner:grok");
+  assert.ok(entry !== undefined, "planner:grok is registered in the policy identity registry");
+  assert.equal(entry.identity_class.product, PLAN_PROVIDERS.grok.identity_class_product);
+});

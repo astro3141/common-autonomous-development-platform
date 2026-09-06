@@ -702,14 +702,29 @@ export function runVerifier(
 }
 
 /**
+ * Reviewer/planner auth, resolved by the broker per provider profile — descriptors carry either an
+ * operator-extracted token (claude: env injection) or host-copied auth files mounted READ-ONLY at
+ * their provider path (grok: `~/.grok/auth.json`, the same posture `runWorker` uses). Exactly one
+ * provider's auth enters the container; the keychain and every other provider stay unreachable.
+ */
+export type ReviewerAuth =
+  | { kind: "oauth_env"; env_var: string; token: string }
+  | { kind: "auth_files"; auth_subdir: string; authDir: string; auth_files: readonly string[] };
+
+/** Pure arg-builder for the reviewer container's auth (unit-testable without docker). */
+export function reviewerAuthArgs(auth: ReviewerAuth): string[] {
+  if (auth.kind === "oauth_env") return ["-e", `${auth.env_var}=${auth.token}`];
+  return auth.auth_files.flatMap((file) => ["-v", `${auth.authDir}/${file}:/root/${auth.auth_subdir}/${file}:ro`]);
+}
+
+/**
  * Reviewer container: host fs invisible (only a ro checkout); on the internal network with
- * provider-only egress via the proxy → GitHub/record/Kernel are unreachable (http-000). The
- * model OAuth token is injected by env (operator-extracted), so no keychain/host credential is
- * reachable.
+ * provider-only egress via the proxy → GitHub/record/Kernel are unreachable (http-000). Auth is
+ * injected per the provider profile (`ReviewerAuth`), so no keychain/host credential is reachable.
  */
 export function runReviewer(
   config: IsolationConfig,
-  input: { workspace: string; providerToken: string; argv: readonly string[]; timeout_ms?: number },
+  input: { workspace: string; auth: ReviewerAuth; argv: readonly string[]; timeout_ms?: number },
   options: SurfaceRunOptions = {},
 ): Promise<RunResult> {
   return runBoundedSurface({
@@ -719,7 +734,7 @@ export function runReviewer(
       ...PROXY_ENV(config.egress_proxy),
       "-v", `${input.workspace}:/ws:ro`,
       "-e", "HOME=/root",
-      "-e", `CLAUDE_CODE_OAUTH_TOKEN=${input.providerToken}`,
+      ...reviewerAuthArgs(input.auth),
       "-w", "/ws",
       config.worker_image,
       ...input.argv,

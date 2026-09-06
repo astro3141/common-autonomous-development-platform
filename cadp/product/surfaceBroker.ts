@@ -35,7 +35,7 @@ import type { PlanProviderProfile } from "./planProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
-import type { IsolationConfig, RunResult } from "./isolation.ts";
+import type { IsolationConfig, ReviewerAuth, RunResult } from "./isolation.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -311,13 +311,32 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
 
 // ------------------------------------------------------------------ /review
 
-function reviewProviderToken(profile: ReviewProviderProfile): string {
-  // Fail closed on an auth method isolation.ts does not yet inject. Never reuse the claude
-  // OAuth token for a different provider, and never fall back to worker auth files.
-  if (profile.auth_method.kind === "oauth_env" && profile.auth_method.env_var === "CLAUDE_CODE_OAUTH_TOKEN") {
-    return claudeProviderToken();
+/**
+ * Resolve a reviewer/planner profile's auth descriptor into the container injection (#155 §8.4).
+ * `oauth_env` extracts the operator token; `auth_files` copies the declared files from the host
+ * HOME into a fresh dir under `base` (deleted with the run) and mounts them READ-ONLY. Fail closed
+ * on anything else — never reuse another provider's token, never fall back to worker auth.
+ */
+function surfaceProviderAuth(
+  auth_method: ReviewProviderProfile["auth_method"] | PlanProviderProfile["auth_method"],
+  base: string,
+): ReviewerAuth {
+  if (auth_method.kind === "oauth_env" && auth_method.env_var === "CLAUDE_CODE_OAUTH_TOKEN") {
+    return { kind: "oauth_env", env_var: auth_method.env_var, token: claudeProviderToken() };
   }
-  throw new Error(`unsupported review auth method: ${profile.auth_method.kind}`);
+  if (auth_method.kind === "auth_files") {
+    const host = process.env["HOME"];
+    if (host === undefined || host.length === 0) throw new Error("host HOME unavailable for provider auth files — failing closed");
+    const authDir = join(base, "surface-auth");
+    mkdirSync(authDir, { recursive: true });
+    for (const file of auth_method.auth_files) {
+      const src = join(host, auth_method.auth_subdir, file);
+      if (!existsSync(src)) throw new Error(`provider auth file missing on host: ~/${auth_method.auth_subdir}/${file} — failing closed`);
+      cpSync(src, join(authDir, file));
+    }
+    return { kind: "auth_files", auth_subdir: auth_method.auth_subdir, authDir, auth_files: auth_method.auth_files };
+  }
+  throw new Error(`unsupported surface auth method: ${auth_method.kind}`);
 }
 
 export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
@@ -352,7 +371,7 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     mkdirSync(reviewWs, { recursive: true });
     const review = await runReviewer(config(), {
       workspace: reviewWs,
-      providerToken: reviewProviderToken(profile),
+      auth: surfaceProviderAuth(profile.auth_method, base),
       argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
     });
@@ -370,15 +389,6 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
 }
 
 // ------------------------------------------------------------------ /plan
-
-function planProviderToken(profile: PlanProviderProfile): string {
-  // Fail closed on an auth method isolation.ts does not yet inject. Never reuse the claude
-  // OAuth token for a different provider, and never fall back to worker auth files.
-  if (profile.auth_method.kind === "oauth_env" && profile.auth_method.env_var === "CLAUDE_CODE_OAUTH_TOKEN") {
-    return claudeProviderToken();
-  }
-  throw new Error(`unsupported plan auth method: ${profile.auth_method.kind}`);
-}
 
 /**
  * Proposal-only planner surface (#61 roadmap): a read-only reviewer-class container reads the
@@ -406,7 +416,7 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
     const prompt = buildPlanPrompt(body.intent, body.repo_full_name, body.base_sha);
     const run = await runReviewer(config(), {
       workspace,
-      providerToken: planProviderToken(profile),
+      auth: surfaceProviderAuth(profile.auth_method, base),
       // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
       argv: planArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.plan.surface_ms,

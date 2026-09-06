@@ -1,15 +1,16 @@
 /** Closed set of planner CLI profiles supported by the product. */
-export type PlanProvider = "claude";
+export type PlanProvider = "claude" | "grok";
 
-export interface PlanAuthMethod {
-  /**
-   * How the planner authenticates inside the isolated container. Descriptor only — never a
-   * credential. `oauth_env` injects an operator-extracted token via the named env var (the claude
-   * path: `CLAUDE_CODE_OAUTH_TOKEN`). Host keychain and worker auth files stay unreachable.
-   */
-  readonly kind: "oauth_env";
-  readonly env_var: string;
-}
+/**
+ * How the planner authenticates inside the isolated container. Descriptors only — never a
+ * credential. `oauth_env` injects an operator-extracted token via the named env var (the claude
+ * path). `auth_files` copies the named files from the host HOME's auth subdirectory into the
+ * container HOME read-only (the grok path — same posture as the worker surface). Host keychain
+ * and every OTHER provider's auth stay unreachable either way.
+ */
+export type PlanAuthMethod =
+  | { readonly kind: "oauth_env"; readonly env_var: string }
+  | { readonly kind: "auth_files"; readonly auth_subdir: string; readonly auth_files: readonly string[] };
 
 export interface PlanProviderProfile {
   /**
@@ -47,6 +48,22 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
     ],
     auth_method: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN" },
     identity_class_product: "claude-code",
+  },
+  grok: {
+    // Measured read-only posture (2026-09-06 container probes, grok 1.0.13) — see the grok entry
+    // in reviewProviders.ts for the probe details. The `--tools` allow-list (not plan mode) is the
+    // enforced boundary: plan mode blocks `write` but NOT `run_terminal_command`.
+    argv_template: [
+      "-p",
+      PLAN_PROMPT_SENTINEL,
+      "--permission-mode",
+      "plan",
+      "--disable-web-search",
+      "--tools",
+      "read_file,list_dir,grep",
+    ],
+    auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
+    identity_class_product: "grok",
   },
 };
 

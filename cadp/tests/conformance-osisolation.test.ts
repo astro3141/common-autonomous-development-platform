@@ -93,7 +93,7 @@ test("F6: reviewer container — no host fs; governed egress http-000 by every r
     spawnSync("cp", [PAYLOAD, join(ws, "probe.mjs")]);
     const targets = governedTargets(stub.port);
     const run = await runReviewer(config(), {
-      workspace: ws, providerToken: "probe",
+      workspace: ws, auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "probe" },
       argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws:/root' PROBE_TARGETS='${JSON.stringify(targets)}' node /ws/probe.mjs`],
       timeout_ms: 60_000,
     });

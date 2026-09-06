@@ -15,6 +15,12 @@ export interface WorkerProviderProfile {
   /** Session-log subdirectory the CLI writes under HOME. */
   readonly sessions_subdir: string;
   /**
+   * `identity_class.product` (TD §8.4) of this worker — matches the policy identity registry's
+   * product string. Reviewer independence compares the review provider's product against THIS, so
+   * a same-product reviewer selection can fail closed at entry, before anything is sealed.
+   */
+  readonly identity_class_product: string;
+  /**
    * How to scan the provider's OWN session log / stdout for the observed model (#91). Absent ⇒ the
    * observed model stays UNKNOWN (never guessed): a provider's format must be MEASURED before a
    * `PRESENT` value with a locator is claimed. Both regexes carry exactly ONE capture group that
@@ -34,6 +40,7 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     auth_files: ["auth.json"],
     auth_subdir: ".codex",
     sessions_subdir: "codex-sessions",
+    identity_class_product: "codex-cli",
     // Measured: codex writes rollout-*.jsonl with a "model":"..." field (#91).
     model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: "model:\\s*(\\S+)" },
   },
@@ -53,6 +60,7 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     auth_files: ["auth.json"],
     auth_subdir: ".grok",
     sessions_subdir: "grok-sessions",
+    identity_class_product: "grok",
     // Measured (2026-09-06 container probe, grok 1.0.13): the mounted /root/.grok/sessions dir gets
     // <urlencoded-cwd>/<session-id>/chat_history.jsonl with `"model_id":"grok-4.6-build"` (the
     // serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with

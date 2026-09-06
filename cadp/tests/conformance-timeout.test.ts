@@ -1277,7 +1277,7 @@ test("#128 T4-5: worker, verifier and reviewer all delegate to the bounded owner
   const runs = await Promise.all([
     runWorker(ISOLATION, { workspace: "/ws-w", codexAuthDir: "/auth", argv: ["codex"], timeout_ms: 250 }, options),
     runVerifier(ISOLATION, { workspace: "/ws-v", argv: ["node", "--test"], timeout_ms: 250 }, options),
-    runReviewer(ISOLATION, { workspace: "/ws-r", providerToken: "t", argv: ["claude"], timeout_ms: 250 }, options),
+    runReviewer(ISOLATION, { workspace: "/ws-r", auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "t" }, argv: ["claude"], timeout_ms: 250 }, options),
   ]);
   for (const run of runs) {
     assert.equal(run.timed_out, true, "every surface runner is bounded by the same owner");
