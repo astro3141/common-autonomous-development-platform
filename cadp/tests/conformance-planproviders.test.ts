@@ -82,7 +82,7 @@ test("unknown plan providers fail synchronously without filesystem effects", () 
   try {
     const before = readdirSync(root);
     assert.throws(() => resolvePlanProvider("made-up"), /unknown plan provider/u);
-    assert.throws(() => resolvePlanProvider("codex"), /unknown plan provider/u, "a worker name is not a planner");
+    assert.throws(() => resolvePlanProvider("gemini"), /unknown plan provider/u, "a dropped provider name never resolves");
     assert.throws(() => resolvePlanProvider(""), /unknown plan provider/u);
     assert.throws(() => resolvePlanProvider(undefined as unknown as string), /unknown plan provider/u);
     assert.deepEqual(readdirSync(root), before);

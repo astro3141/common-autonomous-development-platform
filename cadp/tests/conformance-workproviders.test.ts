@@ -156,3 +156,29 @@ test("codex backend scan leaves absent facts UNKNOWN", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ------------------------------------------------ claude worker (2026-09-07 container probes)
+
+test("claude worker carries the MEASURED headless-edit argv, env auth, and session layout", () => {
+  assert.deepEqual(workerArgv("claude", "do it"), ["claude", "-p", "do it", "--permission-mode", "bypassPermissions"]);
+  const p = WORKER_PROVIDERS.claude;
+  // Measured: as root claude refuses bypassPermissions unless IS_SANDBOX=1 acknowledges the container.
+  assert.deepEqual(p.auth_env, { env_var: "CLAUDE_CODE_OAUTH_TOKEN", static_env: { IS_SANDBOX: "1" } });
+  assert.deepEqual(p.auth_files, [], "no auth file is copied — the token is env-injected");
+  assert.equal(p.sessions_container_dir, "projects", "measured: claude writes ~/.claude/projects, not .../sessions");
+  assert.equal(p.identity_class_product, "claude-code");
+});
+
+test("claude backend scan reads the measured projects-jsonl model field", () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-scan-claude-"));
+  try {
+    const sessions = join(root, WORKER_PROVIDERS.claude.sessions_subdir, "-ws", "");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "128b41c7.jsonl"), `${JSON.stringify({ model: "claude-sonnet-5" })}\n`);
+    const fact = scanBackendModel("claude", join(root, WORKER_PROVIDERS.claude.sessions_subdir), "");
+    assert.equal(fact.model, "claude-sonnet-5");
+    assert.match(fact.locator ?? "", /128b41c7\.jsonl#offset=/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

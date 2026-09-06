@@ -1,5 +1,5 @@
 /** Closed set of reviewer CLI profiles supported by the product. */
-export type ReviewProvider = "claude" | "grok";
+export type ReviewProvider = "claude" | "grok" | "codex";
 
 /**
  * How the reviewer authenticates inside the isolated container. Descriptors only — never a
@@ -87,6 +87,17 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
     auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
     identity_class_product: "grok",
     verdict_format: "json-schema-text",
+  },
+  codex: {
+    // Measured (2026-09-07 container probes): `codex exec --sandbox read-only` starts inside the
+    // surface container and BLOCKS writes ("Shell write failed due to sandbox permissions", no
+    // file created). With stderr discarded, stdout is the final message ONLY — first-line verdict
+    // contract, no wrapper needed. `--skip-git-repo-check` matches the worker profile: the
+    // reviewer checkout is a fresh clone, not the broker's own repo.
+    argv_template: ["exec", "--sandbox", "read-only", "--skip-git-repo-check", DIFF_PROMPT_SENTINEL],
+    auth_method: { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] },
+    identity_class_product: "codex-cli",
+    verdict_format: "first-line",
   },
 };
 

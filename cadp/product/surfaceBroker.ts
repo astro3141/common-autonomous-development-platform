@@ -134,7 +134,13 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       workerAuthDir: join(sandbox.home, profile.auth_subdir),
       authSubdir: profile.auth_subdir,
       authFiles: profile.auth_files,
+      // Env-injected auth (claude): the operator-extracted token + measured static env. Resolved
+      // here, never stored in the registry; other providers keep file auth only.
+      ...(profile.auth_env !== undefined
+        ? { authEnv: { env_var: profile.auth_env.env_var, token: claudeProviderToken(), static_env: profile.auth_env.static_env } }
+        : {}),
       sessionsDir,
+      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       argv: workerArgv(provider, body.work_item),
       timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });

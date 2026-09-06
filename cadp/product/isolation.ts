@@ -651,7 +651,11 @@ export function runWorker(
     workerAuthDir?: string;
     authSubdir?: string;
     authFiles?: readonly string[];
+    /** Env-injected worker auth (the claude path): operator token + measured static env. */
+    authEnv?: { env_var: string; token: string; static_env: Readonly<Record<string, string>> };
     sessionsDir?: string;
+    /** Directory name under `/root/<authSubdir>` the CLI writes sessions into (default "sessions"). */
+    sessionsContainerDir?: string;
     argv: readonly string[];
     timeout_ms?: number;
   },
@@ -662,7 +666,13 @@ export function runWorker(
   const authSubdir = input.authSubdir ?? ".codex";
   const authFiles = input.authFiles ?? ["auth.json"];
   const authMounts = authFiles.flatMap((file) => ["-v", `${authDir}/${file}:/root/${authSubdir}/${file}:ro`]);
-  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${authSubdir}/sessions`] : [];
+  const authEnvArgs = input.authEnv !== undefined
+    ? [
+        "-e", `${input.authEnv.env_var}=${input.authEnv.token}`,
+        ...Object.entries(input.authEnv.static_env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+      ]
+    : [];
+  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${authSubdir}/${input.sessionsContainerDir ?? "sessions"}`] : [];
   return runBoundedSurface({
     kind: "worker",
     args: [
@@ -670,6 +680,7 @@ export function runWorker(
       ...PROXY_ENV(config.egress_proxy),
       "-v", `${input.workspace}:/ws`,
       ...authMounts,
+      ...authEnvArgs,
       ...sessionsMount,
       "-w", "/ws",
       config.worker_image,

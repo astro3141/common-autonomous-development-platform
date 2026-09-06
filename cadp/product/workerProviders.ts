@@ -1,5 +1,5 @@
 /** Closed set of worker CLI profiles supported by the product. */
-export type WorkerProvider = "codex" | "grok";
+export type WorkerProvider = "codex" | "grok" | "claude";
 
 export interface WorkerProviderProfile {
   /**
@@ -10,10 +10,22 @@ export interface WorkerProviderProfile {
   readonly argv_template: readonly string[];
   /** Relative auth files copied from the host `~/<auth_subdir>` into the fresh sandbox HOME. */
   readonly auth_files: readonly string[];
-  /** Auth subdirectory under HOME (e.g. `.codex`, `.grok`). */
+  /** Auth subdirectory under HOME (e.g. `.codex`, `.grok`, `.claude`). */
   readonly auth_subdir: string;
-  /** Session-log subdirectory the CLI writes under HOME. */
+  /**
+   * Env-injected auth (the claude path): the operator-extracted token enters via `env_var`, plus
+   * measured static env the CLI requires headless. MEASURED: claude refuses
+   * `--permission-mode bypassPermissions` as root unless `IS_SANDBOX=1` acknowledges the isolated
+   * container. Providers with file auth omit this; `auth_files` may then be empty.
+   */
+  readonly auth_env?: { readonly env_var: string; readonly static_env: Readonly<Record<string, string>> };
+  /** Session-log subdirectory the broker preserves on the host side. */
   readonly sessions_subdir: string;
+  /**
+   * The directory name UNDER `~/<auth_subdir>` the CLI actually writes sessions into inside the
+   * container. Default "sessions" (codex/grok, measured); claude writes `~/.claude/projects`.
+   */
+  readonly sessions_container_dir?: string;
   /**
    * `identity_class.product` (TD §8.4) of this worker — matches the policy identity registry's
    * product string. Reviewer independence compares the review provider's product against THIS, so
@@ -66,6 +78,22 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     // serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with
     // an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture.
     model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"modelUsage":\\{"([^"]+)"' },
+  },
+  claude: {
+    // Measured (2026-09-06 container probes): headless `claude -p <item> --permission-mode
+    // bypassPermissions` edits files IF IS_SANDBOX=1 and the OAuth token are in env — as root
+    // without IS_SANDBOX it refuses outright ("cannot be used with root/sudo privileges"). The
+    // declaration is honest: the worker genuinely runs in the isolated surface container.
+    argv_template: ["-p", WORK_ITEM_SENTINEL, "--permission-mode", "bypassPermissions"],
+    auth_files: [], // no file auth — the operator-extracted token is injected by env
+    auth_subdir: ".claude",
+    auth_env: { env_var: "CLAUDE_CODE_OAUTH_TOKEN", static_env: { IS_SANDBOX: "1" } },
+    sessions_subdir: "claude-sessions",
+    // Measured: claude writes ~/.claude/projects/<cwd-slug>/<uuid>.jsonl (not .../sessions).
+    sessions_container_dir: "projects",
+    identity_class_product: "claude-code",
+    // Measured: the session jsonl carries "model":"claude-sonnet-5" — same field shape as codex.
+    model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' },
   },
 };
 

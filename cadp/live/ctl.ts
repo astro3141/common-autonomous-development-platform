@@ -115,6 +115,8 @@ function startComponent(name: string): void {
         // Per-provider reviewer principal (#149). Conditional: an env minted before this principal
         // existed still starts; selecting the grok reviewer there fails closed in the activity.
         ...(m.tokens["cadp-reviewer-grok"] !== undefined ? { CADP_REVIEWER_TOKEN_GROK: m.tokens["cadp-reviewer-grok"]! } : {}),
+        ...(m.tokens["cadp-reviewer-codex"] !== undefined ? { CADP_REVIEWER_TOKEN_CODEX: m.tokens["cadp-reviewer-codex"]! } : {}),
+        ...(m.tokens["cadp-backend-scan-claude"] !== undefined ? { CADP_BACKEND_SCAN_TOKEN_CLAUDE: m.tokens["cadp-backend-scan-claude"]! } : {}),
         CADP_BACKEND_SCAN_TOKEN: m.tokens["cadp-backend-scan"]!,
         CADP_BACKEND_SCAN_TOKEN_GROK: m.tokens["cadp-backend-scan-grok"]!,
         CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
