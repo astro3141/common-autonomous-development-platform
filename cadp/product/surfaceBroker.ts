@@ -25,13 +25,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-import { buildWorkerSandbox, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
+import { buildWorkerSandbox } from "./workerProfile.ts";
+import { resolveWorkerProvider, WORKER_PROVIDERS } from "./workerProviders.ts";
+import type { WorkerProvider } from "./workerProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { IsolationConfig, RunResult } from "./isolation.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
+
+export function workerArgv(provider: WorkerProvider, workItem: string): string[] {
+  const profile = WORKER_PROVIDERS[provider];
+  return [provider, ...profile.argv_prefix, ...(provider === "codex" ? ["-C", "/ws"] : []), workItem];
+}
 
 function sha256(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -91,17 +98,21 @@ function config(): IsolationConfig {
 // ------------------------------------------------------------------ /implement
 
 /**
- * Clone at base_sha in a fresh ephemeral tree, run codex inside the worker container (fixed
- * mounts: only this workspace + a copied auth.json), commit + bundle the candidate. Returns the
- * candidate sha, the bundle bytes (b64), and the observed backend model scanned from the codex
- * session log. NO governed credential and NO caller-supplied path is involved.
+ * Clone at base_sha in a fresh ephemeral tree, run the selected closed-set worker provider inside
+ * the worker container (fixed mounts: only this workspace + its declared auth files), then commit
+ * and bundle the candidate. NO governed credential and NO caller-supplied path is involved.
  */
-export async function brokerImplement(body: { repo_full_name: string; base_sha: string; work_item: string }): Promise<{
+export async function brokerImplement(body: { repo_full_name: string; base_sha: string; work_item: string; worker_product: string }): Promise<{
   candidate_sha: string;
   bundle_b64: string;
   backend_model?: string;
   backend_locator?: string;
+  backend_provider: WorkerProvider;
 }> {
+  // Validation is deliberately first: an invalid/missing selection cannot probe Docker, touch the
+  // filesystem, or run git, and never falls back to a privileged default worker.
+  const provider = resolveWorkerProvider(body.worker_product);
+  const profile = WORKER_PROVIDERS[provider];
   if (!(await dockerAvailable())) throw new Error("surface isolation runtime (docker) unavailable — failing closed");
   const base = mkdtempSync(join(tmpdir(), "cadp-impl-"));
   try {
@@ -115,14 +126,15 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       if (r.status !== 0) throw new Error(`checkout ${body.base_sha} failed: ${r.stderr.slice(0, 300)}`);
     }
 
-    const sandbox = buildWorkerSandbox(base);
-    const sessionsDir = join(sandbox.home, "codex-sessions");
+    const sandbox = buildWorkerSandbox(base, provider);
+    const sessionsDir = join(sandbox.home, profile.sessions_subdir);
     mkdirSync(sessionsDir, { recursive: true });
     const workerRun = await runWorker(config(), {
       workspace,
-      codexAuthDir: join(sandbox.home, ".codex"),
+      workerAuthDir: join(sandbox.home, profile.auth_subdir),
+      workerProvider: provider,
       sessionsDir,
-      argv: ["codex", ...WORKER_ARGV_PREFIX, "-C", "/ws", body.work_item],
+      argv: workerArgv(provider, body.work_item),
       timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });
     if (workerRun.status !== 0) throw new Error(surfaceFailure("worker", workerRun));
@@ -140,15 +152,15 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
     if (r.status !== 0) throw new Error(`bundle create failed: ${r.stderr.slice(0, 300)}`);
     const bundle_b64 = readFileSync(bundlePath).toString("base64");
 
-    const backend = scanBackendModel(sessionsDir, workerRun.stdout);
-    return { candidate_sha, bundle_b64, backend_model: backend.model, backend_locator: backend.locator };
+    const backend = scanBackendModel(provider, sessionsDir, workerRun.stdout);
+    return { candidate_sha, bundle_b64, backend_provider: provider, backend_model: backend.model, backend_locator: backend.locator };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 }
 
-/** #91 method: scan the worker's OWN codex session log; PRESENT facts carry a locator. */
-function scanBackendModel(sessionsDir: string, stdout: string): { model?: string; locator?: string } {
+/** #91 method: scan the worker's OWN provider session log; PRESENT facts carry a locator. */
+export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, stdout: string): { model?: string; locator?: string } {
   let model: string | undefined;
   let locator: string | undefined;
   const scan = (file: string): void => {
@@ -156,7 +168,7 @@ function scanBackendModel(sessionsDir: string, stdout: string): { model?: string
     const idx = content.search(/"model"\s*:\s*"/u);
     if (idx >= 0) {
       const m = /"model"\s*:\s*"([^"]+)"/u.exec(content.slice(idx, idx + 200));
-      if (m !== null) { model = m[1]; locator = `${file}#offset=${idx}`; }
+      if (m !== null) { model = m[1]; locator = `${provider}-session:${file}#offset=${idx}`; }
     }
   };
   try {
@@ -170,8 +182,13 @@ function scanBackendModel(sessionsDir: string, stdout: string): { model?: string
     if (existsSync(sessionsDir)) walk(sessionsDir);
   } catch { /* absent facts stay UNKNOWN */ }
   if (model === undefined) {
-    const m = /model:\s*(\S+)/u.exec(stdout);
-    if (m !== null) { model = m[1]; locator = "worker-stdout#pattern=model:"; }
+    const patterns: Record<WorkerProvider, RegExp> = {
+      codex: /model:\s*(\S+)/u,
+      grok: /(?:model|model_name)[:=]\s*["']?([^\s"']+)/u,
+      gemini: /(?:model|model_name)[:=]\s*["']?([^\s"']+)/u,
+    };
+    const m = patterns[provider].exec(stdout);
+    if (m !== null) { model = m[1]; locator = `${provider}-stdout#pattern=${m[0].slice(0, m[0].indexOf(m[1]))}`; }
   }
   return { model, locator };
 }
@@ -326,7 +343,7 @@ export interface BrokerOperation {
 export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   "/implement": {
     response_budget_ms: SURFACE_BUDGETS.implement.broker_response_ms,
-    run: (b) => brokerImplement(b as { repo_full_name: string; base_sha: string; work_item: string }),
+    run: (b) => brokerImplement(b as { repo_full_name: string; base_sha: string; work_item: string; worker_product: string }),
   },
   "/verify": {
     response_budget_ms: SURFACE_BUDGETS.verify.broker_response_ms,

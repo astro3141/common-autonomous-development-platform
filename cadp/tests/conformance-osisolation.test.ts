@@ -147,7 +147,7 @@ test("F8: worker container — no host fs; governed targets unreachable by name/
     spawnSync("cp", [PAYLOAD, join(ws, "probe.mjs")]);
     const targets = { ...governedTargets(42999), provider_openai: "https://api.openai.com/v1/models" };
     const run = await runWorker(config(), {
-      workspace: ws, codexAuthDir: auth,
+      workspace: ws, workerAuthDir: auth, workerProvider: "codex",
       argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='/:/ws' PROBE_TARGETS='${JSON.stringify(targets)}' node /ws/probe.mjs`],
       timeout_ms: 60_000,
     });

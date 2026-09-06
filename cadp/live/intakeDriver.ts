@@ -361,7 +361,7 @@ async function devPositive(work_item: string): Promise<void> {
   const proj = await projectFinding(finding, "CREATE_INDEX", [finding.evidence_id], true);
   receipt["issue_projection"] = { outcome: proj.outcome, ref: ((proj.admitted as { outcome?: { target_operation_ref?: string } } | undefined)?.outcome)?.target_operation_ref };
   // 4. Bounded implementation WORK_START bound to the finding → dispatch cadpWork development.
-  const args = { vertical: "development", bounds: { max_steps: 8, max_effects: 6 }, development: { repo_id: m.repo_id, repo_full_name: m.repo_full_name, base_ref: "refs/heads/main", base_sha: m.base_sha, work_item, require_human_merge: true } };
+  const args = { vertical: "development", bounds: { max_steps: 8, max_effects: 6 }, development: { repo_id: m.repo_id, repo_full_name: m.repo_full_name, base_ref: "refs/heads/main", base_sha: m.base_sha, work_item, worker_product: "codex", require_human_merge: true } };
   const ws = await sealIntakeWorkStart(finding, args, [finding.evidence_id]);
   receipt["work_start"] = { outcome: ws.outcome, workflow_id: ws.workflow_id };
   if (ws.outcome !== "ALLOW") throw new Error(`intake WORK_START not admitted: ${JSON.stringify(ws)}`);

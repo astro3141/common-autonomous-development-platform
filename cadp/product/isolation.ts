@@ -28,6 +28,8 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { SURFACE_BUDGETS, SURFACE_TERMINATION_MS } from "./timeouts.ts";
+import { WORKER_PROVIDERS } from "./workerProviders.ts";
+import type { WorkerProvider } from "./workerProviders.ts";
 
 export interface IsolationConfig {
   /** Pinned surface image (name:tag). */
@@ -639,29 +641,38 @@ const PROXY_ENV = (proxy: string): string[] => [
 ];
 
 /**
- * Worker container: host fs invisible (only /ws + ro auth.json); on the internal network with
+ * Worker container: host fs invisible (only /ws + provider-declared ro auth files); on the internal network with
  * provider-only egress via the proxy. Governed targets have no route.
  */
 export function runWorker(
   config: IsolationConfig,
-  input: { workspace: string; codexAuthDir: string; sessionsDir?: string; argv: readonly string[]; timeout_ms?: number },
+  input: { workspace: string; workerAuthDir: string; workerProvider: WorkerProvider; sessionsDir?: string; argv: readonly string[]; timeout_ms?: number },
   options: SurfaceRunOptions = {},
 ): Promise<RunResult> {
-  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/.codex/sessions`] : [];
   return runBoundedSurface({
     kind: "worker",
-    args: [
-      "--network", config.egress_network,
-      ...PROXY_ENV(config.egress_proxy),
-      "-v", `${input.workspace}:/ws`,
-      "-v", `${input.codexAuthDir}/auth.json:/root/.codex/auth.json:ro`,
-      ...sessionsMount,
-      "-w", "/ws",
-      config.worker_image,
-      ...input.argv,
-    ],
+    args: workerDockerArgs(config, input),
     timeout_ms: input.timeout_ms ?? SURFACE_BUDGETS.implement.surface_ms,
   }, options);
+}
+
+export function workerDockerArgs(
+  config: IsolationConfig,
+  input: { workspace: string; workerAuthDir: string; workerProvider: WorkerProvider; sessionsDir?: string; argv: readonly string[] },
+): string[] {
+  const profile = WORKER_PROVIDERS[input.workerProvider];
+  const authMounts = profile.auth_files.flatMap((file) => ["-v", `${input.workerAuthDir}/${file}:/root/${profile.auth_subdir}/${file}:ro`]);
+  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${profile.auth_subdir}/sessions`] : [];
+  return [
+    "--network", config.egress_network,
+    ...PROXY_ENV(config.egress_proxy),
+    "-v", `${input.workspace}:/ws`,
+    ...authMounts,
+    ...sessionsMount,
+    "-w", "/ws",
+    config.worker_image,
+    ...input.argv,
+  ];
 }
 
 /**

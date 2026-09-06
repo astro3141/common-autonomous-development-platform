@@ -1275,7 +1275,7 @@ test("#128 T4-5: worker, verifier and reviewer all delegate to the bounded owner
   t.after(() => { scripted.killAll(); });
   const options = { port: scripted.port, termination_ms: 2_000 };
   const runs = await Promise.all([
-    runWorker(ISOLATION, { workspace: "/ws-w", codexAuthDir: "/auth", argv: ["codex"], timeout_ms: 250 }, options),
+    runWorker(ISOLATION, { workspace: "/ws-w", workerAuthDir: "/auth", workerProvider: "codex", argv: ["codex"], timeout_ms: 250 }, options),
     runVerifier(ISOLATION, { workspace: "/ws-v", argv: ["node", "--test"], timeout_ms: 250 }, options),
     runReviewer(ISOLATION, { workspace: "/ws-r", providerToken: "t", argv: ["claude"], timeout_ms: 250 }, options),
   ]);

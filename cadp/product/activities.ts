@@ -284,6 +284,7 @@ export async function implementCandidate(input: {
   repo_full_name: string;
   base_sha: string;
   work_item: string;
+  worker_product: string;
   prior_step_envelope_digest?: string;
 }): Promise<{
   candidate_sha: string;
@@ -293,16 +294,16 @@ export async function implementCandidate(input: {
   backend_evidence_id: string;
 }> {
   const client = workflowClient();
-  // The bounded broker clones at base_sha, runs codex in the isolated worker container, commits
+  // The bounded broker clones at base_sha, runs the selected provider in the isolated worker container, commits
   // the worker-local candidate, and bundles it (TD §8.1/§6.6). It returns the candidate sha, the
-  // bundle bytes, and the model scanned from the worker's own codex session log (#91).
-  const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_model?: string; backend_locator?: string }>(
+  // bundle bytes, and the model scanned from the worker's own provider session log (#91).
+  const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_provider: string; backend_model?: string; backend_locator?: string }>(
     "/implement",
-    { repo_full_name: input.repo_full_name, base_sha: input.base_sha, work_item: input.work_item },
+    { repo_full_name: input.repo_full_name, base_sha: input.base_sha, work_item: input.work_item, worker_product: input.worker_product },
     SURFACE_BUDGETS.implement,
   );
   const { cas_key: bundle_cas_key } = await client.putBlob(Buffer.from(impl.bundle_b64, "base64"));
-  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_model, impl.backend_locator);
+  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, input.worker_product, impl.backend_provider, impl.backend_model, impl.backend_locator);
 
   const workStep = await submitWorkStep({
     work_run_ref: input.work_run_ref,
@@ -322,14 +323,14 @@ export async function implementCandidate(input: {
 }
 
 /** #91 method: the broker scanned the worker's own session log; PRESENT facts carry a locator. */
-async function submitBackendExecution(work_run_ref: string, step_ordinal: number, model?: string, locator?: string): Promise<string> {
+async function submitBackendExecution(work_run_ref: string, step_ordinal: number, requestedProvider: string, observedProvider: string, model?: string, locator?: string): Promise<string> {
   const scanClient = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_BACKEND_SCAN_TOKEN"));
   const observed: Record<string, unknown> = {
     model:
       model !== undefined
         ? { availability: "PRESENT", value: model, locator }
         : { availability: "UNKNOWN" },
-    provider: { availability: "UNKNOWN" },
+    provider: { availability: "PRESENT", value: observedProvider, locator: "surface-broker#resolved-worker-provider" },
     run_id: { availability: "UNKNOWN" },
     version: { availability: "UNKNOWN" },
     effort: { availability: "UNKNOWN" },
@@ -342,9 +343,9 @@ async function submitBackendExecution(work_run_ref: string, step_ordinal: number
     ],
     availability: "PRESENT",
     claim_schema: "cadp.backend.v1",
-    claim: { requested: { model: "codex default" }, observed },
-    producer_ref: "backend-scan:codex",
-    source_ref: "codex session log scan",
+    claim: { requested: { provider: requestedProvider, model: `${requestedProvider} default` }, observed },
+    producer_ref: `backend-scan:${observedProvider}`,
+    source_ref: `${observedProvider} session log scan`,
     source_relation: "SELF_REPORT",
   });
   return envelope.evidence_id;

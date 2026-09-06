@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { jcsDigest } from "../kernel/canonical.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_ARGV_PREFIX, WORKER_AUTH_FILES } from "../product/workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS } from "../product/workerProviders.ts";
+import { brokerImplement, scanBackendModel, workerArgv } from "../product/surfaceBroker.ts";
+import { workerDockerArgs } from "../product/isolation.ts";
 
 test("codex provider retains the byte-identical worker profile", () => {
   assert.deepEqual(WORKER_PROVIDERS.codex.argv_prefix, ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]);
@@ -19,6 +21,21 @@ test("codex provider retains the byte-identical worker profile", () => {
     home: "fresh-per-invocation",
   }).value;
   assert.equal(workerProfileDigest(), previous);
+  assert.deepEqual(workerArgv("codex", "do work"), ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", "/ws", "do work"]);
+});
+
+test("worker argv and mounts are selected only from each provider profile", () => {
+  for (const provider of ["codex", "grok", "gemini"] as const) {
+    assert.deepEqual(workerArgv(provider, "item"), [provider, ...WORKER_PROVIDERS[provider].argv_prefix, ...(provider === "codex" ? ["-C", "/ws"] : []), "item"]);
+    const args = workerDockerArgs(
+      { worker_image: "worker", egress_network: "egress", egress_proxy: "proxy:1" },
+      { workspace: "/workspace", workerAuthDir: "/auth", workerProvider: provider, sessionsDir: "/sessions", argv: workerArgv(provider, "item") },
+    );
+    for (const file of WORKER_PROVIDERS[provider].auth_files) {
+      assert.ok(args.includes(`/auth/${file}:/root/${WORKER_PROVIDERS[provider].auth_subdir}/${file}:ro`));
+    }
+    assert.ok(args.includes(`/sessions:/root/${WORKER_PROVIDERS[provider].auth_subdir}/sessions`));
+  }
 });
 
 for (const provider of ["grok", "gemini"] as const) {
@@ -62,3 +79,30 @@ test("unknown providers fail synchronously without filesystem effects", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("/implement resolves worker_product before Docker or temporary workspace effects", async () => {
+  const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith("cadp-impl-")).sort();
+  await assert.rejects(
+    brokerImplement({ repo_full_name: "unused/unused", base_sha: "0", work_item: "unused", worker_product: "made-up" }),
+    /unknown worker provider: made-up/u,
+  );
+  const after = readdirSync(tmpdir()).filter((entry) => entry.startsWith("cadp-impl-")).sort();
+  assert.deepEqual(after, before);
+});
+
+for (const provider of ["codex", "grok", "gemini"] as const) {
+  test(`${provider} backend scan reports provider-specific evidence locators`, () => {
+    const root = mkdtempSync(join(tmpdir(), `cadp-scan-${provider}-`));
+    try {
+      const session = join(root, "session.jsonl");
+      writeFileSync(session, `${JSON.stringify({ model: `${provider}-observed-model` })}\n`);
+      assert.deepEqual(scanBackendModel(provider, root, "model: requested-model"), {
+        model: `${provider}-observed-model`,
+        locator: `${provider}-session:${session}#offset=1`,
+      });
+      assert.deepEqual(scanBackendModel(provider, join(root, "absent"), ""), { model: undefined, locator: undefined });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
