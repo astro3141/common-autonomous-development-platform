@@ -15,6 +15,9 @@ import { heartbeat } from "@temporalio/activity";
 import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
+import { brokerPostJson } from "./brokerTransport.ts";
+import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, SURFACE_BUDGETS } from "./timeouts.ts";
+import type { SurfaceOperationBudget } from "./timeouts.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -37,20 +40,20 @@ function sha256(bytes: Uint8Array | string): string {
  * Call the bounded surface broker over its localhost port. The activity host's network is pinned
  * to only the Kernel/Temporal/broker ports; the broker owns GitHub + Docker. Heartbeat while the
  * (possibly long) surface run is in flight.
+ *
+ * #128: the RPC runs on the explicit-timeout `node:http` transport, NOT on global fetch. undici's
+ * implicit ~300s response-headers timeout is shorter than every declared budget of a long surface
+ * run and is what killed three healthy in-bound `/implement` attempts in #127. The only bound on
+ * this call is `budget.rpc_ms` (see ./timeouts.ts).
  */
-async function brokerCall<T>(path: string, body: unknown, timeout_ms: number): Promise<T> {
+async function brokerCall<T>(path: string, body: unknown, budget: SurfaceOperationBudget): Promise<T> {
   const url = env("CADP_BROKER_URL");
-  const beat = setInterval(() => { try { heartbeat(); } catch { /* outside activity context (tests) */ } }, 5000);
+  const beat = setInterval(
+    () => { try { heartbeat(); } catch { /* outside activity context (tests) */ } },
+    BROKER_CALL_HEARTBEAT_INTERVAL_MS,
+  );
   try {
-    const res = await fetch(`${url}${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeout_ms),
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`broker ${path} ${res.status}: ${text.slice(0, 300)}`);
-    return JSON.parse(text) as T;
+    return await brokerPostJson<T>(url, path, body, { rpc_ms: budget.rpc_ms });
   } finally {
     clearInterval(beat);
   }
@@ -296,7 +299,7 @@ export async function implementCandidate(input: {
   const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_model?: string; backend_locator?: string }>(
     "/implement",
     { repo_full_name: input.repo_full_name, base_sha: input.base_sha, work_item: input.work_item },
-    960_000,
+    SURFACE_BUDGETS.implement,
   );
   const { cas_key: bundle_cas_key } = await client.putBlob(Buffer.from(impl.bundle_b64, "base64"));
   const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_model, impl.backend_locator);
@@ -397,7 +400,7 @@ export async function verifyCandidate(input: {
   const v = await brokerCall<
     | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
     | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
-  >("/verify", { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha }, 360_000);
+  >("/verify", { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha }, SURFACE_BUDGETS.verify);
 
   if (v.status === "UNKNOWN") {
     // Dirty tree / head mismatch ⇒ UNKNOWN, never PASS (C11 / #89 false-PASS).
@@ -463,7 +466,7 @@ export async function reviewCandidate(input: {
   const rv = await brokerCall<{ verdict: string; reason: string; stdout: string }>(
     "/review",
     { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item },
-    360_000,
+    SURFACE_BUDGETS.review,
   );
   const envelope = await reviewer.submitEvidence({
     evidence_kind: "REVIEW",

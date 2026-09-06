@@ -15,6 +15,12 @@
  *      and cannot use the docker daemon to bind-mount+read the secret. Guard-bites breach each.
  *
  * Container legs skip (not fail) when Docker is unavailable; Seatbelt legs skip off macOS.
+ *
+ * The #128 surface-lifetime bound is deliberately NOT here. Its deterministic controls are the
+ * always-running T4 block in cadp/tests/conformance-timeout.test.ts, and its real-container check is
+ * an explicit live probe — `node cadp/live/surfaceLifetimeProbe.ts` — which FAILS rather than skips
+ * when docker or the pinned image is missing. A control that can only ever skip on a machine without
+ * docker would report a pass while proving nothing.
  */
 
 import assert from "node:assert/strict";
