@@ -78,6 +78,17 @@ implementer_refs contains p if {
 	p := e.producer_ref
 }
 
+# The MODEL that actually implemented the candidate is attributed by BACKEND_EXECUTION, not by
+# WORK_STEP (every step is submitted by the orchestrator). Without this clause the 8.4/5.3
+# product-independence comparison only ever ran against the workflow's own product — measured
+# live (12th pilot): a claude-implemented run was auto-merged by the claude-product delegated
+# agent decision. The implementer set must therefore include the backend producers.
+implementer_refs contains p if {
+	some e in input.evidence
+	e.evidence_kind == "BACKEND_EXECUTION"
+	p := e.producer_ref
+}
+
 verification_ok(sha) if {
 	some e in input.evidence
 	e.evidence_kind == "VERIFICATION"
