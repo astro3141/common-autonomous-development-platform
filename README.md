@@ -70,8 +70,23 @@ node cadp/live/ctl.ts <dir> plan "<whole intent>"       # proposal-only planner 
 node cadp/live/ctl.ts <dir> work-dev "<work item>" [max_steps] [max_effects] [proposal_evidence_id]
 node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
 node cadp/live/ctl.ts <dir> state <effect_id>
+node cadp/live/ctl.ts <dir> work-plan <proposal_evidence_id>   # drive proposal items sequentially
 node cadp/live/observe.ts <dir> run|effect|attribution <ref>   # read-only observer projection
 ```
+
+Hands-off supervision (commodity session as the loop — CADP owns no supervisor):
+
+```bash
+node cadp/live/mcpServer.ts <dir>    # MCP stdio server: cadp_plan, cadp_work_start,
+                                     # cadp_run_status, cadp_human_state
+# e.g. with Claude Code as the supervising session:
+claude --mcp-config '{"mcpServers":{"cadp":{"command":"node","args":["cadp/live/mcpServer.ts","<dir>"]}}}'
+```
+
+The session receives ALLOW/DENY/evidence text back — never a credential. Work
+starts are capped per session; Human decisions stay out-of-band
+(`ctl human-approve`), and kernel state — not the conversation — is the durable
+resume truth (`cadp_run_status`).
 
 Process entry points: `npm run kernel -- <config.json>`, `npm run worker`,
 `npm run broker`, `npm run live -- <dir> …`.
