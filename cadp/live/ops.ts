@@ -59,23 +59,25 @@ export function temporalNamespaceId(m: LiveEnvManifest): string {
  */
 export async function sealPlan(dir: string, intent: string): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
   const m = loadManifest(dir);
+  // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
+  const base_sha = resolveBaseSha(m.repo_full_name, "refs/heads/main");
   const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
-    { repo_full_name: m.repo_full_name, base_sha: m.base_sha, intent },
+    { repo_full_name: m.repo_full_name, base_sha, intent },
     { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
   );
   const envelope = await liveClient(dir, "cadp-planner").submitEvidence({
     evidence_kind: "WORK_PROPOSAL",
     subject_bindings: [
       { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
-      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${m.base_sha}` },
+      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${base_sha}` },
     ],
     availability: "PRESENT",
     claim_schema: "cadp.work-proposal.v1",
     claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
     producer_ref: "planner:claude-code",
-    source_ref: `planner:${m.base_sha}:${sha256Hex(intent).slice(0, 16)}`,
+    source_ref: `planner:${base_sha}:${sha256Hex(intent).slice(0, 16)}`,
     source_relation: "SELF_REPORT",
   });
   return {
@@ -93,6 +95,32 @@ export async function loadProposal(dir: string, proposalEvidenceId: string): Pro
   return parseWorkProposal(
     JSON.stringify({ schema: claim["schema"], items: claim["items"], ...(claim["notes"] !== undefined ? { notes: claim["notes"] } : {}) }),
   );
+}
+
+/**
+ * Resolve the CURRENT tip of the declared base ref at seal time. The manifest's `base_sha` is the
+ * ref tip AT ENV SETUP and only ever gets staler: the 7th #149 pilot implemented on a base four
+ * merges behind main, and the (correctly verified, correctly reviewed) candidate then conflicted
+ * at merge. `base_ref` is what the material DECLARES the run builds on, so the sealed `base_sha`
+ * must be that ref's tip when the run is sealed — resolved fresh, never the manifest snapshot.
+ * Fail closed on any resolution problem: sealing a knowingly stale base is worse than refusing.
+ */
+export function resolveBaseSha(
+  repo_full_name: string,
+  base_ref: string,
+  run: (cmd: string, args: string[]) => string = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", timeout: 15_000 }),
+): string {
+  let out: string;
+  try {
+    out = run("git", ["ls-remote", `https://github.com/${repo_full_name}.git`, base_ref]);
+  } catch (e) {
+    throw new Error(`cannot resolve ${base_ref} for ${repo_full_name} (${e instanceof Error ? e.message : String(e)}) — refusing to seal a stale base`);
+  }
+  const sha = out.split(/\s+/u)[0];
+  if (sha === undefined || !/^[0-9a-f]{40}$/u.test(sha)) {
+    throw new Error(`cannot resolve ${base_ref} for ${repo_full_name} (unexpected ls-remote output) — refusing to seal a stale base`);
+  }
+  return sha;
 }
 
 /** One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly logged. */
@@ -123,7 +151,9 @@ export async function startWork(
             repo_id: m.repo_id,
             repo_full_name: m.repo_full_name,
             base_ref: "refs/heads/main",
-            base_sha: m.base_sha,
+            // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
+            // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
+            base_sha: resolveBaseSha(m.repo_full_name, "refs/heads/main"),
             work_item: extra[0]!,
             worker_product: workerProduct,
             require_human_merge: true,
