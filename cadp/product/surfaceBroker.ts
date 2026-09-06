@@ -197,6 +197,27 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
     if (porcelain.length > 0 || clone_head !== body.candidate_sha) {
       return { status: "UNKNOWN", clone_head, unknown_reason: porcelain.length > 0 ? "DIRTY_WORKSPACE" : "HEAD_MISMATCH" };
     }
+    // Dependency provisioning (self-host friction): the verifier container runs `node --test`
+    // under `--network none`, so it cannot fetch dependencies — a target whose own suite imports
+    // packages (CADP itself imports @temporalio/*) would fail every such test with
+    // ERR_MODULE_NOT_FOUND, which is NOT a verdict about the candidate. The trusted broker (which
+    // has network but holds no kernel token or secret) therefore populates node_modules HERE,
+    // before the network-isolated test run, with `--ignore-scripts` so a candidate's install
+    // scripts never execute on the broker host. A provisioning failure is UNKNOWN, never failure.
+    const hasLock = existsSync(join(workspace, "package-lock.json"));
+    if (hasLock || existsSync(join(workspace, "package.json"))) {
+      const install = spawn("npm", [hasLock ? "ci" : "install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] });
+      const installResult = await new Promise<{ status: number | null; stderr: string }>((resolve) => {
+        const err: Buffer[] = [];
+        install.stderr?.on("data", (c: Buffer) => err.push(c));
+        const timer = setTimeout(() => install.kill("SIGKILL"), 180_000);
+        install.on("close", (status) => { clearTimeout(timer); resolve({ status, stderr: Buffer.concat(err).toString("utf8") }); });
+        install.on("error", (e) => { clearTimeout(timer); resolve({ status: 127, stderr: String(e) }); });
+      });
+      if (installResult.status !== 0) {
+        return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
+      }
+    }
     const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
