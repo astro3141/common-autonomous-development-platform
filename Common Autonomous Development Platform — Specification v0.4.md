@@ -421,6 +421,16 @@ Policy가 Human judgment를 요구하면 Human interaction product는 `EvidenceE
 
 Human UI, approval queue, notification, synchronous/asynchronous interaction 및 escalation workflow는 commodity boundary다.
 
+#### 5.3a Delegated machine decision (candidate)
+
+Policy가 요구하는 decision을 Human이 명시적으로 machine agent에게 위임할 수 있다. 이 경우 decision은 `evidence_kind = HUMAN_DECISION`이 아니라 machine decision(예: `AGENT_DECISION`)으로 **정직하게 attribute**되며 Human identity로 위장하지 않는다. 위임은 deployment별 opt-in이고, policy가 허용한 exact producer만 해당 gate를 만족시킨다.
+
+핵심 제약 (§3의 "같은 identity가 incompatible duties를 동시에 수행하면 independence를 만족하지 못한다"의 machine-decision 적용):
+
+- delegated machine decision의 producer는 그 work run의 implementer/orchestrator와 **독립**이어야 한다 — §5.4가 independent reviewer에 요구하는 것과 동일한 separation을 decision 층에도 적용한다. 자신이 만든 work를 자신이 승인하는 self-approval은 허용되지 않는다.
+- 위임 가능한 gate는 policy가 명시한 것으로 제한된다. Constitutional/root operation(예: policy activation)은 위임되지 않으며 계속 Human decision을 요구한다.
+- machine decision도 §5.3의 최소 rule(exact scope binding, freshness, no-reuse)을 동일하게 만족한다.
+
 ### 5.4 Review and verification
 
 Verification과 review는 `EvidenceEnvelopeV1` producer다.

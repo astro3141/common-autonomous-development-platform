@@ -24,6 +24,8 @@ import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
 import { sealPlan, startWork, workPlan } from "./ops.ts";
+import { brokerPostJson } from "../product/brokerTransport.ts";
+import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -360,14 +362,17 @@ async function attest(): Promise<void> {
 const opsLog = (line: Record<string, unknown>): void => console.log(JSON.stringify(line, null, 2));
 
 /**
- * Delegated owner-agent merge approval. Identical §9.3 contract to human-approve, but the
- * envelope is AGENT_DECISION from agent:claude-owner — honestly attributed. It satisfies the
- * merge gate only where the active policy's delegated_merge_producers names this producer.
+ * Delegated owner-agent merge approval. The decision is NOT formed by the calling (possibly
+ * build-contaminated) context: it is delegated to a FRESH ISOLATED reviewer surface fed ONLY the
+ * governed evidence (candidate sha, its diff, the verification conclusion and the independent
+ * review verdict). AGENT_DECISION(APPROVE) is sealed only if that isolated reviewer approves —
+ * mirroring §8.4 reviewer independence for the machine DECISION (Spec §3: one identity may not
+ * perform incompatible duties). The kernel policy separately refuses a non-independent producer.
  */
 async function agentApprove(effect_id: string, workflow_id: string): Promise<void> {
   const m = manifest();
   const c = client("cadp-agent-owner");
-  const state = await c.getEffectState(effect_id);
+  const state = await client("cadp-observer").getEffectState(effect_id);
   const shown = {
     effect_id,
     request_digest: state.request.request_digest.value,
@@ -376,6 +381,37 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<voi
     operation: state.request.operation_kind,
   };
   console.log("AGENT SURFACE RENDERS:", JSON.stringify(shown, null, 2));
+
+  // Gather the scoped governed evidence this merge cites — nothing else.
+  const evidenceIds = [...new Set(state.inputs.flatMap((i) => i.evidence_refs.map((r) => r.evidence_id)))];
+  let candidateSha: string | undefined;
+  let verificationConclusion = "UNKNOWN";
+  let reviewVerdict = "UNKNOWN";
+  for (const id of evidenceIds) {
+    const { envelope } = await client("cadp-observer").getEvidence(id);
+    const claim = envelope.claim as Record<string, unknown> | undefined;
+    if (envelope.evidence_kind === "VERIFICATION" && claim !== undefined) {
+      candidateSha = (claim["head_sha"] as string | undefined) ?? candidateSha;
+      verificationConclusion = String(claim["conclusion"] ?? "UNKNOWN");
+    }
+    if (envelope.evidence_kind === "REVIEW" && claim !== undefined) reviewVerdict = String(claim["verdict"] ?? "UNKNOWN");
+  }
+  if (candidateSha === undefined) throw new Error("merge effect has no verification-bound candidate sha — refusing to approve");
+
+  // Fresh ISOLATED merge reviewer: only the governed facts reach it, no build/direction context.
+  const workItem = `Final merge gate review for candidate ${candidateSha} into ${m.repo_full_name} main. Governed evidence: verification conclusion = ${verificationConclusion}; independent review verdict = ${reviewVerdict}. Reply APPROVE only if this exact committed candidate is safe to merge; otherwise REQUEST_CHANGES.`;
+  const review = await brokerPostJson<{ verdict: string; reason: string }>(
+    `http://127.0.0.1:${m.broker_port}`,
+    "/review",
+    { repo_full_name: m.repo_full_name, candidate_sha: candidateSha, work_item: workItem },
+    { rpc_ms: SURFACE_BUDGETS.review.rpc_ms },
+  );
+  console.log("ISOLATED MERGE REVIEW:", JSON.stringify(review));
+  if (review.verdict !== "APPROVE") {
+    console.log(JSON.stringify({ agent_decision: "WITHHELD", reason: review.reason }));
+    return; // the isolated reviewer did not approve — no AGENT_DECISION is sealed
+  }
+
   const envelope = await c.submitEvidence({
     evidence_kind: "AGENT_DECISION",
     subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id }],
@@ -386,7 +422,7 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<voi
       decision: "APPROVE",
       scope: { effect_id, target_ref: shown.target_ref, material_digest: shown.material_digest },
       presented_request_digest: state.request.request_digest,
-      statement: "approved by the delegated owner-agent after reviewing the exact sealed merge effect",
+      statement: `approved by the delegated owner-agent after an isolated merge review (verification=${verificationConclusion}, review=${reviewVerdict}): ${review.reason.slice(0, 160)}`,
       issued_at: new Date().toISOString(),
     },
     producer_ref: "agent:claude-owner",
