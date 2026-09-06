@@ -238,7 +238,12 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       repo_id: dev.repo_id,
       pr_number: pr.pr_number!,
       expected_head_sha: implemented.candidate_sha,
-      evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id],
+      // The implementer evidence (BACKEND_EXECUTION + WORK_STEP) MUST reach the merge admission:
+      // the policy's 8.4/5.3 independence comparison runs over the implementer set visible in the
+      // input, and an input without it made the comparison vacuous (12th/13th pilots: a
+      // claude-implemented run auto-merged by the claude-product delegate — twice, because only
+      // the rule was fixed the first time, not this assembly).
+      evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id],
       prior_step_envelope_digest: priorStepDigest,
     });
     priorStepDigest = prepared.work_step_envelope_digest;
@@ -248,7 +253,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       const merged = await acts.completeMergeWithHumanDecision({
         effect_id: prepared.effect_id,
         human_evidence_id: humanEvidenceId!,
-        evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id],
+        evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id],
       });
       trace["merge_outcome"] = merged.outcome;
       trace["merge_detail"] = merged.detail;

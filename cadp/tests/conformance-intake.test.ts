@@ -447,7 +447,7 @@ async function evalBoundOp(h: Harness, op: "PR_MERGE" | "POLICY_ACTIVATE", findi
 
 /** Ordinary PR_MERGE clearance evidence (verification + independent review of the exact sha) —
  * independent of ancestry, so a PR_MERGE proof can isolate the ancestry barrier as the cause. */
-function mergeOrdinaryEvidence(h: Harness, sha: string): { verification: EvidenceEnvelopeV1; review: EvidenceEnvelopeV1 } {
+function mergeOrdinaryEvidence(h: Harness, sha: string): { verification: EvidenceEnvelopeV1; review: EvidenceEnvelopeV1; workStep: EvidenceEnvelopeV1 } {
   const completedAt = new Date(h.clock.fn()).toISOString();
   const verification = h.ingress.submitEvidence(
     {
@@ -476,7 +476,25 @@ function mergeOrdinaryEvidence(h: Harness, sha: string): { verification: Evidenc
     },
     PRINCIPALS.reviewer,
   );
-  return { verification, review };
+  // Independence is fail-closed over an EMPTY implementer set (13th-pilot fix): review_ok needs
+  // the run's implementer visible, so ordinary merge clearance includes a WORK_STEP.
+  const workStep = h.ingress.submitEvidence(
+    {
+      evidence_kind: "WORK_STEP",
+      subject_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000s2" },
+        { authority_ref: "cadp-store:k04", namespace: "step-output", object_id: sha },
+      ],
+      availability: "PRESENT",
+      claim_schema: "cadp.work-step.v1",
+      claim: { step_ordinal: 1, summary: "implemented (ordinary merge fixture)" },
+      producer_ref: "workflow:cadp-work",
+      source_ref: `ws-${sha.slice(0, 8)}`,
+      source_relation: "SELF_REPORT",
+    },
+    PRINCIPALS.workflow,
+  );
+  return { verification, review, workStep };
 }
 
 test("S2-1: omitted CONTRACT_* predecessor cannot vanish from ancestry → DENY; presenting it restores the reviewed clearing path", async () => {
@@ -553,14 +571,14 @@ test("S2-4: PR_MERGE / POLICY_ACTIVATE bound to an ancestry-incomplete tip are d
 
     // Isolate causation: with every ordinary PR_MERGE predicate (verification + independent
     // review of the exact merge sha) satisfied, the barrier — not merge_base_ok — is what denies.
-    const { verification, review } = mergeOrdinaryEvidence(h, "h".repeat(40));
-    const mergeOrdinaryOk = await evalBoundOp(h, "PR_MERGE", x, [x, verification, review], { humanApprove: true });
+    const { verification, review, workStep } = mergeOrdinaryEvidence(h, "h".repeat(40));
+    const mergeOrdinaryOk = await evalBoundOp(h, "PR_MERGE", x, [x, verification, review, workStep], { humanApprove: true });
     assert.equal(mergeOrdinaryOk.outcome, "DENY", JSON.stringify(mergeOrdinaryOk));
     assert.ok(mergeOrdinaryOk.reason_codes.includes("contract_barrier_nonindex_denied"), JSON.stringify(mergeOrdinaryOk.reason_codes));
     assert.ok(!mergeOrdinaryOk.reason_codes.includes("verification_missing_or_unbound"), JSON.stringify(mergeOrdinaryOk.reason_codes));
     assert.ok(!mergeOrdinaryOk.reason_codes.includes("review_missing_or_wrong_subject"), JSON.stringify(mergeOrdinaryOk.reason_codes));
     // Positive control: same ordinary predicates plus the complete presented ancestry → ALLOW.
-    const mergeComplete = await evalBoundOp(h, "PR_MERGE", x, [x, c, verification, review], { humanApprove: true });
+    const mergeComplete = await evalBoundOp(h, "PR_MERGE", x, [x, c, verification, review, workStep], { humanApprove: true });
     assert.equal(mergeComplete.outcome, "ALLOW", JSON.stringify(mergeComplete));
   } finally { h.close(); }
 });

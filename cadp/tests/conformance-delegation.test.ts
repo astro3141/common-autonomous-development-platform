@@ -27,7 +27,7 @@ after(() => stopSharedOpa());
 const SHA = "c".repeat(40);
 let step = 500;
 
-function sealMergeBase(h: Harness): { verification: string; review: string } {
+function sealMergeBase(h: Harness): { verification: string; review: string; workStep: string } {
   const completedAt = nowIso(h.clock.fn);
   const verification = h.ingress.submitEvidence(
     {
@@ -56,7 +56,9 @@ function sealMergeBase(h: Harness): { verification: string; review: string } {
     },
     PRINCIPALS.reviewer,
   ).evidence_id;
-  return { verification, review };
+  // Independence is fail-closed over an EMPTY implementer set (13th-pilot fix), so every merge
+  // evaluation needs the run's implementer evidence present.
+  return { verification, review, workStep: sealWorkStep(h) };
 }
 
 function sealOp(h: Harness, operation_kind: "PR_MERGE" | "POLICY_ACTIVATE"): string {
@@ -125,11 +127,11 @@ test("AD1: with delegation, an exactly-scoped AGENT_DECISION satisfies the merge
   try {
     const base = sealMergeBase(h);
     const merge = sealOp(h, "PR_MERGE");
-    const before = await evaluate(h, merge, [base.verification, base.review]);
+    const before = await evaluate(h, merge, [base.verification, base.review, base.workStep]);
     assert.equal(before.outcome, "REQUIRE_EVIDENCE");
     assert.ok(before.reasons.includes("HUMAN_DECISION"));
     const decision = agentApprove(h, merge);
-    const after_ = await evaluate(h, merge, [base.verification, base.review, decision.evidence_id]);
+    const after_ = await evaluate(h, merge, [base.verification, base.review, base.workStep, decision.evidence_id]);
     assert.equal(after_.outcome, "ALLOW", JSON.stringify(after_));
   } finally {
     h.close();
@@ -142,7 +144,7 @@ test("AD2: the reference default delegates nothing — the same envelope satisfi
     const base = sealMergeBase(h);
     const merge = sealOp(h, "PR_MERGE");
     const decision = agentApprove(h, merge);
-    const result = await evaluate(h, merge, [base.verification, base.review, decision.evidence_id]);
+    const result = await evaluate(h, merge, [base.verification, base.review, base.workStep, decision.evidence_id]);
     assert.equal(result.outcome, "REQUIRE_EVIDENCE", "delegation is opt-in; an unlisted producer clears nothing");
     assert.ok(result.reasons.includes("HUMAN_DECISION"));
   } finally {
@@ -170,11 +172,11 @@ test("AD4: exact scope — an agent decision for X never clears Y; human approva
     const mergeX = sealOp(h, "PR_MERGE");
     const mergeY = sealOp(h, "PR_MERGE");
     const decisionX = agentApprove(h, mergeX);
-    const crossed = await evaluate(h, mergeY, [base.verification, base.review, decisionX.evidence_id]);
+    const crossed = await evaluate(h, mergeY, [base.verification, base.review, base.workStep, decisionX.evidence_id]);
     assert.equal(crossed.outcome, "REQUIRE_EVIDENCE", "X-scoped agent decision does not clear Y");
 
     const human = h.humanApprove(mergeY);
-    const humanCleared = await evaluate(h, mergeY, [base.verification, base.review, human.evidence_id]);
+    const humanCleared = await evaluate(h, mergeY, [base.verification, base.review, base.workStep, human.evidence_id]);
     assert.equal(humanCleared.outcome, "ALLOW", "human_ok is unchanged by the delegation machinery");
   } finally {
     h.close();
