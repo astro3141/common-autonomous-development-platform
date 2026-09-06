@@ -790,7 +790,7 @@ export function imageIdentity(image: string): { image: string; image_digest: str
   const image_digest = docker(["image", "inspect", image, "--format", "{{.Id}}"]);
   const versions = docker([
     "run", "--rm", "--network", "none", image,
-    "sh", "-c", "printf 'codex-cli=%s\\nclaude=%s\\n' \"$(codex --version)\" \"$(claude --version)\"",
+    "sh", "-c", "printf 'codex-cli=%s\\nclaude=%s\\ngrok=%s\\n' \"$(codex --version)\" \"$(claude --version)\" \"$(grok --version 2>/dev/null || echo absent)\"",
   ]);
   const tool_versions: Record<string, string> = {};
   for (const line of versions.split("\n")) {

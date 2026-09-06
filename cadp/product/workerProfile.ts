@@ -22,7 +22,8 @@ export type { WorkerProvider } from "./workerProviders.ts";
 
 // Inside the isolation container the container itself is the sandbox boundary, so codex runs
 // with container-native full access (nesting bubblewrap adds no security and stalls startup).
-export const WORKER_ARGV_PREFIX: readonly string[] = WORKER_PROVIDERS.codex.argv_prefix;
+// Kept for back-compat; the codex argv now lives in the provider registry's argv_template.
+export const WORKER_ARGV_PREFIX: readonly string[] = WORKER_PROVIDERS.codex.argv_template;
 
 /** Relative paths copied from the host `~/.codex` into the worker sandbox — auth only. */
 export const WORKER_AUTH_FILES: readonly string[] = WORKER_PROVIDERS.codex.auth_files;
@@ -57,7 +58,7 @@ export function workerProfileDigest(sandbox?: WorkerSandbox, provider: WorkerPro
   return jcsDigest({
     schema: "cadp.worker-profile.v1",
     product: `${provider}-cli`,
-    argv_prefix: [...profile.argv_prefix],
+    argv_template: [...profile.argv_template],
     auth_files: sandbox === undefined ? [...profile.auth_files] : [...sandbox.copied],
     home: "fresh-per-invocation",
   }).value;

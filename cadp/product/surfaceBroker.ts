@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { buildWorkerSandbox } from "./workerProfile.ts";
-import { resolveWorkerProvider, WORKER_PROVIDERS } from "./workerProviders.ts";
+import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
@@ -131,9 +131,7 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       authSubdir: profile.auth_subdir,
       authFiles: profile.auth_files,
       sessionsDir,
-      argv: provider === "codex"
-        ? [provider, ...profile.argv_prefix, "-C", "/ws", body.work_item]
-        : [provider, ...profile.argv_prefix, body.work_item],
+      argv: workerArgv(provider, body.work_item),
       timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });
     // Opt-in worker session preservation for debugging (default OFF so runs don't accumulate).
@@ -178,18 +176,21 @@ function preserveWorkerSession(sessionsDir: string, run: { status: number | null
   } catch { /* debugging aid must never break a run */ }
 }
 
-/** #91 method: scan the worker's OWN provider session log; PRESENT facts carry a locator. */
+/**
+ * #91 method: scan the worker's OWN provider session log for the observed model; PRESENT facts
+ * carry a locator. A provider WITHOUT a measured `model_scan` returns UNKNOWN (no guessed value) —
+ * requested != observed honesty. The session field pattern is a literal-prefix search; the group
+ * capture that follows is provider-independent (`"model":"..."`).
+ */
 export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, stdout: string): { model?: string; locator?: string } {
+  const spec = WORKER_PROVIDERS[provider].model_scan;
+  if (spec === undefined) return {}; // format not measured for this provider → UNKNOWN
   let model: string | undefined;
   let locator: string | undefined;
+  const sessionRe = new RegExp(spec.session_regex, "u");
   const scan = (file: string): void => {
     const content = readFileSync(file, "utf8");
-    const patterns: Record<WorkerProvider, RegExp> = {
-      codex: /"model"\s*:\s*"/u,
-      grok: /"model"\s*:\s*"/u,
-      gemini: /"model"\s*:\s*"/u,
-    };
-    const idx = content.search(patterns[provider]);
+    const idx = content.search(sessionRe);
     if (idx >= 0) {
       const m = /"model"\s*:\s*"([^"]+)"/u.exec(content.slice(idx, idx + 200));
       if (m !== null) { model = m[1]; locator = `${file}#offset=${idx}`; }
@@ -206,13 +207,8 @@ export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, 
     if (existsSync(sessionsDir)) walk(sessionsDir);
   } catch { /* absent facts stay UNKNOWN */ }
   if (model === undefined) {
-    const stdoutPatterns: Record<WorkerProvider, RegExp> = {
-      codex: /model:\s*(\S+)/u,
-      grok: /model:\s*(\S+)/u,
-      gemini: /model:\s*(\S+)/u,
-    };
-    const m = stdoutPatterns[provider].exec(stdout);
-    if (m !== null) { model = m[1]; locator = provider === "codex" ? "worker-stdout#pattern=model:" : `${provider}-worker-stdout#pattern=model:`; }
+    const m = new RegExp(spec.stdout_regex, "u").exec(stdout);
+    if (m !== null) { model = m[1]; locator = `${provider}-worker-stdout#pattern=${spec.stdout_regex}`; }
   }
   return { model, locator };
 }

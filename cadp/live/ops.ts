@@ -21,6 +21,7 @@ import { imageIdentity } from "../product/isolation.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { parseWorkProposal } from "../product/planner.ts";
+import { resolveWorkerProvider } from "../product/workerProviders.ts";
 import type { WorkProposalV1 } from "../product/planner.ts";
 import { devEffectFloorViolation } from "../product/workBounds.ts";
 import { classifyRun, nextAction } from "../product/driver.ts";
@@ -110,6 +111,9 @@ export async function startWork(
     const floor = devEffectFloorViolation(boundArg(extra[2], 6));
     if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
   }
+  // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
+  // an unknown provider at entry, before anything is sealed.
+  const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
   const args =
     vertical === "development"
       ? {
@@ -121,7 +125,7 @@ export async function startWork(
             base_ref: "refs/heads/main",
             base_sha: m.base_sha,
             work_item: extra[0]!,
-            worker_product: "codex",
+            worker_product: workerProduct,
             require_human_merge: true,
           },
         }
@@ -170,7 +174,7 @@ export async function startWork(
     work_bindings: [
       { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
       // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
-      ...(vertical === "development" && extra[3] !== undefined
+      ...(vertical === "development" && extra[3] !== undefined && extra[3] !== ""
         ? [{ authority_ref: "cadp-store:k04", namespace: "work-proposal", object_id: extra[3] }]
         : []),
     ],
