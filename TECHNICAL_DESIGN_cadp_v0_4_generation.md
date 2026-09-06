@@ -1056,3 +1056,121 @@ Two independent opt-ins; neither is on by default.
 2. **Policy param.** `require_external_verification` in `data.policy_params`. Default `false` keeps PR/MERGE gates byte-identical. When `true`, those gates additionally require a `PRESENT` `VERIFICATION` from `verifier:github-actions` bound to the exact candidate sha with `claim.conclusion == "success"` and `source_authoritative`. Unmet is reason code `external_verification_missing` — `DENY`. A completed failure is `PRESENT` and still does not satisfy `conclusion == "success"`, so it never clears the gate.
 
 `.github/` is a gate path (`cadp/product/gateFiles.ts`): the workflow defines what the external verifier actually runs, so a delegated merge must not auto-merge an edit to it.
+
+---
+
+## 19. Surface execution observability: observed model and reasoning effort for every model surface
+
+Product-layer design for two follow-ups that are **not implemented here** and authorize no production change: (1) record observed execution facts (model, and the rest of `cadp.backend.v1` `observed.*`) for every model surface — WORKER, REVIEWER, PLANNER — not only the implementer; (2) bind requested and observed reasoning effort per surface. Implementation follows this design. An argv or log format that has not been probed live in the isolated surface is marked **requires a container probe before the registry entry is added**, never asserted. Guessing is the defect §17.2 exists to prevent.
+
+This is not a kernel primitive. It does not add a K1–K7 record, does not change `identity_class` derivation (§9.1 / S2), and does not change the §8.4 independence predicate's inputs other than requiring that predicate to stay honest once more than one surface emits `BACKEND_EXECUTION`.
+
+### 19.1 Current state
+
+Only the WORKER surface records observed execution facts today.
+
+**WORKER.** `brokerImplement` (`cadp/product/surfaceBroker.ts`) creates a fresh host directory, passes it to `runWorker` as `sessionsDir`, and mounts it writable at `/root/<auth_subdir>/<sessions_container_dir>` (`cadp/product/isolation.ts`). After the container exits, `scanBackendModel` walks that tree (and falls back to stdout) using `WORKER_PROVIDERS[p].model_scan`. `implementCandidate` then submits `BACKEND_EXECUTION` as `backend-scan:<provider>` (`cadp/product/activities.ts` `submitBackendExecution`):
+
+- `claim_schema` `cadp.backend.v1`; `source_relation` `SELF_REPORT` (U1: backends do not sign).
+- `subject_bindings` = `work_run` + `step`. There is no surface-role binding.
+- `observed.model` is `PRESENT` with a locator when the scan hits, else `UNKNOWN`. Requested is a separate sub-object (`requested.model` is the broker placeholder `` `${provider} default` ``) and is never consulted to fill observed (C13 / #91 T5).
+- `observed.effort` is hardcoded `{ availability: "UNKNOWN" }` for every provider. There is no `effort_scan` field and no effort capture in `scanBackendModel`.
+- `observed.run_id` and `observed.version` are likewise `UNKNOWN`. `observed.provider` is `PRESENT` with locator `broker-response#backend_provider` (the broker's selection, not a session-log fact).
+
+`model_scan` is measured only for the **worker** argv of each provider (§17.2): codex `"model"` in `rollout-*.jsonl`; grok `"model_id"` in `chat_history.jsonl` (2026-09-06 container probe, grok 1.0.13) with stdout `modelUsage` fallback; claude `"model"` in `~/.claude/projects/<slug>/<uuid>.jsonl`. Those measurements do not license a reviewer or planner registry entry.
+
+**REVIEW.** `reviewCandidate` submits `REVIEW` as `reviewer:claude-code` / `reviewer:grok` / `reviewer:codex` with `cadp.review.v1` `{ verdict, body_digest, reviewer_run_id }`. The chosen product is the kernel-stamped `producer_ref` (identity_class derived from the active `identity_registry`, never from the claim). The claim carries no observed model and no effort. `brokerReview` calls `runReviewer` with `{ workspace, auth, argv }` only.
+
+**WORK_PROPOSAL.** `sealPlan` (`cadp/live/ops.ts`) submits `WORK_PROPOSAL` as `planner:claude-code` / `planner:grok` / `planner:codex` with `cadp.work-proposal.v1` `{ schema, items, notes?, intent, stdout_digest }`. Same attribution-via-`producer_ref`, no observed model, no effort. `brokerPlan` also calls `runReviewer` — the planner is a reviewer-class container — with no session directory.
+
+**No session mount on read-only surfaces.** `runReviewer` mounts the workspace `:ro`, injects one provider's auth, and places the container on the internal network with the provider-only proxy. It has no `sessionsDir` parameter and emits no session mount. `runWorker`'s optional writable sessions bind is the only such construction. After a reviewer or planner run there is therefore nothing on the host to scan: the CLI's session tree, if it wrote one, lived in the container overlay and vanished with `--rm`.
+
+**Adapter registry (current).** `backend-scan:*` may submit `BACKEND_EXECUTION`; `reviewer:*` may submit `REVIEW`; `planner:*` may submit `WORK_PROPOSAL`. A reviewer or planner principal cannot seal `BACKEND_EXECUTION`; a backend-scan principal cannot seal `REVIEW` / `WORK_PROPOSAL`.
+
+**Policy (current).** `implementer_refs` includes every `BACKEND_EXECUTION` `producer_ref` (and every `WORK_STEP` producer). `backend_model_present` / `backend_effort_present` quantify over any `BACKEND_EXECUTION` with the corresponding `observed.*.availability == "PRESENT"`. `require_backend_effort` (default `false`) gates `PR_CREATE` via `effort_requirement_met`; unmet is `required_fact_unknown` (C14). Because every provider's `observed.effort` is `UNKNOWN`, turning the param on today denies every `PR_CREATE`. `PR_CREATE` / `PR_MERGE` `evidence_refs` carry the implementer's `BACKEND_EXECUTION` and the `REVIEW` envelope, not a reviewer or planner execution envelope (`cadp/product/workflows.ts`).
+
+### 19.2 Design decision — evidence shape
+
+Two options.
+
+**(a) Reuse `BACKEND_EXECUTION` with a role binding per surface run.** Each model-surface invocation that should be observed submits a `cadp.backend.v1` envelope through the existing `backend-scan:<provider>` principal, with one additional subject binding:
+
+```text
+{ authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" | "REVIEWER" | "PLANNER" }
+```
+
+The claim stays the scan payload (`requested` / `observed`). Ingress locator rules (C13) apply unchanged. Worker envelopes add `surface-role = WORKER` (today they have none). Reviewer envelopes bind `work_run` + `step` (the review step) + `surface-role = REVIEWER`, plus the candidate sha already bound on the sibling `REVIEW`. Planner envelopes bind the same `work-intent` + `repo-base` as the sibling `WORK_PROPOSAL` + `surface-role = PLANNER` (there is no work run yet).
+
+**(b) Embed an `observed` sub-object into the `REVIEW` / `WORK_PROPOSAL` claims.** `cadp.review.v1` and `cadp.work-proposal.v1` would grow `{ observed: { model, effort, … } }` (and likely `requested`) beside the verdict / proposal.
+
+**Recommendation: (a).** Grounded in the vocabulary the kernel and the policy already speak.
+
+1. **K2 claim is source-native and Ingress-untouched (§9.1).** `cadp.review.v1` is the verdict; `cadp.work-proposal.v1` is a closed proposal schema (`parseWorkProposal` rejects unknown keys). Session-scan facts are a different source. Mixing them into those claims makes the claim no longer the adapter's native payload. `cadp.backend.v1` already exists for that payload.
+2. **Adapter registry is exact `producer_ref` → kinds (§5.4 / §9.1).** The worker path already separates producers: `WORK_STEP` is `workflow:cadp-work`; `BACKEND_EXECUTION` is `backend-scan:<provider>`. The broker scans; the activity host submits with the scan token. REVIEW / WORK_PROPOSAL are submitted as `reviewer:*` / `planner:*`. Putting observed facts inside those envelopes would have the reviewer/planner principal attest to a scan it did not perform, or would force those principals onto `BACKEND_EXECUTION` in the registry — either way a producer/kind confusion the registry exists to prevent. Reuse keeps `backend-scan:* → BACKEND_EXECUTION` as the sole execution-observation producer class; no new registry producers.
+3. **Requested ≠ observed is already mechanical on this kind (§9.2, C13).** Ingress `assertBackendObservedLocators` is kind-specific to `BACKEND_EXECUTION`. Option (b) either duplicates that rule onto two more kinds or leaves `PRESENT`-without-locator possible on REVIEW / WORK_PROPOSAL — the #91 T5 harm. One kind, one rule.
+4. **Policy already consumes `BACKEND_EXECUTION` for model, effort, and implementer identity.** `implementer_refs`, `backend_model_present`, `backend_effort_present`, and C14 are written against this kind. Extending them with a `surface-role` predicate is a smaller, closed change than teaching `review_ok` (and any future planner check) to parse a nested backend object out of a verdict or a proposal.
+
+**Load-bearing companion (without it (a) is a regression).** Today's predicates quantify over *any* `BACKEND_EXECUTION`. A REVIEWER envelope from `backend-scan:grok` (product `grok`) entering `implementer_refs` would make `independent_product` fail a grok review of a non-grok implementation, and could make `backend_model_present` succeed on a reviewer scan while the worker model is `UNKNOWN`. Once a second role emits this kind, every existing quantifier is role-qualified: `implementer_refs`, `backend_model_present`, and `backend_effort_present` match only `surface-role = WORKER`. Ingress, at the same landing, requires exactly one `surface-role` binding from the closed set on every `PRESENT` `BACKEND_EXECUTION`, so a role-less draft cannot satisfy a leftover unqualified rule.
+
+Option (b) is rejected. It is not a kernel-vocabulary fit and it splits the honesty rule.
+
+### 19.3 Design decision — capture mechanics for read-only surfaces
+
+The reviewer/planner containers are read-only toward the **workspace**. They can be given a writable **session** mount exactly like `runWorker`'s `sessionsDir` without widening what the surface can reach.
+
+**Minimal `isolation.ts` change.** `runReviewer` gains the same optional triple `runWorker` already has: `sessionsDir`, `sessionsContainerDir`, and `authSubdir` (required for the container path when auth is `oauth_env` and so does not carry `auth_subdir`). When `sessionsDir` is set, append the identical bind:
+
+```text
+-v ${sessionsDir}:/root/${authSubdir}/${sessionsContainerDir ?? "sessions"}
+```
+
+No `:ro` on that bind — the CLI has to write the log. The workspace bind stays `-v ${workspace}:/ws:ro`. Network, proxy, auth injection (`reviewerAuthArgs`), argv, and `--init --rm` are unchanged. `brokerPlan` already calls `runReviewer`; one mount construction covers both read-only surfaces. `runVerifier` is out of scope (no model CLI).
+
+**Why this does not widen the surface's reach.** The session directory is a fresh, empty, broker-owned per-run path — the same object `brokerImplement` already creates — not a path into host `HOME`, the PEP secret dir, or another workspace. The container's extra write is only into that directory, so the host can scan the CLI's own session files after exit. `/ws` remains read-only; auth files remain `:ro`; the egress allowlist and the measured read-only argv (plan-mode / `--tools` allow-list / `--sandbox read-only`, §17.2) are untouched. The broker deletes the directory in `finally`, so nothing persists into a later run. A writable log directory is not a write to the candidate, not a credential, and not a governed target. CREDENTIAL_REACH_ATTESTATION continues to measure the same profile minus this log bind; the bind does not add a route.
+
+**Broker / scan.** `brokerReview` and `brokerPlan` create the directory, pass it through, and after exit run the same scan function generalized over the **profile's** `model_scan` (not hardcoded `WORKER_PROVIDERS`). Absent `model_scan` ⇒ no model, no locator ⇒ `observed.model = UNKNOWN`. Worker `model_scan` regexes are **not** copied onto reviewer/planner profiles because they were measured under different argv (grok worker: `streaming-json` + `bypassPermissions`; grok reviewer/planner: `--permission-mode plan` + `--tools` allow-list + `--json-schema` on the reviewer). Same binary, different invocation: **requires a container probe before the registry entry is added** for that surface's `sessions_subdir` / `sessions_container_dir` / `model_scan`. Claude reviewer/planner session layout is likewise unmeasured on those argv (worker claude was measured at `~/.claude/projects`).
+
+Stdout remains a fallback only when that surface's `stdout_regex` has been measured. A worker stdout pattern is not a reviewer stdout pattern.
+
+### 19.4 Reasoning-effort binding
+
+Two independent facts, same requested ≠ observed split as model.
+
+**Requested (orchestrator → argv).** Each provider profile (worker, review, plan) may carry a per-role `requested_effort` together with a measured `effort_argv` expansion (flag token + how the value is placed). The resolver fails closed if one is present without the other. Expansion inserts the measured flag and the requested value into that surface's argv **only** where a live container probe has measured that the flag is accepted on that surface's isolated argv. Values the probe did not list are refused. If `effort_argv` is absent, argv is byte-identical to today and the claim's `requested` object carries no effort field — we do not record a CLI request we did not send. `requested` is never consulted to fill `observed`.
+
+**Candidates (host CLI help is not a container probe).** Recorded here so a later probe has a starting pointer; **requires a container probe before the registry entry is added** for every row.
+
+| Provider | Host CLI help (this workspace; not a surface probe) | In any current `argv_template`? | Registry action until probed |
+|---|---|---|---|
+| grok 1.0.13 | `--reasoning-effort <EFFORT>` (alias `--effort`), help text "Reasoning effort for reasoning models"; allowed values **not listed** | no | do not add |
+| claude 2.1.221 | `--effort <level>` with help listing `low, medium, high, xhigh, max` | no | do not add |
+| codex-cli 0.151.0 | no effort flag in `codex --help` or `codex exec --help` | no | do not invent a flag |
+
+Grok 1.0.13 is the same version whose container probes measured worker `model_scan` and reviewer/planner read-only argv (§17.2). That still does not measure that `--reasoning-effort` is accepted inside those argv, that it changes the session, what values it takes, or that the applied value is written to a scannable log. Claude's help line is the same class of candidate, not a probe. Codex has no candidate flag on this host.
+
+**Observed (session / stdout scan).** `observed.effort` stays `{ availability: "UNKNOWN" }` for every provider and every role until an `effort_scan` (same shape as `model_scan`: one capture group each for session and stdout) is measured **on that surface**. A present requested value, a help-text flag, or a sibling provider's log field is not a locator. `scanBackendModel` (generalized) returns no effort until that field exists; `submitBackendExecution` continues to record `UNKNOWN` rather than copy `requested`. Locator replay (C13) applies the moment a `PRESENT` effort is claimed.
+
+No profile in this generation carries `requested_effort`, `effort_argv`, or `effort_scan`.
+
+### 19.5 Policy consequences
+
+`require_backend_effort` today means: `PR_CREATE` sees some `BACKEND_EXECUTION` whose `observed.effort.availability == "PRESENT"` (`effort_requirement_met`); default `false` keeps the gate byte-identical; `UNKNOWN` denies with `required_fact_unknown` (C14). It does not apply to `PR_MERGE` or `WORK_START`.
+
+Once more than one surface emits `BACKEND_EXECUTION`, an unqualified `some e` would change meaning: a reviewer `PRESENT` effort could clear a worker-unknown run, and a reviewer `UNKNOWN` could fail a worker-present run if the quantifier were flipped to `every e`. Neither is the current gate.
+
+**Decision.** `require_backend_effort` continues to mean the **implementing WORKER** surface: a `PRESENT` `BACKEND_EXECUTION` with `surface-role = WORKER` and `observed.effort.availability == "PRESENT"`. That is what C14 and `PR_CREATE` already gate in substance (only the worker emits the kind today). Default remains `false`. `UNKNOWN` never satisfies. Requested effort never satisfies.
+
+Additional roles, if a deployment wants them, get their own opt-in params (`require_review_effort`, `require_plan_effort`), default `false`, same `PRESENT` / fail-closed / `required_fact_unknown` shape, matching `require_external_verification` (§18.4): new facts stay off until explicitly armed. Planner envelopes are not added to `WORK_START` / `PR_CREATE` / `PR_MERGE` `evidence_refs` unless such a param is on — `WORK_PROPOSAL` confers no authority and this design does not silently start gating on a plan-time scan. Reviewer execution envelopes **are** added to the PR/MERGE `evidence_refs` (alongside the existing implementer `BACKEND_EXECUTION` and the `REVIEW`) so the observation is visible; role qualification keeps `implementer_refs` / `backend_model_present` / `require_backend_effort` worker-only, so the gates stay byte-identical while those params remain default-off.
+
+All new observed facts are opt-in in the registry (field absent ⇒ scan returns nothing ⇒ `UNKNOWN`) and fail-closed in policy (`UNKNOWN` is not a pass). No code path copies requested into observed. No code path invents an effort value from help text.
+
+### 19.6 Implementation plan
+
+Independently reviewable items, in this order. Later items may depend on earlier ones; an earlier item must not change gate meaning by itself. None of them is done by this section.
+
+1. **Registry field additions.** On `REVIEW_PROVIDERS` and `PLAN_PROVIDERS`: optional `sessions_subdir`, `sessions_container_dir`, `model_scan` — present only after a live container probe of **that** surface's argv. On all three registries: optional paired `requested_effort` + `effort_argv`, and optional `effort_scan`, under the same probe rule. Worker `model_scan` entries stay as they are; they are not copied. A profile missing a field behaves as today.
+2. **Isolation session mount.** `runReviewer` optional sessions bind as §19.3. Conformance: workspace remains `:ro`; the session path is the only extra writable bind; omitted `sessionsDir` keeps today's argv. No change to `runVerifier`.
+3. **Broker + activity submission.** `brokerReview` / `brokerPlan` create a per-run sessions dir, pass it, scan after exit, return `{ backend_model?, backend_locator? }` (and later effort, when scanned). Generalize `scanBackendModel` over the profile's scan fields. `submitBackendExecution` grows a `surface-role` argument and always binds it; worker calls pass `WORKER`. `reviewCandidate` submits a sibling `BACKEND_EXECUTION` as `backend-scan:<provider>` with `REVIEWER`. `sealPlan` submits a sibling `BACKEND_EXECUTION` as `backend-scan:<provider>` with `PLANNER` (needs the scan token; the planner token stays `WORK_PROPOSAL`-only). These sibling envelopes are sealed for the record; they are **not** added to PR/MERGE `evidence_refs` in this item — that wait is what keeps `implementer_refs` byte-identical until item 4. Adapter registry: no new producers.
+4. **Policy adapter entries.** Role-qualify `implementer_refs`, `backend_model_present`, and `backend_effort_present` to `surface-role = WORKER`. Keep `require_backend_effort` worker-scoped, default `false`. Ingress: `PRESENT` `BACKEND_EXECUTION` requires exactly one closed-set `surface-role` binding. Same landing: add the reviewer execution envelope to PR/MERGE `evidence_refs` (planner envelopes stay out unless a planner requirement is armed). Add `require_review_effort` / `require_plan_effort` default `false` only if a deployment needs them in that landing; otherwise leave the params unintroduced until a consumer exists.
+5. **Conformance.** C13 still rejects `PRESENT` without locator, including on reviewer/planner execution envelopes. C14 still denies worker `observed.effort = UNKNOWN` when `require_backend_effort` is true. New controls, independently: (i) a REVIEWER `BACKEND_EXECUTION` from `backend-scan:<review-product>` does not enter `implementer_refs` and does not break a legal independent review; (ii) a REVIEWER `PRESENT` model does not satisfy `backend_model_present` when the WORKER model is `UNKNOWN`; (iii) unmeasured `model_scan` / `effort_scan` yields `UNKNOWN`, never a guessed value; (iv) `effort_argv` absent ⇒ argv byte-identical to the pre-change template; (v) reviewer/planner session mount does not make `/ws` writable and does not mount host `HOME`; (vi) a `PRESENT` `BACKEND_EXECUTION` without `surface-role` is refused at Ingress.
+
