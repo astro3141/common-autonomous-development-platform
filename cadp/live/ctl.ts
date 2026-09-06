@@ -110,6 +110,7 @@ function startComponent(name: string): void {
         CADP_VERIFIER_TOKEN: m.tokens["cadp-verifier"]!,
         CADP_REVIEWER_TOKEN: m.tokens["cadp-reviewer-claude"]!,
         CADP_BACKEND_SCAN_TOKEN: m.tokens["cadp-backend-scan"]!,
+        CADP_BACKEND_SCAN_TOKEN_GROK: m.tokens["cadp-backend-scan-grok"]!,
         CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
         CADP_TEMPORAL_NAMESPACE: "cadp-v04",
         CADP_TASK_QUEUE: "cadp-worker",

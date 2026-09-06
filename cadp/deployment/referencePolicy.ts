@@ -1287,6 +1287,7 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   { principal: "cadp-workflow", producer_ref: "workflow:cadp-work", identity_class: { vendor: "temporalio", product: "temporal-workflow", account: "cadp-v04", process_class: "workflow" } },
   { principal: "cadp-worker-codex", producer_ref: "worker:codex-cli", identity_class: { vendor: "openai", product: "codex-cli", account: "cadp-v04", process_class: "worker" } },
   { principal: "cadp-backend-scan", producer_ref: "backend-scan:codex", identity_class: { vendor: "openai", product: "codex-cli", account: "cadp-v04", process_class: "evidence-adapter" } },
+  { principal: "cadp-backend-scan-grok", producer_ref: "backend-scan:grok", identity_class: { vendor: "xai", product: "grok", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "cadp-reviewer-claude", producer_ref: "reviewer:claude-code", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "worker" } },
   { principal: "cadp-verifier", producer_ref: "verifier:harness", identity_class: { vendor: "cadp", product: "node-test-harness", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "sso:a.t.laplace@gmail.com", producer_ref: "human:astro3141", identity_class: { vendor: "github", product: "human", account: "astro3141", process_class: "human-surface" } },
@@ -1313,6 +1314,7 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
 export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "workflow:cadp-work", evidence_kinds: ["WORK_STEP", "WORK_BOUND_STOP"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "backend-scan:codex", evidence_kinds: ["BACKEND_EXECUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
+  { producer_ref: "backend-scan:grok", evidence_kinds: ["BACKEND_EXECUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "verifier:harness", evidence_kinds: ["VERIFICATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "SOURCE", claim_pointer: "/completed_at" } },
   { producer_ref: "reviewer:claude-code", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "human:astro3141", evidence_kinds: ["HUMAN_DECISION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
