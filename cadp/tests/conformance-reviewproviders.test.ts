@@ -9,6 +9,7 @@ import { brokerReview } from "../product/surfaceBroker.ts";
 import { reviewerAuthArgs } from "../product/isolation.ts";
 import {
   assertReviewIndependence,
+  parseReviewVerdict,
   DEFAULT_REVIEW_PROVIDER,
   DIFF_PROMPT_SENTINEL,
   REVIEW_PROVIDERS,
@@ -120,6 +121,8 @@ test("grok reviewer carries the MEASURED read-only argv (allow-list is the bound
     "--disable-web-search",
     "--tools",
     "read_file,list_dir,grep",
+    "--json-schema",
+    '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","REQUEST_CHANGES"]},"reason":{"type":"string"}},"required":["verdict","reason"]}',
   ]);
   const argv = REVIEW_PROVIDERS.grok.argv_template;
   assert.ok(!argv.includes("bypassPermissions"), "the reviewer must NEVER carry the worker's edit-approval bypass");
@@ -149,4 +152,41 @@ test("reviewer auth arg-builder: oauth_env injects exactly one env var; auth_fil
     reviewerAuthArgs({ kind: "auth_files", auth_subdir: ".grok", authDir: "/base/surface-auth", auth_files: ["auth.json"] }),
     ["-v", "/base/surface-auth/auth.json:/root/.grok/auth.json:ro"],
   );
+});
+
+// -------------------------------------------------- verdict contracts (9th pilot measurement)
+
+test("claude verdict contract: first line, reason next — byte-identical to the pre-registry parse", () => {
+  assert.deepEqual(parseReviewVerdict("claude", "APPROVE\nlooks correct\n"), { verdict: "APPROVE", reason: "looks correct" });
+  assert.deepEqual(parseReviewVerdict("claude", "REQUEST_CHANGES\nmissing test\n"), { verdict: "REQUEST_CHANGES", reason: "missing test" });
+  // Unparseable output fails closed.
+  assert.equal(parseReviewVerdict("claude", "narration without any verdict").verdict, "REQUEST_CHANGES");
+});
+
+test("grok verdict contract: the LAST schema object in the measured {text} wrapper is final", () => {
+  // Measured fixture shape (json-schema probe): narration turns are coerced into the schema too;
+  // only the final object is the verdict.
+  const wrapper = JSON.stringify({
+    text:
+      '{ "verdict": "REQUEST_CHANGES", "reason": "still locating the diff" }' +
+      '{ "verdict": "REQUEST_CHANGES", "reason": "reading the file" }' +
+      '{"verdict":"APPROVE","reason":"the JSDoc matches the stated constraints"}',
+  });
+  assert.deepEqual(parseReviewVerdict("grok", wrapper), { verdict: "APPROVE", reason: "the JSDoc matches the stated constraints" });
+});
+
+test("grok verdict contract fails closed on shapes outside the measured contract", () => {
+  assert.equal(parseReviewVerdict("grok", "not json at all APPROVE").verdict, "REQUEST_CHANGES");
+  assert.equal(parseReviewVerdict("grok", JSON.stringify({ text: "prose with no schema object" })).verdict, "REQUEST_CHANGES");
+  // The 9th-pilot failure shape (plain-output glue) must NOT parse as an approval.
+  assert.equal(parseReviewVerdict("grok", "I'll inspect the committed JSDoc against the stated constraints and the surrounding file.APPROVE").verdict, "REQUEST_CHANGES");
+});
+
+test("grok reviewer argv now carries the verdict json-schema constraint", () => {
+  const argv = REVIEW_PROVIDERS.grok.argv_template;
+  const i = argv.indexOf("--json-schema");
+  assert.ok(i >= 0 && typeof argv[i + 1] === "string");
+  const schema = JSON.parse(argv[i + 1]!) as { properties: { verdict: { enum: string[] } }; required: string[] };
+  assert.deepEqual(schema.properties.verdict.enum, ["APPROVE", "REQUEST_CHANGES"]);
+  assert.deepEqual(schema.required, ["verdict", "reason"]);
 });

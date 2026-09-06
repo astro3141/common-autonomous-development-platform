@@ -28,7 +28,7 @@ import { createHash } from "node:crypto";
 import { buildWorkerSandbox } from "./workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
-import { DEFAULT_REVIEW_PROVIDER, REVIEW_PROVIDERS, resolveReviewProvider, reviewArgv } from "./reviewProviders.ts";
+import { DEFAULT_REVIEW_PROVIDER, parseReviewVerdict, REVIEW_PROVIDERS, resolveReviewProvider, reviewArgv } from "./reviewProviders.ts";
 import type { ReviewProviderProfile } from "./reviewProviders.ts";
 import { DEFAULT_PLAN_PROVIDER, PLAN_PROVIDERS, resolvePlanProvider, planArgv } from "./planProviders.ts";
 import type { PlanProviderProfile } from "./planProviders.ts";
@@ -378,10 +378,9 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     if (review.status !== 0 || review.stdout.trim().length === 0) {
       throw new Error(`reviewer surface failed — ${surfaceFailure("reviewer", review)}`);
     }
-    const lines = review.stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
-    const verdict = verdictLine.startsWith("APPROVE") ? "APPROVE" : "REQUEST_CHANGES";
-    const reason = lines[lines.indexOf(verdictLine) + 1] ?? review.stdout.trim().slice(0, 200);
+    // Verdict extraction follows the provider's MEASURED output contract (9th pilot: grok's plain
+    // output glues narration to the verdict, so it runs under --json-schema instead).
+    const { verdict, reason } = parseReviewVerdict(provider, review.stdout);
     return { verdict, reason, stdout: review.stdout };
   } finally {
     rmSync(base, { recursive: true, force: true });
