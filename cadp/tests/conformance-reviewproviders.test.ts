@@ -6,7 +6,9 @@ import { join } from "node:path";
 
 import { REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
 import { brokerReview } from "../product/surfaceBroker.ts";
+import { reviewerAuthArgs } from "../product/isolation.ts";
 import {
+  assertReviewIndependence,
   DEFAULT_REVIEW_PROVIDER,
   DIFF_PROMPT_SENTINEL,
   REVIEW_PROVIDERS,
@@ -102,4 +104,49 @@ test("/review rejects an unknown provider before creating its workspace", async 
     else process.env["TMPDIR"] = oldTmp;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------- grok reviewer (#149, measured)
+
+test("grok reviewer carries the MEASURED read-only argv (allow-list is the boundary, not plan mode)", () => {
+  // Probes (2026-09-06, grok 1.0.13): plan mode blocks `write` but NOT `run_terminal_command`;
+  // the `--tools read_file,list_dir,grep` allow-list held against a direct terminal attempt.
+  assert.deepEqual(reviewArgv("grok", "PROMPT"), [
+    "grok",
+    "-p",
+    "PROMPT",
+    "--permission-mode",
+    "plan",
+    "--disable-web-search",
+    "--tools",
+    "read_file,list_dir,grep",
+  ]);
+  const argv = REVIEW_PROVIDERS.grok.argv_template;
+  assert.ok(!argv.includes("bypassPermissions"), "the reviewer must NEVER carry the worker's edit-approval bypass");
+  assert.ok(argv.includes("--tools"), "the enforced read-only boundary is the tool allow-list");
+});
+
+test("grok reviewer authenticates via its own auth files, never the claude token", () => {
+  assert.deepEqual(REVIEW_PROVIDERS.grok.auth_method, { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] });
+});
+
+test("grok reviewer identity product matches the policy registry and the grok WORKER product", () => {
+  const entry = REFERENCE_IDENTITIES.find((i) => i.producer_ref === "reviewer:grok");
+  assert.ok(entry !== undefined, "reviewer:grok is registered in the policy identity registry");
+  assert.equal(entry.identity_class.product, REVIEW_PROVIDERS.grok.identity_class_product);
+});
+
+test("§8.4 independence guard refuses a same-product reviewer at entry", () => {
+  assert.throws(() => assertReviewIndependence("grok", "grok"), /reviewer independence/u, "grok cannot review a grok-implemented run");
+  assert.doesNotThrow(() => assertReviewIndependence("codex-cli", "grok"), "grok may review a codex-implemented run");
+  assert.doesNotThrow(() => assertReviewIndependence("grok", "claude"), "claude may review a grok-implemented run");
+  assert.throws(() => assertReviewIndependence("claude-code", "claude"), /reviewer independence/u);
+});
+
+test("reviewer auth arg-builder: oauth_env injects exactly one env var; auth_files mount READ-ONLY", () => {
+  assert.deepEqual(reviewerAuthArgs({ kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "tok" }), ["-e", "CLAUDE_CODE_OAUTH_TOKEN=tok"]);
+  assert.deepEqual(
+    reviewerAuthArgs({ kind: "auth_files", auth_subdir: ".grok", authDir: "/base/surface-auth", auth_files: ["auth.json"] }),
+    ["-v", "/base/surface-auth/auth.json:/root/.grok/auth.json:ro"],
+  );
 });

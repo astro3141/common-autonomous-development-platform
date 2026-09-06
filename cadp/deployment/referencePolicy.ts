@@ -1289,6 +1289,10 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   { principal: "cadp-backend-scan", producer_ref: "backend-scan:codex", identity_class: { vendor: "openai", product: "codex-cli", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "cadp-backend-scan-grok", producer_ref: "backend-scan:grok", identity_class: { vendor: "xai", product: "grok", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "cadp-reviewer-claude", producer_ref: "reviewer:claude-code", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "worker" } },
+  // grok reviewer (#149): measured read-only profile (allow-list `--tools read_file,list_dir,grep`).
+  // product "grok" equals the grok WORKER's product, so §8.4 independence correctly forbids a
+  // grok-implemented run from being grok-reviewed; valid only against a different-product worker.
+  { principal: "cadp-reviewer-grok", producer_ref: "reviewer:grok", identity_class: { vendor: "xai", product: "grok", account: "cadp-v04", process_class: "worker" } },
   { principal: "cadp-verifier", producer_ref: "verifier:harness", identity_class: { vendor: "cadp", product: "node-test-harness", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "sso:a.t.laplace@gmail.com", producer_ref: "human:astro3141", identity_class: { vendor: "github", product: "human", account: "astro3141", process_class: "human-surface" } },
   { principal: "cadp-depctl-probe", producer_ref: "deployment-control-probe", identity_class: { vendor: "cadp", product: "deployment-control", account: "cadp-v04", process_class: "deployment-control" } },
@@ -1306,6 +1310,8 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // Proposal-only planner (#61): the sole registered producer of WORK_PROPOSAL. Its output is
   // read-only discovery evidence (Spec §8.2); autonomous work admission stays governed WORK_START.
   { principal: "cadp-planner", producer_ref: "planner:claude-code", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "evidence-adapter" } },
+  // grok planner (#149): proposal-only, same measured read-only profile as the grok reviewer.
+  { principal: "cadp-planner-grok", producer_ref: "planner:grok", identity_class: { vendor: "xai", product: "grok", account: "cadp-v04", process_class: "evidence-adapter" } },
   // Delegated owner-agent decision surface: produces AGENT_DECISION only, honestly attributed to
   // the agent. It satisfies nothing unless the active policy's delegated_merge_producers names it.
   { principal: "cadp-agent-owner", producer_ref: "agent:claude-owner", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "agent-surface" } },
@@ -1317,11 +1323,13 @@ export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "backend-scan:grok", evidence_kinds: ["BACKEND_EXECUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "verifier:harness", evidence_kinds: ["VERIFICATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "SOURCE", claim_pointer: "/completed_at" } },
   { producer_ref: "reviewer:claude-code", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
+  { producer_ref: "reviewer:grok", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "human:astro3141", evidence_kinds: ["HUMAN_DECISION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "deployment-control-probe", evidence_kinds: ["CREDENTIAL_REACH_ATTESTATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "deployment-control-target", evidence_kinds: ["TARGET_IMMUTABILITY_ATTESTATION"], source_relation: "TARGET_AUTHORITY_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "intake:cadp-improvement", evidence_kinds: ["IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "planner:claude-code", evidence_kinds: ["WORK_PROPOSAL"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
+  { producer_ref: "planner:grok", evidence_kinds: ["WORK_PROPOSAL"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "agent:claude-owner", evidence_kinds: ["AGENT_DECISION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   // v1.1 (#117 §5.2/§5.3): the two separated mechanisms declared explicitly — replay idempotency
   // on the effect-bound source_ref (what makes the adapter's NATIVE_KEY true at the target) and

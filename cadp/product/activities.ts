@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 
 import { KernelClient } from "../clients/kernelClient.ts";
 import { brokerPostJson } from "./brokerTransport.ts";
+import { resolveReviewProvider } from "./reviewProviders.ts";
 import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { SurfaceOperationBudget } from "./timeouts.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
@@ -463,15 +464,23 @@ export async function reviewCandidate(input: {
   repo_id: string;
   candidate_sha: string;
   work_item: string;
+  review_product?: string;
   prior_step_envelope_digest?: string;
 }): Promise<{ review_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
-  const reviewer = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_REVIEWER_TOKEN"));
+  // Fail closed on an unknown selection BEFORE any surface or kernel call; omitted keeps claude.
+  const reviewProvider = resolveReviewProvider(input.review_product ?? "claude");
+  // Honest attribution: the REVIEW evidence is authenticated as the provider that actually
+  // reviewed. Each provider has its OWN principal token; a provider without one fails closed
+  // rather than borrowing claude's identity.
+  const reviewerTokenVar = `CADP_REVIEWER_TOKEN_${reviewProvider.toUpperCase()}`;
+  const reviewerToken = reviewProvider === "claude" ? env("CADP_REVIEWER_TOKEN") : env(reviewerTokenVar);
+  const reviewer = new KernelClient(env("CADP_KERNEL_URL"), reviewerToken);
   // The broker fresh-clones the candidate and runs the second-surface reviewer (measured #90:
-  // Claude Code, read-only) inside the isolated reviewer container over the exact committed diff;
-  // it returns the verdict, a short reason, and the raw stdout. The activity submits REVIEW here.
+  // claude plan-mode; #149: per-provider read-only profile) inside the isolated reviewer container
+  // over the exact committed diff; it returns the verdict, a short reason, and the raw stdout.
   const rv = await brokerCall<{ verdict: string; reason: string; stdout: string }>(
     "/review",
-    { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item },
+    { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item, review_product: reviewProvider },
     SURFACE_BUDGETS.review,
   );
   const envelope = await reviewer.submitEvidence({
@@ -479,9 +488,9 @@ export async function reviewCandidate(input: {
     subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
     availability: "PRESENT",
     claim_schema: "cadp.review.v1",
-    claim: { verdict: rv.verdict, body_digest: sha256(rv.stdout), reviewer_run_id: `claude-p:${Date.now()}` },
-    producer_ref: "reviewer:claude-code",
-    source_ref: `claude-code:plan-mode`,
+    claim: { verdict: rv.verdict, body_digest: sha256(rv.stdout), reviewer_run_id: `${reviewProvider}-p:${Date.now()}` },
+    producer_ref: reviewProvider === "claude" ? "reviewer:claude-code" : `reviewer:${reviewProvider}`,
+    source_ref: `${reviewProvider}:read-only-profile`,
     source_relation: "INDEPENDENT_OBSERVATION",
   });
   const workStep = await submitWorkStep({

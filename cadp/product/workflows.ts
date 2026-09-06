@@ -22,6 +22,7 @@ export interface WorkArgs {
     base_sha: string;
     work_item: string;
     worker_product: string;
+    review_product?: string;
     require_human_merge: boolean;
   };
   record?: {
@@ -190,6 +191,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       candidate_sha: implemented.candidate_sha,
       repo_id: dev.repo_id,
       work_item: dev.work_item,
+      ...(dev.review_product !== undefined ? { review_product: dev.review_product } : {}),
       prior_step_envelope_digest: priorStepDigest,
     });
     priorStepDigest = reviewed.work_step_envelope_digest;
