@@ -55,13 +55,16 @@ export type EvidenceKind =
   // new constitutional primitive. The claim contracts are validated by the registered product
   // adapter before submission; ingress still only stamps identity/provenance (TD §9.1).
   | "IMPROVEMENT_FINDING"
-  | "IMPROVEMENT_FINDING_RESOLUTION";
+  | "IMPROVEMENT_FINDING_RESOLUTION"
+  // Proposal-only planner output (#61): read-only discovery evidence with exact provenance.
+  // Never authority — autonomous work admission remains the governed WORK_START.
+  | "WORK_PROPOSAL";
 
 export const EVIDENCE_KINDS: readonly EvidenceKind[] = [
   "VERIFICATION", "REVIEW", "BACKEND_EXECUTION", "HUMAN_DECISION", "TARGET_RECONCILIATION",
   "PEP_TARGET_IDENTITY", "CREDENTIAL_REACH_ATTESTATION", "TARGET_IMMUTABILITY_ATTESTATION",
   "KERNEL_INCIDENT", "WORK_STEP", "WORK_BOUND_STOP", "GENESIS", "BREAK_GLASS", "LEGACY_V03_ARTIFACT",
-  "RECONCILE_EXHAUSTED", "IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION",
+  "RECONCILE_EXHAUSTED", "IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION", "WORK_PROPOSAL",
 ];
 
 export interface Provenance {

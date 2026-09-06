@@ -318,6 +318,17 @@ export class ConstitutionalStore {
     return row === undefined ? undefined : (JSON.parse(row.envelope_json) as EvidenceEnvelopeV1);
   }
 
+  /** Every envelope bound to one exact subject key, in insertion order (K2 read, TD §12 r8). */
+  evidenceBySubjectKey(subject_key: string): EvidenceEnvelopeV1[] {
+    const rows = this.db
+      .prepare(
+        `SELECT e.envelope_json FROM evidence_envelope e JOIN evidence_subject s ON s.evidence_id = e.evidence_id
+         WHERE s.subject_key = ? ORDER BY e.rowid`,
+      )
+      .all(subject_key) as Array<{ envelope_json: string }>;
+    return rows.map((r) => JSON.parse(r.envelope_json) as EvidenceEnvelopeV1);
+  }
+
   workStepByOrdinal(work_run_ref: string, step_ordinal: number): EvidenceEnvelopeV1 | undefined {
     const row = this.db
       .prepare("SELECT envelope_json FROM evidence_envelope WHERE evidence_kind = 'WORK_STEP' AND work_run_ref = ? AND step_ordinal = ?")

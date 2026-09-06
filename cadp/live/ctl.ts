@@ -3,7 +3,9 @@
  *   node cadp/live/ctl.ts <dir> up                          start record/temporal/kernel/worker
  *   node cadp/live/ctl.ts <dir> stop|start <component>      kill / restart one real process
  *   node cadp/live/ctl.ts <dir> attest                      reach + immutability attestations
- *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects]
+ *   node cadp/live/ctl.ts <dir> plan "<whole intent>"       proposal-only planner → WORK_PROPOSAL evidence
+ *   node cadp/live/ctl.ts <dir> work-plan <proposalEvidenceId> [maxItems]   drive items through governed WORK_START
+ *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects] [proposalEvidenceId]
  *   node cadp/live/ctl.ts <dir> work-record <n-payloads> [maxSteps maxEffects]
  *   node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
  *   node cadp/live/ctl.ts <dir> state <effect_id>
@@ -20,7 +22,8 @@ import { claudeProviderToken, createEgressBoundary, dockerAvailable, imageIdenti
 import type { IsolationConfig } from "../product/isolation.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
-import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { sha256Hex } from "../kernel/canonical.ts";
+import { sealPlan, startWork, workPlan } from "./ops.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -128,12 +131,6 @@ function startComponent(name: string): void {
   console.log(JSON.stringify({ started: name }));
 }
 
-function temporalNamespaceId(): string {
-  const m = manifest();
-  const out = execFileSync("temporal", ["operator", "namespace", "describe", "--namespace", "cadp-v04", "--address", `127.0.0.1:${m.temporal_port}`, "-o", "json"], { encoding: "utf8" });
-  const parsed = JSON.parse(out) as { namespaceInfo?: { id?: string } };
-  return parsed.namespaceInfo?.id ?? "cadp-v04";
-}
 
 function safeJson(text: string): { fs_reads?: Array<Record<string, unknown>>; credential_use?: Array<Record<string, unknown>>; egress?: Array<Record<string, unknown>>; enumerated?: string[] } | undefined {
   const line = text.trim().split("\n").reverse().find((l) => l.trim().startsWith("{"));
@@ -345,94 +342,7 @@ async function attest(): Promise<void> {
   console.log(JSON.stringify({ immutability: immutability.evidence_id, write_once_enforced: enforced, move_rejected: moveRejected, delete_rejected: deleteRejected }, null, 2));
 }
 
-/** #127: a malformed CLI bound refuses at entry — it must never become NaN→null in sealed material. */
-function boundArg(raw: string | undefined, fallback: number): number {
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`malformed work bound '${raw}' — need a positive integer`);
-  return value;
-}
-
-async function startWork(vertical: "development" | "record", extra: string[], ordinalArg?: string): Promise<void> {
-  const m = manifest();
-  const c = client("cadp-workflow");
-  const namespaceId = temporalNamespaceId();
-
-  const args =
-    vertical === "development"
-      ? {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
-          development: {
-            repo_id: m.repo_id,
-            repo_full_name: m.repo_full_name,
-            base_ref: "refs/heads/main",
-            base_sha: m.base_sha,
-            work_item: extra[0]!,
-            require_human_merge: true,
-          },
-        }
-      : {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
-          record: {
-            tenant: "cadp-disposable",
-            resource_prefix: `live-${Date.now() % 100000}`,
-            payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
-          },
-        };
-
-  const ordinal = ordinalArg !== undefined ? Number(ordinalArg) : Math.floor(Date.now() / 1000) % 1000000;
-  const { effect_id } = await c.allocateEffectId({
-    schema: "cadp.allocation-key.v1",
-    work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-    step_ordinal: ordinal,
-    purpose: "work-start",
-  });
-  const argsBytes = Buffer.from(JSON.stringify(args), "utf8");
-  const { cas_key: args_cas_key } = await c.putBlob(argsBytes);
-  // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
-  // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
-  const image = imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim());
-  const worker_profile_digest = jcsDigest({
-    profile: workerProfileDigest(),
-    surface_image: image.image,
-    image_digest: image.image_digest,
-    tool_versions: image.tool_versions,
-  }).value;
-  const material = {
-    workflow_id: `cadp-work-${effect_id}`,
-    workflow_type: "cadpWork",
-    task_queue: "cadp-worker",
-    args_cas_key,
-    args_digest: jcsDigest(args).value,
-    bounds: args.bounds,
-    worker_profile_digest,
-    surface_image: image,
-    continuation_target: `temporal:cadp-v04:${namespaceId}`,
-  };
-  const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
-  const request = await c.sealEffectRequest({
-    effect_id,
-    requester_ref: "workflow:cadp-work",
-    work_bindings: [
-      { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
-    ],
-    target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: namespaceId },
-    operation_kind: "WORK_START",
-    material_schema: "cadp.work-start.v1",
-    material_ref,
-    prior_effect_refs: [],
-  });
-  const input = await c.assembleAdmissionInput(effect_id, []);
-  const evaluated = await c.evaluate(input.input_digest.value);
-  if (evaluated.kind !== "DECISION" || evaluated.decision.outcome !== "ALLOW") {
-    console.log(JSON.stringify({ effect_id, evaluated }, null, 2));
-    return;
-  }
-  const admitted = await c.admitAndDispatch(effect_id, evaluated.decision.decision_id);
-  console.log(JSON.stringify({ effect_id, workflow_id: material.workflow_id, request_digest: request.request_digest.value, admitted }, null, 2));
-}
+const opsLog = (line: Record<string, unknown>): void => console.log(JSON.stringify(line, null, 2));
 
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
   const m = manifest();
@@ -507,11 +417,17 @@ async function main(): Promise<void> {
     case "attest":
       await attest();
       break;
+    case "plan":
+      console.log(JSON.stringify(await sealPlan(dir, process.argv[4]!), null, 2));
+      break;
+    case "work-plan":
+      console.log(JSON.stringify({ driver: "done", proposal_evidence_id: process.argv[4]!, results: await workPlan(dir, process.argv[4]!, process.argv[5], opsLog) }, null, 2));
+      break;
     case "work-dev":
-      await startWork("development", process.argv.slice(4));
+      await startWork(dir, "development", process.argv.slice(4), { log: opsLog });
       break;
     case "work-record":
-      await startWork("record", process.argv.slice(4));
+      await startWork(dir, "record", process.argv.slice(4), { log: opsLog });
       break;
     case "human-approve":
       await humanApprove(process.argv[4]!, process.argv[5]!);

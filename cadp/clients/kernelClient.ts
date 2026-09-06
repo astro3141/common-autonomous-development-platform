@@ -93,4 +93,16 @@ export class KernelClient {
   listEffects(work_run_ref: string): Promise<{ effect_ids: string[] }> {
     return this.#call("list_effects", { work_run_ref });
   }
+
+  /** K2 read (TD §12 r8); the kernel refuses with 409 DIGEST_CORRUPTION instead of serving a corrupted row. */
+  getEvidence(evidence_id: string): Promise<{ envelope: EvidenceEnvelopeV1 }> {
+    return this.#call("get_evidence", { evidence_id });
+  }
+
+  /** Envelope summaries bound to a work run. An empty list is this store's answer, not universal absence. */
+  listEvidence(work_run_ref: string): Promise<{
+    evidence: Array<Pick<EvidenceEnvelopeV1, "evidence_id" | "evidence_kind" | "availability" | "producer_ref" | "produced_at" | "envelope_digest">>;
+  }> {
+    return this.#call("list_evidence", { work_run_ref });
+  }
 }

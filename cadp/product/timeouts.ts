@@ -97,11 +97,20 @@ export const REVIEW_BUDGET: SurfaceOperationBudget = {
   activity_attempt_ms: 420_000,
 };
 
+/** `/plan`: the proposal-only planner surface reading the checkout (read-only, no authority). */
+export const PLAN_BUDGET: SurfaceOperationBudget = {
+  surface_ms: 300_000,
+  broker_response_ms: 330_000,
+  rpc_ms: 360_000,
+  activity_attempt_ms: 420_000,
+};
+
 /** Every long-running broker operation of the development vertical, by operation name. */
 export const SURFACE_BUDGETS = {
   implement: IMPLEMENT_BUDGET,
   verify: VERIFY_BUDGET,
   review: REVIEW_BUDGET,
+  plan: PLAN_BUDGET,
 } as const;
 
 export type SurfaceOperation = keyof typeof SURFACE_BUDGETS;
