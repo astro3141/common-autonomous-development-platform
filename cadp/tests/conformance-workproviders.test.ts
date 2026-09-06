@@ -91,7 +91,7 @@ test("/implement rejects a missing provider before creating its workspace", asyn
   }
 });
 
-// codex has a MEASURED model_scan; grok deliberately does not (format unmeasured → UNKNOWN, never guessed).
+// Both providers now carry a MEASURED model_scan; a provider without one stays UNKNOWN, never guessed.
 test("codex backend scan reports observed model with a locator; requested is not collapsed", () => {
   const root = mkdtempSync(join(tmpdir(), "cadp-scan-codex-"));
   try {
@@ -107,15 +107,38 @@ test("codex backend scan reports observed model with a locator; requested is not
   }
 });
 
-test("grok backend scan stays UNKNOWN (format not yet measured — no guessed model)", () => {
+test("grok backend scan reads model_id from the measured chat_history.jsonl layout", () => {
   const root = mkdtempSync(join(tmpdir(), "cadp-scan-grok-"));
   try {
-    const sessions = join(root, WORKER_PROVIDERS.grok.sessions_subdir);
+    // Measured layout (2026-09-06 probe): sessions/<urlencoded-cwd>/<session-id>/chat_history.jsonl
+    const sessions = join(root, WORKER_PROVIDERS.grok.sessions_subdir, "%2Fws", "01a0768e-af89-7063-92d8-9c7a43be0408");
     mkdirSync(sessions, { recursive: true });
-    // Even if a session file happens to contain a model field, grok has no measured scan spec,
-    // so the observed model is honestly UNKNOWN rather than a value scraped by a guessed pattern.
-    writeFileSync(join(sessions, "session.jsonl"), `${JSON.stringify({ model: "grok-guessable" })}\n`);
-    const fact = scanBackendModel("grok", sessions, "model: grok-guessable");
+    writeFileSync(join(sessions, "chat_history.jsonl"), `${JSON.stringify({ model_id: "grok-4.6-build", model_fingerprint: "fp_08d0bc26c22b024e" })}\n`);
+    const fact = scanBackendModel("grok", join(root, WORKER_PROVIDERS.grok.sessions_subdir), "");
+    assert.equal(fact.model, "grok-4.6-build");
+    assert.match(fact.locator ?? "", /chat_history\.jsonl#offset=/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("grok backend scan falls back to the measured stdout end-event modelUsage key", () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-scan-grok-stdout-"));
+  try {
+    // Measured: the headless NDJSON stream ends with {"type":"end",...,"modelUsage":{"<model>":{...}}}.
+    const stdout = '{"type":"end","stopReason":"end_turn","modelUsage":{"grok-4.6-build":{"modelCalls":1}}}';
+    const fact = scanBackendModel("grok", join(root, "absent-sessions"), stdout);
+    assert.equal(fact.model, "grok-4.6-build");
+    assert.match(fact.locator ?? "", /grok-worker-stdout#pattern=/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("grok backend scan leaves absent facts UNKNOWN (no session match, no stdout match)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-scan-grok-empty-"));
+  try {
+    const fact = scanBackendModel("grok", root, "no backend facts here");
     assert.equal(fact.model, undefined);
     assert.equal(fact.locator, undefined);
   } finally {

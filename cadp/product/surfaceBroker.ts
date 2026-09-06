@@ -179,8 +179,8 @@ function preserveWorkerSession(sessionsDir: string, run: { status: number | null
 /**
  * #91 method: scan the worker's OWN provider session log for the observed model; PRESENT facts
  * carry a locator. A provider WITHOUT a measured `model_scan` returns UNKNOWN (no guessed value) —
- * requested != observed honesty. The session field pattern is a literal-prefix search; the group
- * capture that follows is provider-independent (`"model":"..."`).
+ * requested != observed honesty. The capture group lives in the provider's MEASURED spec (codex
+ * `"model":"…"`, grok `"model_id":"…"`), so the scan itself is provider-independent.
  */
 export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, stdout: string): { model?: string; locator?: string } {
   const spec = WORKER_PROVIDERS[provider].model_scan;
@@ -190,11 +190,8 @@ export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, 
   const sessionRe = new RegExp(spec.session_regex, "u");
   const scan = (file: string): void => {
     const content = readFileSync(file, "utf8");
-    const idx = content.search(sessionRe);
-    if (idx >= 0) {
-      const m = /"model"\s*:\s*"([^"]+)"/u.exec(content.slice(idx, idx + 200));
-      if (m !== null) { model = m[1]; locator = `${file}#offset=${idx}`; }
-    }
+    const m = sessionRe.exec(content);
+    if (m !== null && m[1] !== undefined) { model = m[1]; locator = `${file}#offset=${m.index}`; }
   };
   try {
     const walk = (d: string): void => {
