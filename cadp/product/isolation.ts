@@ -644,17 +644,32 @@ const PROXY_ENV = (proxy: string): string[] => [
  */
 export function runWorker(
   config: IsolationConfig,
-  input: { workspace: string; codexAuthDir: string; sessionsDir?: string; argv: readonly string[]; timeout_ms?: number },
+  input: {
+    workspace: string;
+    /** @deprecated Compatibility spelling for the codex profile. */
+    codexAuthDir?: string;
+    workerAuthDir?: string;
+    authSubdir?: string;
+    authFiles?: readonly string[];
+    sessionsDir?: string;
+    argv: readonly string[];
+    timeout_ms?: number;
+  },
   options: SurfaceRunOptions = {},
 ): Promise<RunResult> {
-  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/.codex/sessions`] : [];
+  const authDir = input.workerAuthDir ?? input.codexAuthDir;
+  if (authDir === undefined) throw new Error("worker auth directory missing");
+  const authSubdir = input.authSubdir ?? ".codex";
+  const authFiles = input.authFiles ?? ["auth.json"];
+  const authMounts = authFiles.flatMap((file) => ["-v", `${authDir}/${file}:/root/${authSubdir}/${file}:ro`]);
+  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${authSubdir}/sessions`] : [];
   return runBoundedSurface({
     kind: "worker",
     args: [
       "--network", config.egress_network,
       ...PROXY_ENV(config.egress_proxy),
       "-v", `${input.workspace}:/ws`,
-      "-v", `${input.codexAuthDir}/auth.json:/root/.codex/auth.json:ro`,
+      ...authMounts,
       ...sessionsMount,
       "-w", "/ws",
       config.worker_image,

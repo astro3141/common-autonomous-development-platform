@@ -121,6 +121,7 @@ export async function startWork(
             base_ref: "refs/heads/main",
             base_sha: m.base_sha,
             work_item: extra[0]!,
+            worker_product: "codex",
             require_human_merge: true,
           },
         }

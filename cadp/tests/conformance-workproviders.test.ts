@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { jcsDigest } from "../kernel/canonical.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_ARGV_PREFIX, WORKER_AUTH_FILES } from "../product/workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS } from "../product/workerProviders.ts";
+import { brokerImplement, scanBackendModel } from "../product/surfaceBroker.ts";
 
 test("codex provider retains the byte-identical worker profile", () => {
   assert.deepEqual(WORKER_PROVIDERS.codex.argv_prefix, ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]);
@@ -62,3 +63,49 @@ test("unknown providers fail synchronously without filesystem effects", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("/implement rejects a missing provider before creating its workspace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-provider-required-"));
+  const oldTmp = process.env["TMPDIR"];
+  try {
+    process.env["TMPDIR"] = root;
+    const before = readdirSync(root);
+    await assert.rejects(
+      brokerImplement({ repo_full_name: "unused/unused", base_sha: "unused", work_item: "unused", worker_product: undefined as unknown as string }),
+      /unknown worker provider/u,
+    );
+    assert.deepEqual(readdirSync(root), before);
+  } finally {
+    if (oldTmp === undefined) delete process.env["TMPDIR"];
+    else process.env["TMPDIR"] = oldTmp;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const provider of ["codex", "grok", "gemini"] as const) {
+  test(`${provider} backend scan reports observed model with a provider-owned locator`, () => {
+    const root = mkdtempSync(join(tmpdir(), `cadp-scan-${provider}-`));
+    try {
+      const sessions = join(root, WORKER_PROVIDERS[provider].sessions_subdir);
+      mkdirSync(sessions, { recursive: true });
+      writeFileSync(join(sessions, "session.jsonl"), `${JSON.stringify({ requested_model: `${provider}-requested` })}\n${JSON.stringify({ model: `${provider}-observed` })}\n`);
+      const fact = scanBackendModel(provider, sessions, "");
+      assert.equal(fact.model, `${provider}-observed`);
+      assert.match(fact.locator ?? "", new RegExp(`${WORKER_PROVIDERS[provider].sessions_subdir}.*session\\.jsonl#offset=`));
+      assert.notEqual(fact.model, `${provider}-requested`, "requested and observed model facts must not be collapsed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test(`${provider} backend scan leaves absent facts UNKNOWN`, () => {
+    const root = mkdtempSync(join(tmpdir(), `cadp-scan-empty-${provider}-`));
+    try {
+      const fact = scanBackendModel(provider, root, "no backend facts");
+      assert.equal(fact.model, undefined);
+      assert.equal(fact.locator, undefined);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
