@@ -1,13 +1,18 @@
 {
-  "name": "@platform/core",
-  "version": "0.0.1",
-  "description": "Common Autonomous Development Platform — deterministic Core contract primitives",
+  "name": "cadp",
+  "version": "0.4.0",
+  "description": "Common Autonomous Development Platform — v0.4 thin constitutional kernel and commodity-backed autonomous-work reference composition",
   "private": true,
   "type": "module",
   "license": "MIT",
   "scripts": {
     "test": "node --test",
     "typecheck": "tsc --noEmit",
+    "kernel": "node cadp/kernel/kernelService.ts",
+    "worker": "node cadp/product/worker.ts",
+    "broker": "node cadp/product/surfaceBroker.ts",
+    "live": "node cadp/live/ctl.ts",
+    "live-setup": "node cadp/live/env.ts",
     "devharness": "node devharness/cli.ts"
   },
   "devDependencies": {

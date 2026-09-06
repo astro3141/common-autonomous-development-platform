@@ -1,139 +1,93 @@
-# Common Autonomous Development Platform
+# Common Autonomous Development Platform (CADP)
 
-A deterministic platform core for supervising autonomous development work: it discovers tasks,
-validates a Supervisor's structured proposal, freezes an immutable Task Contract, issues scoped
-capability grants, runs an Actor, verifies the result under Platform control, has an independent
-Auditor review it, and stops at a mandatory human merge decision.
+CADP v0.4 is a policy-first control plane for autonomous work. It is not a
+workflow framework: mature commodity products own orchestration, agents,
+review, CI and repositories, while CADP owns only the thin constitutional
+kernel that governs how any of them may cause an external effect.
 
-The design premise is that **model output is never authority**. A Runtime turn can say `DONE` and
-nothing happens; a person can say "I merged it" and nothing happens. Every lifecycle transition is
-driven by durable state, structured submissions through an authoritative ingress, and facts read
-back from the repository.
+Authority order: `Common Autonomous Development Platform — Specification v0.4.md`
+> `TECHNICAL_DESIGN_cadp_v0_4_generation.md` (TD v2.0) > exact current
+implementation / tests / live evidence. See `Authority order.md`.
 
-```text
-MVP 0   FORMAL COMPLETE
-MVP 1   FORMAL COMPLETE
-MVP 2   IMPLEMENTED (this branch — Safe Automatic Merge; see STATUS_integration_adp_fixed_point.md)
-MVP 3   IMPLEMENTED (this branch — Subflow / Hold-next / Batch)
-MVP 4   IMPLEMENTED (this branch — recovery / circuit breaker / read-only monitoring)
-```
+## What the kernel guarantees (Spec v0.4 K1–K7)
 
-## Status — read this before reading anything else
-
-**This is not production ready, and nothing here has ever run against a live backend.**
-
-`MVP 1 FORMAL COMPLETE` means one precise thing: the Spec §65 path is implemented, composed by the
-production Coordinator, and proven by executable tests. Every Runtime session, repository mutation,
-verification run and report delivery proven in this repository is a deterministic test double.
-
-```text
-tests      1099 / 1099 PASS
-typecheck  PASS
-schema     v7 / 17 tables
-
-production composition root   present (deployment/ — runnable entrypoint)
-live backend READY proof      absent  (RA-4 BLOCKED in this environment; fail-closed proven)
-automatic merge               implemented (Repository Gate, strategy A; refused on Backend v1)
-RA-4 live preflight           BLOCKED (C1..C5 here — no backend install)
-```
-
-The repository also carries its own failures in the open. `STATUS_common_platform_mvp1.md` §3
-records that the first B13 seal was **invalid** — the end-to-end test bypassed activation and the
-report claimed a wiring that did not exist — along with the correction (CORR1) that fixed it.
-`PREFLIGHT_composition_root.md` records a further gap found afterwards: no production code path
-issues the run-scoped SUPERVISOR capability grant, so a live run cannot currently open.
-
-That is deliberate. A status document that only records successes is not evidence.
-
-## Documents
-
-Architecture authority order. Where documents disagree, **the higher one wins** and the lower one
-is wrong and must be corrected.
-
-| # | Document | Role |
-|---|---|---|
-| 1 | `Common Autonomous Development Platform — Specification v0.3.md` | What the platform is |
-| 2 | `TECHNICAL_DESIGN_autonomous_development_platform.md` | How it is built — schemas, state machines, contracts |
-| 3 | `PLATFORM_BACKEND_CAPABILITY.md` | What Backend v1 can and cannot honestly claim |
-| 4 | `STATUS_workflow_harness.md` | Backend harness observations |
-| 5 | `STATUS_common_platform_mvp1.md` | MVP 1 implementation/evidence record |
-
-Operational and supporting:
-
-- `HANDOFF_common_platform_mvp1_live_pilot.md` — how to run the first live pilot, and what not to do
-- `PREFLIGHT_composition_root.md` — read-only survey of what the production composition root needs
-- `STATUS_common_platform_mvp0.md` — the MVP 0 record, untouched
-- `Authority order.md` — project boundary and document precedence
-
-Status documents record what was built and proven. They introduce no contract, no state, no
-vocabulary and no decision of their own.
+- A policy decision binds to one exact effect identity, input digest and
+  evidence set; policy `ALLOW` is never an effect permit by itself.
+- The PEP alone holds governed credentials and admits effects; workers,
+  reviewers and workflows have no mutation reach to governed targets.
+- Every non-trivial external call has a durable admission record written
+  before dispatch, and outcomes are target-authoritative: an ambiguous call
+  stays `UNKNOWN` and is never blindly retried.
+- Requested values are never copied into observed facts; unavailable facts
+  stay `UNKNOWN`; stale, missing or contradictory required evidence fails
+  closed.
+- Human decisions are scoped, attributable, fresh evidence — not ambient
+  authority.
 
 ## Layout
 
 ```text
-core/          the deterministic Platform Core — no backend vocabulary anywhere in it
-  admission/     proposal submission, validation, activation, run bootstrap
-  capability/    capability broker, grants, backend manifests, enforcement receipts
-  contract/      immutable Task Contract snapshot + contract source capture
-  coordinator/   ProductionCoordinator.tickOnce() — dispatch only, never duplicate a rule
-  decision/      Decision Validator V1–V11
-  discovery/     TaskSource observation → durable projection
-  execution/     Actor / Verification / Auditor / rework / human-merge use-cases
-  humandecision/ PendingHumanDecision
-  profile/       Project Profile + Execution Policy → Compiled Profile
-  schemas/       canonical JSON, envelopes, digests, identifiers
-  statemachine/  Task / Attempt / Batch transitions and commit guards
-  store/         SQLite durable state, migrations, outbox
-  tasksource/    generic TaskSource contract + ProjectDocumentTaskSource
-
-adapters/      the backend boundaries
-  interfaces/               the five adapter contracts — interfaces only
-  local-git/                RepositoryAdapter over git worktrees
-  local-verification/       VerificationAdapter over a durable workflow
-  local-drift-source/       ProfileSource + ContractSourceReader
-  backend-runtime-preflight/ RA-4 — read-only, measures and never repairs
-  runtime-result-channel/   structured result collection, adapter-owned
-
-testdoubles/   deterministic fakes, one per interface
-tests/         1034 deterministic tests
+cadp/kernel/        K1–K7 records, constitutional store (SQLite), CAS, ingress,
+                    OPA evaluator seam, PEP, reconciler, genesis/break-glass,
+                    kernel HTTP API, composition root (kernelService.ts)
+cadp/kernel/adapters/  target adapters: GitHub, GitHub Issues, Temporal,
+                    record service, store policy activation, finding seal
+cadp/product/       commodity-backed autonomous-work composition: Temporal
+                    cadpWork workflow + activities, surface broker, Docker/
+                    Seatbelt isolation, timeout hierarchy, recurring-improvement
+                    intake
+cadp/deployment/    reference OPA policy (rego + kernel config)
+cadp/live/          disposable live composition (env setup, ctl driver, probes)
+cadp/tests/         deterministic conformance suites (C*/P*/FC*/WB*/T* controls)
+devharness/         standalone bootstrap development supervisor for building
+                    CADP itself — NOT a platform component
 ```
 
-## Backend independence
-
-```text
-OpenClaw + durable-jobs = replaceable Backend v1  ≠  Common Platform
-```
-
-The long-lived asset is the deterministic Core. Neither backend was modified to satisfy Platform
-architecture, and neither may be. `core/` carries no backend vocabulary — the one module that names
-backend mechanisms is the RA-4 preflight, whose entire job is naming them.
+The v0.3 generation (`core/`, `adapters/`, `deployment/`, `testdoubles/`,
+`tests/`) is preserved in git history only; Spec v0.3 / TD v1.5 remain in the
+tree as historical records.
 
 ## Running it
 
-Requires Node.js with `node:sqlite` (Node 22+).
+Deterministic validation (requires Node ≥ 22 with `node:sqlite`, and the `opa`
+binary on PATH — the conformance suites run a real OPA sidecar):
 
-```sh
+```bash
 npm install
-npm test        # 1034 deterministic tests
+npm test            # cadp + devharness conformance suites
 npm run typecheck
 ```
 
-The production composition root exists on this branch:
+Live composition (additionally requires `temporal` CLI, `docker`, `gh` with a
+GitHub token, and macOS `sandbox-exec` for the confined worker processes):
 
-```sh
-node deployment/main.ts --config <deployment.json> [--once]
+```bash
+node cadp/live/env.ts setup <dir> [--repo owner/name]   # disposable repo, genesis, tokens, image
+node cadp/live/ctl.ts <dir> up                          # record service, temporal dev server,
+                                                        # kernel, surface broker, worker
+node cadp/live/ctl.ts <dir> attest                      # credential-reach + immutability evidence
+node cadp/live/ctl.ts <dir> work-dev "<work item>" [max_steps] [max_effects]
+node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
+node cadp/live/ctl.ts <dir> state <effect_id>
 ```
 
-It opens (or resumes) a run, reports the RA-4 verdict, starts the HTTP ingress and ticks. In an
-environment where the Backend v1 install is absent the preflight is BLOCKED and no Runtime
-external effect ever starts — that boundary is proven live and by test.
+Process entry points: `npm run kernel -- <config.json>`, `npm run worker`,
+`npm run broker`, `npm run live -- <dir> …`.
 
-## Safety boundary
+## Commodity boundaries
 
-No Runtime external effect may start before the RA-4 preflight reports `READY`. The preflight is
-currently `BLOCKED(C2,C3,C4,C5)` against the measured install. It must not be bypassed, and
-Platform policy must not be weakened to make it pass.
+CADP does not build or own: policy language/evaluator (OPA), durable workflow
+(Temporal), coding agents (codex-cli / Claude Code), CI, review products,
+repositories/PRs (GitHub), sandbox runtimes (Docker/Seatbelt), secret managers,
+issue trackers or observability platforms. Each sits behind a small replaceable
+seam (`EvaluatorPort`, `TargetAdapterV1`, the surface broker); replacing one
+requires re-proving the same conformance evidence, never new kernel authority.
 
-## License
+## Status
 
-MIT — see `LICENSE`.
+- Constitutional kernel + development/record verticals: landed, deterministic
+  conformance green, live-proven (#100/#102, #105, #126).
+- Broker/activity timeout hierarchy and bounded surface lifetime (#127/#128):
+  repaired; see `cadp/product/timeouts.ts` and `cadp/tests/conformance-timeout.test.ts`.
+- Production deployment: NOT AUTHORIZED. The live composition is a disposable
+  reference proof, not a hosted service.

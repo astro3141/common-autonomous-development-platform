@@ -33,7 +33,7 @@ after(() => stopSharedOpa());
 /** An intake implementation WORK_START bound to a tip — the barrier consumer (#98 §7/§8). */
 async function evalWorkStart(h: Harness, finding: EvidenceEnvelopeV1, evidence: EvidenceEnvelopeV1[]): Promise<{ outcome: string; reason_codes: string[] }> {
   const admission = buildFindingAdmission({ finding_ref: refOf(finding), purpose: "IMPLEMENTATION", conflict_complete: true });
-  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ finding_admission: admission, bounds: {} }), "utf8"));
+  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ finding_admission: admission, bounds: { max_steps: 8, max_effects: 6 } }), "utf8"));
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: "work-start",

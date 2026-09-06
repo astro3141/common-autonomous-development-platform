@@ -94,7 +94,8 @@ async function evalWorkStart(h: Harness, input: {
     conflict_complete: input.conflict_complete ?? true,
     external_inputs: input.external_inputs,
   });
-  const material = { finding_admission: admission, bounds: {} };
+  // #127: bounds must be well-formed positive integers — `bounds: {}` is now DENIED.
+  const material = { finding_admission: admission, bounds: { max_steps: 8, max_effects: 6 } };
   const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",

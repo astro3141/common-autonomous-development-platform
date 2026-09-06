@@ -27,7 +27,8 @@ import { createHash } from "node:crypto";
 
 import { buildWorkerSandbox, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
-import type { IsolationConfig } from "./isolation.ts";
+import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
+import type { IsolationConfig, RunResult } from "./isolation.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -49,6 +50,32 @@ async function git(args: string[], cwd?: string): Promise<{ status: number | nul
     child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }));
     child.on("error", (e) => resolve({ status: 127, stdout: "", stderr: String(e) }));
   });
+}
+
+/**
+ * A non-zero surface run is always a failure, never a result (#128 T2). When the run ended at its
+ * declared bound the message says so — and reports what was OBSERVED about the container, so a
+ * bounded failure whose termination could not be confirmed is never described as a clean one.
+ */
+export function surfaceFailure(kind: string, run: RunResult): string {
+  // A run that could not release a command it started may still hold a live docker client, so the
+  // report says that first — it is the part an operator has to act on (#128 round-9 F8).
+  const held = run.commands_released === false ? " (a control-plane command could not be confirmed released)" : "";
+  if (run.timed_out === true) {
+    return `${kind} surface exceeded its declared bound; termination ${run.surface_state}${held} (container ${run.container}): ${run.stderr.slice(-400)}`;
+  }
+  // A surface can fail before it ever runs as well as after (#128 round-4/round-5): a creation the
+  // daemon refused never had a launcher at all, and an unacknowledged one never got that far either.
+  // Keep those distinct from "it outlived its launcher" instead of flattening every non-EXITED state
+  // into one sentence — the runner went to some trouble to tell them apart.
+  if (run.creation === "REJECTED") {
+    return `${kind} surface was never created (container ${run.container}): ${run.stderr.slice(-400)}`;
+  }
+  if (run.surface_state !== undefined && run.surface_state !== "EXITED") {
+    const phase = run.creation === "UNKNOWN" ? "surface creation was never acknowledged" : "surface outlived its launcher";
+    return `${kind} ${phase}; termination ${run.surface_state}${held} (container ${run.container}): ${run.stderr.slice(-400)}`;
+  }
+  return `${kind} container exited ${run.status}: ${run.stderr.slice(0, 400)}`;
 }
 
 function config(): IsolationConfig {
@@ -95,9 +122,9 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       codexAuthDir: join(sandbox.home, ".codex"),
       sessionsDir,
       argv: ["codex", ...WORKER_ARGV_PREFIX, "-C", "/ws", body.work_item],
-      timeout_ms: 900_000,
+      timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });
-    if (workerRun.status !== 0) throw new Error(`worker container exited ${workerRun.status}: ${workerRun.stderr.slice(0, 400)}`);
+    if (workerRun.status !== 0) throw new Error(surfaceFailure("worker", workerRun));
 
     await git(["add", "-A"], workspace);
     r = await git(["-c", "user.name=cadp-worker", "-c", "user.email=worker@cadp-v04.invalid", "commit", "-m", `cadp candidate: ${body.work_item.slice(0, 60)}`], workspace);
@@ -169,7 +196,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
     if (porcelain.length > 0 || clone_head !== body.candidate_sha) {
       return { status: "UNKNOWN", clone_head, unknown_reason: porcelain.length > 0 ? "DIRTY_WORKSPACE" : "HEAD_MISMATCH" };
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: 300_000 });
+    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",
@@ -209,10 +236,10 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       workspace: reviewWs,
       providerToken: claudeProviderToken(),
       argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
-      timeout_ms: 300_000,
+      timeout_ms: SURFACE_BUDGETS.review.surface_ms,
     });
     if (review.status !== 0 || review.stdout.trim().length === 0) {
-      throw new Error(`reviewer surface failed (exit ${review.status}): ${(review.stderr || review.stdout).slice(0, 200)}`);
+      throw new Error(`reviewer surface failed — ${surfaceFailure("reviewer", review)}`);
     }
     const lines = review.stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
@@ -226,31 +253,87 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
 
 // ------------------------------------------------------------------ server
 
-const HANDLERS: Record<string, (body: Record<string, unknown>) => Promise<unknown>> = {
-  "/implement": (b) => brokerImplement(b as { repo_full_name: string; base_sha: string; work_item: string }),
-  "/verify": (b) => brokerVerify(b as { repo_full_name: string; candidate_sha: string }),
-  "/review": (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string }),
+/**
+ * One broker operation: the surface run plus the explicit bound (#128) on answering the request
+ * at all. `response_budget_ms` sits above the inner surface kill and below the caller's RPC
+ * budget, so the normal ordering lets the surface terminate and run its cleanup first.
+ */
+export interface BrokerOperation {
+  readonly response_budget_ms: number;
+  readonly run: (body: Record<string, unknown>) => Promise<unknown>;
+}
+
+export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
+  "/implement": {
+    response_budget_ms: SURFACE_BUDGETS.implement.broker_response_ms,
+    run: (b) => brokerImplement(b as { repo_full_name: string; base_sha: string; work_item: string }),
+  },
+  "/verify": {
+    response_budget_ms: SURFACE_BUDGETS.verify.broker_response_ms,
+    run: (b) => brokerVerify(b as { repo_full_name: string; candidate_sha: string }),
+  },
+  "/review": {
+    response_budget_ms: SURFACE_BUDGETS.review.broker_response_ms,
+    run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string }),
+  },
 };
 
-export function startBroker(port: number): ReturnType<typeof createServer> {
+/**
+ * The broker HTTP server. `operations` defaults to the production table; the conformance controls
+ * pass a scripted operation so they exercise THIS server construction, not a copy of it.
+ */
+export function startBroker(port: number, operations: Record<string, BrokerOperation> = BROKER_OPERATIONS): ReturnType<typeof createServer> {
   const server = createServer((req, res) => {
-    const handler = req.url !== undefined ? HANDLERS[req.url] : undefined;
-    if (req.method !== "POST" || handler === undefined) {
+    const operation = req.url !== undefined ? operations[req.url] : undefined;
+    if (req.method !== "POST" || operation === undefined) {
       res.writeHead(404).end(JSON.stringify({ error: "not found" }));
       return;
     }
+    const path = req.url!;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       let body: Record<string, unknown>;
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; }
       catch { res.writeHead(400).end(JSON.stringify({ error: "bad json" })); return; }
-      handler(body)
-        .then((result) => { res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result)); })
-        .catch((e: unknown) => { res.writeHead(500).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) })); });
+
+      // Exactly one response per request. A surface run that outlives its declared response
+      // budget gets a bounded 504 here; its late result — however it eventually resolves — is
+      // DISCARDED, so an over-budget run can never be answered as a success or reused as a
+      // stale response (#128 T2). The run's own `finally` cleanup still executes.
+      let answered = false;
+      const started = Date.now();
+      const answer = (status: number, payload: unknown): void => {
+        if (answered) return;
+        answered = true;
+        clearTimeout(guard);
+        res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(payload));
+      };
+      const guard = setTimeout(() => {
+        answer(504, {
+          error: `broker ${path} exceeded its declared response budget of ${operation.response_budget_ms}ms after ${Date.now() - started}ms`,
+        });
+      }, operation.response_budget_ms);
+      // A client that walked away (its own RPC budget expired) leaves no dangling guard timer.
+      res.on("close", () => { answered = true; clearTimeout(guard); });
+
+      operation.run(body)
+        .then((result) => { answer(200, result); })
+        .catch((e: unknown) => { answer(500, { error: e instanceof Error ? e.message : String(e) }); });
     });
   });
-  server.listen(port, "127.0.0.1", () => console.log(JSON.stringify({ broker: "started", pid: process.pid, port })));
+  // Request-RECEIPT bounds only: measured on Node v26, neither bounds an already-received request
+  // whose long response is still being produced. The socket-inactivity timer stays disabled — it
+  // would kill exactly the healthy long-running responses #127 lost; the finite server-side bound
+  // is the per-request response guard above.
+  server.headersTimeout = BROKER_SERVER_TIMEOUTS.headers_ms;
+  server.requestTimeout = BROKER_SERVER_TIMEOUTS.request_ms;
+  server.keepAliveTimeout = BROKER_SERVER_TIMEOUTS.keep_alive_ms;
+  server.timeout = BROKER_SERVER_TIMEOUTS.socket_inactivity_ms;
+  server.listen(port, "127.0.0.1", () => {
+    const bound = server.address();
+    console.log(JSON.stringify({ broker: "started", pid: process.pid, port: typeof bound === "object" && bound !== null ? bound.port : port }));
+  });
   return server;
 }
 

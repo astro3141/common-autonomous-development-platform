@@ -7,7 +7,9 @@
  */
 
 import { condition, defineSignal, proxyActivities, setHandler, workflowInfo } from "@temporalio/workflow";
+import type { ActivityOptions } from "@temporalio/workflow";
 
+import { ACTIVITY_HEARTBEAT_TIMEOUT_MS, KERNEL_ACTIVITY_ATTEMPT_MS, SURFACE_BUDGETS } from "./timeouts.ts";
 import type * as activities from "./activities.ts";
 
 export interface WorkArgs {
@@ -30,17 +32,49 @@ export interface WorkArgs {
 
 export const humanDecisionSignal = defineSignal<[string]>("humanDecision");
 
-const acts = proxyActivities<typeof activities>({
-  startToCloseTimeout: "15 minutes",
+/**
+ * #127: a malformed bound must stop the run before any step or effect, never fail open. NaN and
+ * Infinity flatten to null across JSON transport; fractional, zero and negative values survive it.
+ * Either way `ordinal + 1 > bound` would be silently false (or trivially true) instead of a bound.
+ * Returns the offending field, or undefined when every bound is well-formed.
+ */
+export function malformedWorkBounds(bounds: WorkArgs["bounds"]): string | undefined {
+  for (const [name, value] of [["max_steps", bounds.max_steps], ["max_effects", bounds.max_effects]] as const) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return `${name}=${String(value)}`;
+  }
+  if (bounds.deadline !== undefined && Number.isNaN(Date.parse(bounds.deadline))) return `deadline=${String(bounds.deadline)}`;
+  return undefined;
+}
+
+const ACTIVITY_BASE = {
   // Long activities heartbeat; a killed worker is detected within ~30s instead of the full
   // start-to-close timeout, so restart recovery (P4) converges quickly.
-  heartbeatTimeout: "30 seconds",
+  heartbeatTimeout: ACTIVITY_HEARTBEAT_TIMEOUT_MS,
   retry: {
     // Activities converge via durable kernel state reads (get_effect_state), never via blind
     // re-dispatch: the PEP refuses non-admissible ordinals, so retries are safe reads.
     maximumAttempts: 3,
   },
-});
+} as const satisfies ActivityOptions;
+
+/**
+ * #128: each activity that waits on a model surface runs under ITS operation's attempt budget,
+ * strictly above that operation's broker-RPC budget (./timeouts.ts). Before the repair every
+ * activity shared one 15-minute budget that was EQUAL to the inner worker budget, so an in-bound
+ * long `/implement` had no margin left for the RPC and its response. Exported so the conformance
+ * control asserts the ordering over the exact options the workflow proxies with.
+ */
+export const SURFACE_ACTIVITY_OPTIONS = {
+  implementCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.implement.activity_attempt_ms },
+  verifyCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.verify.activity_attempt_ms },
+  reviewCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.review.activity_attempt_ms },
+} as const satisfies Record<string, ActivityOptions>;
+
+/** Kernel-only activities (allocate → seal → evaluate → admit, evidence): no surface wait. */
+const acts = proxyActivities<typeof activities>({ ...ACTIVITY_BASE, startToCloseTimeout: KERNEL_ACTIVITY_ATTEMPT_MS });
+const implementActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.implementCandidate);
+const verifyActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.verifyCandidate);
+const reviewActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.reviewCandidate);
 
 export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>> {
   const memo = workflowInfo().memo as { cadp_effect_id?: string };
@@ -53,6 +87,15 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
   });
 
   const trace: Record<string, unknown> = { work_run_ref: workRunRef };
+
+  // #127: fail closed on malformed bounds before the first step. The reference policy already
+  // DENIES such a WORK_START; this guard keeps the run bounded under any conforming policy.
+  const malformed = malformedWorkBounds(args.bounds);
+  if (malformed !== undefined) {
+    await acts.submitBoundStop(workRunRef, 0, `MALFORMED_BOUNDS ${malformed}`);
+    return { ...trace, stopped: "MALFORMED_BOUNDS", detail: malformed };
+  }
+
   let stepOrdinal = 0;
   let priorStepDigest: string | undefined;
 
@@ -102,14 +145,14 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
   // reviewer's stated reason (P1: address feedback with a NEW candidate — a new immutable ref).
   let baseSha = dev.base_sha;
   let workItem = dev.work_item;
-  let implemented!: Awaited<ReturnType<typeof acts.implementCandidate>>;
-  let verified!: Awaited<ReturnType<typeof acts.verifyCandidate>>;
-  let reviewed!: Awaited<ReturnType<typeof acts.reviewCandidate>>;
+  let implemented!: Awaited<ReturnType<typeof implementActs.implementCandidate>>;
+  let verified!: Awaited<ReturnType<typeof verifyActs.verifyCandidate>>;
+  let reviewed!: Awaited<ReturnType<typeof reviewActs.reviewCandidate>>;
   let approved = false;
   for (let round = 1; round <= 2 && !approved; round += 1) {
     const implStep = await nextStep();
     if (implStep === undefined) return { ...trace, stopped: "BOUND" };
-    implemented = await acts.implementCandidate({
+    implemented = await implementActs.implementCandidate({
       work_run_ref: workRunRef,
       step_ordinal: implStep,
       repo_full_name: dev.repo_full_name,
@@ -136,7 +179,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
 
     const verifyStep = await nextStep();
     if (verifyStep === undefined) return { ...trace, stopped: "BOUND" };
-    verified = await acts.verifyCandidate({
+    verified = await verifyActs.verifyCandidate({
       work_run_ref: workRunRef,
       step_ordinal: verifyStep,
       repo_full_name: dev.repo_full_name,
@@ -149,7 +192,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
 
     const reviewStep = await nextStep();
     if (reviewStep === undefined) return { ...trace, stopped: "BOUND" };
-    reviewed = await acts.reviewCandidate({
+    reviewed = await reviewActs.reviewCandidate({
       work_run_ref: workRunRef,
       step_ordinal: reviewStep,
       repo_full_name: dev.repo_full_name,

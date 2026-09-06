@@ -154,15 +154,39 @@ outcome := "ALLOW" if {
 	not intake_nonindex_denied
 }
 
+# #127: WORK_START bounds must be well-formed before any work is released. A malformed bound —
+# null (a NaN/Infinity that JSON serialization flattened), fractional, zero, negative, missing,
+# or an unparseable deadline — fails closed HERE, at the constitutional gate, never inside the
+# workflow where "ordinal + 1 > NaN" is silently false and the bound simply stops existing.
+work_bounds_ok if {
+	is_number(mat.bounds.max_steps)
+	round(mat.bounds.max_steps) == mat.bounds.max_steps
+	mat.bounds.max_steps >= 1
+	mat.bounds.max_steps <= params.max_steps_cap
+	is_number(mat.bounds.max_effects)
+	round(mat.bounds.max_effects) == mat.bounds.max_effects
+	mat.bounds.max_effects >= 1
+	work_deadline_ok
+}
+
+work_deadline_ok if not mat.bounds.deadline
+
+work_deadline_ok if {
+	is_string(mat.bounds.deadline)
+	time.parse_rfc3339_ns(mat.bounds.deadline)
+}
+
 # A WORK_START not carrying intake finding_admission keeps the plain allow; an intake
 # implementation WORK_START is gated by the finding predicates below.
 outcome := "ALLOW" if {
 	op == "WORK_START"
+	work_bounds_ok
 	not is_intake_workstart
 }
 
 outcome := "ALLOW" if {
 	op == "WORK_START"
+	work_bounds_ok
 	is_intake_workstart
 	intake_workstart_ok
 }
@@ -232,6 +256,11 @@ outcome := "REQUIRE_EVIDENCE" if {
 }
 
 # ---------------------------------------------------------------- reasons
+
+reason_codes contains "malformed_work_bounds" if {
+	op == "WORK_START"
+	not work_bounds_ok
+}
 
 reason_codes contains "verification_missing_or_unbound" if {
 	op == "PR_CREATE"
@@ -1286,6 +1315,7 @@ export function buildReferenceBundle(input: ReferencePolicyInput): Uint8Array {
   const policy_params = {
     verification_max_age_s: 3600,
     max_effects_cap: 1000,
+    max_steps_cap: 1000,
     require_backend_effort: false,
     extra_plain_allow_operations: [],
     ...input.paramOverrides,
