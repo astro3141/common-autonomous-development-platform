@@ -33,8 +33,9 @@ import type { ReviewProviderProfile } from "./reviewProviders.ts";
 import { DEFAULT_PLAN_PROVIDER, PLAN_PROVIDERS, resolvePlanProvider, planArgv } from "./planProviders.ts";
 import type { PlanProviderProfile } from "./planProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
+import { fetchExternalVerification } from "./externalVerification.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
-import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
+import { BROKER_SERVER_TIMEOUTS, EXTERNAL_VERIFY, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { IsolationConfig, ReviewerAuth, RunResult } from "./isolation.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -455,6 +456,12 @@ export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   "/verify": {
     response_budget_ms: SURFACE_BUDGETS.verify.broker_response_ms,
     run: (b) => brokerVerify(b as { repo_full_name: string; candidate_sha: string }),
+  },
+  // External verification backend (#57): one authoritative check-runs read per call; the polling
+  // loop lives in the activity. No container, no credential, exact-sha query only.
+  "/verify-external": {
+    response_budget_ms: EXTERNAL_VERIFY.broker_response_ms,
+    run: (b) => fetchExternalVerification((b as { repo_full_name: string }).repo_full_name, (b as { candidate_sha: string }).candidate_sha),
   },
   "/review": {
     response_budget_ms: SURFACE_BUDGETS.review.broker_response_ms,

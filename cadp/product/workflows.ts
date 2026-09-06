@@ -9,7 +9,7 @@
 import { condition, defineSignal, proxyActivities, setHandler, workflowInfo } from "@temporalio/workflow";
 import type { ActivityOptions } from "@temporalio/workflow";
 
-import { ACTIVITY_HEARTBEAT_TIMEOUT_MS, KERNEL_ACTIVITY_ATTEMPT_MS, SURFACE_BUDGETS } from "./timeouts.ts";
+import { ACTIVITY_HEARTBEAT_TIMEOUT_MS, EXTERNAL_VERIFY, KERNEL_ACTIVITY_ATTEMPT_MS, SURFACE_BUDGETS } from "./timeouts.ts";
 import type * as activities from "./activities.ts";
 
 export interface WorkArgs {
@@ -23,6 +23,8 @@ export interface WorkArgs {
     work_item: string;
     worker_product: string;
     review_product?: string;
+    /** Opt-in second verification backend (#57): the repository-owned GitHub Actions run. */
+    external_verification?: boolean;
     require_human_merge: boolean;
   };
   record?: {
@@ -59,6 +61,7 @@ export const SURFACE_ACTIVITY_OPTIONS = {
   implementCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.implement.activity_attempt_ms },
   verifyCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.verify.activity_attempt_ms },
   reviewCandidate: { ...ACTIVITY_BASE, startToCloseTimeout: SURFACE_BUDGETS.review.activity_attempt_ms },
+  verifyCandidateExternal: { ...ACTIVITY_BASE, startToCloseTimeout: EXTERNAL_VERIFY.activity_attempt_ms },
 } as const satisfies Record<string, ActivityOptions>;
 
 /** Kernel-only activities (allocate → seal → evaluate → admit, evidence): no surface wait. */
@@ -66,6 +69,7 @@ const acts = proxyActivities<typeof activities>({ ...ACTIVITY_BASE, startToClose
 const implementActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.implementCandidate);
 const verifyActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.verifyCandidate);
 const reviewActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.reviewCandidate);
+const externalVerifyActs = proxyActivities<typeof activities>(SURFACE_ACTIVITY_OPTIONS.verifyCandidateExternal);
 
 export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>> {
   const memo = workflowInfo().memo as { cadp_effect_id?: string };
@@ -139,6 +143,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
   let implemented!: Awaited<ReturnType<typeof implementActs.implementCandidate>>;
   let verified!: Awaited<ReturnType<typeof verifyActs.verifyCandidate>>;
   let reviewed!: Awaited<ReturnType<typeof reviewActs.reviewCandidate>>;
+  let externalVerified: Awaited<ReturnType<typeof externalVerifyActs.verifyCandidateExternal>> | undefined;
   let approved = false;
   for (let round = 1; round <= 2 && !approved; round += 1) {
     const implStep = await nextStep();
@@ -182,6 +187,28 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
     priorStepDigest = verified.work_step_envelope_digest;
     trace["verification_evidence_id"] = verified.verification_evidence_id;
 
+    // Opt-in external verification backend (#57): a second, independent-infrastructure
+    // VERIFICATION over the exact candidate sha. GitHub Actions is an evidence source only —
+    // the policy (require_external_verification) decides sufficiency; here a requested-but-not-
+    // successful external run fails closed before any PR effect is sealed.
+    if (dev.external_verification === true) {
+      const extStep = await nextStep();
+      if (extStep === undefined) return { ...trace, stopped: "BOUND" };
+      externalVerified = await externalVerifyActs.verifyCandidateExternal({
+        work_run_ref: workRunRef,
+        step_ordinal: extStep,
+        repo_full_name: dev.repo_full_name,
+        candidate_sha: implemented.candidate_sha,
+        repo_id: dev.repo_id,
+        prior_step_envelope_digest: priorStepDigest,
+      });
+      priorStepDigest = externalVerified.work_step_envelope_digest;
+      trace["external_verification_evidence_id"] = externalVerified.verification_evidence_id;
+      if (externalVerified.conclusion !== "success") {
+        return { ...trace, stopped: "EXTERNAL_VERIFY_NOT_SUCCESS", detail: externalVerified.conclusion };
+      }
+    }
+
     const reviewStep = await nextStep();
     if (reviewStep === undefined) return { ...trace, stopped: "BOUND" };
     reviewed = await reviewActs.reviewCandidate({
@@ -220,6 +247,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       reviewed.review_evidence_id,
       implemented.backend_evidence_id,
       implemented.work_step_envelope_id,
+      ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : []),
     ],
     prior_step_envelope_digest: priorStepDigest,
   });
@@ -243,7 +271,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       // input, and an input without it made the comparison vacuous (12th/13th pilots: a
       // claude-implemented run auto-merged by the claude-product delegate — twice, because only
       // the rule was fixed the first time, not this assembly).
-      evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id],
+      evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id, ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : [])],
       prior_step_envelope_digest: priorStepDigest,
     });
     priorStepDigest = prepared.work_step_envelope_digest;
@@ -253,7 +281,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       const merged = await acts.completeMergeWithHumanDecision({
         effect_id: prepared.effect_id,
         human_evidence_id: humanEvidenceId!,
-        evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id],
+        evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id, ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : [])],
       });
       trace["merge_outcome"] = merged.outcome;
       trace["merge_detail"] = merged.detail;

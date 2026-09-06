@@ -117,6 +117,7 @@ function startComponent(name: string): void {
         ...(m.tokens["cadp-reviewer-grok"] !== undefined ? { CADP_REVIEWER_TOKEN_GROK: m.tokens["cadp-reviewer-grok"]! } : {}),
         ...(m.tokens["cadp-reviewer-codex"] !== undefined ? { CADP_REVIEWER_TOKEN_CODEX: m.tokens["cadp-reviewer-codex"]! } : {}),
         ...(m.tokens["cadp-backend-scan-claude"] !== undefined ? { CADP_BACKEND_SCAN_TOKEN_CLAUDE: m.tokens["cadp-backend-scan-claude"]! } : {}),
+        ...(m.tokens["cadp-verifier-actions"] !== undefined ? { CADP_VERIFIER_ACTIONS_TOKEN: m.tokens["cadp-verifier-actions"]! } : {}),
         CADP_BACKEND_SCAN_TOKEN: m.tokens["cadp-backend-scan"]!,
         CADP_BACKEND_SCAN_TOKEN_GROK: m.tokens["cadp-backend-scan-grok"]!,
         CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
@@ -474,11 +475,11 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<{ a
  * ONLY on its APPROVE. It never edits code/policy/bounds and never bypasses a refusal; a
  * withheld/failed/stopped run halts and is REPORTED. One JSON status line per poll.
  */
-async function autoDev(work_item: string, maxSteps: string, maxEffects: string, proposalId?: string, workerProduct?: string, reviewProduct?: string): Promise<void> {
+async function autoDev(work_item: string, maxSteps: string, maxEffects: string, proposalId?: string, workerProduct?: string, reviewProduct?: string, externalVerify?: string): Promise<void> {
   let started: Awaited<ReturnType<typeof startWork>>;
   try {
-    // extra positions: [work_item, maxSteps, maxEffects, proposalId, worker_product, review_product].
-    started = await startWork(dir, "development", [work_item, maxSteps, maxEffects, proposalId ?? "", workerProduct ?? "codex", reviewProduct ?? ""], { log: opsLog });
+    // extra positions: [work_item, maxSteps, maxEffects, proposalId, worker_product, review_product, external].
+    started = await startWork(dir, "development", [work_item, maxSteps, maxEffects, proposalId ?? "", workerProduct ?? "codex", reviewProduct ?? "", externalVerify ?? ""], { log: opsLog });
   } catch (e) {
     console.log(JSON.stringify({ auto: "NOT_ADMITTED", detail: e instanceof Error ? e.message : String(e) }));
     return;
@@ -598,7 +599,7 @@ async function main(): Promise<void> {
       break;
     case "auto-dev":
       // auto-dev <work_item> [maxSteps maxEffects] [proposalId] [worker_product=codex|grok] [review_product=claude|grok]
-      await autoDev(process.argv[4]!, process.argv[5] ?? "12", process.argv[6] ?? "5", process.argv[7], process.argv[8], process.argv[9]);
+      await autoDev(process.argv[4]!, process.argv[5] ?? "12", process.argv[6] ?? "5", process.argv[7], process.argv[8], process.argv[9], process.argv[10]);
       break;
     case "state": {
       const state = await client("cadp-workflow").getEffectState(process.argv[4]!);

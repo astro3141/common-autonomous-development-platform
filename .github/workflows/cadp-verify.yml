@@ -1,0 +1,25 @@
+# CADP external verification backend (#57).
+#
+# Authority boundary (issue #57): GitHub Actions is an EVIDENCE SOURCE, never a lifecycle
+# authority. A green check here transitions nothing by itself — the broker reads the check-run
+# result for the exact candidate sha, the activity submits it as VERIFICATION evidence produced
+# by `verifier:github-actions`, and the deployment policy decides sufficiency
+# (`require_external_verification`). Workers get no GitHub credentials for this: the workflow is
+# repository-owned and triggers on the governed candidate-branch push that already happened.
+name: cadp-verify
+on:
+  push:
+    branches:
+      - "cadp/candidate/**"
+jobs:
+  verify:
+    name: cadp-verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci --ignore-scripts
+      - run: npm test

@@ -152,6 +152,10 @@ export async function startWork(
   // independence fails closed HERE, before anything is sealed or any surface spends compute.
   const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
   assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
+  // extra[6]: opt-in external verification backend (#57). Only the exact literal enables it —
+  // anything else fails closed rather than silently running without the second verifier.
+  if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
+  const externalVerification = extra[6] === "external";
   const args =
     vertical === "development"
       ? {
@@ -167,6 +171,7 @@ export async function startWork(
             work_item: extra[0]!,
             worker_product: workerProduct,
             review_product: reviewProduct,
+            external_verification: externalVerification,
             require_human_merge: true,
           },
         }

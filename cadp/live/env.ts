@@ -41,6 +41,7 @@ export interface LiveEnvManifest {
 const PRINCIPAL_TOKEN_NAMES = [
   "cadp-workflow", "cadp-worker-codex", "cadp-backend-scan", "cadp-backend-scan-grok", "cadp-reviewer-claude",
   "cadp-reviewer-grok", "cadp-planner-grok", "cadp-backend-scan-claude", "cadp-reviewer-codex", "cadp-planner-codex",
+  "cadp-verifier-actions",
   "cadp-verifier", "sso:a.t.laplace@gmail.com", "cadp-depctl-probe", "cadp-depctl-target",
   "cadp-improvement-intake", "cadp-observer", "cadp-planner", "cadp-agent-owner",
 ];

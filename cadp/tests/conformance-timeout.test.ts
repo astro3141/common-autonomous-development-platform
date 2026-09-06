@@ -92,6 +92,7 @@ import {
   BROKER_SERVER_TIMEOUTS,
   MIN_LAYER_MARGIN_MS,
   OLD_IMPLICIT_TRANSPORT_HEADERS_TIMEOUT_MS,
+  EXTERNAL_VERIFY,
   SURFACE_BUDGETS,
   SURFACE_TERMINATION_MS,
 } from "../product/timeouts.ts";
@@ -208,13 +209,20 @@ test("#128 T1-4: the production broker operation table declares each response bu
     ["/review", SURFACE_BUDGETS.review],
     ["/plan", SURFACE_BUDGETS.plan],
   ] as const;
-  assert.deepEqual(Object.keys(BROKER_OPERATIONS).sort(), wiring.map(([p]) => p).sort(), "the broker exposes exactly the declared operations");
+  // /verify-external is a surface-less operation (#57): one quick authoritative HTTP read, no
+  // container to bound, so it sits outside the four-layer SURFACE_BUDGETS hierarchy but must
+  // still declare a finite response budget strictly inside its caller's RPC budget.
+  assert.deepEqual(Object.keys(BROKER_OPERATIONS).sort(), [...wiring.map(([p]) => p), "/verify-external"].sort(), "the broker exposes exactly the declared operations");
   for (const [path, budget] of wiring) {
     const operation = BROKER_OPERATIONS[path]!;
     assert.equal(operation.response_budget_ms, budget.broker_response_ms);
     assert.ok(operation.response_budget_ms > budget.surface_ms, `${path}: the inner surface run is killed and cleaned up before the broker answers`);
     assert.ok(operation.response_budget_ms < budget.rpc_ms, `${path}: the broker answers before the caller's RPC budget expires`);
   }
+  const external = BROKER_OPERATIONS["/verify-external"]!;
+  assert.equal(external.response_budget_ms, EXTERNAL_VERIFY.broker_response_ms);
+  assert.ok(EXTERNAL_VERIFY.broker_response_ms + MIN_LAYER_MARGIN_MS <= EXTERNAL_VERIFY.rpc_ms, "/verify-external: broker answers a real margin before the RPC budget");
+  assert.ok(EXTERNAL_VERIFY.poll_interval_ms < EXTERNAL_VERIFY.activity_attempt_ms, "/verify-external: at least one poll fits the attempt budget");
 });
 
 test("#128 T1-5: stopping the surface and confirming it is gone is reserved inside the surface→broker margin", () => {
