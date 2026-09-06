@@ -304,15 +304,30 @@ async function attest(): Promise<void> {
   const rulesetDetail = ruleset === undefined
     ? undefined
     : (JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/rulesets/${ruleset.id}`], { encoding: "utf8" })) as { enforcement: string; rules: Array<{ type: string }>; conditions: unknown; bypass_actors?: unknown[] });
-  const probeSha = m.base_sha;
+  // Negative probe needs a local git repo with a commit to push into the DISPOSABLE
+  // cadp/candidate/* namespace — it never touches main. A self-host target has no `seed` dir,
+  // so use a dedicated throwaway probe repo whose history is unrelated to the real repo.
+  const probeDir = join(dir, "immutability-probe");
+  if (!existsSync(join(probeDir, ".git"))) {
+    mkdirSync(probeDir, { recursive: true });
+    execFileSync("git", ["init", "--quiet", "-b", "probe"], { cwd: probeDir });
+    writeFileSync(join(probeDir, "probe.txt"), `cadp immutability probe ${m.repo_id}\n`);
+    execFileSync("git", ["add", "-A"], { cwd: probeDir });
+    execFileSync("git", ["-c", "user.name=cadp-probe", "-c", "user.email=probe@cadp-v04.invalid", "commit", "--quiet", "-m", "immutability probe"], { cwd: probeDir });
+  }
+  const probeSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: probeDir, encoding: "utf8" }).trim();
   const probeRef = `refs/heads/cadp/candidate/${probeSha}`;
   const token = readFileSync(join(dir, "secret", "github-token"), "utf8").trim();
   const remote = `https://x-access-token:${token}@github.com/${m.repo_full_name}.git`;
-  spawnSync("git", ["push", remote, `${probeSha}:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
-  const seedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: join(dir, "seed"), encoding: "utf8" }).trim();
-  const moveAttempt = spawnSync("git", ["push", "--force", remote, `${seedHead}:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
-  const deleteAttempt = spawnSync("git", ["push", remote, `:${probeRef}`], { cwd: join(dir, "seed"), encoding: "utf8" });
-  const moveRejected = moveAttempt.status !== 0 || seedHead === probeSha;
+  spawnSync("git", ["push", remote, `${probeSha}:${probeRef}`], { cwd: probeDir, encoding: "utf8" });
+  // A second distinct commit to attempt moving the write-once ref to.
+  writeFileSync(join(probeDir, "probe.txt"), `cadp immutability probe move ${Date.now()}\n`);
+  execFileSync("git", ["add", "-A"], { cwd: probeDir });
+  execFileSync("git", ["-c", "user.name=cadp-probe", "-c", "user.email=probe@cadp-v04.invalid", "commit", "--quiet", "-m", "immutability probe move"], { cwd: probeDir });
+  const moveHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: probeDir, encoding: "utf8" }).trim();
+  const moveAttempt = spawnSync("git", ["push", "--force", remote, `${moveHead}:${probeRef}`], { cwd: probeDir, encoding: "utf8" });
+  const deleteAttempt = spawnSync("git", ["push", remote, `:${probeRef}`], { cwd: probeDir, encoding: "utf8" });
+  const moveRejected = moveAttempt.status !== 0;
   const deleteRejected = deleteAttempt.status !== 0;
   const enforced =
     rulesetDetail?.enforcement === "active" &&
