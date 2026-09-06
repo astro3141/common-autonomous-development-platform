@@ -21,6 +21,8 @@ Every model surface (worker, reviewer, planner) is a replaceable provider adapte
 
 Reviewer and merge-decision independence is enforced at the policy layer: no run can be reviewed or auto-merged by the same model product that implemented it. A run whose implementing model product matches the delegated merge agent is never auto-merged; it always requires a human decision.
 
+Cross-product delegation remains intact: a run implemented by one model product may be auto-merged by a delegated agent of a different product after independent review.
+
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
 - A policy decision binds to one exact effect identity, input digest and
