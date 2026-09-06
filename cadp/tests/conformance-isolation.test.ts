@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,8 +24,19 @@ import { buildWorkerSandbox, workerProfileDigest, WORKER_AUTH_FILES } from "../p
 after(() => stopSharedOpa());
 
 test("F2: the worker sandbox imports ONLY codex auth material; the profile digest is deterministic", () => {
+  // Hermetic: build a CONTROLLED host HOME with exactly the declared auth material + a config.toml
+  // decoy, so the test does not depend on the machine's real ~/.codex (which the isolated verifier
+  // container does not have — an ambient dependency made this test fail in-container and pass only
+  // on a developer host that happened to be codex-configured).
   const dir = mkdtempSync(join(tmpdir(), "cadp-f2-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "cadp-f2-home-"));
+  const realHome = process.env["HOME"];
   try {
+    mkdirSync(join(fakeHome, ".codex"), { recursive: true });
+    for (const f of WORKER_AUTH_FILES) writeFileSync(join(fakeHome, ".codex", f), "{}");
+    writeFileSync(join(fakeHome, ".codex", "config.toml"), "# host config that must NOT be imported\n");
+    process.env["HOME"] = fakeHome;
+
     const sandbox = buildWorkerSandbox(dir);
     const codexDir = join(sandbox.home, ".codex");
     const contents = existsSync(codexDir) ? readdirSync(codexDir) : [];
@@ -33,10 +44,13 @@ test("F2: the worker sandbox imports ONLY codex auth material; the profile diges
       assert.ok((WORKER_AUTH_FILES as readonly string[]).includes(entry), `unexpected import into worker profile: ${entry}`);
     }
     assert.ok(!contents.includes("config.toml"), "host config.toml (MCP/config mutation surface) is NOT imported");
+    assert.deepEqual([...sandbox.copied].sort(), [...WORKER_AUTH_FILES].sort(), "exactly the declared auth files are imported");
     assert.equal(workerProfileDigest(sandbox), workerProfileDigest(sandbox));
     assert.equal(workerProfileDigest(sandbox), workerProfileDigest(), "probe construction == production construction");
   } finally {
+    if (realHome === undefined) delete process.env["HOME"]; else process.env["HOME"] = realHome;
     rmSync(dir, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
   }
 });
 
