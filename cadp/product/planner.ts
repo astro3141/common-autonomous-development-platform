@@ -46,8 +46,11 @@ export function buildPlanPrompt(intent: string, repo_full_name: string, base_sha
     '               "rationale": "<why this is one bounded item>" } ],',
     '  "notes": "<optional overall notes>" }',
     "",
-    `At most ${MAX_PROPOSAL_ITEMS} items. Every bound must be a positive integer. Do not include any`,
-    "text outside the JSON object.",
+    `At most ${MAX_PROPOSAL_ITEMS} items. Every bound must be a positive integer. The executing`,
+    "development vertical spends one governed effect each for git push, PR creation and PR merge,",
+    "plus one more push per revision round — set max_effects to at least 4 (hard minimum 3), and",
+    "max_steps to at least 6 (implement/push/verify/review per round, plus PR and merge steps).",
+    "Do not include any text outside the JSON object.",
   ].join("\n");
 }
 

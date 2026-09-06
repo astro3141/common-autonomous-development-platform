@@ -248,6 +248,11 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       });
       trace["merge_outcome"] = merged.outcome;
       trace["merge_detail"] = merged.detail;
+      // A refused merge is a STOP, never a completion — the first hands-off supervision pilot
+      // measured a REFUSED_MAX_EFFECTS_IN_WORK_RUN being reported as completed:true.
+      if (merged.outcome !== "COMMITTED") {
+        return { ...trace, stopped: `MERGE_${merged.outcome}`, detail: merged.detail };
+      }
     }
   }
 

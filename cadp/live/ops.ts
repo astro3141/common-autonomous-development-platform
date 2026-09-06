@@ -22,6 +22,7 @@ import { brokerPostJson } from "../product/brokerTransport.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { parseWorkProposal } from "../product/planner.ts";
 import type { WorkProposalV1 } from "../product/planner.ts";
+import { devEffectFloorViolation } from "../product/workBounds.ts";
 import { classifyRun, nextAction } from "../product/driver.ts";
 import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
 import { attribution, collectRun, humanWait } from "../product/observationProjection.ts";
@@ -105,6 +106,10 @@ export async function startWork(
   const c = liveClient(dir, "cadp-workflow");
   const namespaceId = temporalNamespaceId(m);
 
+  if (vertical === "development") {
+    const floor = devEffectFloorViolation(boundArg(extra[2], 6));
+    if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
+  }
   const args =
     vertical === "development"
       ? {
