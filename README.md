@@ -13,11 +13,11 @@ implementation / tests / live evidence. See `Authority order.md`.
 
 Every model surface is a replaceable provider adapter selected per run, with unknown selections failing closed.
 
-| Role     | Available providers    |
-| -------- | ----------------------- |
-| worker   | codex, grok, claude     |
-| reviewer | claude, grok, codex     |
-| planner  | claude, grok, codex     |
+| Role     | codex | grok | claude |
+| -------- | ----- | ---- | ------ |
+| worker   | yes   | yes  | yes    |
+| reviewer | yes   | yes  | yes    |
+| planner  | yes   | yes  | yes    |
 
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
