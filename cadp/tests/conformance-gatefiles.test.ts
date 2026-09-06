@@ -19,6 +19,7 @@ test("GF1: gate machinery is flagged (kernel, policy, verify/review/model surfac
     "cadp/product/workerProfile.ts",
     "cadp/product/workerProviders.ts",
     "cadp/product/reviewProviders.ts",
+    "cadp/product/planProviders.ts",
     "cadp/product/timeouts.ts",
     "cadp/product/mcp.ts",
     "cadp/product/driver.ts",
