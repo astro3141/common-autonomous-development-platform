@@ -80,7 +80,7 @@ test("unknown review providers fail synchronously without filesystem effects", (
   try {
     const before = readdirSync(root);
     assert.throws(() => resolveReviewProvider("made-up"), /unknown review provider/u);
-    assert.throws(() => resolveReviewProvider("codex"), /unknown review provider/u, "a worker name is not a reviewer");
+    assert.throws(() => resolveReviewProvider("gemini"), /unknown review provider/u, "a dropped provider name never resolves");
     assert.throws(() => resolveReviewProvider(""), /unknown review provider/u);
     assert.throws(() => resolveReviewProvider(undefined as unknown as string), /unknown review provider/u);
     assert.deepEqual(readdirSync(root), before);
@@ -189,4 +189,24 @@ test("grok reviewer argv now carries the verdict json-schema constraint", () => 
   const schema = JSON.parse(argv[i + 1]!) as { properties: { verdict: { enum: string[] } }; required: string[] };
   assert.deepEqual(schema.properties.verdict.enum, ["APPROVE", "REQUEST_CHANGES"]);
   assert.deepEqual(schema.required, ["verdict", "reason"]);
+});
+
+// ------------------------------------------------ codex reviewer + claude worker (2026-09-07 probes)
+
+test("codex reviewer carries the MEASURED read-only sandbox argv and first-line contract", () => {
+  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT"]);
+  assert.ok(!REVIEW_PROVIDERS.codex.argv_template.includes("danger-full-access"), "the reviewer must NEVER carry the worker's full-access sandbox");
+  assert.equal(REVIEW_PROVIDERS.codex.verdict_format, "first-line");
+  assert.deepEqual(REVIEW_PROVIDERS.codex.auth_method, { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] });
+  const entry = REFERENCE_IDENTITIES.find((i) => i.producer_ref === "reviewer:codex");
+  assert.ok(entry !== undefined && entry.identity_class.product === REVIEW_PROVIDERS.codex.identity_class_product);
+});
+
+test("independence matrix over the full worker×reviewer product space", () => {
+  // Same product refuses; every cross-product pair passes.
+  assert.throws(() => assertReviewIndependence("codex-cli", "codex"), /reviewer independence/u);
+  assert.throws(() => assertReviewIndependence("claude-code", "claude"), /reviewer independence/u, "a claude-implemented run cannot be claude-reviewed");
+  for (const [worker, review] of [["codex-cli", "claude"], ["codex-cli", "grok"], ["grok", "claude"], ["grok", "codex"], ["claude-code", "grok"], ["claude-code", "codex"]] as const) {
+    assert.doesNotThrow(() => assertReviewIndependence(worker, review), `${worker} × ${review} must be a valid pairing`);
+  }
 });

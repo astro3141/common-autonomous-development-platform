@@ -1,5 +1,5 @@
 /** Closed set of planner CLI profiles supported by the product. */
-export type PlanProvider = "claude" | "grok";
+export type PlanProvider = "claude" | "grok" | "codex";
 
 /**
  * How the planner authenticates inside the isolated container. Descriptors only — never a
@@ -64,6 +64,14 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
     ],
     auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
     identity_class_product: "grok",
+  },
+  codex: {
+    // Measured read-only posture (2026-09-07 probe — see the codex entry in reviewProviders.ts).
+    // Proposal output is parsed against the closed cadp.work-proposal.v1 schema, failing closed on
+    // any deviation, so no extra output contract is needed here.
+    argv_template: ["exec", "--sandbox", "read-only", "--skip-git-repo-check", PLAN_PROMPT_SENTINEL],
+    auth_method: { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] },
+    identity_class_product: "codex-cli",
   },
 };
 
