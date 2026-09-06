@@ -9,6 +9,16 @@ Authority order: `Common Autonomous Development Platform — Specification v0.4.
 > `TECHNICAL_DESIGN_cadp_v0_4_generation.md` (TD v2.0) > exact current
 implementation / tests / live evidence. See `Authority order.md`.
 
+## Model providers
+
+Every model surface (worker, reviewer, planner) is a replaceable provider adapter selected per run; unknown selections fail closed.
+
+| Role | Providers |
+|---|---|
+| Worker | codex, grok, claude |
+| Reviewer | claude, grok, codex |
+| Planner | claude, grok, codex |
+
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
 - A policy decision binds to one exact effect identity, input digest and
