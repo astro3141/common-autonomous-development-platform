@@ -19,7 +19,15 @@ test("codex provider retains the byte-identical worker profile", () => {
 });
 
 test("grok argv places the prompt BEFORE its flags (template, not last-token prefix)", () => {
-  assert.deepEqual(workerArgv("grok", "fix the bug"), ["grok", "-p", "fix the bug", "--output-format", "streaming-json"]);
+  assert.deepEqual(workerArgv("grok", "fix the bug"), ["grok", "-p", "fix the bug", "--output-format", "streaming-json", "--permission-mode", "bypassPermissions"]);
+});
+
+test("grok runs with edit approvals bypassed (headless autonomous-edit posture, codex parity)", () => {
+  // Without this, grok's default permission mode blocks edit tools in a no-TTY headless session and
+  // it emits a prose plan instead of a diff (observed live). This is grok's analogue of codex's
+  // `--sandbox danger-full-access`; container isolation, not the CLI prompt, is the real boundary.
+  assert.ok(workerArgv("grok", "x").includes("bypassPermissions"), "grok must bypass its own edit-approval prompts");
+  assert.ok(WORKER_PROVIDERS.grok.argv_template.includes("--permission-mode"), "grok argv must set an explicit permission mode");
 });
 
 for (const provider of ["grok"] as const) {

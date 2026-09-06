@@ -37,7 +37,16 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
   grok: {
     // Measured live: `grok -p "<prompt>" --output-format streaming-json` authenticates from the
     // injected ~/.grok/auth.json (subscription OAuth) and emits an NDJSON event stream.
-    argv_template: ["-p", WORK_ITEM_SENTINEL, "--output-format", "streaming-json"],
+    //
+    // `--permission-mode bypassPermissions` is grok's analogue of codex's `--sandbox
+    // danger-full-access`: it bypasses grok's OWN in-CLI approval prompts for edit tools. Without
+    // it grok's default permission mode requires interactive approval, which a headless (`-p`, no
+    // TTY) session cannot grant — so grok falls back to emitting a prose plan and never edits
+    // files, yielding a no-op candidate the reviewer correctly rejects (observed live, 3rd pilot).
+    // Bypassing grok's internal prompts does NOT widen what the surface can reach: the worker still
+    // runs inside `--network none` + egress allowlist + host-fs-not-mounted, with only auth.json
+    // injected. This restores byte-for-byte the same autonomous-edit posture codex already has.
+    argv_template: ["-p", WORK_ITEM_SENTINEL, "--output-format", "streaming-json", "--permission-mode", "bypassPermissions"],
     auth_files: ["auth.json"],
     auth_subdir: ".grok",
     sessions_subdir: "grok-sessions",
