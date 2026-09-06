@@ -3,7 +3,8 @@
  *   node cadp/live/ctl.ts <dir> up                          start record/temporal/kernel/worker
  *   node cadp/live/ctl.ts <dir> stop|start <component>      kill / restart one real process
  *   node cadp/live/ctl.ts <dir> attest                      reach + immutability attestations
- *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects]
+ *   node cadp/live/ctl.ts <dir> plan "<whole intent>"       proposal-only planner → WORK_PROPOSAL evidence
+ *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects] [proposalEvidenceId]
  *   node cadp/live/ctl.ts <dir> work-record <n-payloads> [maxSteps maxEffects]
  *   node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
  *   node cadp/live/ctl.ts <dir> state <effect_id>
@@ -21,6 +22,9 @@ import type { IsolationConfig } from "../product/isolation.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { brokerPostJson } from "../product/brokerTransport.ts";
+import { SURFACE_BUDGETS } from "../product/timeouts.ts";
+import type { WorkProposalV1 } from "../product/planner.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -417,6 +421,10 @@ async function startWork(vertical: "development" | "record", extra: string[], or
     requester_ref: "workflow:cadp-work",
     work_bindings: [
       { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
+      // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
+      ...(vertical === "development" && extra[3] !== undefined
+        ? [{ authority_ref: "cadp-store:k04", namespace: "work-proposal", object_id: extra[3] }]
+        : []),
     ],
     target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: namespaceId },
     operation_kind: "WORK_START",
@@ -432,6 +440,36 @@ async function startWork(vertical: "development" | "record", extra: string[], or
   }
   const admitted = await c.admitAndDispatch(effect_id, evaluated.decision.decision_id);
   console.log(JSON.stringify({ effect_id, workflow_id: material.workflow_id, request_digest: request.request_digest.value, admitted }, null, 2));
+}
+
+/**
+ * Proposal-only planning (#61): run the commodity planner surface over the whole intent, seal the
+ * typed proposal as WORK_PROPOSAL evidence with exact provenance, and print it. The proposal
+ * confers no authority — each item still enters through the ordinary governed WORK_START
+ * (`work-dev "<item>" [maxSteps maxEffects] [proposal_evidence_id]` for exact provenance binding).
+ */
+async function plan(intent: string): Promise<void> {
+  const m = manifest();
+  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
+    `http://127.0.0.1:${m.broker_port}`,
+    "/plan",
+    { repo_full_name: m.repo_full_name, base_sha: m.base_sha, intent },
+    { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
+  );
+  const envelope = await client("cadp-planner").submitEvidence({
+    evidence_kind: "WORK_PROPOSAL",
+    subject_bindings: [
+      { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
+      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${m.base_sha}` },
+    ],
+    availability: "PRESENT",
+    claim_schema: "cadp.work-proposal.v1",
+    claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
+    producer_ref: "planner:claude-code",
+    source_ref: `planner:${m.base_sha}:${sha256Hex(intent).slice(0, 16)}`,
+    source_relation: "SELF_REPORT",
+  });
+  console.log(JSON.stringify({ proposal_evidence_id: envelope.evidence_id, items: result.proposal.items, notes: result.proposal.notes }, null, 2));
 }
 
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
@@ -506,6 +544,9 @@ async function main(): Promise<void> {
       break;
     case "attest":
       await attest();
+      break;
+    case "plan":
+      await plan(process.argv[4]!);
       break;
     case "work-dev":
       await startWork("development", process.argv.slice(4));

@@ -206,6 +206,7 @@ test("#128 T1-4: the production broker operation table declares each response bu
     ["/implement", SURFACE_BUDGETS.implement],
     ["/verify", SURFACE_BUDGETS.verify],
     ["/review", SURFACE_BUDGETS.review],
+    ["/plan", SURFACE_BUDGETS.plan],
   ] as const;
   assert.deepEqual(Object.keys(BROKER_OPERATIONS).sort(), wiring.map(([p]) => p).sort(), "the broker exposes exactly the declared operations");
   for (const [path, budget] of wiring) {

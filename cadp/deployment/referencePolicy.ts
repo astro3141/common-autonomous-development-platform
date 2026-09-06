@@ -1264,6 +1264,9 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // TD §12 r8 (#96/#106): the read-only constitutional observer. Its reach is exactly the four
   // Kernel read methods; it produces no evidence and holds no write or evaluate path.
   { principal: "cadp-observer", producer_ref: "observer:cadp-readonly", identity_class: { vendor: "cadp", product: "readonly-observer", account: "cadp-v04", process_class: "observer" } },
+  // Proposal-only planner (#61): the sole registered producer of WORK_PROPOSAL. Its output is
+  // read-only discovery evidence (Spec §8.2); autonomous work admission stays governed WORK_START.
+  { principal: "cadp-planner", producer_ref: "planner:claude-code", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "evidence-adapter" } },
 ];
 
 export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
@@ -1275,6 +1278,7 @@ export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "deployment-control-probe", evidence_kinds: ["CREDENTIAL_REACH_ATTESTATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "deployment-control-target", evidence_kinds: ["TARGET_IMMUTABILITY_ATTESTATION"], source_relation: "TARGET_AUTHORITY_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "intake:cadp-improvement", evidence_kinds: ["IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
+  { producer_ref: "planner:claude-code", evidence_kinds: ["WORK_PROPOSAL"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   // v1.1 (#117 §5.2/§5.3): the two separated mechanisms declared explicitly — replay idempotency
   // on the effect-bound source_ref (what makes the adapter's NATIVE_KEY true at the target) and
   // governed-edge uniqueness on the sealed draft's own supersedes singleton (invariant U).

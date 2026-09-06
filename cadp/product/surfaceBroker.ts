@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { buildWorkerSandbox, WORKER_ARGV_PREFIX } from "./workerProfile.ts";
+import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { IsolationConfig, RunResult } from "./isolation.ts";
@@ -251,6 +252,44 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
   }
 }
 
+// ------------------------------------------------------------------ /plan
+
+/**
+ * Proposal-only planner surface (#61 roadmap): a read-only reviewer-class container reads the
+ * checkout at base_sha and decomposes the whole intent into bounded work items. Output is parsed
+ * against the closed cadp.work-proposal.v1 schema and FAILS CLOSED on any deviation — a proposal
+ * is never repaired, and it confers no authority (WORK_START remains the only admission).
+ */
+export async function brokerPlan(body: { repo_full_name: string; base_sha: string; intent: string }): Promise<{
+  proposal: ReturnType<typeof parseWorkProposal>;
+  stdout_digest: string;
+}> {
+  if (!(await dockerAvailable())) throw new Error("planner isolation runtime (docker) unavailable — failing closed");
+  const base = mkdtempSync(join(tmpdir(), "cadp-plan-"));
+  try {
+    const workspace = join(base, "ws");
+    let r = await git(["clone", "--quiet", `https://github.com/${body.repo_full_name}.git`, workspace]);
+    if (r.status !== 0) throw new Error(`clone failed: ${r.stderr.slice(0, 300)}`);
+    r = await git(["checkout", "--quiet", body.base_sha], workspace);
+    if (r.status !== 0) throw new Error(`checkout ${body.base_sha} failed: ${r.stderr.slice(0, 300)}`);
+
+    const prompt = buildPlanPrompt(body.intent, body.repo_full_name, body.base_sha);
+    const run = await runReviewer(config(), {
+      workspace,
+      providerToken: claudeProviderToken(),
+      // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
+      argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task", prompt],
+      timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
+    });
+    if (run.status !== 0 || run.stdout.trim().length === 0) {
+      throw new Error(`planner surface failed — ${surfaceFailure("planner", run)}`);
+    }
+    return { proposal: parseWorkProposal(run.stdout), stdout_digest: sha256(run.stdout) };
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
 // ------------------------------------------------------------------ server
 
 /**
@@ -275,6 +314,10 @@ export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   "/review": {
     response_budget_ms: SURFACE_BUDGETS.review.broker_response_ms,
     run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string }),
+  },
+  "/plan": {
+    response_budget_ms: SURFACE_BUDGETS.plan.broker_response_ms,
+    run: (b) => brokerPlan(b as { repo_full_name: string; base_sha: string; intent: string }),
   },
 };
 
