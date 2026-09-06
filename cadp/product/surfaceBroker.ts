@@ -28,6 +28,7 @@ import { createHash } from "node:crypto";
 import { buildWorkerSandbox } from "./workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
+import { DEFAULT_REVIEW_PROVIDER, resolveReviewProvider, reviewArgv } from "./reviewProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
@@ -272,11 +273,16 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
 
 // ------------------------------------------------------------------ /review
 
-export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string }): Promise<{
+export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
   verdict: string;
   reason: string;
   stdout: string;
 }> {
+  // Deliberately precedes even the docker availability probe: an unknown selection has no
+  // filesystem, process, docker, or network side effect and can never fall back to another
+  // provider. Omitting the name defaults to claude so the pre-registry argv is byte-identical;
+  // resolveReviewProvider itself never substitutes a default.
+  const provider = resolveReviewProvider(body.review_product ?? DEFAULT_REVIEW_PROVIDER);
   if (!(await dockerAvailable())) throw new Error("reviewer isolation runtime (docker) unavailable — failing closed");
   const base = mkdtempSync(join(tmpdir(), "cadp-review-"));
   try {
@@ -301,7 +307,7 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     const review = await runReviewer(config(), {
       workspace: reviewWs,
       providerToken: claudeProviderToken(),
-      argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
+      argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
     });
     if (review.status !== 0 || review.stdout.trim().length === 0) {
@@ -378,7 +384,7 @@ export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   },
   "/review": {
     response_budget_ms: SURFACE_BUDGETS.review.broker_response_ms,
-    run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string }),
+    run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }),
   },
   "/plan": {
     response_budget_ms: SURFACE_BUDGETS.plan.broker_response_ms,
