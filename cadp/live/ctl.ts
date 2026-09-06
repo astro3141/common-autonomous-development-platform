@@ -23,7 +23,7 @@ import type { IsolationConfig } from "../product/isolation.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
-import { sealPlan, startWork, workPlan } from "./ops.ts";
+import { sealPlan, startWork, workPlan, runSnapshot } from "./ops.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 
@@ -369,7 +369,7 @@ const opsLog = (line: Record<string, unknown>): void => console.log(JSON.stringi
  * mirroring §8.4 reviewer independence for the machine DECISION (Spec §3: one identity may not
  * perform incompatible duties). The kernel policy separately refuses a non-independent producer.
  */
-async function agentApprove(effect_id: string, workflow_id: string): Promise<void> {
+async function agentApprove(effect_id: string, workflow_id: string): Promise<{ approved: boolean; reason: string }> {
   const m = manifest();
   const c = client("cadp-agent-owner");
   const state = await client("cadp-observer").getEffectState(effect_id);
@@ -409,7 +409,7 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<voi
   console.log("ISOLATED MERGE REVIEW:", JSON.stringify(review));
   if (review.verdict !== "APPROVE") {
     console.log(JSON.stringify({ agent_decision: "WITHHELD", reason: review.reason }));
-    return; // the isolated reviewer did not approve — no AGENT_DECISION is sealed
+    return { approved: false, reason: review.reason }; // isolated reviewer did not approve — no AGENT_DECISION
   }
 
   const envelope = await c.submitEvidence({
@@ -435,6 +435,43 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<voi
     "--address", `127.0.0.1:${m.temporal_port}`, "--namespace", "cadp-v04",
   ]);
   console.log(JSON.stringify({ agent_evidence: envelope.evidence_id, signalled: workflow_id }));
+  return { approved: true, reason: review.reason };
+}
+
+/**
+ * Fully autonomous single work item to actual merge (hands-off test). The operator TRIGGERS this
+ * and then only monitors. From worker action onward nothing is hand-driven: implement → governed
+ * push → verify → review → PR → at the merge gate the driver invokes the ISOLATED merge reviewer
+ * (agentApprove, whose verdict is formed in a fresh reviewer context, not this one) and merges
+ * ONLY on its APPROVE. It never edits code/policy/bounds and never bypasses a refusal; a
+ * withheld/failed/stopped run halts and is REPORTED. One JSON status line per poll.
+ */
+async function autoDev(work_item: string, maxSteps: string, maxEffects: string, proposalId?: string): Promise<void> {
+  let started: Awaited<ReturnType<typeof startWork>>;
+  try {
+    started = await startWork(dir, "development", [work_item, maxSteps, maxEffects, ...(proposalId !== undefined ? [proposalId] : [])], { log: opsLog });
+  } catch (e) {
+    console.log(JSON.stringify({ auto: "NOT_ADMITTED", detail: e instanceof Error ? e.message : String(e) }));
+    return;
+  }
+  if (started === undefined) { console.log(JSON.stringify({ auto: "NOT_ADMITTED" })); return; }
+  const { effect_id: workRunRef, workflow_id } = started;
+  const approvedMerges = new Set<string>();
+  const deadline = Date.now() + 45 * 60_000;
+  for (;;) {
+    if (Date.now() > deadline) { console.log(JSON.stringify({ auto: "STALLED", work_run_ref: workRunRef })); return; }
+    const snap = await runSnapshot(dir, workRunRef, workflow_id);
+    console.log(JSON.stringify({ auto: "poll", work_run_ref: workRunRef, status: snap.item.status, human_wait: snap.human_wait }));
+    if (snap.item.status === "COMPLETED") { console.log(JSON.stringify({ auto: "COMPLETED", work_run_ref: workRunRef, trace: snap.item.trace })); return; }
+    if (snap.item.status === "STOPPED" || snap.item.status === "FAILED") { console.log(JSON.stringify({ auto: snap.item.status, work_run_ref: workRunRef, detail: snap.item })); return; }
+    for (const mergeEffect of snap.human_wait) {
+      if (approvedMerges.has(mergeEffect)) continue;
+      approvedMerges.add(mergeEffect);
+      const outcome = await agentApprove(mergeEffect, workflow_id);
+      if (!outcome.approved) { console.log(JSON.stringify({ auto: "MERGE_WITHHELD", work_run_ref: workRunRef, effect: mergeEffect, reason: outcome.reason })); return; }
+    }
+    await new Promise((r) => setTimeout(r, 15_000));
+  }
 }
 
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
@@ -527,6 +564,9 @@ async function main(): Promise<void> {
       break;
     case "agent-approve":
       await agentApprove(process.argv[4]!, process.argv[5]!);
+      break;
+    case "auto-dev":
+      await autoDev(process.argv[4]!, process.argv[5] ?? "12", process.argv[6] ?? "5", process.argv[7]);
       break;
     case "state": {
       const state = await client("cadp-workflow").getEffectState(process.argv[4]!);
