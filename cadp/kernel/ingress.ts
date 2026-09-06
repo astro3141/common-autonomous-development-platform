@@ -285,7 +285,8 @@ export class Ingress {
     if (draft.evidence_kind === "BACKEND_EXECUTION" && draft.availability === "PRESENT") {
       this.assertBackendObservedLocators(draft.claim);
     }
-    if (draft.evidence_kind === "HUMAN_DECISION") {
+    if (draft.evidence_kind === "HUMAN_DECISION" || draft.evidence_kind === "AGENT_DECISION") {
+      // A delegated agent decision carries the exact same §9.3 pre-sealed-scope obligations.
       this.assertHumanDecisionScope(draft, produced_at);
     }
 

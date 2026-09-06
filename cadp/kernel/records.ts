@@ -58,13 +58,20 @@ export type EvidenceKind =
   | "IMPROVEMENT_FINDING_RESOLUTION"
   // Proposal-only planner output (#61): read-only discovery evidence with exact provenance.
   // Never authority — autonomous work admission remains the governed WORK_START.
-  | "WORK_PROPOSAL";
+  | "WORK_PROPOSAL"
+  // Delegated (machine) decision — Spec K2 explicitly allows machine decisions. Same §9.3
+  // pre-sealed-scope contract and PEP #5 single-effect rule as HUMAN_DECISION; the policy
+  // decides which effects may accept it (reference: PR_MERGE only, from producers the
+  // deployment's Human listed in delegated_merge_producers). Recorded as what it is: an
+  // agent's decision, never disguised as a Human's.
+  | "AGENT_DECISION";
 
 export const EVIDENCE_KINDS: readonly EvidenceKind[] = [
   "VERIFICATION", "REVIEW", "BACKEND_EXECUTION", "HUMAN_DECISION", "TARGET_RECONCILIATION",
   "PEP_TARGET_IDENTITY", "CREDENTIAL_REACH_ATTESTATION", "TARGET_IMMUTABILITY_ATTESTATION",
   "KERNEL_INCIDENT", "WORK_STEP", "WORK_BOUND_STOP", "GENESIS", "BREAK_GLASS", "LEGACY_V03_ARTIFACT",
   "RECONCILE_EXHAUSTED", "IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION", "WORK_PROPOSAL",
+  "AGENT_DECISION",
 ];
 
 export interface Provenance {

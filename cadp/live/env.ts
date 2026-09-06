@@ -41,7 +41,7 @@ export interface LiveEnvManifest {
 const PRINCIPAL_TOKEN_NAMES = [
   "cadp-workflow", "cadp-worker-codex", "cadp-backend-scan", "cadp-reviewer-claude",
   "cadp-verifier", "sso:a.t.laplace@gmail.com", "cadp-depctl-probe", "cadp-depctl-target",
-  "cadp-improvement-intake", "cadp-observer", "cadp-planner",
+  "cadp-improvement-intake", "cadp-observer", "cadp-planner", "cadp-agent-owner",
 ];
 
 function sh(cmd: string, args: string[], options: { cwd?: string; input?: string } = {}): string {
@@ -137,6 +137,10 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     revision: 1,
     root_public_keys: [{ key_id: root.key_id, alg: "Ed25519", public_key: root.public_key_base64, valid_from: "2026-01-01T00:00:00.000Z" }],
     configOverrides: { temporal_idempotency_horizon_s: 86400 },
+    // Human delegation (2026-09-06): the deployment owner delegated MERGE decisions to the
+    // owner-agent. Recorded honestly as AGENT_DECISION from agent:claude-owner — never as a
+    // Human's. POLICY_ACTIVATE and judgment gates still require a HUMAN_DECISION.
+    paramOverrides: { delegated_merge_producers: ["agent:claude-owner"] },
   });
   const dbPath = join(dir, "k04.sqlite");
   {

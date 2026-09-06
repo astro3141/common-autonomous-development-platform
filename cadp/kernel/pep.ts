@@ -338,10 +338,10 @@ export class Pep {
       }
     }
 
-    // #5 — HUMAN_DECISION exact scope, single-effect use.
+    // #5 — HUMAN_DECISION / AGENT_DECISION exact scope, single-effect use.
     if (this.#enabled("recheck5_human_scope")) {
       for (const envelope of evidence) {
-        if (envelope.evidence_kind !== "HUMAN_DECISION") continue;
+        if (envelope.evidence_kind !== "HUMAN_DECISION" && envelope.evidence_kind !== "AGENT_DECISION") continue;
         const scope = (envelope.claim as { scope?: { effect_id?: string; work_run_ref?: string } })?.scope;
         const boundEffect = scope?.effect_id;
         if (boundEffect !== undefined) {
