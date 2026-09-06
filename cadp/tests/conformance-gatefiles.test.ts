@@ -47,7 +47,7 @@ test("GF4: the rule file guards itself and every rule is a real repo path shape"
   for (const rule of GATE_PATH_RULES) {
     // Machinery rules live under cadp/; constitutional documents live at the repo root and are
     // named by exact file or a trailing-`*` filename prefix.
-    const constitutional = rule === "Authority order.md" || rule.endsWith("*");
+    const constitutional = rule === "Authority order.md" || rule.endsWith("*") || rule === ".github/";
     assert.ok(rule.startsWith("cadp/") || constitutional, `rule ${rule} should be a cadp path or a constitutional-doc rule`);
   }
 });
@@ -56,6 +56,7 @@ test("GF5: constitutional/design documents route to HUMAN — the design lane ca
   // The Spec, every TD generation, the authority order, and standalone design notes DEFINE the
   // authority boundaries; a delegated agent must never auto-merge an edit to them.
   for (const p of [
+    ".github/workflows/cadp-verify.yml",
     "Authority order.md",
     "Common Autonomous Development Platform — Specification v0.4.md",
     "Common Autonomous Development Platform — Specification v0.3.md",

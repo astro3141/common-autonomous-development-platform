@@ -9,6 +9,8 @@
  * credentials merely to run CI).
  */
 
+import { execFileSync } from "node:child_process";
+
 /** The check name the repository-owned workflow (.github/workflows/cadp-verify.yml) declares. */
 export const EXTERNAL_CHECK_NAME = "cadp-verify";
 
@@ -49,17 +51,24 @@ export function projectCheckRuns(payload: unknown): ExternalVerification {
   return { status: "PRESENT", conclusion, check_run_id: id, html_url, started_at, completed_at };
 }
 
-/** One authoritative read of the check-runs for a sha (the broker host has GitHub reachability). */
+/**
+ * One authoritative read of the check-runs for a sha. Via the OPERATOR's gh CLI on the broker
+ * host: the unauthenticated API read measured out at HTTP 403 within one polling run (60/h/IP —
+ * 16th pilot), and the credential stays host-side, never inside any actor container (the issue
+ * #57 boundary is about ACTOR sessions). Any read failure is honest UNKNOWN — never a pass or a
+ * failure.
+ */
 export async function fetchExternalVerification(repo_full_name: string, sha: string): Promise<ExternalVerification> {
   let payload: unknown;
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo_full_name}/commits/${sha}/check-runs?check_name=${EXTERNAL_CHECK_NAME}`, {
-      headers: { "user-agent": "cadp-broker", accept: "application/vnd.github+json" },
-    });
-    if (!res.ok) return { status: "UNKNOWN", unknown_reason: `check-runs read failed: HTTP ${String(res.status)}` };
-    payload = await res.json();
+    const raw = execFileSync(
+      "gh",
+      ["api", `repos/${repo_full_name}/commits/${sha}/check-runs?check_name=${EXTERNAL_CHECK_NAME}`, "-H", "accept: application/vnd.github+json"],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    payload = JSON.parse(raw);
   } catch (e) {
-    return { status: "UNKNOWN", unknown_reason: `check-runs read failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { status: "UNKNOWN", unknown_reason: `check-runs read failed: ${e instanceof Error ? e.message.slice(0, 200) : String(e)}` };
   }
   return projectCheckRuns(payload);
 }

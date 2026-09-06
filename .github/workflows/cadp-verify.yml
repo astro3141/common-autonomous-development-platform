@@ -15,11 +15,18 @@ jobs:
   verify:
     name: cadp-verify
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      # The conformance suite drives a real OPA evaluator; pin the SAME version the deployment's
+      # evaluator integrity records (1.20.1). Without it the suite stalls to the job timeout
+      # (measured live, 16th pilot: npm test cancelled at 10m, check-run conclusion=cancelled).
+      - run: |
+          curl -fsSL -o /usr/local/bin/opa https://openpolicyagent.org/downloads/v1.20.1/opa_linux_amd64_static
+          chmod +x /usr/local/bin/opa
+          opa version
       - run: npm ci --ignore-scripts
       - run: npm test

@@ -35,6 +35,7 @@ export const GATE_PATH_RULES: readonly string[] = [
   // the self-approval hazard in its purest form. Every constitutional/design document routes to a
   // HUMAN_DECISION. A trailing `*` marks a filename prefix, covering past and future revisions
   // (v0.3, v0.4, next generations) without re-editing this list per revision.
+  ".github/", // the external verification workflow — what the Actions verifier actually RUNS
   "Authority order.md",
   "Common Autonomous Development Platform — Specification*", // every Spec revision
   "TECHNICAL_DESIGN_*", // every TD document
