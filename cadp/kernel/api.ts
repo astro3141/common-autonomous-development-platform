@@ -52,7 +52,7 @@ const METHOD_REACH: Record<string, readonly ProcessClass[]> = {
   admit_and_dispatch: ["workflow"],
   get_effect_state: ["workflow", "worker", "evidence-adapter", "deployment-control", "human-surface", "agent-surface", "observer"],
   request_reconcile: ["workflow", "deployment-control"],
-  list_effects: ["workflow", "worker", "observer"],
+  list_effects: ["workflow", "observer"],
   get_evidence: ["workflow", "evidence-adapter", "deployment-control", "human-surface", "observer"],
   list_evidence: ["workflow", "deployment-control", "observer"],
 };
