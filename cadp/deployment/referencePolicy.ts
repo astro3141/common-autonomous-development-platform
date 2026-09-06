@@ -138,6 +138,24 @@ human_ok if {
 	e.claim.scope.material_digest == req.material_digest.value
 }
 
+# Delegated merge decision: the deployment's Human may list exact agent producers whose
+# AGENT_DECISION satisfies the MERGE gate ONLY (the default list is empty = no delegation).
+# POLICY_ACTIVATE and every human-judgment transition gate keep requiring a HUMAN_DECISION —
+# constitution changes and judgment calls are never delegated by this rule.
+agent_merge_ok if {
+	some e in input.evidence
+	e.evidence_kind == "AGENT_DECISION"
+	e.availability == "PRESENT"
+	e.claim.decision == "APPROVE"
+	e.claim.scope.effect_id == req.effect_id
+	e.claim.scope.material_digest == req.material_digest.value
+	e.producer_ref in params.delegated_merge_producers
+}
+
+merge_decision_ok if human_ok
+
+merge_decision_ok if agent_merge_ok
+
 has_work_run if {
 	some wb in req.work_bindings
 	wb.namespace == "work-run"
@@ -219,13 +237,13 @@ merge_base_ok if {
 
 outcome := "ALLOW" if {
 	merge_base_ok
-	human_ok
+	merge_decision_ok
 	not intake_nonindex_denied
 }
 
 outcome := "REQUIRE_EVIDENCE" if {
 	merge_base_ok
-	not human_ok
+	not merge_decision_ok
 	not intake_nonindex_denied
 }
 
@@ -307,7 +325,7 @@ reason_codes contains "required_fact_unknown" if {
 
 reason_codes contains "HUMAN_DECISION" if {
 	merge_base_ok
-	not human_ok
+	not merge_decision_ok
 }
 
 reason_codes contains "HUMAN_DECISION" if {
@@ -1267,6 +1285,9 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // Proposal-only planner (#61): the sole registered producer of WORK_PROPOSAL. Its output is
   // read-only discovery evidence (Spec §8.2); autonomous work admission stays governed WORK_START.
   { principal: "cadp-planner", producer_ref: "planner:claude-code", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "evidence-adapter" } },
+  // Delegated owner-agent decision surface: produces AGENT_DECISION only, honestly attributed to
+  // the agent. It satisfies nothing unless the active policy's delegated_merge_producers names it.
+  { principal: "cadp-agent-owner", producer_ref: "agent:claude-owner", identity_class: { vendor: "anthropic", product: "claude-code", account: "cadp-v04", process_class: "agent-surface" } },
 ];
 
 export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
@@ -1279,6 +1300,7 @@ export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "deployment-control-target", evidence_kinds: ["TARGET_IMMUTABILITY_ATTESTATION"], source_relation: "TARGET_AUTHORITY_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "intake:cadp-improvement", evidence_kinds: ["IMPROVEMENT_FINDING", "IMPROVEMENT_FINDING_RESOLUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "planner:claude-code", evidence_kinds: ["WORK_PROPOSAL"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
+  { producer_ref: "agent:claude-owner", evidence_kinds: ["AGENT_DECISION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   // v1.1 (#117 §5.2/§5.3): the two separated mechanisms declared explicitly — replay idempotency
   // on the effect-bound source_ref (what makes the adapter's NATIVE_KEY true at the target) and
   // governed-edge uniqueness on the sealed draft's own supersedes singleton (invariant U).
@@ -1325,6 +1347,9 @@ export function buildReferenceBundle(input: ReferencePolicyInput): Uint8Array {
     max_steps_cap: 1000,
     require_backend_effort: false,
     extra_plain_allow_operations: [],
+    // Empty = no delegation. A deployment's Human may list exact AGENT_DECISION producers whose
+    // approval satisfies the MERGE gate only (never POLICY_ACTIVATE / judgment gates).
+    delegated_merge_producers: [],
     ...input.paramOverrides,
   };
   return buildPolicyBundle({

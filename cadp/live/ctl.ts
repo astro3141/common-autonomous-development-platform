@@ -344,6 +344,48 @@ async function attest(): Promise<void> {
 
 const opsLog = (line: Record<string, unknown>): void => console.log(JSON.stringify(line, null, 2));
 
+/**
+ * Delegated owner-agent merge approval. Identical §9.3 contract to human-approve, but the
+ * envelope is AGENT_DECISION from agent:claude-owner — honestly attributed. It satisfies the
+ * merge gate only where the active policy's delegated_merge_producers names this producer.
+ */
+async function agentApprove(effect_id: string, workflow_id: string): Promise<void> {
+  const m = manifest();
+  const c = client("cadp-agent-owner");
+  const state = await c.getEffectState(effect_id);
+  const shown = {
+    effect_id,
+    request_digest: state.request.request_digest.value,
+    target_ref: state.request.target_ref,
+    material_digest: state.request.material_digest.value,
+    operation: state.request.operation_kind,
+  };
+  console.log("AGENT SURFACE RENDERS:", JSON.stringify(shown, null, 2));
+  const envelope = await c.submitEvidence({
+    evidence_kind: "AGENT_DECISION",
+    subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id }],
+    availability: "PRESENT",
+    claim_schema: "cadp.human-decision.v1",
+    claim: {
+      principal: "agent:claude-owner",
+      decision: "APPROVE",
+      scope: { effect_id, target_ref: shown.target_ref, material_digest: shown.material_digest },
+      presented_request_digest: state.request.request_digest,
+      statement: "approved by the delegated owner-agent after reviewing the exact sealed merge effect",
+      issued_at: new Date().toISOString(),
+    },
+    producer_ref: "agent:claude-owner",
+    source_ref: "agent-owner-approval-surface",
+    source_relation: "INDEPENDENT_OBSERVATION",
+  });
+  execFileSync("temporal", [
+    "workflow", "signal", "--workflow-id", workflow_id, "--name", "humanDecision",
+    "--input", JSON.stringify(envelope.evidence_id),
+    "--address", `127.0.0.1:${m.temporal_port}`, "--namespace", "cadp-v04",
+  ]);
+  console.log(JSON.stringify({ agent_evidence: envelope.evidence_id, signalled: workflow_id }));
+}
+
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
   const m = manifest();
   const c = client("sso:a.t.laplace@gmail.com");
@@ -431,6 +473,9 @@ async function main(): Promise<void> {
       break;
     case "human-approve":
       await humanApprove(process.argv[4]!, process.argv[5]!);
+      break;
+    case "agent-approve":
+      await agentApprove(process.argv[4]!, process.argv[5]!);
       break;
     case "state": {
       const state = await client("cadp-workflow").getEffectState(process.argv[4]!);
