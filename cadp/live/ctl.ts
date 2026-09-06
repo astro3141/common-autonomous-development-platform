@@ -237,7 +237,7 @@ async function attest(): Promise<void> {
     mkdirSync(wsDir, { recursive: true });
     execFileSync("cp", [payload, join(wsDir, "probe.mjs")]);
     await runProbe("reviewer", "docker container; internal network + provider-only allowlist proxy; model token by env", (env) =>
-      runReviewer(config, { workspace: wsDir, providerToken: "probe-not-used", argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
+      runReviewer(config, { workspace: wsDir, auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "probe-not-used" }, argv: ["sh", "-c", `PROBE_SEARCH_ROOTS='${env.PROBE_SEARCH_ROOTS}' PROBE_TARGETS='${env.PROBE_TARGETS.replace(/'/gu, "")}' node /ws/probe.mjs`], timeout_ms: 60_000 }));
   }
   // Activity-host (re-review 5101871379): the Temporal worker process holds the Kernel tokens.
   // Under its EXACT production Seatbelt profile it must (1) not read the PEP secret files, (2) not
