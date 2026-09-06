@@ -95,6 +95,9 @@ function startComponent(name: string): void {
         CADP_WORKER_IMAGE: readFileSync(join(dir, "worker-image"), "utf8").trim(),
         CADP_EGRESS_NETWORK: egress.network,
         CADP_EGRESS_PROXY: egress.proxy,
+        // Failure-only session retention (bounded): a failed worker run's session log is its only
+        // postmortem record. Wired here (not a hand-set env var) so every broker restart keeps it.
+        CADP_FAILED_SESSIONS_DIR: join(dir, "failed-sessions"),
       };
       // The bounded surface launcher (TD §4.1): it clones (public read) and drives Docker, so it
       // keeps network + daemon access, but it holds NO Kernel token and its Seatbelt profile
