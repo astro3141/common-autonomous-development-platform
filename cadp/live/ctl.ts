@@ -345,6 +345,14 @@ async function attest(): Promise<void> {
   console.log(JSON.stringify({ immutability: immutability.evidence_id, write_once_enforced: enforced, move_rejected: moveRejected, delete_rejected: deleteRejected }, null, 2));
 }
 
+/** #127: a malformed CLI bound refuses at entry — it must never become NaN→null in sealed material. */
+function boundArg(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`malformed work bound '${raw}' — need a positive integer`);
+  return value;
+}
+
 async function startWork(vertical: "development" | "record", extra: string[], ordinalArg?: string): Promise<void> {
   const m = manifest();
   const c = client("cadp-workflow");
@@ -354,7 +362,7 @@ async function startWork(vertical: "development" | "record", extra: string[], or
     vertical === "development"
       ? {
           vertical,
-          bounds: { max_steps: Number(extra[1] ?? 8), max_effects: Number(extra[2] ?? 6) },
+          bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
           development: {
             repo_id: m.repo_id,
             repo_full_name: m.repo_full_name,
@@ -366,11 +374,11 @@ async function startWork(vertical: "development" | "record", extra: string[], or
         }
       : {
           vertical,
-          bounds: { max_steps: Number(extra[1] ?? 6), max_effects: Number(extra[2] ?? 4) },
+          bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
           record: {
             tenant: "cadp-disposable",
             resource_prefix: `live-${Date.now() % 100000}`,
-            payloads: Array.from({ length: Number(extra[0] ?? 2) }, (_, i) => `live payload ${i + 1}`),
+            payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
           },
         };
 

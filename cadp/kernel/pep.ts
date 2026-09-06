@@ -593,14 +593,24 @@ export class Pep {
           let bound = Number(constraint.args[0]);
           const workStart = this.store.effectRequest(workRun);
           if (workStart !== undefined) {
+            let declared: unknown;
+            let readable = false;
             try {
               const startMaterial = JSON.parse(Buffer.from(this.cas.get(workStart.material_ref)).toString("utf8")) as {
-                bounds?: { max_effects?: number };
+                bounds?: { max_effects?: unknown };
               };
-              if (Number.isInteger(startMaterial.bounds?.max_effects)) {
-                bound = Math.min(bound, startMaterial.bounds!.max_effects!);
-              }
+              declared = startMaterial.bounds?.max_effects;
+              readable = true;
             } catch { /* material refusal is #15's job for the WORK_START effect itself */ }
+            if (readable && declared !== undefined) {
+              // #127: a declared bound that is not a positive integer refuses — it is never
+              // silently widened to the policy cap (`Number.isInteger(NaN)` used to drop it;
+              // a NaN/Infinity bound arrives here as null after JSON serialization).
+              if (typeof declared !== "number" || !Number.isSafeInteger(declared) || declared < 1) {
+                throw new Refuse("CONSTRAINT_VIOLATED", `MALFORMED_WORK_BOUNDS: max_effects=${String(declared)}`);
+              }
+              bound = Math.min(bound, declared);
+            }
           }
           const count = this.store.effectIdsByWorkRun(workRun).length;
           if (count > bound) throw new Refuse("MAX_EFFECTS_IN_WORK_RUN", `${count} > ${bound}`);

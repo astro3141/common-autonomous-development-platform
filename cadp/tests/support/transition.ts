@@ -105,7 +105,7 @@ export async function makeFinding(h: Harness, over: MakeFindingInput): Promise<E
  * effect_id IS the work run ref (TD §7.3 / pep.ts work-run resolution).
  */
 export async function startRun(h: Harness): Promise<{ run: string; outcome: string }> {
-  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ bounds: {} }), "utf8"));
+  const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ bounds: { max_steps: 8, max_effects: 6 } }), "utf8"));
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: "work-start",
