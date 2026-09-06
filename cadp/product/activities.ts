@@ -324,7 +324,12 @@ export async function implementCandidate(input: {
 
 /** #91 method: the broker scanned the worker's own session log; PRESENT facts carry a locator. */
 async function submitBackendExecution(work_run_ref: string, step_ordinal: number, provider: string, model?: string, locator?: string): Promise<string> {
-  const scanClient = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_BACKEND_SCAN_TOKEN"));
+  // The BACKEND_EXECUTION producer_ref is `backend-scan:<provider>`, so the token must authenticate
+  // as that exact producer (the kernel refuses a producer/principal mismatch, fail closed). Select
+  // the per-provider scan token (CADP_BACKEND_SCAN_TOKEN_<PROVIDER>), defaulting to the codex token.
+  const providerTokenVar = `CADP_BACKEND_SCAN_TOKEN_${provider.toUpperCase()}`;
+  const scanToken = process.env[providerTokenVar] ?? env("CADP_BACKEND_SCAN_TOKEN");
+  const scanClient = new KernelClient(env("CADP_KERNEL_URL"), scanToken);
   const observed: Record<string, unknown> = {
     model:
       model !== undefined
