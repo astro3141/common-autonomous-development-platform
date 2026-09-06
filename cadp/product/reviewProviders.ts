@@ -27,6 +27,15 @@ export interface ReviewProviderProfile {
    * cannot self-assert a different class at submit time.
    */
   readonly identity_class_product: string;
+  /**
+   * MEASURED verdict output contract. `first-line`: the verdict is the first stdout line starting
+   * with APPROVE/REQUEST_CHANGES, reason on the next line (claude `-p`). `json-schema-text`: the
+   * provider runs under `--json-schema`, stdout is `{"text": "..."}` whose text concatenates one
+   * JSON object PER TURN (tool-use narration is coerced into the schema too — measured live, 9th
+   * pilot); the LAST object is the final verdict. Anything unparseable fails closed to
+   * REQUEST_CHANGES — a verdict is never guessed.
+   */
+  readonly verdict_format: "first-line" | "json-schema-text";
 }
 
 export const DIFF_PROMPT_SENTINEL = "{{DIFF_PROMPT}}";
@@ -48,6 +57,7 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
     ],
     auth_method: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN" },
     identity_class_product: "claude-code",
+    verdict_format: "first-line",
   },
   grok: {
     // Measured (2026-09-06 container probes, grok 1.0.13):
@@ -59,6 +69,10 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
     //    is the enforced read-only boundary; plan mode stays as defense in depth.
     //  - `--disable-web-search` removes web_search/web_fetch.
     //  - Plain `-p` output prints the verdict text directly (APPROVE\n<reason>), parser-compatible.
+    // 9th-pilot measurement: in plain `-p` output grok concatenates tool-use narration and the
+    // final verdict WITHOUT a newline ("...file.APPROVE"), so the first-line contract is
+    // unparseable. `--json-schema` constrains the reply to a verdict object instead (see
+    // `verdict_format` for the measured wrapper shape).
     argv_template: [
       "-p",
       DIFF_PROMPT_SENTINEL,
@@ -67,9 +81,12 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
       "--disable-web-search",
       "--tools",
       "read_file,list_dir,grep",
+      "--json-schema",
+      '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","REQUEST_CHANGES"]},"reason":{"type":"string"}},"required":["verdict","reason"]}',
     ],
     auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
     identity_class_product: "grok",
+    verdict_format: "json-schema-text",
   },
 };
 
@@ -82,6 +99,33 @@ export function reviewArgv(provider: ReviewProvider, diff_prompt: string): strin
 export function resolveReviewProvider(name: string): ReviewProvider {
   if (Object.prototype.hasOwnProperty.call(REVIEW_PROVIDERS, name)) return name as ReviewProvider;
   throw new Error(`unknown review provider: ${name}`);
+}
+
+/**
+ * Parse a reviewer surface's stdout into a verdict per the provider's MEASURED contract. Fails
+ * closed: anything that does not contain an unambiguous final verdict is REQUEST_CHANGES with an
+ * honest reason — a verdict is never guessed from prose.
+ */
+export function parseReviewVerdict(provider: ReviewProvider, stdout: string): { verdict: "APPROVE" | "REQUEST_CHANGES"; reason: string } {
+  const format = REVIEW_PROVIDERS[provider].verdict_format;
+  if (format === "first-line") {
+    const lines = stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    const verdictLine = lines.find((l) => l === "APPROVE" || l === "REQUEST_CHANGES" || l.startsWith("APPROVE") || l.startsWith("REQUEST_CHANGES")) ?? "";
+    const verdict = verdictLine.startsWith("APPROVE") ? "APPROVE" : "REQUEST_CHANGES";
+    const reason = lines[lines.indexOf(verdictLine) + 1] ?? stdout.trim().slice(0, 200);
+    return { verdict, reason };
+  }
+  // json-schema-text: {"text": "<one JSON object per turn, concatenated>"} — the LAST is final.
+  try {
+    const wrapper = JSON.parse(stdout) as { text?: string };
+    const text = typeof wrapper.text === "string" ? wrapper.text : stdout;
+    const matches = [...text.matchAll(/\{\s*"verdict"\s*:\s*"(APPROVE|REQUEST_CHANGES)"\s*,\s*"reason"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/gu)];
+    const last = matches[matches.length - 1];
+    if (last === undefined) return { verdict: "REQUEST_CHANGES", reason: "reviewer output carried no schema-shaped verdict — failing closed" };
+    return { verdict: last[1] as "APPROVE" | "REQUEST_CHANGES", reason: JSON.parse(`"${last[2]!}"`) as string };
+  } catch {
+    return { verdict: "REQUEST_CHANGES", reason: "reviewer output was not the measured json-schema wrapper — failing closed" };
+  }
 }
 
 /**
