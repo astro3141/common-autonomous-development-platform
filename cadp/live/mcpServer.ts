@@ -98,7 +98,7 @@ const TOOLS: McpTool[] = [
       required: ["work_run_ref"],
     },
     call: async (args) => {
-      const run = await collectRun(liveClient(dir, "cadp-workflow"), String(args["work_run_ref"]));
+      const run = await collectRun(liveClient(dir, "cadp-observer"), String(args["work_run_ref"]));
       const waiting = humanWait(run.effects);
       return {
         human_wait: waiting,

@@ -85,7 +85,7 @@ export async function sealPlan(dir: string, intent: string): Promise<{ proposal_
 
 /** Fetch + fail-closed re-validate a sealed WORK_PROPOSAL. */
 export async function loadProposal(dir: string, proposalEvidenceId: string): Promise<WorkProposalV1> {
-  const { envelope } = await liveClient(dir, "cadp-workflow").getEvidence(proposalEvidenceId);
+  const { envelope } = await liveClient(dir, "cadp-observer").getEvidence(proposalEvidenceId);
   if (envelope.evidence_kind !== "WORK_PROPOSAL") throw new Error(`evidence ${proposalEvidenceId} is ${envelope.evidence_kind}, not WORK_PROPOSAL`);
   const claim = envelope.claim as Record<string, unknown>;
   return parseWorkProposal(
@@ -212,7 +212,7 @@ export async function runSnapshot(dir: string, workRunRef: string, workflowId?: 
   attribution: Record<string, unknown>;
 }> {
   const m = loadManifest(dir);
-  const c = liveClient(dir, "cadp-workflow");
+  const c = liveClient(dir, "cadp-observer");
   const status = workflowId !== undefined ? await temporalStatus(m, workflowId) : { workflow_status: "UNKNOWN" as const };
   const run = await collectRun(c, workRunRef);
   const wait = humanWait(run.effects);
@@ -226,7 +226,7 @@ export async function runSnapshot(dir: string, workRunRef: string, workflowId?: 
 /** Poll one work run until it settles: Temporal status + kernel human-wait projection. */
 export async function pollRun(dir: string, workRunRef: string, workflowId: string, deadlineMs: number): Promise<ItemStatus> {
   const m = loadManifest(dir);
-  const c = liveClient(dir, "cadp-workflow");
+  const c = liveClient(dir, "cadp-observer");
   const startedAt = Date.now();
   for (;;) {
     const status = await temporalStatus(m, workflowId);
