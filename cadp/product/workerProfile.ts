@@ -14,7 +14,7 @@ import { cpSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { jcsDigest } from "../kernel/canonical.ts";
-import { WORKER_PROVIDERS } from "./workerProviders.ts";
+import { resolveWorkerProvider, WORKER_PROVIDERS } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
 
 export { WORKER_PROVIDERS, resolveWorkerProvider } from "./workerProviders.ts";
@@ -34,7 +34,7 @@ export interface WorkerSandbox {
 
 /** Fresh worker HOME with ONLY the minimum codex auth material (finding 2). */
 export function buildWorkerSandbox(baseDir: string, provider: WorkerProvider = "codex"): WorkerSandbox {
-  const profile = WORKER_PROVIDERS[provider];
+  const profile = WORKER_PROVIDERS[resolveWorkerProvider(provider)];
   const home = join(baseDir, "home");
   mkdirSync(join(home, "tmp"), { recursive: true });
   mkdirSync(join(home, profile.auth_subdir), { recursive: true });
@@ -53,7 +53,7 @@ export function buildWorkerSandbox(baseDir: string, provider: WorkerProvider = "
 
 /** The worker profile identity bound into WORK_START material AND the reach attestation. */
 export function workerProfileDigest(sandbox?: WorkerSandbox, provider: WorkerProvider = "codex"): string {
-  const profile = WORKER_PROVIDERS[provider];
+  const profile = WORKER_PROVIDERS[resolveWorkerProvider(provider)];
   return jcsDigest({
     schema: "cadp.worker-profile.v1",
     product: `${provider}-cli`,
