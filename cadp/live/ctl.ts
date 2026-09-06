@@ -25,6 +25,7 @@ import { KernelClient } from "../clients/kernelClient.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
 import { sealPlan, startWork, workPlan, runSnapshot } from "./ops.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
+import { touchesGateMachinery } from "../product/gateFiles.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 
 const dir = process.argv[2]!;
@@ -397,6 +398,24 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<{ a
     if (envelope.evidence_kind === "REVIEW" && claim !== undefined) reviewVerdict = String(claim["verdict"] ?? "UNKNOWN");
   }
   if (candidateSha === undefined) throw new Error("merge effect has no verification-bound candidate sha — refusing to approve");
+
+  // Gate-machinery guard: a delegated agent decision may NOT auto-merge a change to the machinery
+  // that forms the gate itself (kernel, policy, verifier/reviewer/isolation surfaces, model
+  // selection, conformance suite). Such candidates route to a HUMAN_DECISION — neither the agent
+  // nor a conductor triggering it can weaken its own checks. Changed files come from the target's
+  // authoritative compare API (no local clone needed).
+  let changedFiles: string[] = [];
+  try {
+    const cmp = JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/compare/main...${candidateSha}`, "--jq", "[.files[].filename]"], { encoding: "utf8" })) as string[];
+    changedFiles = cmp;
+  } catch (e) {
+    return { approved: false, reason: `could not determine changed files for gate-machinery check: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const gateHits = touchesGateMachinery(changedFiles);
+  if (gateHits.length > 0) {
+    console.log(JSON.stringify({ agent_decision: "WITHHELD_HUMAN_REQUIRED", gate_files: gateHits }));
+    return { approved: false, reason: `candidate touches gate machinery (${gateHits.join(", ")}) — merge must be a HUMAN_DECISION, not a delegated agent decision` };
+  }
 
   // Fresh ISOLATED merge reviewer: only the governed facts reach it, no build/direction context.
   const workItem = `Final merge gate review for candidate ${candidateSha} into ${m.repo_full_name} main. Governed evidence: verification conclusion = ${verificationConclusion}; independent review verdict = ${reviewVerdict}. Reply APPROVE only if this exact committed candidate is safe to merge; otherwise REQUEST_CHANGES.`;
