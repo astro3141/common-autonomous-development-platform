@@ -20,7 +20,7 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -125,6 +125,9 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       argv: ["codex", ...WORKER_ARGV_PREFIX, "-C", "/ws", body.work_item],
       timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });
+    // Opt-in worker session preservation for debugging (default OFF so runs don't accumulate).
+    // Captured BEFORE the status check so a FAILED run's session (the interesting one) is kept too.
+    preserveWorkerSession(sessionsDir, workerRun, body.work_item);
     if (workerRun.status !== 0) throw new Error(surfaceFailure("worker", workerRun));
 
     await git(["add", "-A"], workspace);
@@ -145,6 +148,23 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+}
+
+/**
+ * Debug-only worker session preservation. When CADP_DEBUG_SESSIONS_DIR is set, copy the worker's
+ * session log + stdout/stderr/status to a persistent per-run folder so a failed run's reasoning
+ * can be inspected afterward. Default OFF: the container tmp is otherwise deleted (no bloat).
+ */
+function preserveWorkerSession(sessionsDir: string, run: { status: number | null; stdout: string; stderr: string }, work_item: string): void {
+  const debugDir = process.env["CADP_DEBUG_SESSIONS_DIR"];
+  if (debugDir === undefined || debugDir.length === 0) return;
+  try {
+    const stamp = `${new Date().toISOString().replace(/[:.]/gu, "-")}-${sha256(work_item).slice(0, 8)}`;
+    const dest = join(debugDir, stamp);
+    mkdirSync(dest, { recursive: true });
+    if (existsSync(sessionsDir)) cpSync(sessionsDir, join(dest, "sessions"), { recursive: true });
+    writeFileSync(join(dest, "run.json"), JSON.stringify({ status: run.status, work_item, stdout: run.stdout.slice(-20_000), stderr: run.stderr.slice(-20_000) }, null, 2));
+  } catch { /* debugging aid must never break a run */ }
 }
 
 /** #91 method: scan the worker's OWN codex session log; PRESENT facts carry a locator. */
@@ -249,7 +269,14 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     await git(["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${body.candidate_sha}`], workspace);
     r = await git(["checkout", "--quiet", body.candidate_sha], workspace);
     if (r.status !== 0) throw new Error(`checkout failed: ${r.stderr.slice(0, 300)}`);
-    const diff = (await git(["show", "--stat", "--patch", body.candidate_sha], workspace)).stdout.slice(0, 40_000);
+    // The reviewer must see the CANDIDATE'S CUMULATIVE change, not just its tip commit. `git show`
+    // shows only the last commit — so a multi-round run whose real fix landed in an earlier round
+    // and whose tip is a cosmetic follow-up would be reviewed as "no change", a false REJECT
+    // (measured live: a correct api.ts fix rejected because the tip commit only renamed a test).
+    // Diff from the candidate's fork point off main to the candidate.
+    const mb = await git(["merge-base", "origin/main", body.candidate_sha], workspace);
+    const forkBase = mb.status === 0 && mb.stdout.trim().length > 0 ? mb.stdout.trim() : "origin/main";
+    const diff = (await git(["diff", "--stat", "--patch", forkBase, body.candidate_sha], workspace)).stdout.slice(0, 60_000);
 
     const prompt = `You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
     const reviewWs = join(base, "review-ws");
