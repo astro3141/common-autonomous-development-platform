@@ -13,11 +13,6 @@
   },
   "include": [
     "cadp/**/*.ts",
-    "core/**/*.ts",
-    "adapters/**/*.ts",
-    "devharness/**/*.ts",
-    "deployment/**/*.ts",
-    "testdoubles/**/*.ts",
-    "tests/**/*.ts"
+    "devharness/**/*.ts"
   ]
 }
