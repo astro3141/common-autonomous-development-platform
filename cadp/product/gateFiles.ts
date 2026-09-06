@@ -22,6 +22,7 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/isolation.ts", // container/network isolation + bounded surface lifetime
   "cadp/product/workerProfile.ts", // worker argv/auth profile + profile digest
   "cadp/product/workerProviders.ts", // which worker models are selectable
+  "cadp/product/planProviders.ts", // which planner models are selectable
   "cadp/product/brokerTransport.ts", // the activity-host -> broker transport bounds
   "cadp/product/timeouts.ts", // the declared timeout hierarchy
   "cadp/product/mcp.ts", // the tool surface a supervising session drives

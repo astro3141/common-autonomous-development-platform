@@ -28,6 +28,8 @@ import { createHash } from "node:crypto";
 import { buildWorkerSandbox } from "./workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
+import { DEFAULT_PLAN_PROVIDER, PLAN_PROVIDERS, resolvePlanProvider, planArgv } from "./planProviders.ts";
+import type { PlanProviderProfile } from "./planProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
@@ -319,16 +321,29 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
 
 // ------------------------------------------------------------------ /plan
 
+function planProviderToken(profile: PlanProviderProfile): string {
+  // Fail closed on an auth method isolation.ts does not yet inject. Never reuse the claude
+  // OAuth token for a different provider, and never fall back to worker auth files.
+  if (profile.auth_method.kind === "oauth_env" && profile.auth_method.env_var === "CLAUDE_CODE_OAUTH_TOKEN") {
+    return claudeProviderToken();
+  }
+  throw new Error(`unsupported plan auth method: ${profile.auth_method.kind}`);
+}
+
 /**
  * Proposal-only planner surface (#61 roadmap): a read-only reviewer-class container reads the
  * checkout at base_sha and decomposes the whole intent into bounded work items. Output is parsed
  * against the closed cadp.work-proposal.v1 schema and FAILS CLOSED on any deviation — a proposal
  * is never repaired, and it confers no authority (WORK_START remains the only admission).
  */
-export async function brokerPlan(body: { repo_full_name: string; base_sha: string; intent: string }): Promise<{
+export async function brokerPlan(body: { repo_full_name: string; base_sha: string; intent: string; plan_product?: string }): Promise<{
   proposal: ReturnType<typeof parseWorkProposal>;
   stdout_digest: string;
 }> {
+  // Unknown plan_product fails closed with no filesystem, process, docker, or network side
+  // effect. An omitted selection keeps the measured claude path (byte-identical argv).
+  const provider = resolvePlanProvider(body.plan_product ?? DEFAULT_PLAN_PROVIDER);
+  const profile = PLAN_PROVIDERS[provider];
   if (!(await dockerAvailable())) throw new Error("planner isolation runtime (docker) unavailable — failing closed");
   const base = mkdtempSync(join(tmpdir(), "cadp-plan-"));
   try {
@@ -341,9 +356,9 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
     const prompt = buildPlanPrompt(body.intent, body.repo_full_name, body.base_sha);
     const run = await runReviewer(config(), {
       workspace,
-      providerToken: claudeProviderToken(),
+      providerToken: planProviderToken(profile),
       // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
-      argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task", prompt],
+      argv: planArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
     });
     if (run.status !== 0 || run.stdout.trim().length === 0) {
@@ -382,7 +397,7 @@ export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   },
   "/plan": {
     response_budget_ms: SURFACE_BUDGETS.plan.broker_response_ms,
-    run: (b) => brokerPlan(b as { repo_full_name: string; base_sha: string; intent: string }),
+    run: (b) => brokerPlan(b as { repo_full_name: string; base_sha: string; intent: string; plan_product?: string }),
   },
 };
 
