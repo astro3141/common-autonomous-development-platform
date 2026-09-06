@@ -66,9 +66,11 @@ node cadp/live/env.ts setup <dir> [--repo owner/name]   # disposable repo, genes
 node cadp/live/ctl.ts <dir> up                          # record service, temporal dev server,
                                                         # kernel, surface broker, worker
 node cadp/live/ctl.ts <dir> attest                      # credential-reach + immutability evidence
-node cadp/live/ctl.ts <dir> work-dev "<work item>" [max_steps] [max_effects]
+node cadp/live/ctl.ts <dir> plan "<whole intent>"       # proposal-only planner → WORK_PROPOSAL evidence
+node cadp/live/ctl.ts <dir> work-dev "<work item>" [max_steps] [max_effects] [proposal_evidence_id]
 node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
 node cadp/live/ctl.ts <dir> state <effect_id>
+node cadp/live/observe.ts <dir> run|effect|attribution <ref>   # read-only observer projection
 ```
 
 Process entry points: `npm run kernel -- <config.json>`, `npm run worker`,
@@ -89,5 +91,11 @@ requires re-proving the same conformance evidence, never new kernel authority.
   conformance green, live-proven (#100/#102, #105, #126).
 - Broker/activity timeout hierarchy and bounded surface lifetime (#127/#128):
   repaired; see `cadp/product/timeouts.ts` and `cadp/tests/conformance-timeout.test.ts`.
+- Read-only constitutional observation (TD §12 r8, #96/#106): the `observer`
+  caller class, K2 read API with verify-on-read, and the non-authoritative
+  trace/attribution projections (`cadp/live/observe.ts`).
+- Proposal-only planner (#61): `ctl plan` decomposes a whole intent into
+  bounded items sealed as `WORK_PROPOSAL` evidence; starting any item still
+  goes through the governed `WORK_START` admission.
 - Production deployment: NOT AUTHORIZED. The live composition is a disposable
   reference proof, not a hosted service.
