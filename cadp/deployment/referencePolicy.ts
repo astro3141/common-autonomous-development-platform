@@ -150,6 +150,13 @@ agent_merge_ok if {
 	e.claim.scope.effect_id == req.effect_id
 	e.claim.scope.material_digest == req.material_digest.value
 	e.producer_ref in params.delegated_merge_producers
+	# A delegated merge decision must be INDEPENDENT of the run's implementer — the same §8.4
+	# separation the machine reviewer must satisfy, extended to the machine DECISION (Spec §3:
+	# one identity may not perform incompatible duties). A backend that also drove the work can
+	# neither be the reviewer nor the merge approver.
+	entry := registry_entry(e.producer_ref)
+	not implementer_refs[e.producer_ref]
+	independent_product(entry)
 }
 
 merge_decision_ok if human_ok
@@ -326,6 +333,19 @@ reason_codes contains "required_fact_unknown" if {
 reason_codes contains "HUMAN_DECISION" if {
 	merge_base_ok
 	not merge_decision_ok
+}
+
+# A listed delegate whose AGENT_DECISION is present but NOT independent of the implementer is
+# reported distinctly, so the failure is "self-approval blocked", not "no decision".
+reason_codes contains "agent_merge_not_independent" if {
+	merge_base_ok
+	some e in input.evidence
+	e.evidence_kind == "AGENT_DECISION"
+	e.availability == "PRESENT"
+	e.claim.decision == "APPROVE"
+	e.claim.scope.effect_id == req.effect_id
+	e.producer_ref in params.delegated_merge_producers
+	not agent_merge_ok
 }
 
 reason_codes contains "HUMAN_DECISION" if {

@@ -9,6 +9,8 @@
  *   AD2  reference default (empty list): the same envelope satisfies NOTHING — delegation is opt-in
  *   AD3  POLICY_ACTIVATE is never delegated: constitution changes keep requiring HUMAN_DECISION
  *   AD4  exact scope: an agent decision for effect X does not clear effect Y; human_ok unaffected
+ *   AD5  independence: a delegate NOT independent of the run's implementer cannot self-approve —
+ *        an independent one can (Spec §8.4 extended to the machine decision; §3 incompatible duties)
  */
 
 import assert from "node:assert/strict";
@@ -18,6 +20,7 @@ import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { nowIso } from "../kernel/canonical.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
+import { REFERENCE_IDENTITIES, REFERENCE_ADAPTERS } from "../deployment/referencePolicy.ts";
 
 after(() => stopSharedOpa());
 
@@ -173,6 +176,87 @@ test("AD4: exact scope — an agent decision for X never clears Y; human approva
     const human = h.humanApprove(mergeY);
     const humanCleared = await evaluate(h, mergeY, [base.verification, base.review, human.evidence_id]);
     assert.equal(humanCleared.outcome, "ALLOW", "human_ok is unchanged by the delegation machinery");
+  } finally {
+    h.close();
+  }
+});
+
+/** Seal a WORK_STEP so implementer_refs (product temporal-workflow) is populated in the merge input. */
+function sealWorkStep(h: Harness): string {
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "WORK_STEP",
+      subject_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000ad" },
+        { authority_ref: "cadp-store:k04", namespace: "step-output", object_id: SHA },
+      ],
+      availability: "PRESENT",
+      claim_schema: "cadp.work-step.v1",
+      claim: { step_ordinal: (step += 1), summary: "implemented" },
+      producer_ref: "workflow:cadp-work",
+      source_ref: `ws-${step}`,
+      source_relation: "SELF_REPORT",
+    },
+    PRINCIPALS.workflow,
+  ).evidence_id;
+}
+
+function agentApproveAs(h: Harness, effect_id: string, principal: string, producer_ref: string): EvidenceEnvelopeV1 {
+  const request = h.store.effectRequest(effect_id)!;
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "AGENT_DECISION",
+      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id }],
+      availability: "PRESENT",
+      claim_schema: "cadp.human-decision.v1",
+      claim: {
+        principal: producer_ref,
+        decision: "APPROVE",
+        scope: { effect_id, target_ref: request.target_ref, material_digest: request.material_digest.value },
+        presented_request_digest: request.request_digest,
+        statement: "delegate approval (conformance)",
+        issued_at: nowIso(h.clock.fn),
+      },
+      producer_ref,
+      source_ref: `agent-${effect_id}-${producer_ref}`,
+      source_relation: "INDEPENDENT_OBSERVATION",
+    },
+    { principal },
+  );
+}
+
+test("AD5: a non-independent delegate cannot self-approve; an independent one can", async () => {
+  // Two extra agent-surface delegates: one whose product collides with the WORK_STEP implementer
+  // (temporal-workflow), one independent (claude-code).
+  const identity_registry = [
+    ...REFERENCE_IDENTITIES,
+    { principal: "cadp-agent-wf", producer_ref: "agent:wf-clone", identity_class: { vendor: "temporalio", product: "temporal-workflow", account: "cadp-v04", process_class: "agent-surface" } },
+  ];
+  const adapter_registry = [
+    ...REFERENCE_ADAPTERS,
+    { producer_ref: "agent:wf-clone", evidence_kinds: ["AGENT_DECISION"], source_relation: "INDEPENDENT_OBSERVATION" as const, produced_at_source: { kind: "NONE" as const } },
+  ];
+  const h = await makeHarness({
+    paramOverrides: { delegated_merge_producers: ["agent:wf-clone", "agent:claude-owner"] },
+    identityRegistry: identity_registry,
+    adapterRegistry: adapter_registry,
+  });
+  try {
+    const base = sealMergeBase(h);
+    const ws = sealWorkStep(h); // implementer_refs = {workflow:cadp-work, product temporal-workflow}
+
+    // Non-independent: agent:wf-clone shares the implementer's product → refused, distinct reason.
+    const mergeA = sealOp(h, "PR_MERGE");
+    const bad = agentApproveAs(h, mergeA, "cadp-agent-wf", "agent:wf-clone");
+    const refused = await evaluate(h, mergeA, [base.verification, base.review, ws, bad.evidence_id]);
+    assert.equal(refused.outcome, "REQUIRE_EVIDENCE", JSON.stringify(refused));
+    assert.ok(refused.reasons.includes("agent_merge_not_independent"), JSON.stringify(refused.reasons));
+
+    // Independent: agent:claude-owner (product claude-code) with the same implementer present → ALLOW.
+    const mergeB = sealOp(h, "PR_MERGE");
+    const good = agentApproveAs(h, mergeB, "cadp-agent-owner", "agent:claude-owner");
+    const ok = await evaluate(h, mergeB, [base.verification, base.review, ws, good.evidence_id]);
+    assert.equal(ok.outcome, "ALLOW", JSON.stringify(ok));
   } finally {
     h.close();
   }
