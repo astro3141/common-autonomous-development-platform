@@ -17,6 +17,7 @@ import { Pep } from "./pep.ts";
 import { Reconciler } from "./reconciler.ts";
 import { executeRootOperation, RootRejection } from "./rootListener.ts";
 import type { BreakGlassDocument } from "./rootListener.ts";
+import { digestsEqual, recordDigest } from "./canonical.ts";
 import { identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { Sig1 } from "./sig.ts";
 import { ConstitutionalStore } from "./store.ts";
@@ -33,8 +34,14 @@ export interface ApiDeps {
   clock?: () => number;
 }
 
-type ProcessClass = "workflow" | "worker" | "evidence-adapter" | "human-surface" | "deployment-control" | string;
+type ProcessClass = "workflow" | "worker" | "evidence-adapter" | "human-surface" | "deployment-control" | "observer" | string;
 
+/**
+ * TD §12 r8: `observer` is the read-only constitutional caller class (#96/#106 B1). Its reach is
+ * exactly the four read methods and nothing else — in particular NOT `evaluate` or
+ * `assemble_admission_input`, which write K5/K4 rows (#96 review B2): a diagnostic reader must
+ * never be able to manufacture the very facts it reports.
+ */
 const METHOD_REACH: Record<string, readonly ProcessClass[]> = {
   put_blob: ["workflow", "worker", "evidence-adapter", "deployment-control"],
   allocate_effect_id: ["workflow"],
@@ -43,9 +50,11 @@ const METHOD_REACH: Record<string, readonly ProcessClass[]> = {
   assemble_admission_input: ["workflow"],
   evaluate: ["workflow"],
   admit_and_dispatch: ["workflow"],
-  get_effect_state: ["workflow", "worker", "evidence-adapter", "deployment-control", "human-surface"],
+  get_effect_state: ["workflow", "worker", "evidence-adapter", "deployment-control", "human-surface", "observer"],
   request_reconcile: ["workflow", "deployment-control"],
-  list_effects: ["workflow", "worker"],
+  list_effects: ["workflow", "worker", "observer"],
+  get_evidence: ["workflow", "evidence-adapter", "deployment-control", "human-surface", "observer"],
+  list_evidence: ["workflow", "deployment-control", "observer"],
 };
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -148,6 +157,34 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
       case "list_effects": {
         const body = JSON.parse(raw.toString("utf8")) as { work_run_ref: string };
         return send(200, { effect_ids: deps.store.effectIdsByWorkRun(body.work_run_ref) });
+      }
+      case "get_evidence": {
+        // K2 read (TD §12 r8). Verify-on-read: a stored envelope that no longer recomputes its
+        // own digest is corruption, never truth — refused with 409, not served.
+        const body = JSON.parse(raw.toString("utf8")) as { evidence_id: string };
+        const envelope = deps.store.evidenceById(body.evidence_id);
+        if (envelope === undefined) return send(404, { error: "EVIDENCE_NOT_FOUND" });
+        const recomputed = recordDigest(envelope as unknown as Record<string, unknown>, "envelope_digest");
+        if (!digestsEqual(recomputed, envelope.envelope_digest)) {
+          return send(409, { error: "DIGEST_CORRUPTION", detail: `stored envelope ${body.evidence_id} does not recompute` });
+        }
+        return send(200, { envelope });
+      }
+      case "list_evidence": {
+        // Summaries only; bodies come one at a time through get_evidence's verify-on-read. A 200
+        // with an empty list means "this kernel's store holds no such row" — the caller must not
+        // read it as universal absence (#96 review B3); a failed call establishes nothing.
+        const body = JSON.parse(raw.toString("utf8")) as { work_run_ref: string };
+        const subjectKey = `cadp-store:k04|work-run|${body.work_run_ref}`;
+        const evidence = deps.store.evidenceBySubjectKey(subjectKey).map((e) => ({
+          evidence_id: e.evidence_id,
+          evidence_kind: e.evidence_kind,
+          availability: e.availability,
+          producer_ref: e.producer_ref,
+          produced_at: e.produced_at,
+          envelope_digest: e.envelope_digest,
+        }));
+        return send(200, { evidence });
       }
       default:
         return send(404, { error: "NO_SUCH_METHOD" });

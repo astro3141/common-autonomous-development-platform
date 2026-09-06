@@ -41,7 +41,7 @@ export interface LiveEnvManifest {
 const PRINCIPAL_TOKEN_NAMES = [
   "cadp-workflow", "cadp-worker-codex", "cadp-backend-scan", "cadp-reviewer-claude",
   "cadp-verifier", "sso:a.t.laplace@gmail.com", "cadp-depctl-probe", "cadp-depctl-target",
-  "cadp-improvement-intake",
+  "cadp-improvement-intake", "cadp-observer",
 ];
 
 function sh(cmd: string, args: string[], options: { cwd?: string; input?: string } = {}): string {

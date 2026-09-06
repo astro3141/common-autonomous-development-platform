@@ -1261,6 +1261,9 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // contract constant; THIS row is the rotatable/revocable part — the workload credential bound
   // to it. Only the PEP-held FINDING_SEAL adapter authenticates as this principal (FC5).
   { principal: "cadp-governed-reclassification", producer_ref: "governed:reclassification", identity_class: { vendor: "cadp", product: "governed-transition", account: "cadp-v04", process_class: "evidence-adapter" } },
+  // TD §12 r8 (#96/#106): the read-only constitutional observer. Its reach is exactly the four
+  // Kernel read methods; it produces no evidence and holds no write or evaluate path.
+  { principal: "cadp-observer", producer_ref: "observer:cadp-readonly", identity_class: { vendor: "cadp", product: "readonly-observer", account: "cadp-v04", process_class: "observer" } },
 ];
 
 export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
