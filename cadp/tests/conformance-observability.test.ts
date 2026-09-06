@@ -94,7 +94,7 @@ test("O1: observer reach serves state, effects, evidence and summaries end-to-en
   }
 });
 
-test("O1 reach: worker cannot list a foreign run's effects; workflow and observer can", async () => {
+test("O1 reach: worker cannot list effects; workflow and observer can", async () => {
   const h = await makeHarness();
   try {
     h.sealReach();
@@ -115,7 +115,12 @@ test("O1 reach: worker cannot list a foreign run's effects; workflow and observe
       assert.deepEqual(await observer.listEffects(runRef), { effect_ids: [request.effect_id] });
       await assert.rejects(
         () => worker.listEffects(runRef),
-        (e: unknown) => e instanceof KernelApiError && e.status === 403 && e.reason === "FORBIDDEN_FOR_PRINCIPAL",
+        (e: unknown) => {
+          assert.ok(e instanceof KernelApiError);
+          assert.equal(e.status, 403);
+          assert.equal(e.reason, "FORBIDDEN_FOR_PRINCIPAL");
+          return true;
+        },
       );
     } finally {
       api.close();
