@@ -191,11 +191,31 @@ test("O5: attribution and human-wait derive only from stored rows through observ
     const chain = await runChain(h, request.effect_id);
     assert.equal(chain.admitted?.kind, "ADMITTED");
 
+    // Evidence cited by an admission input but bound to a non-work-run subject (the live-pilot
+    // gap): a REVIEW about a commit must still reach the run's attribution.
+    const review = h.ingress.submitEvidence(
+      {
+        evidence_kind: "REVIEW",
+        subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "a".repeat(40) }],
+        availability: "PRESENT",
+        claim_schema: "cadp.review.v1",
+        claim: { verdict: "APPROVE", body_digest: "d".repeat(64) },
+        producer_ref: "reviewer:claude-code",
+        source_ref: "review:o5",
+        source_relation: "INDEPENDENT_OBSERVATION",
+      },
+      PRINCIPALS.reviewer,
+    );
+    const cited = sealScriptedRequest(h, { operation_kind: "SCRIPTED_KEYED_WRITE", work_run_ref: runRef });
+    const citedChain = await runChain(h, cited.request.effect_id, [review.evidence_id]);
+    assert.equal(citedChain.admitted?.kind, "ADMITTED");
+
     await withApi(h, async (obs) => {
       const run = await collectRun(obs, runRef);
-      const report = attribution(run) as { derived_domain: string; bound_stops: string[] };
+      const report = attribution(run) as { derived_domain: string; bound_stops: string[]; review: Array<{ verdict?: string }> };
       assert.equal(report.derived_domain, "BOUNDED_STOP");
       assert.deepEqual(report.bound_stops, ["MAX_STEPS"]);
+      assert.deepEqual(report.review.map((r) => r.verdict), ["APPROVE"], "input-cited evidence reaches the run projection");
     });
 
     // humanWait fires on exactly REQUIRE_EVIDENCE + HUMAN_DECISION (the reference-policy shape).

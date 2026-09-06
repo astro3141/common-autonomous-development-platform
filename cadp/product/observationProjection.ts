@@ -92,6 +92,19 @@ export async function collectRun(reader: ObserverReader, work_run_ref: string): 
       effects.push(projectEffect(id, await attempt(() => reader.getEffectState(id))));
     }
   }
+  // Evidence cited by the run's admission inputs (VERIFICATION/REVIEW/HUMAN_DECISION bind to
+  // repo+sha or effect subjects, not to the work-run subject, so the subject listing alone
+  // misses them — measured in the first live pilot of this projection).
+  for (const effect of effects) {
+    if (effect.state.query !== "COMPLETE") continue;
+    for (const input of effect.state.value.inputs) {
+      for (const ref of (input as { evidence_refs?: ReadonlyArray<{ readonly evidence_id: string }> }).evidence_refs ?? []) {
+        if (envelopes[ref.evidence_id] !== undefined) continue;
+        const fetched = await attempt(() => reader.getEvidence(ref.evidence_id));
+        envelopes[ref.evidence_id] = fetched.query === "COMPLETE" ? { query: "COMPLETE", value: fetched.value.envelope } : fetched;
+      }
+    }
+  }
   return {
     summaries,
     effectIds,
