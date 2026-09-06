@@ -948,15 +948,17 @@ Architecture-blocking unresolved questions: **0**.
 
 Product-layer closed registries for the CLI surfaces that implement, review, and plan autonomous work. This is not a kernel primitive and does not change K1–K7, `identity_class` derivation (§9.1), or the §8.4 independence predicate: the kernel still stamps `producer_ref` from the authenticated principal and derives class from the active `identity_registry`. What this section records is the adapter that now exists in the implementation — the exact argv, auth injection, and product string a named surface runs under — so a provider capability is declared only after a live container probe has measured it, and an unmeasured fact stays `UNKNOWN` rather than guessed.
 
+Independence consequences now enforced, because they were measured not to be. The implementer set the policy compares against includes `BACKEND_EXECUTION` producers (the model that implemented the candidate is attributed there, not by the orchestrator's `WORK_STEP`) and fails closed when empty (`count(implementer_refs) > 0` — a vacuous universal quantifier is not a proof of independence). The merge admission input carries the run's `BACKEND_EXECUTION` and `WORK_STEP` evidence so that comparison can see who implemented the candidate. Because the claude worker shares product `claude-code` with both the claude reviewer and the delegated merge agent, a claude-implemented run requires a grok or codex review and always a `HUMAN` merge decision.
+
 ### 17.1 Closed union keyed registries
 
 Three registries, each a `Record` keyed by a closed provider-name union. Unknown names fail closed at `resolveWorkerProvider` / `resolveReviewProvider` / `resolvePlanProvider` with no filesystem, process, docker, or network side effect; those resolvers never default. An omitted `review_product` / `plan_product` keeps the measured claude path; an omitted worker selection is not a silent fallback inside `resolveWorkerProvider`.
 
 | Registry | File | Closed union | Prompt sentinel | Surfaces |
 |---|---|---|---|---|
-| `WORKER_PROVIDERS` | `cadp/product/workerProviders.ts` | `"codex" \| "grok"` | `{{WORK_ITEM}}` | `/implement` worker container |
-| `REVIEW_PROVIDERS` | `cadp/product/reviewProviders.ts` | `"claude" \| "grok"` | `{{DIFF_PROMPT}}` | `/review` reviewer container |
-| `PLAN_PROVIDERS` | `cadp/product/planProviders.ts` | `"claude" \| "grok"` | `{{PLAN_PROMPT}}` | `/plan` planner container (proposal-only) |
+| `WORKER_PROVIDERS` | `cadp/product/workerProviders.ts` | `"codex" \| "grok" \| "claude"` | `{{WORK_ITEM}}` | `/implement` worker container |
+| `REVIEW_PROVIDERS` | `cadp/product/reviewProviders.ts` | `"claude" \| "grok" \| "codex"` | `{{DIFF_PROMPT}}` | `/review` reviewer container |
+| `PLAN_PROVIDERS` | `cadp/product/planProviders.ts` | `"claude" \| "grok" \| "codex"` | `{{PLAN_PROMPT}}` | `/plan` planner container (proposal-only) |
 
 Every profile carries three load-bearing fields:
 
@@ -970,10 +972,13 @@ Pinned measured entries (argv identity is the profile; permission posture is par
 |---|---|---|---|
 | worker `codex` | `codex-cli` | `auth_files` `.codex/auth.json` | `exec --sandbox danger-full-access … {{WORK_ITEM}}` |
 | worker `grok` | `grok` | `auth_files` `.grok/auth.json` | `-p {{WORK_ITEM}} --output-format streaming-json --permission-mode bypassPermissions` (headless autonomous-edit; container isolation is the real boundary) |
+| worker `claude` | `claude-code` | env-injected `auth_env` `CLAUDE_CODE_OAUTH_TOKEN` plus measured static env `IS_SANDBOX=1` (claude refuses `bypassPermissions` as root without it) | `-p {{WORK_ITEM}} --permission-mode bypassPermissions`; sessions written to `~/.claude/projects` so the profile carries `sessions_container_dir` `'projects'` |
 | reviewer `claude` | `claude-code` | `oauth_env` `CLAUDE_CODE_OAUTH_TOKEN` | `-p --model claude-sonnet-5 --permission-mode plan --disallowedTools=… {{DIFF_PROMPT}}` |
 | reviewer `grok` | `grok` | `auth_files` `.grok/auth.json` | `-p {{DIFF_PROMPT}} --permission-mode plan --disable-web-search --tools read_file,list_dir,grep --json-schema <verdict schema>` |
+| reviewer `codex` | `codex-cli` | `auth_files` `.codex/auth.json` | `exec --sandbox read-only --skip-git-repo-check {{DIFF_PROMPT}}` (measured: read-only sandbox blocks writes in-container; stdout with stderr discarded is the final message only, hence `verdict_format` `first-line`) |
 | planner `claude` | `claude-code` | `oauth_env` `CLAUDE_CODE_OAUTH_TOKEN` | plan-mode, mutating/external tools disallowed; reading the checkout remains allowed |
 | planner `grok` | `grok` | `auth_files` `.grok/auth.json` | same measured read-only argv as the grok reviewer, without `--json-schema` (proposal parse is a closed JSON schema of its own) |
+| planner `codex` | `codex-cli` | `auth_files` `.codex/auth.json` | same measured read-only argv as the codex reviewer, with `{{PLAN_PROMPT}}` |
 
 The grok **worker** must never share the reviewer/planner argv: `bypassPermissions` is grok's analogue of codex `--sandbox danger-full-access` and is forbidden on the read-only surfaces.
 
@@ -983,7 +988,7 @@ A provider capability is a field on the profile that is present only after a liv
 
 Three capabilities, each with the grok measurement that forced the field into the spec rather than a hardcoded assumption:
 
-**`model_scan` (worker; #91).** `WORKER_PROVIDERS[p].model_scan` is optional. Absent ⇒ `scanBackendModel` returns no model and no locator; `BACKEND_EXECUTION` records `observed.model.availability = UNKNOWN` (requested is a separate sub-object and is never consulted to fill observed). Both regexes carry exactly one capture group. Codex was measured as `"model":"…"` in `rollout-*.jsonl`. Grok was measured (2026-09-06 container probe, grok 1.0.13): the mounted `/root/.grok/sessions` tree writes `<urlencoded-cwd>/<session-id>/chat_history.jsonl` carrying `"model_id":"grok-4.6-build"` (the serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture. A hardcoded `"model"` capture after a prefix match would have reported UNKNOWN on a live grok session; the capture now lives in the measured spec.
+**`model_scan` (worker; #91).** `WORKER_PROVIDERS[p].model_scan` is optional. Absent ⇒ `scanBackendModel` returns no model and no locator; `BACKEND_EXECUTION` records `observed.model.availability = UNKNOWN` (requested is a separate sub-object and is never consulted to fill observed). Both regexes carry exactly one capture group. Codex was measured as `"model":"…"` in `rollout-*.jsonl`. Grok was measured (2026-09-06 container probe, grok 1.0.13): the mounted `/root/.grok/sessions` tree writes `<urlencoded-cwd>/<session-id>/chat_history.jsonl` carrying `"model_id":"grok-4.6-build"` (the serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture. A hardcoded `"model"` capture after a prefix match would have reported UNKNOWN on a live grok session; the capture now lives in the measured spec. Claude was measured: `~/.claude/projects/<slug>/<uuid>.jsonl` carries a plain `"model"` field (measured `claude-sonnet-5`) — same field shape as codex.
 
 **`verdict_format` (reviewer).** `first-line` is the measured claude `-p` contract (verdict is the first stdout line starting with `APPROVE`/`REQUEST_CHANGES`, reason on the next). `json-schema-text` is the measured grok contract. The 9th-pilot measurement: in plain `-p` output grok concatenates tool-use narration and the final verdict **without a newline** (`…file.APPROVE`), so the first-line contract is unparseable and would fail closed as `REQUEST_CHANGES` even on an approval. The grok reviewer therefore runs under `--json-schema` with `{verdict ∈ {APPROVE, REQUEST_CHANGES}, reason}`. Measured wrapper shape: stdout is `{"text": "…"}` whose text concatenates one JSON object per turn (tool-use narration is coerced into the schema too); the **last** object is the final verdict. Anything outside that shape fails closed to `REQUEST_CHANGES` — a verdict is never guessed from prose (`parseReviewVerdict`).
 
@@ -1020,3 +1025,34 @@ Evidence attribution is honest per provider: each surface authenticates as its o
 | `backend-scan:grok` | `cadp-backend-scan-grok` | activity host `CADP_BACKEND_SCAN_TOKEN_GROK` | `BACKEND_EXECUTION` (`SELF_REPORT`; observed model from that provider's session log) |
 
 The claude/codex counterparts remain `reviewer:claude-code`, `planner:claude-code`, `backend-scan:codex`. Registry, adapter registry, and live-env token mint (`PRINCIPAL_TOKEN_NAMES`) name the grok principals explicitly so a grok review, plan, or backend scan cannot be sealed as a claude/codex observation. `identity_class` for those `producer_ref`s is `{vendor: xai, product: grok, …}` — the same product string the entry independence guard compares.
+
+---
+
+## 18. External verification backend (GitHub Actions)
+
+GitHub Actions is a product-layer evidence source for the exact candidate sha, not a lifecycle authority and not a kernel primitive. A green check transitions nothing by itself. The repository-owned workflow runs; the broker reads the check-run result; the activity submits `VERIFICATION` evidence produced by `verifier:github-actions`; the deployment policy decides sufficiency (`require_external_verification`).
+
+### 18.1 Repository-owned workflow
+
+`.github/workflows/cadp-verify.yml` is the verifier. It triggers on the governed `cadp/candidate/**` push (the candidate branch the `GIT_PUSH` effect already landed). `actions/checkout@v4` checks out that exact candidate sha. The job pins OPA `1.20.1` (the same version the deployment's evaluator integrity records — without it the suite stalls to the job timeout; measured live, 16th pilot: `npm test` cancelled at 10m, check-run `conclusion=cancelled`) and runs `npm test`. Actors receive no GitHub credentials for this: the workflow is repository-owned and fires on a push that already happened.
+
+### 18.2 Authority boundary and the broker read
+
+GitHub is the authority for its own check runs. The broker's `/verify-external` (`cadp/product/surfaceBroker.ts`) performs one authoritative check-runs read per call via the operator's `gh` CLI on the broker host (`cadp/product/externalVerification.ts` `fetchExternalVerification`). The credential stays host-side; actors receive no GitHub credentials merely to run CI (issue #57). The polling loop lives in the activity (`verifyCandidateExternal`); the broker itself is a single read. An unauthenticated API read measured out at HTTP 403 within one polling run (60/h/IP — 16th pilot). Any read failure is honest `UNKNOWN` — never a pass or a failure.
+
+### 18.3 Fail-closed projection and sealed evidence
+
+`projectCheckRuns` is a pure projection of the GitHub check-runs payload. Fail-closed: anything that is not exactly **one** completed `cadp-verify` run with a conclusion projects to `UNKNOWN` with an honest reason. Queued, in-progress, absent, ambiguous-duplicate (two completed runs for one sha), or malformed (missing/unparseable fields) is `UNKNOWN` — never a failure, never a pass. A completed failure is `PRESENT` evidence that never clears a gate.
+
+GitHub emits second-precision RFC3339 (`…:50Z`); the K2 envelope contract requires millisecond precision, and `produced_at` must equal `claim.completed_at` (`source_authoritative`). Both timestamps are normalized to the same instant in kernel form (`Date#toISOString`). An unparseable timestamp is `UNKNOWN`. Measured live (17th pilot): the verbatim GitHub string was refused by K2 and the run failed closed.
+
+The activity submits `VERIFICATION` with `producer_ref` `verifier:github-actions`, `source_relation` `TARGET_AUTHORITY_OBSERVATION`, `claim_schema` `cadp.verification.github-actions.v1`, subject bound to the exact candidate sha, `produced_at = claim.completed_at`. The adapter registry records `produced_at_source: { kind: SOURCE, claim_pointer: /completed_at }`. An incomplete poll inside the attempt budget seals honest `UNKNOWN` evidence, not a pass and not a guessed failure.
+
+### 18.4 Opt-in levels and the gate path
+
+Two independent opt-ins; neither is on by default.
+
+1. **Per-run flag.** `development.external_verification === true` (live `/start` extra arg `"external"`; anything else fails closed rather than silently skipping). The workflow then polls and, if the external conclusion is not `success`, stops with `EXTERNAL_VERIFY_NOT_SUCCESS` before any PR effect is sealed.
+2. **Policy param.** `require_external_verification` in `data.policy_params`. Default `false` keeps PR/MERGE gates byte-identical. When `true`, those gates additionally require a `PRESENT` `VERIFICATION` from `verifier:github-actions` bound to the exact candidate sha with `claim.conclusion == "success"` and `source_authoritative`. Unmet is reason code `external_verification_missing` — `DENY`. A completed failure is `PRESENT` and still does not satisfy `conclusion == "success"`, so it never clears the gate.
+
+`.github/` is a gate path (`cadp/product/gateFiles.ts`): the workflow defines what the external verifier actually runs, so a delegated merge must not auto-merge an edit to it.
