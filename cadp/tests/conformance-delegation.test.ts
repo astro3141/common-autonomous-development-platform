@@ -261,3 +261,84 @@ test("AD5: a non-independent delegate cannot self-approve; an independent one ca
     h.close();
   }
 });
+
+/** Seal BACKEND_EXECUTION attributing the run's IMPLEMENTING MODEL (not the orchestrator). */
+function sealBackendExecution(h: Harness, principal: string, producer_ref: string): string {
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "BACKEND_EXECUTION",
+      subject_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000ad" },
+      ],
+      availability: "PRESENT",
+      claim_schema: "cadp.backend-execution.v1",
+      claim: {
+        requested: { provider: producer_ref.split(":")[1]!, model: "default" },
+        observed: {
+          provider: { availability: "PRESENT", value: producer_ref.split(":")[1]!, locator: "test" },
+          model: { availability: "PRESENT", value: "test-model", locator: "test" },
+          version: { availability: "UNKNOWN" }, run_id: { availability: "UNKNOWN" }, effort: { availability: "UNKNOWN" },
+        },
+      },
+      producer_ref,
+      source_ref: `be-${step += 1}`,
+      source_relation: "SELF_REPORT",
+    },
+    { principal },
+  ).evidence_id;
+}
+
+test("AD6 (12th-pilot regression): the implementer set includes the BACKEND model producer — a same-product delegate cannot self-approve a claude-implemented run", async () => {
+  const h = await makeHarness(DELEGATED);
+  try {
+    const base = sealMergeBase(h);
+    const workStep = sealWorkStep(h);
+    // The run was IMPLEMENTED by the claude backend (product claude-code) — same product as the
+    // delegated merge agent agent:claude-owner. Measured live (12th pilot): without the
+    // BACKEND_EXECUTION clause in implementer_refs this auto-merged.
+    const backend = sealBackendExecution(h, "cadp-backend-scan-claude", "backend-scan:claude");
+    // Cross-product reviewer (grok), so the merge layer — not review independence — is what this
+    // test isolates. (The claude reviewer over a claude-implemented run is refused too, separately:
+    // the same implementer-set fix closes the §8.4 review hole; see the assertion below.)
+    const grokReview = h.ingress.submitEvidence(
+      {
+        evidence_kind: "REVIEW",
+        subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: SHA }],
+        availability: "PRESENT",
+        claim_schema: "cadp.review.v1",
+        claim: { verdict: "APPROVE", body_digest: "2".repeat(64) },
+        producer_ref: "reviewer:grok",
+        source_ref: `test-grok-${step += 1}`,
+        source_relation: "INDEPENDENT_OBSERVATION",
+      },
+      { principal: "cadp-reviewer-grok" },
+    ).evidence_id;
+    const merge = sealOp(h, "PR_MERGE");
+    const decision = agentApprove(h, merge);
+    const result = await evaluate(h, merge, [base.verification, grokReview, workStep, backend, decision.evidence_id]);
+    assert.notEqual(result.outcome, "ALLOW", "a claude-product delegate must not clear a claude-implemented merge");
+    assert.ok(result.reasons.includes("agent_merge_not_independent") || result.reasons.includes("HUMAN_DECISION"), JSON.stringify(result.reasons));
+
+    // And the §8.4 review-layer consequence of the SAME fix: a claude review of this
+    // claude-implemented run is not independent either.
+    const withClaudeReview = await evaluate(h, merge, [base.verification, base.review, workStep, backend, decision.evidence_id]);
+    assert.ok(withClaudeReview.reasons.includes("reviewer_product_not_independent"), JSON.stringify(withClaudeReview.reasons));
+  } finally {
+    h.close();
+  }
+});
+
+test("AD6b: the same delegate still clears a grok-implemented run (cross-product delegation intact)", async () => {
+  const h = await makeHarness(DELEGATED);
+  try {
+    const base = sealMergeBase(h);
+    const workStep = sealWorkStep(h);
+    const backend = sealBackendExecution(h, "cadp-backend-scan-grok", "backend-scan:grok");
+    const merge = sealOp(h, "PR_MERGE");
+    const decision = agentApprove(h, merge);
+    const result = await evaluate(h, merge, [base.verification, base.review, workStep, backend, decision.evidence_id]);
+    assert.equal(result.outcome, "ALLOW", JSON.stringify(result));
+  } finally {
+    h.close();
+  }
+});
