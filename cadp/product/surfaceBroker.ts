@@ -28,6 +28,8 @@ import { createHash } from "node:crypto";
 import { buildWorkerSandbox } from "./workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
+import { DEFAULT_REVIEW_PROVIDER, REVIEW_PROVIDERS, resolveReviewProvider, reviewArgv } from "./reviewProviders.ts";
+import type { ReviewProviderProfile } from "./reviewProviders.ts";
 import { buildPlanPrompt, parseWorkProposal } from "./planner.ts";
 import { claudeProviderToken, dockerAvailable, runReviewer, runVerifier, runWorker } from "./isolation.ts";
 import { BROKER_SERVER_TIMEOUTS, SURFACE_BUDGETS } from "./timeouts.ts";
@@ -307,11 +309,24 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
 
 // ------------------------------------------------------------------ /review
 
-export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string }): Promise<{
+function reviewProviderToken(profile: ReviewProviderProfile): string {
+  // Fail closed on an auth method isolation.ts does not yet inject. Never reuse the claude
+  // OAuth token for a different provider, and never fall back to worker auth files.
+  if (profile.auth_method.kind === "oauth_env" && profile.auth_method.env_var === "CLAUDE_CODE_OAUTH_TOKEN") {
+    return claudeProviderToken();
+  }
+  throw new Error(`unsupported review auth method: ${profile.auth_method.kind}`);
+}
+
+export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
   verdict: string;
   reason: string;
   stdout: string;
 }> {
+  // Unknown review_product fails closed with no filesystem, process, docker, or network side
+  // effect. An omitted selection keeps the measured claude path (byte-identical argv).
+  const provider = resolveReviewProvider(body.review_product ?? DEFAULT_REVIEW_PROVIDER);
+  const profile = REVIEW_PROVIDERS[provider];
   if (!(await dockerAvailable())) throw new Error("reviewer isolation runtime (docker) unavailable — failing closed");
   const base = mkdtempSync(join(tmpdir(), "cadp-review-"));
   try {
@@ -335,8 +350,8 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     mkdirSync(reviewWs, { recursive: true });
     const review = await runReviewer(config(), {
       workspace: reviewWs,
-      providerToken: claudeProviderToken(),
-      argv: ["claude", "-p", "--model", "claude-sonnet-5", "--permission-mode", "plan", "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit", prompt],
+      providerToken: reviewProviderToken(profile),
+      argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
     });
     if (review.status !== 0 || review.stdout.trim().length === 0) {
@@ -413,7 +428,7 @@ export const BROKER_OPERATIONS: Record<string, BrokerOperation> = {
   },
   "/review": {
     response_budget_ms: SURFACE_BUDGETS.review.broker_response_ms,
-    run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string }),
+    run: (b) => brokerReview(b as { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }),
   },
   "/plan": {
     response_budget_ms: SURFACE_BUDGETS.plan.broker_response_ms,
