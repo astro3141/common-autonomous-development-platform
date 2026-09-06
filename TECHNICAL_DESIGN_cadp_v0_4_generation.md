@@ -777,22 +777,24 @@ Twelve calls (r8 added the two K2 reads). There is no task, attempt, batch, pend
 
 **Caller / authentication / reach matrix (reference deployment, S3).** Every call is authenticated by workload identity (mTLS/SPIFFE) or, for Human surfaces, an IdP-signed JWT; the Ingress maps the principal through `identity_registry` (§5.4) and rejects unregistered principals. Reach is enforced by the Kernel Service, not by network position.
 
-| Method | workflow / orchestrator identity | worker / reviewer / verifier identity | evidence adapters (CI, target reconciler, deployment control) | Human SSO surface | read-only observer (r8) | root identity |
-|---|---|---|---|---|---|---|
-| `put_blob` | yes | yes | yes | no | **no** | no |
-| `allocate_effect_id` | yes | no | no | no | **no** | no |
-| `seal_effect_request` | yes (`requester_ref` = caller) | no | no | no | **no** | no |
-| `submit_evidence` | `WORK_STEP`, `WORK_BOUND_STOP` | `BACKEND_EXECUTION`, `REVIEW`, `VERIFICATION` (as registered) | kinds as registered (`VERIFICATION`, `TARGET_RECONCILIATION`, `CREDENTIAL_REACH_ATTESTATION`, `TARGET_IMMUTABILITY_ATTESTATION`, `LEGACY_V03_ARTIFACT`) | `HUMAN_DECISION` only | **no** | `GENESIS`, `BREAK_GLASS` — **root listener only**; a `BREAK_GLASS(ACTIVATE_POLICY)` is the sole non-effect path that publishes a `PolicyRefV1` (§9.4 procedure, one transaction) |
-| `assemble_admission_input` | yes | no | no | no | **no** (writes a K4 row — B2) | no |
-| `evaluate` | yes | no | no | no | **no** (writes a K5 row — B2) | no |
-| `admit_and_dispatch` | yes | **no** | no | no | **no** | no |
-| `get_effect_state` | yes | yes (read-only) | yes (read-only) | yes (read-only, for rendering) | yes | yes |
-| `request_reconcile` | yes | no | yes (deployment control) | no | **no** (observation never triggers reconciliation attempts) | yes |
-| `list_effects` | yes | yes (own `work_run_ref` only) | no | no | yes (unscoped) | yes |
-| `get_evidence` (r8) | yes | no | yes (read-only) | yes (read-only) | yes | yes |
-| `list_evidence` (r8) | yes | no | deployment control only | no | yes | yes |
+| Method | workflow / orchestrator identity | worker / reviewer / verifier identity | evidence adapters (CI, target reconciler, deployment control) | Human SSO surface | read-only observer (r8) | delegated agent-surface (r9) | root identity |
+|---|---|---|---|---|---|---|---|
+| `put_blob` | yes | yes | yes | no | **no** | **no** | no |
+| `allocate_effect_id` | yes | no | no | no | **no** | **no** | no |
+| `seal_effect_request` | yes (`requester_ref` = caller) | no | no | no | **no** | **no** | no |
+| `submit_evidence` | `WORK_STEP`, `WORK_BOUND_STOP` | `BACKEND_EXECUTION`, `REVIEW`, `VERIFICATION` (as registered) | kinds as registered (`VERIFICATION`, `TARGET_RECONCILIATION`, `CREDENTIAL_REACH_ATTESTATION`, `TARGET_IMMUTABILITY_ATTESTATION`, `LEGACY_V03_ARTIFACT`) | `HUMAN_DECISION` only | **no** | `AGENT_DECISION` only | `GENESIS`, `BREAK_GLASS` — **root listener only**; a `BREAK_GLASS(ACTIVATE_POLICY)` is the sole non-effect path that publishes a `PolicyRefV1` (§9.4 procedure, one transaction) |
+| `assemble_admission_input` | yes | no | no | no | **no** (writes a K4 row — B2) | **no** (writes a K4 row — B2) | no |
+| `evaluate` | yes | no | no | no | **no** (writes a K5 row — B2) | **no** (writes a K5 row — B2) | no |
+| `admit_and_dispatch` | yes | **no** | no | no | **no** | **no** | no |
+| `get_effect_state` | yes | yes (read-only) | yes (read-only) | yes (read-only, for rendering) | yes | yes (read-only, to render the exact sealed effect) | yes |
+| `request_reconcile` | yes | no | yes (deployment control) | no | **no** (observation never triggers reconciliation attempts) | **no** | yes |
+| `list_effects` | yes | yes (own `work_run_ref` only) | no | no | yes (unscoped) | **no** | yes |
+| `get_evidence` (r8) | yes | no | yes (read-only) | yes (read-only) | yes | **no** | yes |
+| `list_evidence` (r8) | yes | no | deployment control only | no | yes | **no** | yes |
 
 The `observer` class exists so a diagnostic/operability surface never has to borrow `workflow` reach (the #96 Review B1 defect) and never gains a write or evaluation path (B2). Its projections — chain continuity, human-wait, failure attribution — are derived read-only output over exact stored K1–K7 rows; they are not records, not authority, and a completed empty read is one store's answer, never proof of universal absence (B3).
+
+**Delegated `agent-surface` class (r9).** A deployment's Human may delegate specific merge decisions to an owner-agent. That agent authenticates as its own registered principal (`process_class = agent-surface`) with reach exactly `{ submit_evidence(AGENT_DECISION only), get_effect_state }` — and, like `observer`, **never** `evaluate`, `assemble_admission_input`, `admit_and_dispatch`, `seal_effect_request` or `allocate_effect_id`. Its `AGENT_DECISION` satisfies a gate only where the active policy's `delegated_merge_producers` names its producer, and only the merge gate: `POLICY_ACTIVATE` and every human-judgment transition gate keep requiring a `HUMAN_DECISION`. The decision is recorded as what it is — an agent's, honestly attributed — never disguised as a Human's. The delegation is per-deployment opt-in (reference default: empty list, no delegation).
 
 Why this is safe even where callers are untrusted: no method grants authority. A worker that could call `admit_and_dispatch` would still need a sealed request, an evaluator decision under the active policy, fresh evidence and the PEP's fresh recheck; the matrix removes the *ordering* ambiguity (a worker cannot seal requests or ask for admission at all), not the constitutional gate. `requester_ref`, `producer_ref` and `identity_class` are always stamped from the authenticated principal, never accepted from the body. The root listener is a separate mTLS endpoint bound to the root identity certificate, disabled by default and enabled only for the duration of a root operation; ordinary listeners reject `GENESIS`/`BREAK_GLASS` unconditionally (C29).
 
