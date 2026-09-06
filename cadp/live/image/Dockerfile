@@ -7,8 +7,14 @@
 # TD §11 measured reference surfaces are PINNED, so rebuilding this exact Git head reproduces
 # the same worker/reviewer products (no mutable `latest`).
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+# `opa` is pinned so the verifier can run CADP's OWN conformance suite (which spawns an OPA
+# sidecar) when the governed target is CADP itself — self-hosting verification needs the same
+# toolchain `npm test` needs on a developer host. TARGETARCH picks the matching static binary.
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @openai/codex@0.151.0 @anthropic-ai/claude-code@2.1.221 \
- && codex --version && claude --version
+ && curl -fsSL -o /usr/local/bin/opa "https://openpolicyagent.org/downloads/v1.20.1/opa_linux_${TARGETARCH:-arm64}_static" \
+ && chmod +x /usr/local/bin/opa \
+ && codex --version && claude --version && opa version
 WORKDIR /ws
