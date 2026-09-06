@@ -137,7 +137,12 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
     // Opt-in worker session preservation for debugging (default OFF so runs don't accumulate).
     // Captured BEFORE the status check so a FAILED run's session (the interesting one) is kept too.
     preserveWorkerSession(sessionsDir, workerRun, body.work_item);
-    if (workerRun.status !== 0) throw new Error(surfaceFailure("worker", workerRun));
+    if (workerRun.status !== 0) {
+      // TERMINATED-at-bound and nonzero exits: keep the session for the postmortem before the
+      // ephemeral workspace (the only copy) is deleted by the finally below.
+      preserveFailedSession(sessionsDir, workerRun, body.work_item, `worker-status-${String(workerRun.status)}`);
+      throw new Error(surfaceFailure("worker", workerRun));
+    }
 
     await git(["add", "-A"], workspace);
     r = await git(["-c", "user.name=cadp-worker", "-c", "user.email=worker@cadp-v04.invalid", "commit", "-m", `cadp candidate: ${body.work_item.slice(0, 60)}`], workspace);
@@ -145,6 +150,9 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       throw new Error(`commit failed: ${r.stderr.slice(0, 200)} ${r.stdout.slice(0, 200)}`);
     }
     const candidate_sha = (await git(["rev-parse", "HEAD"], workspace)).stdout.trim();
+    // A no-op candidate (worker exited 0 but changed nothing) is an implement-quality failure the
+    // reviewer will reject downstream (observed live, 3rd pilot) — keep its session for diagnosis.
+    if (candidate_sha === body.base_sha) preserveFailedSession(sessionsDir, workerRun, body.work_item, "no-op-candidate");
 
     await git(["branch", "-f", "cadp-candidate", candidate_sha], workspace);
     const bundlePath = join(base, "candidate.bundle");
@@ -159,21 +167,51 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
   }
 }
 
+/** One preserved run snapshot: the session tree + bounded stdout/stderr/status (+ failure reason). */
+function copySessionSnapshot(destRoot: string, sessionsDir: string, run: { status: number | null; stdout: string; stderr: string }, work_item: string, reason?: string): void {
+  const stamp = `${new Date().toISOString().replace(/[:.]/gu, "-")}-${sha256(work_item).slice(0, 8)}`;
+  const dest = join(destRoot, stamp);
+  mkdirSync(dest, { recursive: true });
+  if (existsSync(sessionsDir)) cpSync(sessionsDir, join(dest, "sessions"), { recursive: true });
+  writeFileSync(join(dest, "run.json"), JSON.stringify({ status: run.status, ...(reason !== undefined ? { reason } : {}), work_item, stdout: run.stdout.slice(-20_000), stderr: run.stderr.slice(-20_000) }, null, 2));
+}
+
 /**
- * Debug-only worker session preservation. When CADP_DEBUG_SESSIONS_DIR is set, copy the worker's
- * session log + stdout/stderr/status to a persistent per-run folder so a failed run's reasoning
- * can be inspected afterward. Default OFF: the container tmp is otherwise deleted (no bloat).
+ * Debug-only worker session preservation. When CADP_DEBUG_SESSIONS_DIR is set, copy EVERY run's
+ * session log + stdout/stderr/status to a persistent per-run folder. Default OFF (no bloat) —
+ * failure retention below covers the postmortem case without this.
  */
 function preserveWorkerSession(sessionsDir: string, run: { status: number | null; stdout: string; stderr: string }, work_item: string): void {
   const debugDir = process.env["CADP_DEBUG_SESSIONS_DIR"];
   if (debugDir === undefined || debugDir.length === 0) return;
   try {
-    const stamp = `${new Date().toISOString().replace(/[:.]/gu, "-")}-${sha256(work_item).slice(0, 8)}`;
-    const dest = join(debugDir, stamp);
-    mkdirSync(dest, { recursive: true });
-    if (existsSync(sessionsDir)) cpSync(sessionsDir, join(dest, "sessions"), { recursive: true });
-    writeFileSync(join(dest, "run.json"), JSON.stringify({ status: run.status, work_item, stdout: run.stdout.slice(-20_000), stderr: run.stderr.slice(-20_000) }, null, 2));
+    copySessionSnapshot(debugDir, sessionsDir, run, work_item);
   } catch { /* debugging aid must never break a run */ }
+}
+
+/** Bounded failure retention: newest snapshots kept, oldest pruned (stamps sort lexicographically). */
+export const FAILED_SESSION_RETENTION = 20;
+
+/**
+ * Failure-only session retention. The pilot series (#149 dogfooding) showed that exactly when a
+ * worker run fails — TERMINATED at its bound, nonzero exit, or a no-op candidate — its session log
+ * is the ONLY record of what the model actually did, and the ephemeral workspace deletion was
+ * destroying it. Successful runs stay ephemeral (the size concern that made retention opt-in);
+ * failures are rare, small, and precisely the runs that need a postmortem. Enabled by the
+ * deployment via CADP_FAILED_SESSIONS_DIR (ctl wires it to <env>/failed-sessions); absent ⇒ off.
+ * Retention is bounded to the newest FAILED_SESSION_RETENTION snapshots so it can never grow
+ * without limit. Never breaks a run.
+ */
+export function preserveFailedSession(sessionsDir: string, run: { status: number | null; stdout: string; stderr: string }, work_item: string, reason: string): void {
+  const failedDir = process.env["CADP_FAILED_SESSIONS_DIR"];
+  if (failedDir === undefined || failedDir.length === 0) return;
+  try {
+    copySessionSnapshot(failedDir, sessionsDir, run, work_item, reason);
+    const entries = readdirSync(failedDir).sort();
+    for (const stale of entries.slice(0, Math.max(0, entries.length - FAILED_SESSION_RETENTION))) {
+      rmSync(join(failedDir, stale), { recursive: true, force: true });
+    }
+  } catch { /* retention aid must never break a run */ }
 }
 
 /**
