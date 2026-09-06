@@ -100,6 +100,23 @@ verification_ok(sha) if {
 	source_authoritative(e)
 }
 
+# External verification backend (#57): when the deployment opts in
+# (require_external_verification), PR gates additionally require a SUCCESS check-run result from
+# verifier:github-actions bound to the exact candidate sha. Default off = byte-identical gates.
+external_verification_ok(_) if not params.require_external_verification
+
+external_verification_ok(sha) if {
+	some e in input.evidence
+	e.evidence_kind == "VERIFICATION"
+	e.producer_ref == "verifier:github-actions"
+	e.availability == "PRESENT"
+	some b in e.subject_bindings
+	b.namespace == "commit"
+	b.object_id == sha
+	e.claim.conclusion == "success"
+	source_authoritative(e)
+}
+
 # C41 leg 1: the REVIEW subject must equal the exact candidate the sealed material names.
 review_ok(sha) if {
 	some e in input.evidence
@@ -243,6 +260,7 @@ outcome := "ALLOW" if {
 pr_create_ok if {
 	op == "PR_CREATE"
 	verification_ok(mat.head_sha)
+	external_verification_ok(mat.head_sha)
 	review_ok(mat.head_sha)
 	backend_model_present
 	effort_requirement_met
@@ -256,6 +274,7 @@ outcome := "ALLOW" if {
 merge_base_ok if {
 	op == "PR_MERGE"
 	verification_ok(mat.expected_head_sha)
+	external_verification_ok(mat.expected_head_sha)
 	review_ok(mat.expected_head_sha)
 }
 
@@ -336,6 +355,16 @@ reason_codes contains "reviewer_product_not_independent" if {
 	entry := registry_entry(e.producer_ref)
 	not independent_product(entry)
 }
+
+reason_codes contains "external_verification_missing" if {
+	op in {"PR_CREATE", "PR_MERGE"}
+	params.require_external_verification
+	not external_verification_ok(pr_subject_sha)
+}
+
+pr_subject_sha := mat.head_sha if op == "PR_CREATE"
+
+pr_subject_sha := mat.expected_head_sha if op == "PR_MERGE"
 
 reason_codes contains "required_fact_unknown" if {
 	op == "PR_CREATE"
@@ -1319,6 +1348,10 @@ export const REFERENCE_IDENTITIES: KernelConfig["identity_registry"] = [
   // final message only, first-line verdict contract).
   { principal: "cadp-reviewer-codex", producer_ref: "reviewer:codex", identity_class: { vendor: "openai", product: "codex-cli", account: "cadp-v04", process_class: "worker" } },
   { principal: "cadp-verifier", producer_ref: "verifier:harness", identity_class: { vendor: "cadp", product: "node-test-harness", account: "cadp-v04", process_class: "evidence-adapter" } },
+  // External verification backend (#57): GitHub Actions check-run results, read authoritatively
+  // for the exact candidate sha. Evidence source only — the policy decides sufficiency; a green
+  // check transitions nothing by itself.
+  { principal: "cadp-verifier-actions", producer_ref: "verifier:github-actions", identity_class: { vendor: "github", product: "actions", account: "cadp-v04", process_class: "evidence-adapter" } },
   { principal: "sso:a.t.laplace@gmail.com", producer_ref: "human:astro3141", identity_class: { vendor: "github", product: "human", account: "astro3141", process_class: "human-surface" } },
   { principal: "cadp-depctl-probe", producer_ref: "deployment-control-probe", identity_class: { vendor: "cadp", product: "deployment-control", account: "cadp-v04", process_class: "deployment-control" } },
   { principal: "cadp-depctl-target", producer_ref: "deployment-control-target", identity_class: { vendor: "cadp", product: "deployment-control", account: "cadp-v04", process_class: "deployment-control" } },
@@ -1349,6 +1382,7 @@ export const REFERENCE_ADAPTERS: KernelConfig["adapter_registry"] = [
   { producer_ref: "backend-scan:grok", evidence_kinds: ["BACKEND_EXECUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "backend-scan:claude", evidence_kinds: ["BACKEND_EXECUTION"], source_relation: "SELF_REPORT", produced_at_source: { kind: "NONE" } },
   { producer_ref: "verifier:harness", evidence_kinds: ["VERIFICATION"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "SOURCE", claim_pointer: "/completed_at" } },
+  { producer_ref: "verifier:github-actions", evidence_kinds: ["VERIFICATION"], source_relation: "TARGET_AUTHORITY_OBSERVATION", produced_at_source: { kind: "SOURCE", claim_pointer: "/completed_at" } },
   { producer_ref: "reviewer:claude-code", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "reviewer:grok", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
   { producer_ref: "reviewer:codex", evidence_kinds: ["REVIEW"], source_relation: "INDEPENDENT_OBSERVATION", produced_at_source: { kind: "NONE" } },
@@ -1405,6 +1439,7 @@ export function buildReferenceBundle(input: ReferencePolicyInput): Uint8Array {
     max_effects_cap: 1000,
     max_steps_cap: 1000,
     require_backend_effort: false,
+    require_external_verification: false,
     extra_plain_allow_operations: [],
     // Empty = no delegation. A deployment's Human may list exact AGENT_DECISION producers whose
     // approval satisfies the MERGE gate only (never POLICY_ACTIVATE / judgment gates).

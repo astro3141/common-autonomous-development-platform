@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { brokerPostJson } from "./brokerTransport.ts";
 import { resolveReviewProvider } from "./reviewProviders.ts";
-import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, SURFACE_BUDGETS } from "./timeouts.ts";
+import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, EXTERNAL_VERIFY, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { SurfaceOperationBudget } from "./timeouts.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
@@ -47,7 +47,7 @@ function sha256(bytes: Uint8Array | string): string {
  * run and is what killed three healthy in-bound `/implement` attempts in #127. The only bound on
  * this call is `budget.rpc_ms` (see ./timeouts.ts).
  */
-async function brokerCall<T>(path: string, body: unknown, budget: SurfaceOperationBudget): Promise<T> {
+async function brokerCall<T>(path: string, body: unknown, budget: Pick<SurfaceOperationBudget, "rpc_ms">): Promise<T> {
   const url = env("CADP_BROKER_URL");
   const beat = setInterval(
     () => { try { heartbeat(); } catch { /* outside activity context (tests) */ } },
@@ -455,6 +455,84 @@ export async function verifyCandidate(input: {
     summary: `verification ${v.conclusion}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
   });
   return { verification_evidence_id: envelope.evidence_id, conclusion: v.conclusion, work_step_envelope_digest: workStep.envelope_digest.value };
+}
+
+/**
+ * External verification backend (#57): poll the broker's authoritative check-runs read until the
+ * repository-owned `cadp-verify` Actions run completes for the EXACT candidate sha, then submit
+ * the result as VERIFICATION evidence produced by `verifier:github-actions`. GitHub never
+ * transitions lifecycle state — the policy decides sufficiency. A run that never completes inside
+ * the attempt budget is honest UNKNOWN evidence, not a failure and never a pass.
+ */
+export async function verifyCandidateExternal(input: {
+  work_run_ref: string;
+  step_ordinal: number;
+  repo_full_name: string;
+  repo_id: string;
+  candidate_sha: string;
+  prior_step_envelope_digest?: string;
+}): Promise<{ verification_evidence_id: string; conclusion: string; work_step_envelope_digest: string }> {
+  const verifier = new KernelClient(env("CADP_KERNEL_URL"), env("CADP_VERIFIER_ACTIONS_TOKEN"));
+  const deadline = Date.now() + EXTERNAL_VERIFY.activity_attempt_ms - EXTERNAL_VERIFY.rpc_ms;
+  let last: { status: "UNKNOWN"; unknown_reason: string } | { status: "PRESENT"; conclusion: string; check_run_id: number; html_url: string; started_at: string; completed_at: string } = {
+    status: "UNKNOWN",
+    unknown_reason: "not yet polled",
+  };
+  while (Date.now() < deadline) {
+    heartbeat();
+    last = await brokerCall<typeof last>(
+      "/verify-external",
+      { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha },
+      { rpc_ms: EXTERNAL_VERIFY.rpc_ms },
+    );
+    if (last.status === "PRESENT") break;
+    await new Promise((r) => setTimeout(r, EXTERNAL_VERIFY.poll_interval_ms));
+  }
+
+  if (last.status === "UNKNOWN") {
+    const envelope = await verifier.submitEvidence({
+      evidence_kind: "VERIFICATION",
+      subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
+      availability: "UNKNOWN",
+      claim_schema: "cadp.verification.github-actions.v1",
+      unknown_reason: last.unknown_reason,
+      producer_ref: "verifier:github-actions",
+      source_ref: `check-runs:${input.candidate_sha}`,
+      source_relation: "TARGET_AUTHORITY_OBSERVATION",
+    });
+    const workStep = await submitWorkStep({
+      work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
+      input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
+      summary: "external verification UNKNOWN", prior_step_envelope_digest: input.prior_step_envelope_digest,
+    });
+    return { verification_evidence_id: envelope.evidence_id, conclusion: "UNKNOWN", work_step_envelope_digest: workStep.envelope_digest.value };
+  }
+
+  const envelope = await verifier.submitEvidence({
+    evidence_kind: "VERIFICATION",
+    subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
+    availability: "PRESENT",
+    claim_schema: "cadp.verification.github-actions.v1",
+    claim: {
+      head_sha: input.candidate_sha,
+      conclusion: last.conclusion,
+      check_run_id: last.check_run_id,
+      html_url: last.html_url,
+      runner: "github-actions:cadp-verify",
+      started_at: last.started_at,
+      completed_at: last.completed_at,
+    },
+    produced_at: last.completed_at, // SOURCE contract /completed_at (TD §9.1) — GitHub's own timestamp
+    producer_ref: "verifier:github-actions",
+    source_ref: `check-run:${String(last.check_run_id)}`,
+    source_relation: "TARGET_AUTHORITY_OBSERVATION",
+  });
+  const workStep = await submitWorkStep({
+    work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
+    input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
+    summary: `external verification ${last.conclusion}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
+  });
+  return { verification_evidence_id: envelope.evidence_id, conclusion: last.conclusion, work_step_envelope_digest: workStep.envelope_digest.value };
 }
 
 export async function reviewCandidate(input: {

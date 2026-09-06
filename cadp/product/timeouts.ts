@@ -127,6 +127,20 @@ export const SURFACE_BUDGETS = {
 export type SurfaceOperation = keyof typeof SURFACE_BUDGETS;
 
 /**
+ * External verification (#57): the broker read of the GitHub check-runs API is a single quick
+ * HTTP call (no container surface), and the POLLING loop lives in the activity — one bounded
+ * read per interval until the run completes or the attempt budget ends. Actions queue+run for
+ * this repo measures in single-digit minutes; the attempt budget covers that with margin while
+ * the heartbeat keeps a dead activity host detectable in ~30s.
+ */
+export const EXTERNAL_VERIFY = {
+  broker_response_ms: 30_000,
+  rpc_ms: 60_000,
+  poll_interval_ms: 15_000,
+  activity_attempt_ms: 660_000,
+} as const;
+
+/**
  * Temporal attempt budget for the activities that do NOT cross the broker seam (kernel-only:
  * allocate → seal → evaluate → admit, evidence submission). Unchanged from the pre-repair
  * composition — those activities never wait on a model surface.
