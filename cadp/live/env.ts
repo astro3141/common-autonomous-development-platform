@@ -64,9 +64,18 @@ export async function setupLiveEnv(dir: string, repoFullName: string | undefined
     fullName = `astro3141/cadp-v04-live-${randomBytes(3).toString("hex")}`;
     sh("gh", ["repo", "create", fullName, "--public", "--description", "CADP v0.4 disposable live-proof target (safe to delete)"]);
   }
+  // Never seed a repo that already has history: overwriting an existing project's main is
+  // destructive. Seeding is only for a freshly-created disposable target. A self-host run points
+  // at the real (non-empty) CADP repo, which already has everything the vertical needs.
+  let repoHasHistory = false;
+  try {
+    sh("gh", ["api", `/repos/${fullName}/commits`, "--jq", ".[0].sha"]);
+    repoHasHistory = true;
+  } catch { repoHasHistory = false; }
+
   // Seed: a real minimal project with a runnable test (the verifier runs `node --test`).
   const seed = join(dir, "seed");
-  if (!existsSync(seed)) {
+  if (!existsSync(seed) && !repoHasHistory) {
     mkdirSync(seed, { recursive: true });
     writeFileSync(join(seed, "package.json"), JSON.stringify({ name: "cadp-live-target", private: true, type: "module" }, null, 2));
     mkdirSync(join(seed, "src"), { recursive: true });
