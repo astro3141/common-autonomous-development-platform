@@ -22,14 +22,8 @@ import { claudeProviderToken, createEgressBoundary, dockerAvailable, imageIdenti
 import type { IsolationConfig } from "../product/isolation.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
-import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
-import { brokerPostJson } from "../product/brokerTransport.ts";
-import { SURFACE_BUDGETS } from "../product/timeouts.ts";
-import { parseWorkProposal } from "../product/planner.ts";
-import type { WorkProposalV1 } from "../product/planner.ts";
-import { classifyRun, nextAction } from "../product/driver.ts";
-import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
-import { collectRun, humanWait } from "../product/observationProjection.ts";
+import { sha256Hex } from "../kernel/canonical.ts";
+import { sealPlan, startWork, workPlan } from "./ops.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -137,12 +131,6 @@ function startComponent(name: string): void {
   console.log(JSON.stringify({ started: name }));
 }
 
-function temporalNamespaceId(): string {
-  const m = manifest();
-  const out = execFileSync("temporal", ["operator", "namespace", "describe", "--namespace", "cadp-v04", "--address", `127.0.0.1:${m.temporal_port}`, "-o", "json"], { encoding: "utf8" });
-  const parsed = JSON.parse(out) as { namespaceInfo?: { id?: string } };
-  return parsed.namespaceInfo?.id ?? "cadp-v04";
-}
 
 function safeJson(text: string): { fs_reads?: Array<Record<string, unknown>>; credential_use?: Array<Record<string, unknown>>; egress?: Array<Record<string, unknown>>; enumerated?: string[] } | undefined {
   const line = text.trim().split("\n").reverse().find((l) => l.trim().startsWith("{"));
@@ -354,196 +342,7 @@ async function attest(): Promise<void> {
   console.log(JSON.stringify({ immutability: immutability.evidence_id, write_once_enforced: enforced, move_rejected: moveRejected, delete_rejected: deleteRejected }, null, 2));
 }
 
-/** #127: a malformed CLI bound refuses at entry — it must never become NaN→null in sealed material. */
-function boundArg(raw: string | undefined, fallback: number): number {
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`malformed work bound '${raw}' — need a positive integer`);
-  return value;
-}
-
-async function startWork(
-  vertical: "development" | "record",
-  extra: string[],
-  ordinalArg?: string,
-): Promise<{ effect_id: string; workflow_id: string } | undefined> {
-  const m = manifest();
-  const c = client("cadp-workflow");
-  const namespaceId = temporalNamespaceId();
-
-  const args =
-    vertical === "development"
-      ? {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
-          development: {
-            repo_id: m.repo_id,
-            repo_full_name: m.repo_full_name,
-            base_ref: "refs/heads/main",
-            base_sha: m.base_sha,
-            work_item: extra[0]!,
-            require_human_merge: true,
-          },
-        }
-      : {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
-          record: {
-            tenant: "cadp-disposable",
-            resource_prefix: `live-${Date.now() % 100000}`,
-            payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
-          },
-        };
-
-  const ordinal = ordinalArg !== undefined ? Number(ordinalArg) : Math.floor(Date.now() / 1000) % 1000000;
-  const { effect_id } = await c.allocateEffectId({
-    schema: "cadp.allocation-key.v1",
-    work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-    step_ordinal: ordinal,
-    purpose: "work-start",
-  });
-  const argsBytes = Buffer.from(JSON.stringify(args), "utf8");
-  const { cas_key: args_cas_key } = await c.putBlob(argsBytes);
-  // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
-  // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
-  const image = imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim());
-  const worker_profile_digest = jcsDigest({
-    profile: workerProfileDigest(),
-    surface_image: image.image,
-    image_digest: image.image_digest,
-    tool_versions: image.tool_versions,
-  }).value;
-  const material = {
-    workflow_id: `cadp-work-${effect_id}`,
-    workflow_type: "cadpWork",
-    task_queue: "cadp-worker",
-    args_cas_key,
-    args_digest: jcsDigest(args).value,
-    bounds: args.bounds,
-    worker_profile_digest,
-    surface_image: image,
-    continuation_target: `temporal:cadp-v04:${namespaceId}`,
-  };
-  const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
-  const request = await c.sealEffectRequest({
-    effect_id,
-    requester_ref: "workflow:cadp-work",
-    work_bindings: [
-      { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
-      // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
-      ...(vertical === "development" && extra[3] !== undefined
-        ? [{ authority_ref: "cadp-store:k04", namespace: "work-proposal", object_id: extra[3] }]
-        : []),
-    ],
-    target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: namespaceId },
-    operation_kind: "WORK_START",
-    material_schema: "cadp.work-start.v1",
-    material_ref,
-    prior_effect_refs: [],
-  });
-  const input = await c.assembleAdmissionInput(effect_id, []);
-  const evaluated = await c.evaluate(input.input_digest.value);
-  if (evaluated.kind !== "DECISION" || evaluated.decision.outcome !== "ALLOW") {
-    console.log(JSON.stringify({ effect_id, evaluated }, null, 2));
-    return undefined;
-  }
-  const admitted = await c.admitAndDispatch(effect_id, evaluated.decision.decision_id);
-  console.log(JSON.stringify({ effect_id, workflow_id: material.workflow_id, request_digest: request.request_digest.value, admitted }, null, 2));
-  if (admitted.kind !== "ADMITTED" || admitted.outcome.result !== "COMMITTED") return undefined;
-  return { effect_id, workflow_id: material.workflow_id };
-}
-
-/**
- * Proposal-only planning (#61): run the commodity planner surface over the whole intent, seal the
- * typed proposal as WORK_PROPOSAL evidence with exact provenance, and print it. The proposal
- * confers no authority — each item still enters through the ordinary governed WORK_START
- * (`work-dev "<item>" [maxSteps maxEffects] [proposal_evidence_id]` for exact provenance binding).
- */
-async function plan(intent: string): Promise<void> {
-  const m = manifest();
-  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
-    `http://127.0.0.1:${m.broker_port}`,
-    "/plan",
-    { repo_full_name: m.repo_full_name, base_sha: m.base_sha, intent },
-    { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
-  );
-  const envelope = await client("cadp-planner").submitEvidence({
-    evidence_kind: "WORK_PROPOSAL",
-    subject_bindings: [
-      { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
-      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${m.base_sha}` },
-    ],
-    availability: "PRESENT",
-    claim_schema: "cadp.work-proposal.v1",
-    claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
-    producer_ref: "planner:claude-code",
-    source_ref: `planner:${m.base_sha}:${sha256Hex(intent).slice(0, 16)}`,
-    source_relation: "SELF_REPORT",
-  });
-  console.log(JSON.stringify({ proposal_evidence_id: envelope.evidence_id, items: result.proposal.items, notes: result.proposal.notes }, null, 2));
-}
-
-/** Poll one work run until it settles: Temporal status (commodity observation) + kernel human-wait projection. */
-async function pollRun(workRunRef: string, workflowId: string, deadlineMs: number): Promise<ItemStatus> {
-  const m = manifest();
-  const c = client("cadp-workflow");
-  const { Connection, Client } = await import("@temporalio/client");
-  const connection = await Connection.connect({ address: `127.0.0.1:${m.temporal_port}` });
-  const temporal = new Client({ connection, namespace: "cadp-v04" });
-  const handle = temporal.workflow.getHandle(workflowId);
-  const startedAt = Date.now();
-  const KNOWN = ["RUNNING", "COMPLETED", "FAILED", "TERMINATED", "TIMED_OUT", "CANCELLED"] as const;
-  try {
-    for (;;) {
-      let workflow_status: RunSnapshot["workflow_status"] = "UNKNOWN";
-      let trace: Record<string, unknown> | undefined;
-      try {
-        const description = await handle.describe();
-        const name = description.status.name.toUpperCase();
-        workflow_status = (KNOWN as readonly string[]).includes(name) ? (name as RunSnapshot["workflow_status"]) : "UNKNOWN";
-        if (workflow_status === "COMPLETED") trace = (await handle.result()) as Record<string, unknown>;
-      } catch { workflow_status = "UNKNOWN"; }
-      const run = await collectRun(c, workRunRef);
-      const item = classifyRun({ workflow_status, trace, human_wait: humanWait(run.effects), deadline_exceeded: Date.now() - startedAt > deadlineMs });
-      if (nextAction(item) !== "CONTINUE_POLLING") return item;
-      await new Promise((resolve) => setTimeout(resolve, 10_000));
-    }
-  } finally {
-    await connection.close();
-  }
-}
-
-/**
- * Proposal driver (#61): run a sealed WORK_PROPOSAL's items sequentially through the ordinary
- * governed WORK_START. Deterministic glue, zero authority: policy gates every start, an item that
- * reaches its Human merge gate is delivered (merges batch out-of-band via human-approve), and any
- * failed/stopped/stalled run halts the loop fail-closed.
- */
-async function workPlan(proposalEvidenceId: string, maxItemsArg?: string): Promise<void> {
-  const c = client("cadp-workflow");
-  const { envelope } = await c.getEvidence(proposalEvidenceId);
-  if (envelope.evidence_kind !== "WORK_PROPOSAL") throw new Error(`evidence ${proposalEvidenceId} is ${envelope.evidence_kind}, not WORK_PROPOSAL`);
-  const claim = envelope.claim as Record<string, unknown>;
-  // Re-validate through the same closed-schema parser the broker used (fail closed, never trust a row shape).
-  const proposal = parseWorkProposal(
-    JSON.stringify({ schema: claim["schema"], items: claim["items"], ...(claim["notes"] !== undefined ? { notes: claim["notes"] } : {}) }),
-  );
-  const maxItems = boundArg(maxItemsArg, proposal.items.length);
-  const results: Array<Record<string, unknown>> = [];
-  for (const [index, item] of proposal.items.slice(0, maxItems).entries()) {
-    console.log(JSON.stringify({ driver: "starting", index, work_item: item.work_item, bounds: { max_steps: item.max_steps, max_effects: item.max_effects } }));
-    const started = await startWork("development", [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId]);
-    if (started === undefined) {
-      results.push({ index, work_item: item.work_item, status: "NOT_ADMITTED" });
-      break; // fail closed: an item the gate refused halts the loop
-    }
-    const settled = await pollRun(started.effect_id, started.workflow_id, 30 * 60_000);
-    results.push({ index, work_item: item.work_item, work_run_ref: started.effect_id, workflow_id: started.workflow_id, ...settled });
-    console.log(JSON.stringify({ driver: "settled", index, ...settled }));
-    if (nextAction(settled) === "HALT") break;
-  }
-  console.log(JSON.stringify({ driver: "done", proposal_evidence_id: proposalEvidenceId, items_total: proposal.items.length, results }, null, 2));
-}
+const opsLog = (line: Record<string, unknown>): void => console.log(JSON.stringify(line, null, 2));
 
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
   const m = manifest();
@@ -619,16 +418,16 @@ async function main(): Promise<void> {
       await attest();
       break;
     case "plan":
-      await plan(process.argv[4]!);
+      console.log(JSON.stringify(await sealPlan(dir, process.argv[4]!), null, 2));
       break;
     case "work-plan":
-      await workPlan(process.argv[4]!, process.argv[5]);
+      console.log(JSON.stringify({ driver: "done", proposal_evidence_id: process.argv[4]!, results: await workPlan(dir, process.argv[4]!, process.argv[5], opsLog) }, null, 2));
       break;
     case "work-dev":
-      await startWork("development", process.argv.slice(4));
+      await startWork(dir, "development", process.argv.slice(4), { log: opsLog });
       break;
     case "work-record":
-      await startWork("record", process.argv.slice(4));
+      await startWork(dir, "record", process.argv.slice(4), { log: opsLog });
       break;
     case "human-approve":
       await humanApprove(process.argv[4]!, process.argv[5]!);
