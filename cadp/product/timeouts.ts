@@ -71,14 +71,25 @@ export const MIN_LAYER_MARGIN_MS = 30_000;
 export const SURFACE_TERMINATION_MS = 10_000;
 
 /**
- * `/implement`: a codex worker run over a real work item. This is the operation #127 measured
- * crossing ~301s while healthy, so every layer above the surface is > the old implicit boundary.
+ * `/implement`: a worker run over a real work item. #127 measured codex crossing ~301s while
+ * healthy, so every layer above the surface already outlived the old implicit boundary.
+ *
+ * `surface_ms` is a CEILING, not a target: a worker that finishes on its own (codex exits ~301s)
+ * is unaffected by a higher ceiling — the bound only caps a run that would otherwise never stop.
+ * grok is a slower agentic worker: the 3rd/4th pilots showed it engaging edit tools (once
+ * #152 unblocked headless edits) but burning the full 900_000ms ceiling without converging on the
+ * multi-file #149 task, so it was TERMINATED before committing a candidate. The ceiling is raised
+ * to 1_800_000ms (30m) to cover the slowest SUPPORTED worker (grok), not just codex's measured
+ * pace. codex's normal ~301s exit is unchanged. grok's actual convergence time remains UNMEASURED —
+ * we only know it exceeds 15m; if 30m still TERMINATES, that is an honest signal grok is not
+ * converging on this class of task rather than merely being slow. The four layers keep their
+ * MIN_LAYER_MARGIN_MS spacing (30k/30k/60k) so the #128 termination→cleanup→response hierarchy holds.
  */
 export const IMPLEMENT_BUDGET: SurfaceOperationBudget = {
-  surface_ms: 900_000,
-  broker_response_ms: 930_000,
-  rpc_ms: 960_000,
-  activity_attempt_ms: 1_020_000,
+  surface_ms: 1_800_000,
+  broker_response_ms: 1_830_000,
+  rpc_ms: 1_860_000,
+  activity_attempt_ms: 1_920_000,
 };
 
 /** `/verify`: `node --test` inside the `--network none` verifier container. */
