@@ -4,6 +4,7 @@
  *   node cadp/live/ctl.ts <dir> stop|start <component>      kill / restart one real process
  *   node cadp/live/ctl.ts <dir> attest                      reach + immutability attestations
  *   node cadp/live/ctl.ts <dir> plan "<whole intent>"       proposal-only planner → WORK_PROPOSAL evidence
+ *   node cadp/live/ctl.ts <dir> work-plan <proposalEvidenceId> [maxItems]   drive items through governed WORK_START
  *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects] [proposalEvidenceId]
  *   node cadp/live/ctl.ts <dir> work-record <n-payloads> [maxSteps maxEffects]
  *   node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
@@ -24,7 +25,11 @@ import { KernelClient } from "../clients/kernelClient.ts";
 import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
+import { parseWorkProposal } from "../product/planner.ts";
 import type { WorkProposalV1 } from "../product/planner.ts";
+import { classifyRun, nextAction } from "../product/driver.ts";
+import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
+import { collectRun, humanWait } from "../product/observationProjection.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -357,7 +362,11 @@ function boundArg(raw: string | undefined, fallback: number): number {
   return value;
 }
 
-async function startWork(vertical: "development" | "record", extra: string[], ordinalArg?: string): Promise<void> {
+async function startWork(
+  vertical: "development" | "record",
+  extra: string[],
+  ordinalArg?: string,
+): Promise<{ effect_id: string; workflow_id: string } | undefined> {
   const m = manifest();
   const c = client("cadp-workflow");
   const namespaceId = temporalNamespaceId();
@@ -436,10 +445,12 @@ async function startWork(vertical: "development" | "record", extra: string[], or
   const evaluated = await c.evaluate(input.input_digest.value);
   if (evaluated.kind !== "DECISION" || evaluated.decision.outcome !== "ALLOW") {
     console.log(JSON.stringify({ effect_id, evaluated }, null, 2));
-    return;
+    return undefined;
   }
   const admitted = await c.admitAndDispatch(effect_id, evaluated.decision.decision_id);
   console.log(JSON.stringify({ effect_id, workflow_id: material.workflow_id, request_digest: request.request_digest.value, admitted }, null, 2));
+  if (admitted.kind !== "ADMITTED" || admitted.outcome.result !== "COMMITTED") return undefined;
+  return { effect_id, workflow_id: material.workflow_id };
 }
 
 /**
@@ -470,6 +481,68 @@ async function plan(intent: string): Promise<void> {
     source_relation: "SELF_REPORT",
   });
   console.log(JSON.stringify({ proposal_evidence_id: envelope.evidence_id, items: result.proposal.items, notes: result.proposal.notes }, null, 2));
+}
+
+/** Poll one work run until it settles: Temporal status (commodity observation) + kernel human-wait projection. */
+async function pollRun(workRunRef: string, workflowId: string, deadlineMs: number): Promise<ItemStatus> {
+  const m = manifest();
+  const c = client("cadp-workflow");
+  const { Connection, Client } = await import("@temporalio/client");
+  const connection = await Connection.connect({ address: `127.0.0.1:${m.temporal_port}` });
+  const temporal = new Client({ connection, namespace: "cadp-v04" });
+  const handle = temporal.workflow.getHandle(workflowId);
+  const startedAt = Date.now();
+  const KNOWN = ["RUNNING", "COMPLETED", "FAILED", "TERMINATED", "TIMED_OUT", "CANCELLED"] as const;
+  try {
+    for (;;) {
+      let workflow_status: RunSnapshot["workflow_status"] = "UNKNOWN";
+      let trace: Record<string, unknown> | undefined;
+      try {
+        const description = await handle.describe();
+        const name = description.status.name.toUpperCase();
+        workflow_status = (KNOWN as readonly string[]).includes(name) ? (name as RunSnapshot["workflow_status"]) : "UNKNOWN";
+        if (workflow_status === "COMPLETED") trace = (await handle.result()) as Record<string, unknown>;
+      } catch { workflow_status = "UNKNOWN"; }
+      const run = await collectRun(c, workRunRef);
+      const item = classifyRun({ workflow_status, trace, human_wait: humanWait(run.effects), deadline_exceeded: Date.now() - startedAt > deadlineMs });
+      if (nextAction(item) !== "CONTINUE_POLLING") return item;
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+    }
+  } finally {
+    await connection.close();
+  }
+}
+
+/**
+ * Proposal driver (#61): run a sealed WORK_PROPOSAL's items sequentially through the ordinary
+ * governed WORK_START. Deterministic glue, zero authority: policy gates every start, an item that
+ * reaches its Human merge gate is delivered (merges batch out-of-band via human-approve), and any
+ * failed/stopped/stalled run halts the loop fail-closed.
+ */
+async function workPlan(proposalEvidenceId: string, maxItemsArg?: string): Promise<void> {
+  const c = client("cadp-workflow");
+  const { envelope } = await c.getEvidence(proposalEvidenceId);
+  if (envelope.evidence_kind !== "WORK_PROPOSAL") throw new Error(`evidence ${proposalEvidenceId} is ${envelope.evidence_kind}, not WORK_PROPOSAL`);
+  const claim = envelope.claim as Record<string, unknown>;
+  // Re-validate through the same closed-schema parser the broker used (fail closed, never trust a row shape).
+  const proposal = parseWorkProposal(
+    JSON.stringify({ schema: claim["schema"], items: claim["items"], ...(claim["notes"] !== undefined ? { notes: claim["notes"] } : {}) }),
+  );
+  const maxItems = boundArg(maxItemsArg, proposal.items.length);
+  const results: Array<Record<string, unknown>> = [];
+  for (const [index, item] of proposal.items.slice(0, maxItems).entries()) {
+    console.log(JSON.stringify({ driver: "starting", index, work_item: item.work_item, bounds: { max_steps: item.max_steps, max_effects: item.max_effects } }));
+    const started = await startWork("development", [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId]);
+    if (started === undefined) {
+      results.push({ index, work_item: item.work_item, status: "NOT_ADMITTED" });
+      break; // fail closed: an item the gate refused halts the loop
+    }
+    const settled = await pollRun(started.effect_id, started.workflow_id, 30 * 60_000);
+    results.push({ index, work_item: item.work_item, work_run_ref: started.effect_id, workflow_id: started.workflow_id, ...settled });
+    console.log(JSON.stringify({ driver: "settled", index, ...settled }));
+    if (nextAction(settled) === "HALT") break;
+  }
+  console.log(JSON.stringify({ driver: "done", proposal_evidence_id: proposalEvidenceId, items_total: proposal.items.length, results }, null, 2));
 }
 
 async function humanApprove(effect_id: string, workflow_id: string): Promise<void> {
@@ -547,6 +620,9 @@ async function main(): Promise<void> {
       break;
     case "plan":
       await plan(process.argv[4]!);
+      break;
+    case "work-plan":
+      await workPlan(process.argv[4]!, process.argv[5]);
       break;
     case "work-dev":
       await startWork("development", process.argv.slice(4));
