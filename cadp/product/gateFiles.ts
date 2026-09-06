@@ -30,9 +30,24 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
   "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // Constitutional documents (design lane): the Spec, TDs and the authority order DEFINE the very
+  // authority boundaries this gate enforces — a delegated agent auto-merging an edit to them is
+  // the self-approval hazard in its purest form. Every constitutional/design document routes to a
+  // HUMAN_DECISION. A trailing `*` marks a filename prefix, covering past and future revisions
+  // (v0.3, v0.4, next generations) without re-editing this list per revision.
+  "Authority order.md",
+  "Common Autonomous Development Platform — Specification*", // every Spec revision
+  "TECHNICAL_DESIGN_*", // every TD document
+  "DESIGN_*", // standalone design/authority notes
 ];
 
 /** Returns the subset of changed paths that touch gate machinery (empty ⇒ ordinary change). */
 export function touchesGateMachinery(changedPaths: readonly string[]): string[] {
-  return changedPaths.filter((p) => GATE_PATH_RULES.some((rule) => (rule.endsWith("/") ? p.startsWith(rule) : p === rule)));
+  return changedPaths.filter((p) =>
+    GATE_PATH_RULES.some((rule) =>
+      rule.endsWith("/") ? p.startsWith(rule) // directory prefix
+      : rule.endsWith("*") ? p.startsWith(rule.slice(0, -1)) // filename prefix (constitutional docs)
+      : p === rule, // exact file
+    ),
+  );
 }
