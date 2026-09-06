@@ -115,7 +115,13 @@ review_ok(sha) if {
 }
 
 # S2 derivation + independence predicate (TD 8.4): product class must differ from every implementer.
+# FAIL CLOSED on an EMPTY implementer set: independence is only provable against a KNOWN
+# implementer. Measured live (13th pilot): the merge admission input carried no WORK_STEP or
+# BACKEND_EXECUTION evidence, the universal quantifier was vacuously true, and a claude-implemented
+# run was auto-merged by the claude-product delegate even after the implementer-set rule fix. An
+# admission that cannot see who implemented the candidate must not claim independence from them.
 independent_product(entry) if {
+	count(implementer_refs) > 0
 	every p in implementer_refs {
 		registry_entry(p).identity_class.product != entry.identity_class.product
 	}

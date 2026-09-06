@@ -462,7 +462,7 @@ test("C41: review-to-effect provenance — positive chain + falsifications 1/1b/
           },
           PRINCIPALS.workflow,
         );
-        const inputB = gh.h.ingress.assembleAdmissionInput(mergeB.effect_id, [evidenceB2.verification, evidenceB2.review, approval.evidence_id]);
+        const inputB = gh.h.ingress.assembleAdmissionInput(mergeB.effect_id, [evidenceB2.verification, evidenceB2.review, evidenceB2.workStep, approval.evidence_id]);
         const evaluatedB = await gh.h.evaluate(inputB.input_digest.value);
         assert.equal(evaluatedB.kind, "DECISION");
         if (evaluatedB.kind !== "DECISION") return;
