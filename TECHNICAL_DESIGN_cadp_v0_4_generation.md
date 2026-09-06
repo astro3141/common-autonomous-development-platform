@@ -941,3 +941,82 @@ Architecture-blocking unresolved questions: **0**.
 | 13 | TD v1.5 disposition historical | §14 |
 | 14 | no production code changes | scope proof in PR |
 | 15 | unresolved explicit; architecture-blocking = 0 | §15 |
+
+---
+
+## 17. Model-surface provider adapters
+
+Product-layer closed registries for the CLI surfaces that implement, review, and plan autonomous work. This is not a kernel primitive and does not change K1–K7, `identity_class` derivation (§9.1), or the §8.4 independence predicate: the kernel still stamps `producer_ref` from the authenticated principal and derives class from the active `identity_registry`. What this section records is the adapter that now exists in the implementation — the exact argv, auth injection, and product string a named surface runs under — so a provider capability is declared only after a live container probe has measured it, and an unmeasured fact stays `UNKNOWN` rather than guessed.
+
+### 17.1 Closed union keyed registries
+
+Three registries, each a `Record` keyed by a closed provider-name union. Unknown names fail closed at `resolveWorkerProvider` / `resolveReviewProvider` / `resolvePlanProvider` with no filesystem, process, docker, or network side effect; those resolvers never default. An omitted `review_product` / `plan_product` keeps the measured claude path; an omitted worker selection is not a silent fallback inside `resolveWorkerProvider`.
+
+| Registry | File | Closed union | Prompt sentinel | Surfaces |
+|---|---|---|---|---|
+| `WORKER_PROVIDERS` | `cadp/product/workerProviders.ts` | `"codex" \| "grok"` | `{{WORK_ITEM}}` | `/implement` worker container |
+| `REVIEW_PROVIDERS` | `cadp/product/reviewProviders.ts` | `"claude" \| "grok"` | `{{DIFF_PROMPT}}` | `/review` reviewer container |
+| `PLAN_PROVIDERS` | `cadp/product/planProviders.ts` | `"claude" \| "grok"` | `{{PLAN_PROMPT}}` | `/plan` planner container (proposal-only) |
+
+Every profile carries three load-bearing fields:
+
+- **argv template, not a prefix.** The provider's exact argv after the binary name, with the sentinel replaced by the prompt. A template so a provider whose prompt is not the last token — grok worker `-p <prompt> --output-format streaming-json`, grok reviewer/planner `-p <prompt> --permission-mode plan …` — is expressible without special-casing.
+- **auth descriptor, never a credential.** Worker profiles declare `auth_files` + `auth_subdir`. Reviewer and planner profiles declare `auth_method` as the closed union in §17.3. Host keychain material is resolved at injection time by the broker, not stored in the registry.
+- **`identity_class_product`.** The product-side declaration of `identity_class.product` (TD §8.4). It must match the policy identity registry's product string for that surface's `producer_ref`. Adapters cannot self-assert a different class at submit time (C28).
+
+Pinned measured entries (argv identity is the profile; permission posture is part of argv, not a separate switch):
+
+| Provider | `identity_class_product` | Auth | Distinctive argv (measured) |
+|---|---|---|---|
+| worker `codex` | `codex-cli` | `auth_files` `.codex/auth.json` | `exec --sandbox danger-full-access … {{WORK_ITEM}}` |
+| worker `grok` | `grok` | `auth_files` `.grok/auth.json` | `-p {{WORK_ITEM}} --output-format streaming-json --permission-mode bypassPermissions` (headless autonomous-edit; container isolation is the real boundary) |
+| reviewer `claude` | `claude-code` | `oauth_env` `CLAUDE_CODE_OAUTH_TOKEN` | `-p --model claude-sonnet-5 --permission-mode plan --disallowedTools=… {{DIFF_PROMPT}}` |
+| reviewer `grok` | `grok` | `auth_files` `.grok/auth.json` | `-p {{DIFF_PROMPT}} --permission-mode plan --disable-web-search --tools read_file,list_dir,grep --json-schema <verdict schema>` |
+| planner `claude` | `claude-code` | `oauth_env` `CLAUDE_CODE_OAUTH_TOKEN` | plan-mode, mutating/external tools disallowed; reading the checkout remains allowed |
+| planner `grok` | `grok` | `auth_files` `.grok/auth.json` | same measured read-only argv as the grok reviewer, without `--json-schema` (proposal parse is a closed JSON schema of its own) |
+
+The grok **worker** must never share the reviewer/planner argv: `bypassPermissions` is grok's analogue of codex `--sandbox danger-full-access` and is forbidden on the read-only surfaces.
+
+### 17.2 Measurement-first capabilities
+
+A provider capability is a field on the profile that is present only after a live container probe has measured the corresponding fact. The scan, the parser, and the isolation argv consume that field; they do not infer a sibling provider's shape. An unmeasured or unmatched fact stays `UNKNOWN` (or fails closed to the conservative verdict). Guessing is the defect this rule exists to prevent.
+
+Three capabilities, each with the grok measurement that forced the field into the spec rather than a hardcoded assumption:
+
+**`model_scan` (worker; #91).** `WORKER_PROVIDERS[p].model_scan` is optional. Absent ⇒ `scanBackendModel` returns no model and no locator; `BACKEND_EXECUTION` records `observed.model.availability = UNKNOWN` (requested is a separate sub-object and is never consulted to fill observed). Both regexes carry exactly one capture group. Codex was measured as `"model":"…"` in `rollout-*.jsonl`. Grok was measured (2026-09-06 container probe, grok 1.0.13): the mounted `/root/.grok/sessions` tree writes `<urlencoded-cwd>/<session-id>/chat_history.jsonl` carrying `"model_id":"grok-4.6-build"` (the serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture. A hardcoded `"model"` capture after a prefix match would have reported UNKNOWN on a live grok session; the capture now lives in the measured spec.
+
+**`verdict_format` (reviewer).** `first-line` is the measured claude `-p` contract (verdict is the first stdout line starting with `APPROVE`/`REQUEST_CHANGES`, reason on the next). `json-schema-text` is the measured grok contract. The 9th-pilot measurement: in plain `-p` output grok concatenates tool-use narration and the final verdict **without a newline** (`…file.APPROVE`), so the first-line contract is unparseable and would fail closed as `REQUEST_CHANGES` even on an approval. The grok reviewer therefore runs under `--json-schema` with `{verdict ∈ {APPROVE, REQUEST_CHANGES}, reason}`. Measured wrapper shape: stdout is `{"text": "…"}` whose text concatenates one JSON object per turn (tool-use narration is coerced into the schema too); the **last** object is the final verdict. Anything outside that shape fails closed to `REQUEST_CHANGES` — a verdict is never guessed from prose (`parseReviewVerdict`).
+
+**Read-only posture (reviewer and planner argv).** Declared as the argv that the probe held, not as a named mode. Measured (2026-09-06 container probes, grok 1.0.13): `--permission-mode plan` blocks the `write` tool (auto-cancelled, no file created) but does **not** block `run_terminal_command` (a `touch` executed and the file appeared), so plan mode alone is not read-only for grok. `--tools read_file,list_dir,grep` (allow-list) held: a direct "run the terminal command" prompt could not execute it and no file was created. That allow-list — not plan mode — is the enforced read-only boundary; plan mode stays as defence in depth. `--disable-web-search` removes `web_search`/`web_fetch`. Claude's measured boundary remains `--permission-mode plan` plus `--disallowedTools=…`.
+
+### 17.3 Auth injection (`oauth_env` vs `auth_files`)
+
+Descriptors only. The broker (`surfaceProviderAuth` in `cadp/product/surfaceBroker.ts`) resolves the descriptor into container injection (`reviewerAuthArgs` in `cadp/product/isolation.ts`). Exactly one provider's auth enters the container; the host keychain and every other provider stay unreachable.
+
+| Kind | Injection | Reference path |
+|---|---|---|
+| `oauth_env` | `-e <env_var>=<token>` — operator-extracted token, never the keychain itself | claude: `CLAUDE_CODE_OAUTH_TOKEN` from `claudeProviderToken()` |
+| `auth_files` | named files copied from host `~/<auth_subdir>/` into a fresh per-run dir, mounted **read-only** at `/root/<auth_subdir>/<file>:ro` | grok: `~/.grok/auth.json` (subscription OAuth; same posture the worker surface already uses) |
+
+Both fail closed: missing host `HOME`, missing named file, or an `oauth_env` that is not the measured claude var throws; there is no fallback to another provider's token and no reuse of worker auth for a reviewer/planner (and the reverse). Worker injection is the `auth_files` path via `buildWorkerSandbox`: only the declared files are copied; host `config.toml`, MCP servers, sessions, and every other provider's subdirectory stay out. Unknown `auth_method.kind` is unsupported and throws.
+
+### 17.4 Reviewer independence, enforced twice (§8.4)
+
+§8.4's predicate is `identity_class.product ≠` the implementer's product. A provider can never review its own product's implementation. The implementation enforces that twice, on different owners, before and after seal:
+
+1. **At entry, before anything is sealed.** `assertReviewIndependence(worker_product, review_provider)` (`cadp/product/reviewProviders.ts`) compares `REVIEW_PROVIDERS[review].identity_class_product` to the implementing worker's `WORKER_PROVIDERS[worker].identity_class_product` and throws on equality. `startWork` (`cadp/live/ops.ts`) calls it after resolving both selections and before `WORK_START` material is built — so a doomed grok-reviews-grok (or claude-reviews-claude-code) run spends no surface compute and writes no kernel row. Pure; the same-product pairs `("grok","grok")` and `("claude-code","claude")` fail; `("codex-cli","grok")` and `("grok","claude")` pass.
+2. **On sealed evidence, at the PR/merge gates.** The reference policy derives `identity_class(envelope)` from `identity_registry[envelope.producer_ref]` under the active policy (never from the claim). `independent_product` requires that product to differ from every implementer's class; `review_ok` additionally requires `producer_ref(REVIEW) ≠ producer_ref(implementer)`. Violation is `reviewer_product_not_independent` / `reviewer_is_the_implementer` — `DENY`, no K6 (C12/C28). Grok's reviewer (`reviewer:grok`) and grok's worker share product `"grok"`, so a `REVIEW` from `reviewer:grok` cannot be independent of an implementer whose registered product is `"grok"`.
+
+The two checks are not substitutes: the entry guard refuses the run before seal; the policy check is the constitutional one on the envelopes the gate actually sees. A draft cannot override class to slip past either (C28).
+
+### 17.5 Per-provider kernel principals
+
+Evidence attribution is honest per provider: each surface authenticates as its own registered principal and submits under its own `producer_ref`. A provider without a token fails closed rather than borrowing another product's identity; the kernel refuses a producer/principal mismatch.
+
+| `producer_ref` | Principal | How the submitter authenticates | Evidence |
+|---|---|---|---|
+| `reviewer:grok` | `cadp-reviewer-grok` | activity host `CADP_REVIEWER_TOKEN_GROK` | `REVIEW` (`INDEPENDENT_OBSERVATION`) |
+| `planner:grok` | `cadp-planner-grok` | `sealPlan` as `cadp-planner-grok` | `WORK_PROPOSAL` (`SELF_REPORT`; confers no authority) |
+| `backend-scan:grok` | `cadp-backend-scan-grok` | activity host `CADP_BACKEND_SCAN_TOKEN_GROK` | `BACKEND_EXECUTION` (`SELF_REPORT`; observed model from that provider's session log) |
+
+The claude/codex counterparts remain `reviewer:claude-code`, `planner:claude-code`, `backend-scan:codex`. Registry, adapter registry, and live-env token mint (`PRINCIPAL_TOKEN_NAMES`) name the grok principals explicitly so a grok review, plan, or backend scan cannot be sealed as a claude/codex observation. `identity_class` for those `producer_ref`s is `{vendor: xai, product: grok, …}` — the same product string the entry independence guard compares.
