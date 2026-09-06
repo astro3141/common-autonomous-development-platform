@@ -83,6 +83,10 @@ test("unknown providers fail synchronously without filesystem effects", () => {
 test("/implement resolves worker_product before Docker or temporary workspace effects", async () => {
   const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith("cadp-impl-")).sort();
   await assert.rejects(
+    brokerImplement({ repo_full_name: "unused/unused", base_sha: "0", work_item: "unused" } as Parameters<typeof brokerImplement>[0]),
+    /unknown worker provider: undefined/u,
+  );
+  await assert.rejects(
     brokerImplement({ repo_full_name: "unused/unused", base_sha: "0", work_item: "unused", worker_product: "made-up" }),
     /unknown worker provider: made-up/u,
   );
