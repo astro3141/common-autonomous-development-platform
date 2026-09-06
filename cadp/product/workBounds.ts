@@ -27,7 +27,7 @@ export function devEffectFloorViolation(max_effects: number): string | undefined
 }
 
 /**
- * This is the shared fail-closed well-formedness check for WorkBounds, used by the workflow, planner and CLI with no Temporal dependency: max_steps and max_effects must be safe integers >= 1, and a present deadline must parse as a date; it returns the first offending field=value string, or undefined when every bound is well-formed. NaN and Infinity flatten to null across JSON transport, while fractional, zero and negative values survive it, so `ordinal + 1 > bound` would be silently false or trivially true instead of a bound—a malformed bound must therefore stop the run before any step or effect.
+ * This is the shared fail-closed well-formedness check for WorkBounds, used by the workflow, planner and CLI with no Temporal dependency: max_steps and max_effects must be safe integers >= 1, and a present deadline must parse as a date; the function returns the first offending field=value string, or undefined when every bound is well-formed. NaN and Infinity flatten to null across JSON transport, while fractional, zero and negative values survive it, so `ordinal + 1 > bound` would be silently false or trivially true instead of a bound—a malformed bound must therefore stop the run before any step or effect.
  */
 export function malformedWorkBounds(bounds: WorkBounds): string | undefined {
   for (const [name, value] of [["max_steps", bounds.max_steps], ["max_effects", bounds.max_effects]] as const) {
