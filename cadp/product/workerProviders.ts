@@ -17,8 +17,11 @@ export interface WorkerProviderProfile {
   /**
    * How to scan the provider's OWN session log / stdout for the observed model (#91). Absent ⇒ the
    * observed model stays UNKNOWN (never guessed): a provider's format must be MEASURED before a
-   * `PRESENT` value with a locator is claimed. `session_regex` runs over each session file's text;
-   * `stdout_regex` (with one capture group) is the fallback over the worker's stdout.
+   * `PRESENT` value with a locator is claimed. Both regexes carry exactly ONE capture group that
+   * yields the model; `session_regex` runs over each session file's text, `stdout_regex` is the
+   * fallback over the worker's stdout. (Previously the session scan hardcoded a `"model":"…"`
+   * capture after a prefix match — grok's measured field is `"model_id"`, so the capture now lives
+   * in the spec itself; codex's expansion is capture-equivalent, byte-identical in effect.)
    */
   readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string };
 }
@@ -32,7 +35,7 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     auth_subdir: ".codex",
     sessions_subdir: "codex-sessions",
     // Measured: codex writes rollout-*.jsonl with a "model":"..." field (#91).
-    model_scan: { session_regex: '"model"\\s*:\\s*"', stdout_regex: "model:\\s*(\\S+)" },
+    model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: "model:\\s*(\\S+)" },
   },
   grok: {
     // Measured live: `grok -p "<prompt>" --output-format streaming-json` authenticates from the
@@ -50,8 +53,11 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     auth_files: ["auth.json"],
     auth_subdir: ".grok",
     sessions_subdir: "grok-sessions",
-    // model_scan intentionally omitted: grok's session/model-field format is not yet measured, so
-    // observed.model stays UNKNOWN rather than a guessed value (requested != observed honesty).
+    // Measured (2026-09-06 container probe, grok 1.0.13): the mounted /root/.grok/sessions dir gets
+    // <urlencoded-cwd>/<session-id>/chat_history.jsonl with `"model_id":"grok-4.6-build"` (the
+    // serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with
+    // an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture.
+    model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"modelUsage":\\{"([^"]+)"' },
   },
 };
 
