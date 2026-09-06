@@ -19,6 +19,8 @@ Every model surface (worker, reviewer, planner) is a replaceable provider adapte
 | Reviewer | claude, grok, codex |
 | Planner | claude, grok, codex |
 
+Reviewer and merge-decision independence is enforced at the policy layer: no run can be reviewed or auto-merged by the same model product that implemented it.
+
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
 - A policy decision binds to one exact effect identity, input digest and
