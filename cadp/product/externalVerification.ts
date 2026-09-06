@@ -48,7 +48,16 @@ export function projectCheckRuns(payload: unknown): ExternalVerification {
   if (typeof conclusion !== "string" || typeof id !== "number" || typeof html_url !== "string" || typeof started_at !== "string" || typeof completed_at !== "string") {
     return { status: "UNKNOWN", unknown_reason: "completed run is missing conclusion/id/url/timestamps" };
   }
-  return { status: "PRESENT", conclusion, check_run_id: id, html_url, started_at, completed_at };
+  // GitHub emits second-precision RFC3339 ("...:50Z"); the K2 envelope contract requires
+  // millisecond precision, and produced_at must EQUAL claim./completed_at (source_authoritative).
+  // Normalize both to the same instant in kernel form — measured live (17th pilot): the verbatim
+  // GitHub string was refused by K2 and the run failed closed. An unparseable timestamp is UNKNOWN.
+  const startedTs = new Date(started_at);
+  const completedTs = new Date(completed_at);
+  if (Number.isNaN(startedTs.getTime()) || Number.isNaN(completedTs.getTime())) {
+    return { status: "UNKNOWN", unknown_reason: "completed run carries unparseable timestamps" };
+  }
+  return { status: "PRESENT", conclusion, check_run_id: id, html_url, started_at: startedTs.toISOString(), completed_at: completedTs.toISOString() };
 }
 
 /**

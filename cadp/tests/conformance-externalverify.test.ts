@@ -34,8 +34,10 @@ test("EV1: exactly one completed cadp-verify run projects PRESENT with its concl
     conclusion: "success",
     check_run_id: 42,
     html_url: "https://github.com/o/r/runs/42",
-    started_at: "2026-09-07T00:00:00Z",
-    completed_at: "2026-09-07T00:01:00Z",
+    // GitHub's second-precision timestamps are normalized to the K2 millisecond form — same
+    // instant, kernel-admissible, and claim./completed_at == produced_at stays derivable.
+    started_at: "2026-09-07T00:00:00.000Z",
+    completed_at: "2026-09-07T00:01:00.000Z",
   });
   assert.equal(projectCheckRuns({ check_runs: [run({ conclusion: "failure" })] }).status, "PRESENT", "a completed failure is PRESENT evidence, not UNKNOWN");
 });
@@ -49,6 +51,7 @@ test("EV2: everything else fails closed to UNKNOWN with an honest reason", () =>
     [{ check_runs: [run({ status: "in_progress", conclusion: null })] }, "not completed"],
     [{ check_runs: [run(), run({ id: 43 })] }, "two completed runs are ambiguous"],
     [{ check_runs: [run({ completed_at: 7 })] }, "malformed timestamps"],
+    [{ check_runs: [run({ completed_at: "not-a-date" })] }, "unparseable timestamps"],
   ] as const) {
     const p = projectCheckRuns(payload);
     assert.equal(p.status, "UNKNOWN", why);
