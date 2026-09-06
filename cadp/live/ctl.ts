@@ -465,10 +465,11 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<{ a
  * ONLY on its APPROVE. It never edits code/policy/bounds and never bypasses a refusal; a
  * withheld/failed/stopped run halts and is REPORTED. One JSON status line per poll.
  */
-async function autoDev(work_item: string, maxSteps: string, maxEffects: string, proposalId?: string): Promise<void> {
+async function autoDev(work_item: string, maxSteps: string, maxEffects: string, proposalId?: string, workerProduct?: string): Promise<void> {
   let started: Awaited<ReturnType<typeof startWork>>;
   try {
-    started = await startWork(dir, "development", [work_item, maxSteps, maxEffects, ...(proposalId !== undefined ? [proposalId] : [])], { log: opsLog });
+    // extra positions: [work_item, maxSteps, maxEffects, proposalId, worker_product].
+    started = await startWork(dir, "development", [work_item, maxSteps, maxEffects, proposalId ?? "", workerProduct ?? "codex"], { log: opsLog });
   } catch (e) {
     console.log(JSON.stringify({ auto: "NOT_ADMITTED", detail: e instanceof Error ? e.message : String(e) }));
     return;
@@ -537,7 +538,7 @@ async function main(): Promise<void> {
   switch (command) {
     case "up": {
       // Surface egress boundary (TD §4.1): internal network + provider-only allowlist proxy.
-      const boundary = createEgressBoundary(`cadp-${m.repo_id}`, ["api.openai.com", "chatgpt.com", "auth.openai.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io"]);
+      const boundary = createEgressBoundary(`cadp-${m.repo_id}`, ["api.openai.com", "chatgpt.com", "auth.openai.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io", "api.x.ai", "auth.x.ai"]);
       writeFileSync(join(dir, "egress.json"), JSON.stringify({ network: boundary.network, proxy: boundary.proxy }));
       startComponent("record");
       startComponent("temporal");
@@ -585,7 +586,8 @@ async function main(): Promise<void> {
       await agentApprove(process.argv[4]!, process.argv[5]!);
       break;
     case "auto-dev":
-      await autoDev(process.argv[4]!, process.argv[5] ?? "12", process.argv[6] ?? "5", process.argv[7]);
+      // auto-dev <work_item> [maxSteps maxEffects] [proposalId] [worker_product=codex|grok]
+      await autoDev(process.argv[4]!, process.argv[5] ?? "12", process.argv[6] ?? "5", process.argv[7], process.argv[8]);
       break;
     case "state": {
       const state = await client("cadp-workflow").getEffectState(process.argv[4]!);
