@@ -538,7 +538,9 @@ async function main(): Promise<void> {
   switch (command) {
     case "up": {
       // Surface egress boundary (TD §4.1): internal network + provider-only allowlist proxy.
-      const boundary = createEgressBoundary(`cadp-${m.repo_id}`, ["api.openai.com", "chatgpt.com", "auth.openai.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io", "api.x.ai", "auth.x.ai"]);
+      // grok's CLI actually calls cli-chat-proxy.grok.com (measured in a live run — the docs'
+      // api.x.ai is the raw API, not the CLI's endpoint); auth.x.ai is the OAuth/token-refresh host.
+      const boundary = createEgressBoundary(`cadp-${m.repo_id}`, ["api.openai.com", "chatgpt.com", "auth.openai.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io", "cli-chat-proxy.grok.com", "auth.x.ai", "api.x.ai"]);
       writeFileSync(join(dir, "egress.json"), JSON.stringify({ network: boundary.network, proxy: boundary.proxy }));
       startComponent("record");
       startComponent("temporal");
