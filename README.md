@@ -23,6 +23,8 @@ Reviewer and merge-decision independence is enforced at the policy layer: no run
 
 Cross-product delegation remains intact: a run implemented by one model product may be auto-merged by a delegated agent of a different product after independent review.
 
+Verification can additionally run on independent infrastructure: a repository-owned GitHub Actions workflow re-tests the exact candidate sha and its result is sealed as authoritative evidence.
+
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
 - A policy decision binds to one exact effect identity, input digest and
