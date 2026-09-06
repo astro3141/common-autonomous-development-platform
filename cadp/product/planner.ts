@@ -29,7 +29,11 @@ export interface WorkProposalV1 {
 }
 
 export const MAX_PROPOSAL_ITEMS = 20;
-export const MAX_WORK_ITEM_CHARS = 2000;
+// A real decomposed work item carries acceptance criteria and constraints, not a one-liner. The
+// first self-host planning run rejected an entire valid proposal because one item exceeded 2000
+// chars; 8000 keeps the bound meaningful (a genuinely absurd item still fails closed) without
+// discarding ordinary, well-specified items.
+export const MAX_WORK_ITEM_CHARS = 8000;
 
 export function buildPlanPrompt(intent: string, repo_full_name: string, base_sha: string): string {
   return [

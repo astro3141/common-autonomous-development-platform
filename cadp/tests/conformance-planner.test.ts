@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
-import { parseWorkProposal, ProposalParseError, MAX_PROPOSAL_ITEMS } from "../product/planner.ts";
+import { parseWorkProposal, ProposalParseError, MAX_PROPOSAL_ITEMS, MAX_WORK_ITEM_CHARS } from "../product/planner.ts";
 import { IngressRejection } from "../kernel/ingress.ts";
 
 after(() => stopSharedOpa());
@@ -42,6 +42,7 @@ test("PL2: every malformed proposal shape fails closed", () => {
     ["wrong schema", JSON.stringify({ ...VALID, schema: "v2" })],
     ["empty items", JSON.stringify({ ...VALID, items: [] })],
     ["oversized", JSON.stringify({ ...VALID, items: Array.from({ length: MAX_PROPOSAL_ITEMS + 1 }, () => VALID.items[0]) })],
+    ["work_item over the char cap", JSON.stringify({ ...VALID, items: [{ ...VALID.items[0], work_item: "x".repeat(MAX_WORK_ITEM_CHARS + 1) }] })],
     ["unknown top key", JSON.stringify({ ...VALID, authority: "yes" })],
     ["unknown item key", JSON.stringify({ ...VALID, items: [{ ...VALID.items[0], admit: true }] })],
     ["zero bound", JSON.stringify({ ...VALID, items: [{ ...VALID.items[0], max_steps: 0 }] })],
