@@ -21,7 +21,7 @@ import { ConstitutionalStore } from "./store.ts";
 import { makeAdapterRegistry } from "./adapters/types.ts";
 import type { TargetAdapterV1 } from "./adapters/types.ts";
 import { FindingSealAdapter } from "./adapters/findingSeal.ts";
-import { DeploymentActuationAdapter, freshPassingImmutabilityAttestation } from "./adapters/deploymentActuation.ts";
+import { DeploymentActuationAdapter, freshPassingImmutabilityAttestation, liveCheckoutRead } from "./adapters/deploymentActuation.ts";
 import { GitHubAdapter } from "./adapters/github.ts";
 import { GitHubIssuesAdapter } from "./adapters/githubIssues.ts";
 import { LiveGitHubTransport } from "./adapters/githubLive.ts";
@@ -74,18 +74,29 @@ export function composeTargetAdapters(
   const adapters: TargetAdapterV1[] = [
     new StorePolicyAdapter(store, cas, ingress),
     new FindingSealAdapter(ingress, store),
-    new DeploymentActuationAdapter(store, cas, config.github?.repo_id, clock),
   ];
   if (config.github !== undefined) {
     const token = readFileSync(config.github.token_file, "utf8").trim();
     const transport = new LiveGitHubTransport(token, config.github.repo_full_name);
     const repoId = config.github.repo_id;
+    const repoFullName = config.github.repo_full_name;
+    const repoRoot = join(import.meta.dirname, "..", "..");
+    adapters.push(new DeploymentActuationAdapter(store, cas, repoId, clock, {
+      compareToMain: async (sha) => {
+        const result = await transport.api("GET", `/repos/${repoFullName}/compare/${encodeURIComponent(sha)}...main`);
+        return { status_code: result.status, compare_status: (result.json as { status?: string })?.status };
+      },
+      checkout: liveCheckoutRead(repoRoot),
+    }));
     adapters.push(
       new GitHubAdapter(transport, cas, repoId, () => freshPassingImmutabilityAttestation(store, cas, repoId, clock)),
     );
     // FINDING_PROJECT over GitHub Issues (#104 §6): a distinct target_type (GIT_ISSUES), not the
     // PR ops. Shares the transport; holds no governed credential beyond the repo token custody.
     adapters.push(new GitHubIssuesAdapter(transport, cas, repoId));
+  }
+  else {
+    adapters.push(new DeploymentActuationAdapter(store, cas, undefined, clock));
   }
   if (config.temporal !== undefined) {
     const transport = new LiveTemporalTransport(config.temporal.address, config.temporal.namespace);

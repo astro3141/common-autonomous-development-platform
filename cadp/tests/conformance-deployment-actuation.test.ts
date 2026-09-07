@@ -22,6 +22,18 @@ function adapterFor(h: Awaited<ReturnType<typeof makeHarness>>): DeploymentActua
   return new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn);
 }
 
+function pinnedAdapter(
+  h: Awaited<ReturnType<typeof makeHarness>>,
+  compareStatus: string,
+  head = SHA,
+  porcelain = "",
+): DeploymentActuationAdapter {
+  return new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, {
+    compareToMain: async () => ({ status_code: 200, compare_status: compareStatus }),
+    checkout: async () => ({ head, porcelain }),
+  });
+}
+
 function sealImmutability(h: Awaited<ReturnType<typeof makeHarness>>, passing = true) {
   return h.ingress.submitEvidence(
     {
@@ -102,5 +114,40 @@ test("DEPLOY closed material refuses unknown keys, empty components, and every o
       },
     });
     assert.equal(processDelta, 0);
+  } finally { h.close(); }
+});
+
+test("DEPLOY pre-K6 refuses unmerged/diverged ancestry and checkout drift without process effects", async () => {
+  const h = await makeHarness();
+  try {
+    const material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
+    const cases = [
+      { adapter: pinnedAdapter(h, "behind"), detail: /status behind/ },
+      { adapter: pinnedAdapter(h, "diverged"), detail: /status diverged/ },
+      { adapter: pinnedAdapter(h, "identical", "b".repeat(40)), detail: /local HEAD/ },
+      { adapter: pinnedAdapter(h, "identical", SHA, " M cadp/product/worker.ts\n"), detail: /worktree is dirty/ },
+    ];
+    let pidDelta = 0;
+    for (const row of cases) {
+      const refusal = await row.adapter.dispatch_precondition_read(DEPLOY_OPERATION, material);
+      assert.match(refusal ?? "", row.detail);
+      assert.equal(pidDelta, 0);
+    }
+  } finally { h.close(); }
+});
+
+test("DEPLOY admits main itself through scripted compare and pin reads, but item 2 still cannot dispatch", async () => {
+  const h = await makeHarness();
+  try {
+    const adapter = pinnedAdapter(h, "identical");
+    const material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
+    await adapter.verify_material(DEPLOY_OPERATION, material);
+    assert.equal(await adapter.dispatch_precondition_read(DEPLOY_OPERATION, material), undefined);
+    await assert.rejects(
+      adapter.dispatch("effect", 1, {
+        authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
+      }, DEPLOY_OPERATION, material),
+      /outside TD §20\.6 items 1-2/,
+    );
   } finally { h.close(); }
 });

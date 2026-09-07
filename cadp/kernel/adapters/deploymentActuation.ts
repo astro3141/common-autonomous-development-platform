@@ -5,6 +5,9 @@
  * pre-deploy attestations are usable, and validates the closed cadp.deploy.v1 material.
  */
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import type { SubjectBinding, TargetRef } from "../records.ts";
 import { resolveActivePolicy } from "../policyState.ts";
 import { Cas } from "../cas.ts";
@@ -23,6 +26,25 @@ export const DEPLOYMENT_ACTUATION_TARGET_ID = "cadp-v04-live" as const;
 const COMPONENTS = new Set(["broker", "worker"]);
 const TOP_LEVEL_KEYS = new Set(["repo_id", "sha", "components", "expected_prior"]);
 const IDENTITY_KEYS = new Set(["code_sha", "image_digest", "pid"]);
+
+export interface DeploymentPreconditionReads {
+  /** Target-authoritative GitHub compare of material.sha...main. */
+  compareToMain(sha: string): Promise<{ status_code: number; compare_status?: string }>;
+  /** Observation of the exact checkout from which broker/worker would be spawned. */
+  checkout(): Promise<{ head: string; porcelain: string }>;
+}
+
+const execFileAsync = promisify(execFile);
+
+export function liveCheckoutRead(repoRoot: string): () => Promise<{ head: string; porcelain: string }> {
+  return async () => {
+    const [head, status] = await Promise.all([
+      execFileAsync("git", ["-C", repoRoot, "rev-parse", "HEAD"], { encoding: "utf8" }),
+      execFileAsync("git", ["-C", repoRoot, "status", "--porcelain"], { encoding: "utf8" }),
+    ]);
+    return { head: head.stdout.trim(), porcelain: status.stdout };
+  };
+}
 
 /** Shared with PR_CREATE so both describe rows use one injected-clock immutability predicate. */
 export function freshPassingImmutabilityAttestation(
@@ -60,17 +82,20 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
   readonly cas: Cas;
   readonly repoId: string | undefined;
   readonly clock: () => number;
+  readonly preconditionReads: DeploymentPreconditionReads | undefined;
 
   constructor(
     store: ConstitutionalStore,
     cas: Cas,
     repoId: string | undefined,
     clock: () => number,
+    preconditionReads?: DeploymentPreconditionReads,
   ) {
     this.store = store;
     this.cas = cas;
     this.repoId = repoId;
     this.clock = clock;
+    this.preconditionReads = preconditionReads;
   }
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -82,7 +107,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
         material_schema: DEPLOY_MATERIAL_SCHEMA,
         available: this.#attestationsFreshAndPassing(),
         idempotency: "NATIVE_PRECONDITION",
-        dispatch_precondition: "NATIVE_CAS",
+        dispatch_precondition: "PEP_READ_THEN_ACT",
         reconcile: "BY_QUERY_PREDICATE",
         no_effect_proof_supported: true,
       }],
@@ -165,10 +190,37 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     }
   }
 
-  async dispatch_precondition_read(): Promise<string | undefined> { return undefined; }
+  async dispatch_precondition_read(operation_kind: string, material: Record<string, unknown>): Promise<string | undefined> {
+    if (operation_kind !== DEPLOY_OPERATION) return undefined;
+    if (this.preconditionReads === undefined) return "DEPLOY precondition reads are unavailable";
+
+    const sha = String(material["sha"]);
+    let compared: { status_code: number; compare_status?: string };
+    try {
+      compared = await this.preconditionReads.compareToMain(sha);
+    } catch (error) {
+      return `GitHub compare ${sha}...main unreadable: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (compared.status_code !== 200 || compared.compare_status === undefined) {
+      return `GitHub compare ${sha}...main unreadable (status ${compared.status_code})`;
+    }
+    if (compared.compare_status !== "ahead" && compared.compare_status !== "identical") {
+      return `GitHub compare ${sha}...main status ${compared.compare_status}; expected ahead or identical`;
+    }
+
+    let checkout: { head: string; porcelain: string };
+    try {
+      checkout = await this.preconditionReads.checkout();
+    } catch (error) {
+      return `local checkout unreadable: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (checkout.head !== sha) return `local HEAD at ${checkout.head}, material sha ${sha}`;
+    if (checkout.porcelain.length !== 0) return "local worktree is dirty";
+    return undefined;
+  }
 
   async dispatch(_effect: string, _ordinal: number, _target: TargetRef, operation: string): Promise<never> {
-    throw new Error(`${operation} dispatch is outside TD §20.6 item 1`);
+    throw new Error(`${operation} dispatch is outside TD §20.6 items 1-2`);
   }
 
   async reconcile(): Promise<never> {
