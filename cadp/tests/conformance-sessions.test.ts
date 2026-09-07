@@ -5,8 +5,87 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { FAILED_SESSION_RETENTION, preserveFailedSession } from "../product/surfaceBroker.ts";
+import { runReviewer, runVerifier } from "../product/isolation.ts";
+import type { IsolationConfig, SurfaceCommand, SurfaceCommandPort } from "../product/isolation.ts";
 
 const RUN = { status: 137, stdout: "worker stdout tail", stderr: "exceeded its declared bound" };
+
+const ISOLATION: IsolationConfig = {
+  worker_image: "cadp-surface:conformance",
+  egress_network: "cadp-conformance-int",
+  egress_proxy: "cadp-conformance-proxy:8888",
+};
+
+function done<T>(value: T): SurfaceCommand<T> {
+  return { result: Promise.resolve(value), closed: Promise.resolve(), cancel() {} };
+}
+
+function argvCapture(): { port: SurfaceCommandPort; args: string[][] } {
+  const args: string[][] = [];
+  return {
+    args,
+    port: {
+      create: (_container, input) => { args.push([...input]); return done({ creation: "CREATED" as const, detail: "" }); },
+      launch: () => done({ status: 0, stdout: "", stderr: "" }),
+      terminate: () => done(true),
+      observe: () => done("ABSENT" as const),
+    },
+  };
+}
+
+const REVIEWER_ARGS = [
+  "--network", "cadp-conformance-int",
+  "-e", "HTTPS_PROXY=http://cadp-conformance-proxy:8888",
+  "-e", "HTTP_PROXY=http://cadp-conformance-proxy:8888",
+  "-e", "https_proxy=http://cadp-conformance-proxy:8888",
+  "-e", "http_proxy=http://cadp-conformance-proxy:8888",
+  "-v", "/checkout:/ws:ro",
+  "-e", "HOME=/root",
+  "-e", "CLAUDE_CODE_OAUTH_TOKEN=token",
+  "-w", "/ws",
+  "cadp-surface:conformance",
+  "claude", "--print",
+];
+
+test("runReviewer without sessionsDir preserves the legacy docker args byte-for-byte", async () => {
+  const capture = argvCapture();
+  await runReviewer(ISOLATION, {
+    workspace: "/checkout",
+    auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "token" },
+    argv: ["claude", "--print"],
+  }, { port: capture.port });
+  assert.deepEqual(capture.args, [REVIEWER_ARGS]);
+});
+
+test("runReviewer sessionsDir adds exactly one writable session bind and keeps workspace read-only", async () => {
+  const capture = argvCapture();
+  await runReviewer(ISOLATION, {
+    workspace: "/checkout",
+    auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "token" },
+    authSubdir: ".claude",
+    sessionsDir: "/host/reviewer-sessions",
+    sessionsContainerDir: "projects",
+    argv: ["claude", "--print"],
+  }, { port: capture.port });
+  const expected = [...REVIEWER_ARGS];
+  expected.splice(expected.indexOf("-w"), 0, "-v", "/host/reviewer-sessions:/root/.claude/projects");
+  assert.deepEqual(capture.args, [expected]);
+  assert.equal(expected.filter((arg) => arg === "/checkout:/ws:ro").length, 1);
+  assert.equal(expected.filter((arg) => arg === "/host/reviewer-sessions:/root/.claude/projects").length, 1);
+  assert.ok(!expected.includes("/host/reviewer-sessions:/root/.claude/projects:ro"));
+});
+
+test("runVerifier docker args remain unchanged", async () => {
+  const capture = argvCapture();
+  await runVerifier(ISOLATION, { workspace: "/checkout", argv: ["node", "--test"] }, { port: capture.port });
+  assert.deepEqual(capture.args, [[
+    "--network", "none",
+    "-v", "/checkout:/ws",
+    "-w", "/ws",
+    "cadp-surface:conformance",
+    "node", "--test",
+  ]]);
+});
 
 function withFailedDir<T>(value: string | undefined, body: () => T): T {
   const old = process.env["CADP_FAILED_SESSIONS_DIR"];

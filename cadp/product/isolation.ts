@@ -735,9 +735,19 @@ export function reviewerAuthArgs(auth: ReviewerAuth): string[] {
  */
 export function runReviewer(
   config: IsolationConfig,
-  input: { workspace: string; auth: ReviewerAuth; argv: readonly string[]; timeout_ms?: number },
+  input: {
+    workspace: string;
+    auth: ReviewerAuth;
+    authSubdir?: string;
+    sessionsDir?: string;
+    sessionsContainerDir?: string;
+    argv: readonly string[];
+    timeout_ms?: number;
+  },
   options: SurfaceRunOptions = {},
 ): Promise<RunResult> {
+  const authSubdir = input.authSubdir ?? ".codex";
+  const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${authSubdir}/${input.sessionsContainerDir ?? "sessions"}`] : [];
   return runBoundedSurface({
     kind: "reviewer",
     args: [
@@ -746,6 +756,7 @@ export function runReviewer(
       "-v", `${input.workspace}:/ws:ro`,
       "-e", "HOME=/root",
       ...reviewerAuthArgs(input.auth),
+      ...sessionsMount,
       "-w", "/ws",
       config.worker_image,
       ...input.argv,
