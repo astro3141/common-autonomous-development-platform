@@ -14,11 +14,16 @@ import test, { after } from "node:test";
 
 import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import { parseWorkProposal, ProposalParseError, MAX_PROPOSAL_ITEMS, MAX_WORK_ITEM_CHARS } from "../product/planner.ts";
+import type { WorkProposalV1 } from "../product/planner.ts";
 import { IngressRejection } from "../kernel/ingress.ts";
+import type { KernelClient } from "../clients/kernelClient.ts";
+import type { EvidenceDraft } from "../kernel/ingress.ts";
+import { submitPlanEvidence } from "../live/ops.ts";
+import { backendScanClient, backendScanPrincipal } from "../product/backendExecution.ts";
 
 after(() => stopSharedOpa());
 
-const VALID = {
+const VALID: WorkProposalV1 = {
   schema: "cadp.work-proposal.v1",
   items: [
     { work_item: "add strict parsing to the stats module", max_steps: 6, max_effects: 4, rationale: "single file, testable" },
@@ -135,5 +140,47 @@ test("PL4: a sealed proposal changes nothing about WORK_START admission (proposa
     assert.equal(await evalStart({ max_steps: null, max_effects: 4 }), "DENY", "a bound proposal cannot launder malformed bounds");
   } finally {
     h.close();
+  }
+});
+
+test("PL5: planner sealing emits proposal and role-qualified backend siblings under distinct principals", async () => {
+  for (const provider of ["claude", "grok", "codex"] as const) {
+    const principal = provider === "codex" ? "cadp-backend-scan" : `cadp-backend-scan-${provider}`;
+    assert.equal(backendScanPrincipal(provider), principal);
+    const selected = backendScanClient(provider, { api_url: "http://kernel.invalid", tokens: { [principal]: `${provider}-scan-token` } });
+    assert.equal(selected.token, `${provider}-scan-token`, "planner uses the provider's scan token, never its planner token");
+    const submitted: Array<{ channel: "planner" | "scan"; draft: EvidenceDraft }> = [];
+    const fakeClient = (channel: "planner" | "scan"): KernelClient => ({
+      submitEvidence: async (draft: EvidenceDraft) => {
+        submitted.push({ channel, draft });
+        return { ...draft, evidence_id: `${channel}-id`, envelope_digest: { alg: "sha256", value: "d".repeat(64) }, sealed_at: "2026-01-01T00:00:00.000Z" };
+      },
+    } as unknown as KernelClient);
+
+    const ids = await submitPlanEvidence({
+      intent: "split the work",
+      repo_id: "42",
+      base_sha: "a".repeat(40),
+      provider,
+      result: { proposal: VALID, stdout_digest: "b".repeat(64) },
+      planner_client: fakeClient("planner"),
+      scan_client: fakeClient("scan"),
+    });
+    assert.deepEqual(ids, { proposal_evidence_id: "planner-id", backend_evidence_id: "scan-id" });
+    assert.equal(submitted.length, 2);
+    const proposal = submitted[0]!;
+    const backend = submitted[1]!;
+    assert.equal(proposal.channel, "planner");
+    assert.equal(proposal.draft.evidence_kind, "WORK_PROPOSAL");
+    assert.equal(proposal.draft.producer_ref, provider === "claude" ? "planner:claude-code" : `planner:${provider}`);
+    assert.equal(backend.channel, "scan");
+    assert.equal(backend.draft.evidence_kind, "BACKEND_EXECUTION");
+    assert.equal(backend.draft.producer_ref, `backend-scan:${provider}`);
+    assert.deepEqual(backend.draft.subject_bindings.slice(0, 2), proposal.draft.subject_bindings);
+    assert.deepEqual(backend.draft.subject_bindings.at(-1), {
+      authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "PLANNER",
+    });
+    const observed = (backend.draft.claim as { observed: { model: { availability: string } } }).observed;
+    assert.equal(observed.model.availability, "UNKNOWN", "unmeasured planner model remains UNKNOWN");
   }
 });

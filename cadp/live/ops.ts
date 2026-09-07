@@ -29,6 +29,7 @@ import { devEffectFloorViolation } from "../product/workBounds.ts";
 import { classifyRun, nextAction } from "../product/driver.ts";
 import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
 import { attribution, collectRun, humanWait } from "../product/observationProjection.ts";
+import { backendScanClient, submitBackendExecutionEvidence } from "../product/backendExecution.ts";
 
 export type Log = (line: Record<string, unknown>) => void;
 const SILENT: Log = () => {};
@@ -59,7 +60,7 @@ export function temporalNamespaceId(m: LiveEnvManifest): string {
  * the typed proposal as WORK_PROPOSAL evidence with exact provenance. The proposal confers no
  * authority — each item still enters through the ordinary governed WORK_START.
  */
-export async function sealPlan(dir: string, intent: string, planProduct?: string): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
+export async function sealPlan(dir: string, intent: string, planProduct?: string): Promise<{ proposal_evidence_id: string; backend_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
   const m = loadManifest(dir);
   // plan_product select: fail closed on an unknown provider before any surface runs; omitted
   // keeps the claude default. Each provider submits under its OWN principal (honest attribution).
@@ -67,29 +68,63 @@ export async function sealPlan(dir: string, intent: string, planProduct?: string
   const planPrincipal = planProvider === "claude" ? "cadp-planner" : `cadp-planner-${planProvider}`;
   // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
   const base_sha = resolveBaseSha(m.repo_full_name, "refs/heads/main");
-  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
+  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string }>(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
     { repo_full_name: m.repo_full_name, base_sha, intent, plan_product: planProvider },
     { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
   );
-  const envelope = await liveClient(dir, planPrincipal).submitEvidence({
+  const sealed = await submitPlanEvidence({
+    intent,
+    repo_id: m.repo_id,
+    base_sha,
+    provider: planProvider,
+    result,
+    planner_client: liveClient(dir, planPrincipal),
+    scan_client: backendScanClient(planProvider, m),
+  });
+  return {
+    ...sealed,
+    items: result.proposal.items,
+    ...(result.proposal.notes !== undefined ? { notes: result.proposal.notes } : {}),
+  };
+}
+
+/** Seal the proposal and its role-qualified observation as siblings, under distinct identities. */
+export async function submitPlanEvidence(input: {
+  intent: string;
+  repo_id: string;
+  base_sha: string;
+  provider: "claude" | "grok" | "codex";
+  result: { proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string };
+  planner_client: KernelClient;
+  scan_client: KernelClient;
+}): Promise<{ proposal_evidence_id: string; backend_evidence_id: string }> {
+  const sharedBindings = [
+    { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(input.intent) },
+    { authority_ref: "github.com", namespace: "repo-base", object_id: `${input.repo_id}@${input.base_sha}` },
+  ];
+  const envelope = await input.planner_client.submitEvidence({
     evidence_kind: "WORK_PROPOSAL",
-    subject_bindings: [
-      { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
-      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${base_sha}` },
-    ],
+    subject_bindings: sharedBindings,
     availability: "PRESENT",
     claim_schema: "cadp.work-proposal.v1",
-    claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
-    producer_ref: planProvider === "claude" ? "planner:claude-code" : `planner:${planProvider}`,
-    source_ref: `planner:${base_sha}:${sha256Hex(intent).slice(0, 16)}`,
+    claim: { ...input.result.proposal, intent: input.intent, stdout_digest: input.result.stdout_digest },
+    producer_ref: input.provider === "claude" ? "planner:claude-code" : `planner:${input.provider}`,
+    source_ref: `planner:${input.base_sha}:${sha256Hex(input.intent).slice(0, 16)}`,
     source_relation: "SELF_REPORT",
+  });
+  const backend = await submitBackendExecutionEvidence({
+    provider: input.provider,
+    surface_role: "PLANNER",
+    subject_bindings: sharedBindings,
+    model: input.result.backend_model,
+    locator: input.result.backend_locator,
+    client: input.scan_client,
   });
   return {
     proposal_evidence_id: envelope.evidence_id,
-    items: result.proposal.items,
-    ...(result.proposal.notes !== undefined ? { notes: result.proposal.notes } : {}),
+    backend_evidence_id: backend.evidence_id,
   };
 }
 
