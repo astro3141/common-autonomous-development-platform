@@ -21,6 +21,7 @@ import { ConstitutionalStore } from "./store.ts";
 import { makeAdapterRegistry } from "./adapters/types.ts";
 import type { TargetAdapterV1 } from "./adapters/types.ts";
 import { FindingSealAdapter } from "./adapters/findingSeal.ts";
+import { DeploymentActuationAdapter, freshPassingImmutabilityAttestation } from "./adapters/deploymentActuation.ts";
 import { GitHubAdapter } from "./adapters/github.ts";
 import { GitHubIssuesAdapter } from "./adapters/githubIssues.ts";
 import { LiveGitHubTransport } from "./adapters/githubLive.ts";
@@ -67,31 +68,20 @@ export interface KernelService {
 export function composeTargetAdapters(
   config: KernelServiceConfig,
   deps: { store: ConstitutionalStore; cas: Cas; ingress: Ingress },
+  clock: () => number,
 ): TargetAdapterV1[] {
   const { store, cas, ingress } = deps;
   const adapters: TargetAdapterV1[] = [
     new StorePolicyAdapter(store, cas, ingress),
     new FindingSealAdapter(ingress, store),
+    new DeploymentActuationAdapter(store, cas, config.github?.repo_id, clock),
   ];
   if (config.github !== undefined) {
     const token = readFileSync(config.github.token_file, "utf8").trim();
     const transport = new LiveGitHubTransport(token, config.github.repo_full_name);
     const repoId = config.github.repo_id;
     adapters.push(
-      new GitHubAdapter(transport, cas, repoId, () => {
-        const attestation = store.latestEvidenceOfKind(
-          "TARGET_IMMUTABILITY_ATTESTATION",
-          `github.com|GIT_REPOSITORY|${repoId}`,
-        );
-        if (attestation === undefined) return false;
-        try {
-          const active = resolveActivePolicy(store, cas);
-          const fresh = Date.now() - Date.parse(attestation.produced_at) <= active.config.target_immutability_attestation_max_age_s * 1000;
-          return fresh && (attestation.claim as { write_once_enforced?: boolean })?.write_once_enforced === true;
-        } catch {
-          return false;
-        }
-      }),
+      new GitHubAdapter(transport, cas, repoId, () => freshPassingImmutabilityAttestation(store, cas, repoId, clock)),
     );
     // FINDING_PROJECT over GitHub Issues (#104 §6): a distinct target_type (GIT_ISSUES), not the
     // PR ops. Shares the transport; holds no governed credential beyond the repo token custody.
@@ -114,7 +104,7 @@ export async function startKernelService(config: KernelServiceConfig): Promise<K
   const ingress = new Ingress(store, cas, config.pep_ref);
   const evaluator = new OpaEvaluator(config.opa_dir);
 
-  const adapters = composeTargetAdapters(config, { store, cas, ingress });
+  const adapters = composeTargetAdapters(config, { store, cas, ingress }, Date.now);
 
   const registry = makeAdapterRegistry(adapters);
   const pep = new Pep(store, cas, ingress, registry, config.pep_ref);
