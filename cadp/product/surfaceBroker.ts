@@ -381,8 +381,6 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
   backend_effort?: string;
   backend_effort_locator?: string;
   backend_requested_effort?: string;
-  backend_model?: string;
-  backend_locator?: string;
 }> {
   // Unknown review_product fails closed with no filesystem, process, docker, or network side
   // effect. An omitted selection keeps the measured claude path (byte-identical argv).
