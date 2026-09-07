@@ -125,6 +125,45 @@ test("O1a: list_effects excludes worker reach while workflow and observer retain
   }
 });
 
+test("WORKER BACKEND_EXECUTION seals the surface role as a subject binding", async () => {
+  const h = await makeHarness();
+  try {
+    const runRef = "cadp-v04:effect:00000000-0000-7000-8000-000000000be0";
+    const envelope = h.ingress.submitEvidence(
+      {
+        evidence_kind: "BACKEND_EXECUTION",
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: runRef },
+          { authority_ref: "cadp-store:k04", namespace: "step", object_id: `${runRef}#1` },
+          { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+        ],
+        availability: "PRESENT",
+        claim_schema: "cadp.backend.v1",
+        claim: {
+          requested: { provider: "codex", model: "codex default" },
+          observed: {
+            model: { availability: "UNKNOWN" },
+            provider: { availability: "PRESENT", value: "codex", locator: "broker-response#backend_provider" },
+            run_id: { availability: "UNKNOWN" },
+            version: { availability: "UNKNOWN" },
+            effort: { availability: "UNKNOWN" },
+          },
+        },
+        producer_ref: "backend-scan:codex",
+        source_ref: "codex session log scan",
+        source_relation: "SELF_REPORT",
+      },
+      PRINCIPALS.backendScan,
+    );
+    assert.equal(
+      envelope.subject_bindings.some((b) => b.authority_ref === "cadp-store:k04" && b.namespace === "surface-role" && b.object_id === "WORKER"),
+      true,
+    );
+  } finally {
+    h.close();
+  }
+});
+
 test("O2: every write/evaluate method is FORBIDDEN for the observer and writes nothing (B2)", async () => {
   const h = await makeHarness();
   try {

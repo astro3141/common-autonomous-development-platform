@@ -171,7 +171,7 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
     if (r.status !== 0) throw new Error(`bundle create failed: ${r.stderr.slice(0, 300)}`);
     const bundle_b64 = readFileSync(bundlePath).toString("base64");
 
-    const backend = scanBackendModel(provider, sessionsDir, workerRun.stdout);
+    const backend = scanBackendModel(profile, sessionsDir, workerRun.stdout, `${provider}-worker-stdout`);
     return { candidate_sha, bundle_b64, backend_provider: provider, backend_model: backend.model, backend_locator: backend.locator };
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -226,13 +226,18 @@ export function preserveFailedSession(sessionsDir: string, run: { status: number
 }
 
 /**
- * #91 method: scan the worker's OWN provider session log for the observed model; PRESENT facts
- * carry a locator. A provider WITHOUT a measured `model_scan` returns UNKNOWN (no guessed value) —
- * requested != observed honesty. The capture group lives in the provider's MEASURED spec (codex
- * `"model":"…"`, grok `"model_id":"…"`), so the scan itself is provider-independent.
+ * Scan a surface's OWN provider session log for the observed model; PRESENT facts carry a locator.
+ * A profile WITHOUT a measured `model_scan` returns UNKNOWN (no guessed value) — requested !=
+ * observed honesty. The capture group lives in the profile's MEASURED spec (codex
+ * `"model":"…"`, grok `"model_id":"…"`), so the scan itself is surface/provider-independent.
  */
-export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, stdout: string): { model?: string; locator?: string } {
-  const spec = WORKER_PROVIDERS[provider].model_scan;
+export function scanBackendModel(
+  profile: { readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string } },
+  sessionsDir: string,
+  stdout: string,
+  stdoutLocator = "surface-stdout",
+): { model?: string; locator?: string } {
+  const spec = profile.model_scan;
   if (spec === undefined) return {}; // format not measured for this provider → UNKNOWN
   let model: string | undefined;
   let locator: string | undefined;
@@ -254,7 +259,7 @@ export function scanBackendModel(provider: WorkerProvider, sessionsDir: string, 
   } catch { /* absent facts stay UNKNOWN */ }
   if (model === undefined) {
     const m = new RegExp(spec.stdout_regex, "u").exec(stdout);
-    if (m !== null) { model = m[1]; locator = `${provider}-worker-stdout#pattern=${spec.stdout_regex}`; }
+    if (m !== null) { model = m[1]; locator = `${stdoutLocator}#pattern=${spec.stdout_regex}`; }
   }
   return { model, locator };
 }
@@ -346,10 +351,20 @@ function surfaceProviderAuth(
   throw new Error(`unsupported surface auth method: ${auth_method.kind}`);
 }
 
+/** Container HOME subdirectory used by a reviewer/planner provider for auth and session state. */
+function surfaceAuthSubdir(
+  provider: string,
+  auth_method: ReviewProviderProfile["auth_method"] | PlanProviderProfile["auth_method"],
+): string {
+  return auth_method.kind === "auth_files" ? auth_method.auth_subdir : `.${provider}`;
+}
+
 export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
   verdict: string;
   reason: string;
   stdout: string;
+  backend_model?: string;
+  backend_locator?: string;
 }> {
   // Unknown review_product fails closed with no filesystem, process, docker, or network side
   // effect. An omitted selection keeps the measured claude path (byte-identical argv).
@@ -376,9 +391,14 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     const prompt = `You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
     const reviewWs = join(base, "review-ws");
     mkdirSync(reviewWs, { recursive: true });
+    const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
+    mkdirSync(sessionsDir, { recursive: true });
     const review = await runReviewer(config(), {
       workspace: reviewWs,
       auth: surfaceProviderAuth(profile.auth_method, base),
+      authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
+      sessionsDir,
+      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
     });
@@ -388,7 +408,8 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // Verdict extraction follows the provider's MEASURED output contract (9th pilot: grok's plain
     // output glues narration to the verdict, so it runs under --json-schema instead).
     const { verdict, reason } = parseReviewVerdict(provider, review.stdout);
-    return { verdict, reason, stdout: review.stdout };
+    const backend = scanBackendModel(profile, sessionsDir, review.stdout, `${provider}-reviewer-stdout`);
+    return { verdict, reason, stdout: review.stdout, backend_model: backend.model, backend_locator: backend.locator };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -405,6 +426,8 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
 export async function brokerPlan(body: { repo_full_name: string; base_sha: string; intent: string; plan_product?: string }): Promise<{
   proposal: ReturnType<typeof parseWorkProposal>;
   stdout_digest: string;
+  backend_model?: string;
+  backend_locator?: string;
 }> {
   // Unknown plan_product fails closed with no filesystem, process, docker, or network side
   // effect. An omitted selection keeps the measured claude path (byte-identical argv).
@@ -420,9 +443,14 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
     if (r.status !== 0) throw new Error(`checkout ${body.base_sha} failed: ${r.stderr.slice(0, 300)}`);
 
     const prompt = buildPlanPrompt(body.intent, body.repo_full_name, body.base_sha);
+    const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
+    mkdirSync(sessionsDir, { recursive: true });
     const run = await runReviewer(config(), {
       workspace,
       auth: surfaceProviderAuth(profile.auth_method, base),
+      authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
+      sessionsDir,
+      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
       argv: planArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
@@ -430,7 +458,13 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
     if (run.status !== 0 || run.stdout.trim().length === 0) {
       throw new Error(`planner surface failed — ${surfaceFailure("planner", run)}`);
     }
-    return { proposal: parseWorkProposal(run.stdout), stdout_digest: sha256(run.stdout) };
+    const backend = scanBackendModel(profile, sessionsDir, run.stdout, `${provider}-planner-stdout`);
+    return {
+      proposal: parseWorkProposal(run.stdout),
+      stdout_digest: sha256(run.stdout),
+      backend_model: backend.model,
+      backend_locator: backend.locator,
+    };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

@@ -304,7 +304,7 @@ export async function implementCandidate(input: {
     SURFACE_BUDGETS.implement,
   );
   const { cas_key: bundle_cas_key } = await client.putBlob(Buffer.from(impl.bundle_b64, "base64"));
-  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_provider, impl.backend_model, impl.backend_locator);
+  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_provider, "WORKER", impl.backend_model, impl.backend_locator);
 
   const workStep = await submitWorkStep({
     work_run_ref: input.work_run_ref,
@@ -324,7 +324,14 @@ export async function implementCandidate(input: {
 }
 
 /** #91 method: the broker scanned the worker's own session log; PRESENT facts carry a locator. */
-async function submitBackendExecution(work_run_ref: string, step_ordinal: number, provider: string, model?: string, locator?: string): Promise<string> {
+export async function submitBackendExecution(
+  work_run_ref: string,
+  step_ordinal: number,
+  provider: string,
+  surface_role: "WORKER" | "REVIEWER" | "PLANNER",
+  model?: string,
+  locator?: string,
+): Promise<string> {
   // The BACKEND_EXECUTION producer_ref is `backend-scan:<provider>`, so the token must authenticate
   // as that exact producer (the kernel refuses a producer/principal mismatch, fail closed). Select
   // the per-provider scan token (CADP_BACKEND_SCAN_TOKEN_<PROVIDER>), defaulting to the codex token.
@@ -346,6 +353,7 @@ async function submitBackendExecution(work_run_ref: string, step_ordinal: number
     subject_bindings: [
       { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: work_run_ref },
       { authority_ref: "cadp-store:k04", namespace: "step", object_id: `${work_run_ref}#${step_ordinal}` },
+      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: surface_role },
     ],
     availability: "PRESENT",
     claim_schema: "cadp.backend.v1",
