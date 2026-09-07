@@ -13,12 +13,17 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import { makeHarness, stopSharedOpa, sealScriptedRequest, runChain, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { KernelClient, KernelApiError } from "../clients/kernelClient.ts";
 import { attribution, chainProjection, collectRun, humanWait, projectEffect, attempt } from "../product/observationProjection.ts";
+import { scanBackendModel } from "../product/surfaceBroker.ts";
+import { REVIEW_PROVIDERS } from "../product/reviewProviders.ts";
+import { PLAN_PROVIDERS } from "../product/planProviders.ts";
 
 after(() => stopSharedOpa());
 
@@ -27,6 +32,30 @@ const TOKENS = new Map([
   ["tok-wf", "cadp-workflow"],
   ["tok-worker", "cadp-worker-codex"],
 ]);
+
+test("measured reviewer/planner session layouts produce PRESENT model facts; an unmeasured profile stays UNKNOWN", () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-observed-surface-models-"));
+  try {
+    for (const [role, providers] of [["reviewer", REVIEW_PROVIDERS], ["planner", PLAN_PROVIDERS]] as const) {
+      for (const [provider, profile] of Object.entries(providers)) {
+        const sessions = join(root, role, profile.sessions_subdir!);
+        const fixture = provider === "grok"
+          ? join(sessions, "%2Fws", "01a0768e-af89-7063-92d8-9c7a43be0408", "chat_history.jsonl")
+          : provider === "codex"
+            ? join(sessions, "2026", "09", "07", "rollout-2026-09-07T00-00-00.jsonl")
+            : join(sessions, "-ws", "128b41c7.jsonl");
+        mkdirSync(join(fixture, ".."), { recursive: true });
+        const model = provider === "grok" ? "grok-4.6-build" : provider === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5";
+        writeFileSync(fixture, `${JSON.stringify(provider === "grok" ? { model_id: model } : { model })}\n`);
+        const fact = scanBackendModel(profile, sessions, "");
+        assert.deepEqual({ availability: fact.model === undefined ? "UNKNOWN" : "PRESENT", ...(fact.model === undefined ? {} : { value: fact.model, locator: fact.locator }) }, { availability: "PRESENT", value: model, locator: `${fixture}#offset=1` });
+      }
+    }
+    assert.deepEqual(scanBackendModel({}, join(root, "unmeasured"), '{"model":"must-not-be-guessed"}'), {});
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function withApi(h: Harness, run: (obs: KernelClient) => Promise<void>): Promise<void> {
   const api = await startKernelApi(

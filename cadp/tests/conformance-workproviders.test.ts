@@ -186,6 +186,5 @@ test("claude backend scan reads the measured projects-jsonl model field", () => 
 });
 
 test("reviewer and planner profiles without measured model scans stay UNKNOWN", () => {
-  assert.deepEqual(scanBackendModel(REVIEW_PROVIDERS.claude, "/unused", 'model: "guessed"'), {});
-  assert.deepEqual(scanBackendModel(PLAN_PROVIDERS.grok, "/unused", '{"model_id":"guessed"}'), {});
+  assert.deepEqual(scanBackendModel({}, "/unused", '{"model":"guessed"}'), {});
 });

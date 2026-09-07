@@ -6,7 +6,6 @@ import { join } from "node:path";
 
 import { REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
 import { brokerPlan } from "../product/surfaceBroker.ts";
-import { scanBackendModel } from "../product/surfaceBroker.ts";
 import { sealPlan } from "../live/ops.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
 import type { EvidenceDraft } from "../kernel/ingress.ts";
@@ -38,11 +37,17 @@ test("§19 effort_argv omission preserves every planner argv byte-for-byte", () 
   assert.deepEqual(planArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT"]);
 });
 
-test("unmeasured planner scan cannot guess a broker model or effort", () => {
+test("measured planner session-scan capabilities are pinned byte-exactly; effort stays unprobed", () => {
+  const expected = {
+    claude: { sessions_subdir: "claude-sessions", sessions_container_dir: "projects", model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' } },
+    grok: { sessions_subdir: "grok-sessions", sessions_container_dir: undefined, model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"model_id"\\s*:\\s*"([^"]+)"' } },
+    codex: { sessions_subdir: "codex-sessions", sessions_container_dir: undefined, model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' } },
+  } as const;
   for (const [provider, profile] of Object.entries(PLAN_PROVIDERS)) {
-    assert.equal(profile.model_scan, undefined);
+    assert.deepEqual({ sessions_subdir: profile.sessions_subdir, sessions_container_dir: profile.sessions_container_dir, model_scan: profile.model_scan }, expected[provider as keyof typeof expected]);
     assert.equal(profile.effort_scan, undefined);
-    assert.deepEqual(scanBackendModel(profile, "/unmeasured/planner-sessions", '{"model_id":"guessed","effort":"high"}'), {}, provider);
+    assert.equal(profile.requested_effort, undefined);
+    assert.equal(profile.effort_argv, undefined);
   }
 });
 

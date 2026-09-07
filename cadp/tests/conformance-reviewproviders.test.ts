@@ -40,12 +40,18 @@ test("§19 effort_argv omission preserves every reviewer argv byte-for-byte", ()
   assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT"]);
 });
 
-test("unmeasured reviewer scans stay UNKNOWN through broker output and sealed BACKEND_EXECUTION", async () => {
+test("measured reviewer session-scan capabilities are pinned byte-exactly; effort stays unprobed", async () => {
+  const expected = {
+    claude: { sessions_subdir: "claude-sessions", sessions_container_dir: "projects", model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' } },
+    grok: { sessions_subdir: "grok-sessions", sessions_container_dir: undefined, model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"model_id"\\s*:\\s*"([^"]+)"' } },
+    codex: { sessions_subdir: "codex-sessions", sessions_container_dir: undefined, model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' } },
+  } as const;
   for (const [provider, profile] of Object.entries(REVIEW_PROVIDERS)) {
-    assert.equal(profile.model_scan, undefined);
+    assert.deepEqual({ sessions_subdir: profile.sessions_subdir, sessions_container_dir: profile.sessions_container_dir, model_scan: profile.model_scan }, expected[provider as keyof typeof expected]);
     assert.equal(profile.effort_scan, undefined);
-    const brokerFact = scanBackendModel(profile, "/unmeasured/reviewer-sessions", '{"model":"guessed","effort":"high"}');
-    assert.deepEqual(brokerFact, {}, `${provider}: broker must not guess from unmeasured output`);
+    assert.equal(profile.requested_effort, undefined);
+    assert.equal(profile.effort_argv, undefined);
+    const brokerFact = scanBackendModel(profile, "/absent/reviewer-sessions", provider === "grok" ? '{"model_id":"measured-fallback"}' : '{"model":"measured-fallback"}', `${provider}-reviewer-stdout`);
     let draft: EvidenceDraft | undefined;
     await submitBackendExecutionEvidence({
       client: { submitEvidence: async (value) => { draft = value; return { evidence_id: "backend-review" } as EvidenceEnvelopeV1; } },
@@ -53,7 +59,7 @@ test("unmeasured reviewer scans stay UNKNOWN through broker output and sealed BA
     });
     assert.ok(draft !== undefined);
     const observed = (draft.claim as { observed: Record<string, unknown> }).observed;
-    assert.deepEqual(observed["model"], { availability: "UNKNOWN" });
+    assert.deepEqual(observed["model"], { availability: "PRESENT", value: "measured-fallback", locator: `${provider}-reviewer-stdout#pattern=${profile.model_scan!.stdout_regex}` });
     assert.deepEqual(observed["effort"], { availability: "UNKNOWN" });
   }
 });
