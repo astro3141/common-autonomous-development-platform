@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { jcsDigest } from "../kernel/canonical.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_ARGV_PREFIX, WORKER_AUTH_FILES } from "../product/workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv, WORK_ITEM_SENTINEL } from "../product/workerProviders.ts";
+import { REVIEW_PROVIDERS } from "../product/reviewProviders.ts";
+import { PLAN_PROVIDERS } from "../product/planProviders.ts";
 import { brokerImplement, scanBackendModel } from "../product/surfaceBroker.ts";
 
 test("codex provider retains the byte-identical worker profile", () => {
@@ -98,7 +100,7 @@ test("codex backend scan reports observed model with a locator; requested is not
     const sessions = join(root, WORKER_PROVIDERS.codex.sessions_subdir);
     mkdirSync(sessions, { recursive: true });
     writeFileSync(join(sessions, "session.jsonl"), `${JSON.stringify({ requested_model: "codex-requested" })}\n${JSON.stringify({ model: "codex-observed" })}\n`);
-    const fact = scanBackendModel("codex", sessions, "");
+    const fact = scanBackendModel(WORKER_PROVIDERS.codex, sessions, "");
     assert.equal(fact.model, "codex-observed");
     assert.match(fact.locator ?? "", /codex-sessions.*session\.jsonl#offset=/u);
     assert.notEqual(fact.model, "codex-requested", "requested and observed model facts must not be collapsed");
@@ -114,7 +116,7 @@ test("grok backend scan reads model_id from the measured chat_history.jsonl layo
     const sessions = join(root, WORKER_PROVIDERS.grok.sessions_subdir, "%2Fws", "01a0768e-af89-7063-92d8-9c7a43be0408");
     mkdirSync(sessions, { recursive: true });
     writeFileSync(join(sessions, "chat_history.jsonl"), `${JSON.stringify({ model_id: "grok-4.6-build", model_fingerprint: "fp_08d0bc26c22b024e" })}\n`);
-    const fact = scanBackendModel("grok", join(root, WORKER_PROVIDERS.grok.sessions_subdir), "");
+    const fact = scanBackendModel(WORKER_PROVIDERS.grok, join(root, WORKER_PROVIDERS.grok.sessions_subdir), "");
     assert.equal(fact.model, "grok-4.6-build");
     assert.match(fact.locator ?? "", /chat_history\.jsonl#offset=/u);
   } finally {
@@ -127,7 +129,7 @@ test("grok backend scan falls back to the measured stdout end-event modelUsage k
   try {
     // Measured: the headless NDJSON stream ends with {"type":"end",...,"modelUsage":{"<model>":{...}}}.
     const stdout = '{"type":"end","stopReason":"end_turn","modelUsage":{"grok-4.6-build":{"modelCalls":1}}}';
-    const fact = scanBackendModel("grok", join(root, "absent-sessions"), stdout);
+    const fact = scanBackendModel(WORKER_PROVIDERS.grok, join(root, "absent-sessions"), stdout, "grok-worker-stdout");
     assert.equal(fact.model, "grok-4.6-build");
     assert.match(fact.locator ?? "", /grok-worker-stdout#pattern=/u);
   } finally {
@@ -138,7 +140,7 @@ test("grok backend scan falls back to the measured stdout end-event modelUsage k
 test("grok backend scan leaves absent facts UNKNOWN (no session match, no stdout match)", () => {
   const root = mkdtempSync(join(tmpdir(), "cadp-scan-grok-empty-"));
   try {
-    const fact = scanBackendModel("grok", root, "no backend facts here");
+    const fact = scanBackendModel(WORKER_PROVIDERS.grok, root, "no backend facts here");
     assert.equal(fact.model, undefined);
     assert.equal(fact.locator, undefined);
   } finally {
@@ -149,7 +151,7 @@ test("grok backend scan leaves absent facts UNKNOWN (no session match, no stdout
 test("codex backend scan leaves absent facts UNKNOWN", () => {
   const root = mkdtempSync(join(tmpdir(), "cadp-scan-empty-"));
   try {
-    const fact = scanBackendModel("codex", root, "no backend facts");
+    const fact = scanBackendModel(WORKER_PROVIDERS.codex, root, "no backend facts");
     assert.equal(fact.model, undefined);
     assert.equal(fact.locator, undefined);
   } finally {
@@ -175,10 +177,15 @@ test("claude backend scan reads the measured projects-jsonl model field", () => 
     const sessions = join(root, WORKER_PROVIDERS.claude.sessions_subdir, "-ws", "");
     mkdirSync(sessions, { recursive: true });
     writeFileSync(join(sessions, "128b41c7.jsonl"), `${JSON.stringify({ model: "claude-sonnet-5" })}\n`);
-    const fact = scanBackendModel("claude", join(root, WORKER_PROVIDERS.claude.sessions_subdir), "");
+    const fact = scanBackendModel(WORKER_PROVIDERS.claude, join(root, WORKER_PROVIDERS.claude.sessions_subdir), "");
     assert.equal(fact.model, "claude-sonnet-5");
     assert.match(fact.locator ?? "", /128b41c7\.jsonl#offset=/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("reviewer and planner profiles without measured model scans stay UNKNOWN", () => {
+  assert.deepEqual(scanBackendModel(REVIEW_PROVIDERS.claude, "/unused", 'model: "guessed"'), {});
+  assert.deepEqual(scanBackendModel(PLAN_PROVIDERS.grok, "/unused", '{"model_id":"guessed"}'), {});
 });
