@@ -1,4 +1,4 @@
-/** TD §20.6 item 1: closed DEPLOY declaration/material, with no actuator. */
+/** TD §20.6 items 1–6: governed DEPLOY, including first-class rollback. */
 
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
@@ -276,7 +276,11 @@ test("DEPLOY is AD3-shaped: only an exactly-scoped HUMAN_DECISION clears the gat
   } finally { h.close(); }
 });
 
-function fakeRunner(initial: Record<string, ComponentIdentity>, nextPid = 9000): DeploymentComponentRunner & { calls: string[] } {
+function fakeRunner(
+  initial: Record<string, ComponentIdentity>,
+  nextPid = 9000,
+  nextCodeSha: () => string = () => SHA,
+): DeploymentComponentRunner & { calls: string[] } {
   const identities = structuredClone(initial);
   const calls: string[] = [];
   return {
@@ -285,10 +289,80 @@ function fakeRunner(initial: Record<string, ComponentIdentity>, nextPid = 9000):
     async kill(component) { calls.push(`kill:${component}`); },
     async start(component) {
       calls.push(`start:${component}`);
-      identities[component] = { ...identities[component]!, code_sha: SHA, pid: nextPid += 1 };
+      identities[component] = { ...identities[component]!, code_sha: nextCodeSha(), pid: nextPid += 1 };
     },
   };
 }
+
+test("TD §20.6 item 6: rollback is a second Human-gated DEPLOY that restores the prior code identity", async () => {
+  const h = await makeHarness();
+  try {
+    const activationBefore = { ...h.store.activeActivation()! };
+    h.sealReach();
+    sealImmutability(h);
+
+    const rollbackSha = priorBroker.code_sha;
+    let pinnedSha = SHA;
+    const compareCalls: string[] = [];
+    const reads = {
+      compareToMain: async (sha: string) => {
+        compareCalls.push(sha);
+        return { status_code: 200, compare_status: sha === SHA ? "identical" : sha === rollbackSha ? "ahead" : "behind" };
+      },
+      checkout: async () => ({ head: pinnedSha, porcelain: "" }),
+    };
+    const runner = fakeRunner({ broker: priorBroker }, 9000, () => pinnedSha);
+
+    const runDeploy = async (effectId: string, ordinal: number, material: ReturnType<typeof deployMaterial>) => {
+      const admittedAt = new Date(h.clock.now).toISOString();
+      const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, reads, runner, async (boundEffectId) => {
+        assert.equal(boundEffectId, effectId);
+        sealPostDeployAttest(h, boundEffectId);
+      });
+      await adapter.verify_material(DEPLOY_OPERATION, material);
+      assert.equal(await adapter.dispatch_precondition_read(DEPLOY_OPERATION, material), undefined);
+      assert.equal((await adapter.dispatch(effectId, ordinal, adapterTarget(), DEPLOY_OPERATION, material)).kind, "AMBIGUOUS");
+      h.clock.now += 1;
+      const outcome = await adapter.reconcile(effectId, ordinal, adapterTarget(), DEPLOY_OPERATION, material, { admitted_at: admittedAt });
+      assert.equal(outcome.kind, "COMMITTED");
+      if (outcome.kind !== "COMMITTED") throw new Error("expected COMMITTED DEPLOY");
+      assert.equal(adapter.receipt_binds(DEPLOY_OPERATION, material, outcome.receipt_claim), true);
+      return (outcome.receipt_claim.components as Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }>)[0]!;
+    };
+
+    const firstMaterial = deployMaterial();
+    const firstEffect = sealDeploy(h, firstMaterial);
+    const firstHuman = h.humanApprove(firstEffect);
+    assert.equal((await deployDecision(h, firstEffect, [firstHuman.evidence_id])).outcome, "ALLOW");
+    const firstReceipt = await runDeploy(firstEffect, 1, firstMaterial);
+
+    const rollbackMaterial = {
+      repo_id: REPO_ID,
+      sha: firstReceipt.prior.code_sha,
+      components: ["broker"],
+      expected_prior: { broker: firstReceipt.next },
+    };
+    const rollbackEffect = sealDeploy(h, rollbackMaterial);
+    const rollbackHuman = h.humanApprove(rollbackEffect);
+    assert.equal((await deployDecision(h, rollbackEffect, [rollbackHuman.evidence_id])).outcome, "ALLOW");
+
+    pinnedSha = rollbackSha;
+    const secondReceipt = await runDeploy(rollbackEffect, 1, rollbackMaterial);
+    assert.deepEqual(secondReceipt.prior, firstReceipt.next, "first receipt next is the rollback receipt prior");
+    assert.equal(secondReceipt.next.code_sha, firstReceipt.prior.code_sha, "rollback restores the original code_sha");
+    assert.deepEqual(compareCalls, [SHA, rollbackSha], "the prior main ancestor still passes the compare check");
+
+    const callsBeforeRefusal = [...runner.calls];
+    const nonAncestorSha = "c".repeat(40);
+    pinnedSha = nonAncestorSha;
+    const refused = await new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, reads, runner)
+      .dispatch_precondition_read(DEPLOY_OPERATION, { ...rollbackMaterial, sha: nonAncestorSha });
+    assert.equal(refused, `GitHub compare ${nonAncestorSha}...main status behind; expected ahead or identical`);
+    assert.deepEqual(runner.calls, callsBeforeRefusal, "item-2 ancestry refusal has no process effect");
+
+    assert.deepEqual({ ...h.store.activeActivation()! }, activationBefore, "DEPLOY and rollback do not touch policy activation or genesis");
+  } finally { h.close(); }
+});
 
 test("DEPLOY dispatch remains UNKNOWN until reconcile invokes scripted post-deploy attest", async () => {
   const h = await makeHarness();
