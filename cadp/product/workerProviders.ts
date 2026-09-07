@@ -101,7 +101,10 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     // bypassPermissions` edits files IF IS_SANDBOX=1 and the OAuth token are in env — as root
     // without IS_SANDBOX it refuses outright ("cannot be used with root/sudo privileges"). The
     // declaration is honest: the worker genuinely runs in the isolated surface container.
-    argv_template: ["-p", WORK_ITEM_SENTINEL, "--permission-mode", "bypassPermissions"],
+    // Model pinned explicitly (probe 2026-09-07: headless edit works and the session records
+    // "model":"claude-fable-5"): an unpinned argv rode the CLI default, so requested was not a
+    // deterministic fact. Owner directive: the claude worker seat runs Fable.
+    argv_template: ["-p", WORK_ITEM_SENTINEL, "--model", "claude-fable-5", "--permission-mode", "bypassPermissions"],
     auth_files: [], // no file auth — the operator-extracted token is injected by env
     auth_subdir: ".claude",
     auth_env: { env_var: "CLAUDE_CODE_OAUTH_TOKEN", static_env: { IS_SANDBOX: "1" } },

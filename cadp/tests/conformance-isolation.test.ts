@@ -61,7 +61,7 @@ test("§19 effort_argv omission preserves every worker argv byte-for-byte", () =
   for (const profile of Object.values(WORKER_PROVIDERS)) assert.equal(profile.effort_argv, undefined);
   assert.deepEqual(workerArgv("codex", "ITEM"), ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", "/ws", "ITEM"]);
   assert.deepEqual(workerArgv("grok", "ITEM"), ["grok", "-p", "ITEM", "--output-format", "streaming-json", "--permission-mode", "bypassPermissions"]);
-  assert.deepEqual(workerArgv("claude", "ITEM"), ["claude", "-p", "ITEM", "--permission-mode", "bypassPermissions"]);
+  assert.deepEqual(workerArgv("claude", "ITEM"), ["claude", "-p", "ITEM", "--model", "claude-fable-5", "--permission-mode", "bypassPermissions"]);
 });
 
 test("§19 reviewer session bind is the only extra writable bind; workspace stays ro and host HOME is absent", async () => {
