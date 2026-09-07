@@ -59,7 +59,7 @@ test("measured reviewer session-scan capabilities are pinned byte-exactly; effor
     });
     assert.ok(draft !== undefined);
     const observed = (draft.claim as { observed: Record<string, unknown> }).observed;
-    assert.deepEqual(observed["model"], { availability: "PRESENT", value: "measured-fallback", locator: `${provider}-reviewer-stdout#pattern=${profile.model_scan.stdout_regex}` });
+    assert.deepEqual(observed["model"], { availability: "PRESENT", value: "measured-fallback", locator: `${provider}-reviewer-stdout#pattern=${profile.model_scan!.stdout_regex}` });
     assert.deepEqual(observed["effort"], { availability: "UNKNOWN" });
   }
 });
