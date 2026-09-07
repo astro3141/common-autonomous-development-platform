@@ -68,11 +68,14 @@ TD §7.4). A deployment chooses the profile or not.
 **What a profile-less deployment loses — stated explicitly:** it is governed **per-effect only**. Every
 mutation still passes the full K1–K7 gate, but (a) there are **no run bounds** — no `max_effects`
 ceiling, no work-run deadline tied to a `WORK_START` material, because there is no work run the kernel
-knows about; and (b) there are **no step-evidence-dependent gates** — policies like the v0.4 merge
-gate's implementer-set derivation, which reads the run's `BACKEND_EXECUTION` and `WORK_STEP` envelopes
-to prove reviewer independence (TD §17 preamble, §17.4), cannot be expressed, because the evidence they
-consume is profile machinery. Independence predicates then have only per-effect envelopes to work with.
-That trade is the deployment's to make; the constitution no longer makes it for them.
+knows about; and (b) there are **no step-evidence-dependent gates** — a policy can no longer
+quantify over a run's `WORK_STEP` chain. In v0.4 that machinery carries no authority-critical weight:
+`implementer_refs` adds every `WORK_STEP` producer only as a conservative widening on top of the
+`BACKEND_EXECUTION` producers (TD §19.1), and the implementer that independence is proven against is
+attributed by `BACKEND_EXECUTION` — "not by the orchestrator's `WORK_STEP`" (TD §17 preamble) — so the
+merge gate's inputs are artifact-bound and survive profile-less, exactly as decision 5 proves. What a
+profile-less deployment loses here is only that step-chain widening and any future gate that would need
+step evidence. That trade is the deployment's to make; the constitution no longer makes it for them.
 
 ## 4. The §7 bisection (what makes the split precise)
 
