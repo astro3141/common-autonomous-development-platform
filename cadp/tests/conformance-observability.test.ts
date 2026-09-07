@@ -179,6 +179,7 @@ test("PRESENT BACKEND_EXECUTION refuses missing, duplicate, or out-of-set surfac
     };
     const workRun = { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: runRef };
     const role = (object_id: string) => ({ authority_ref: "cadp-store:k04", namespace: "surface-role", object_id });
+    assert.equal(h.store.evidenceByProducerSourceRef("backend-scan:codex", "scan"), undefined);
     for (const subject_bindings of [
       [workRun],
       [workRun, role("WORKER"), role("REVIEWER")],
@@ -189,6 +190,7 @@ test("PRESENT BACKEND_EXECUTION refuses missing, duplicate, or out-of-set surfac
         (error: unknown) => (error as { reason?: string }).reason === "BACKEND_SURFACE_ROLE_INVALID",
       );
     }
+    assert.equal(h.store.evidenceByProducerSourceRef("backend-scan:codex", "scan"), undefined, "Ingress refusal must seal no role-less PRESENT envelope");
   } finally {
     h.close();
   }

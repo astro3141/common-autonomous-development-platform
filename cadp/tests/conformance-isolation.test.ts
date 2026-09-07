@@ -20,8 +20,73 @@ import { join } from "node:path";
 import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa } from "./support/harness.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_AUTH_FILES } from "../product/workerProfile.ts";
+import { runReviewer } from "../product/isolation.ts";
+import type { CreationOutcome, IsolationConfig, SurfaceCommand, SurfaceCommandPort } from "../product/isolation.ts";
+import { WORKER_PROVIDERS, workerArgv } from "../product/workerProviders.ts";
 
 after(() => stopSharedOpa());
+
+function done<T>(value: T): SurfaceCommand<T> {
+  return { result: Promise.resolve(value), closed: Promise.resolve(), cancel() {} };
+}
+
+async function reviewerDockerArgs(sessionsDir?: string): Promise<readonly string[]> {
+  let constructed: readonly string[] | undefined;
+  const port: SurfaceCommandPort = {
+    create(_container, args) {
+      constructed = args;
+      return done<CreationOutcome>({ creation: "REJECTED", detail: "argv fixture" });
+    },
+    launch: () => { throw new Error("rejected fixture must not launch"); },
+    terminate: () => { throw new Error("rejected fixture must not terminate"); },
+    observe: () => { throw new Error("rejected fixture must not observe"); },
+  };
+  const config: IsolationConfig = {
+    worker_image: "cadp-surface:fixture",
+    egress_network: "cadp-fixture-int",
+    egress_proxy: "cadp-fixture-proxy:8888",
+  };
+  await runReviewer(config, {
+    workspace: "/checkout",
+    auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "token" },
+    authSubdir: ".claude",
+    ...(sessionsDir === undefined ? {} : { sessionsDir, sessionsContainerDir: "projects" }),
+    argv: ["claude", "-p", "review"],
+  }, { port });
+  assert.ok(constructed !== undefined);
+  return constructed;
+}
+
+test("§19 effort_argv omission preserves every worker argv byte-for-byte", () => {
+  for (const profile of Object.values(WORKER_PROVIDERS)) assert.equal(profile.effort_argv, undefined);
+  assert.deepEqual(workerArgv("codex", "ITEM"), ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", "/ws", "ITEM"]);
+  assert.deepEqual(workerArgv("grok", "ITEM"), ["grok", "-p", "ITEM", "--output-format", "streaming-json", "--permission-mode", "bypassPermissions"]);
+  assert.deepEqual(workerArgv("claude", "ITEM"), ["claude", "-p", "ITEM", "--permission-mode", "bypassPermissions"]);
+});
+
+test("§19 reviewer session bind is the only extra writable bind; workspace stays ro and host HOME is absent", async () => {
+  const oldHome = process.env["HOME"];
+  process.env["HOME"] = "/host/home-decoy";
+  try {
+    const without = await reviewerDockerArgs();
+    const withSessions = await reviewerDockerArgs("/host/reviewer-sessions");
+    assert.deepEqual(without, [
+      "--network", "cadp-fixture-int",
+      "-e", "HTTPS_PROXY=http://cadp-fixture-proxy:8888", "-e", "HTTP_PROXY=http://cadp-fixture-proxy:8888",
+      "-e", "https_proxy=http://cadp-fixture-proxy:8888", "-e", "http_proxy=http://cadp-fixture-proxy:8888",
+      "-v", "/checkout:/ws:ro", "-e", "HOME=/root", "-e", "CLAUDE_CODE_OAUTH_TOKEN=token",
+      "-w", "/ws", "cadp-surface:fixture", "claude", "-p", "review",
+    ]);
+    const expected = [...without];
+    expected.splice(expected.indexOf("-w"), 0, "-v", "/host/reviewer-sessions:/root/.claude/projects");
+    assert.deepEqual(withSessions, expected);
+    assert.equal(withSessions.filter((arg) => arg.includes(":/ws")).length, 1);
+    assert.ok(withSessions.includes("/checkout:/ws:ro"));
+    assert.equal(withSessions.some((arg) => arg.includes("/host/home-decoy")), false, "host HOME must never be mounted");
+  } finally {
+    if (oldHome === undefined) delete process.env["HOME"]; else process.env["HOME"] = oldHome;
+  }
+});
 
 test("F2: the worker sandbox imports ONLY codex auth material; the profile digest is deterministic", () => {
   // Hermetic: build a CONTROLLED host HOME with exactly the declared auth material + a config.toml
