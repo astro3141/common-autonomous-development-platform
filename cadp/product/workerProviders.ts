@@ -42,6 +42,16 @@ export interface WorkerProviderProfile {
    * in the spec itself; codex's expansion is capture-equivalent, byte-identical in effect.)
    */
   readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string };
+  /** Requested reasoning effort; valid only when paired with a measured `effort_argv`. */
+  readonly requested_effort?: string;
+  /** Measured argv encoding and accepted values for `requested_effort`. */
+  readonly effort_argv?: {
+    readonly flag: string;
+    readonly value_placement: "separate" | "equals";
+    readonly allowed_values: readonly string[];
+  };
+  /** Measured session/stdout captures for the effort actually observed. */
+  readonly effort_scan?: { readonly session_regex: string; readonly stdout_regex: string };
 }
 
 export const WORK_ITEM_SENTINEL = "{{WORK_ITEM}}";
@@ -104,6 +114,13 @@ export function workerArgv(provider: WorkerProvider, work_item: string): string[
 
 /** Pure, fail-closed provider-name validation. */
 export function resolveWorkerProvider(name: string): WorkerProvider {
-  if (Object.prototype.hasOwnProperty.call(WORKER_PROVIDERS, name)) return name as WorkerProvider;
+  if (Object.prototype.hasOwnProperty.call(WORKER_PROVIDERS, name)) {
+    const provider = name as WorkerProvider;
+    const profile = WORKER_PROVIDERS[provider];
+    if ((profile.requested_effort === undefined) !== (profile.effort_argv === undefined)) {
+      throw new Error(`worker provider ${name} has an unpaired requested_effort/effort_argv configuration`);
+    }
+    return provider;
+  }
   throw new Error(`unknown worker provider: ${name}`);
 }
