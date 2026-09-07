@@ -1287,3 +1287,88 @@ Independently reviewable items, in this order. Later items may depend on earlier
 6. **Rollback.** A second DEPLOY whose `sha` equals the first receipt's prior `code_sha` and whose `expected_prior` equals the first receipt's `next` is admitted under the same (a)(b)(c) rules and, on COMMITTED, restores that prior identity. Conformance: that sha still compare-ancestors `main`; a sha that is not an ancestor refuses.
 7. **Scheduled attest refresh.** deployment-control timer at half `reach_attestation_max_age_s` running `ctl attest`. Conformance: without the timer, #8 still refuses at `max_age` (no behaviour change if the schedule is omitted); with the timer, a new envelope appears inside the window and a failing probe is sealed as failing, not retried into a pass. Kernel `setInterval` identity probes are untouched and do not start submitting reach envelopes.
 
+---
+
+## 21. Product workflow runtime and the step execution edge (Conductor integration)
+
+Product-layer design. It is **not implemented here** and authorizes no production change; implementation follows this design. This is not a kernel primitive: it adds no K1–K7 record, changes no `identity_class` derivation (§9.1), and does not alter the §8.4 independence predicate. What this section revises is how §7's commodity-orchestrator principle is **realized for product verticals**: alongside the reference Temporal composition (§7, unchanged for kernel-adjacent work), Microsoft **Conductor** (MIT license; YAML-declared multi-agent workflows; deterministic Jinja routing) is adopted as a product workflow runtime.
+
+Measured design inputs (container probe, 2026-09-07): custom `base_url` routing works on the OpenAI chat-completions wire, with `stream: true` and structured output delivered as a **forced `final_result` tool call**; Conductor writes an events JSONL (`workflow_started` / `agent_started` / `agent_retry` / `checkpoint_saved`) under `TMPDIR`; the provider config name is a **closed pydantic literal**, so a native `cadp` provider requires an upstream patch, while the internal `AgentProvider` ABC (`execute(agent, context, rendered_prompt, tools, extra_mcp_servers) -> AgentOutput`) is the natural longer-term seam. Anything not in that probe list is unmeasured and is marked **requires a container probe before implementation** below — never asserted. Guessing is the defect §17.2 exists to prevent.
+
+### 21.1 Conductor is a Product Workflow Runtime outside the kernel
+
+Conductor is composition core only; CADP remains the authority core. The kernel continues to see exactly what §7.1 names: (1) a `WORK_START` governed effect, (2) ordinary `EffectRequestV1`/evidence submissions during the run, (3) `WORK_STEP` / `WORK_BOUND_STOP` evidence that makes the run reconstructable. §7.1 is unchanged, and its rule applies to Conductor **verbatim**: orchestrator history is never authority. Conductor's `events.jsonl` is Temporal history's analogue — a commodity runtime artifact, useful and read (§21.4), but never a kernel row and never what reconstruction trusts. No Conductor state, checkpoint, or event enters the Constitutional Store.
+
+### 21.2 The Step Execution Edge
+
+**Decision.** A single product-layer seam — the **Step Execution Edge** — that Conductor calls for **every** step. No step class executes outside it.
+
+- **Model steps** route through a **Model Facade** protocol adapter: the measured OpenAI chat-completions face (SSE streaming plus the forced `final_result` tool call — the exact wire shape the probe held) presented over the **existing** surface broker and 3×3 provider adapters (§17). The facade is a protocol translation over measured surfaces, not a new provider integration; the closed registries, auth injection (§17.3), and per-provider principals (§17.5) stay the only path to a backend.
+- **Non-model executor classes** — script, deterministic validator, retrieval — each carry an **explicit isolation contract** declared on the executor class, not inferred from the step. Script executors run in the verifier-class network-none container posture (the §8.2 fresh-clone shape: no governed-target egress, no credentials). An executor class without a declared sandbox is a **bypass lane** — a route around every posture §17.2 measured — and is refused at the edge, fail-closed, never defaulted.
+
+### 21.3 Execution Receipt split
+
+Each layer asserts only what it actually observed; neither vouches for the other's facts — the same requested ≠ observed honesty as §19 / C13, applied to the seam.
+
+- **Facade/edge receipt (backend facts).** Requested vs observed product / model / effort, request and response digests, and the backend evidence id. These are facts the facade saw on the wire or scanned from the surface; the facade does not assert step semantics.
+- **Conductor-side conformance edge receipt (step identity).** Step ordinal, logical agent, input and output digests, prior-step digest. These are facts the conformance edge knows from the workflow definition and the step boundary; it does not assert which backend actually served the tokens.
+
+A receipt field neither layer measured is `UNKNOWN`, never copied across the split.
+
+### 21.4 The LIVE path is authoritative
+
+**Decision.** On step completion the conformance edge submits `WORK_STEP` through the **existing** §7.4 replay-idempotent ingress, under the same `(work_run_ref, step_ordinal)` lock, **before any dependent effect admission**. The §7.4 contract applies unchanged: same semantic payload converges on the same envelope; a differing payload is `WORK_STEP_CONFLICT` plus incident and scope hold; reconstruction reads exactly one envelope per ordinal. `events.jsonl` is recovery, reconciliation, and audit **cross-check only** — a commodity locator for "what did the runtime think happened," compared against kernel rows when reconciling a crashed run. It is never promoted post-hoc to authoritative evidence: a step that exists only in `events.jsonl` did not happen, constitutionally.
+
+### 21.5 Tool lanes and the human gate
+
+- **Read/pure tools** may execute directly inside the step's declared executor posture.
+- **Mutating tools carry no real credentials.** Every mutating tool a Conductor agent can name is an **effect-tool shim** that seals an `EffectRequestV1` through the kernel gate (§3.4/§4.4) and returns the kernel's answer; custody stays where §4 put it. A tool that could mutate a governed target directly would be #89 boundary 4 reopened.
+- **`extra_mcp_servers` and provider-native agentic tool loops are pinned by an allowlisted runtime profile**, and that profile is gate-path material (the §18.4 sense: a delegated decision must not auto-approve an edit to it). Name-based trust is forbidden — a tool or server is what its measured posture holds, not what its name claims. The measured lesson is §17.2's grok probe: `--permission-mode plan` sounds read-only and still executed `run_terminal_command`; only the probed allow-list held. The same rule applies to every MCP server and tool loop Conductor can reach.
+- **Conductor's human gate is a UI/wait primitive only.** It can pause a run and render a prompt; it confers nothing. A paused run resumes only on a `HUMAN_DECISION` envelope (§9.3) bound to the exact run, subject, and effect — never on the gate's own local approval event.
+
+### 21.6 Governed runs (P2)
+
+A governed Conductor run is an ordinary §7.2-shaped `WORK_START`:
+
+```text
+EffectRequestV1 {
+  operation_kind = WORK_START
+  target_ref     = { authority_ref: conductor:<deployment>, target_type: WORKFLOW,
+                     target_id: <workflow-name>@<workflow_definition_digest> }
+  material       = { workflow_definition_digest, workflow_input_digest, provider_binding_digest,
+                     runtime_profile_revision, policy_ref,
+                     bounds: { max_steps, max_effects, deadline, budget? } }
+}
+```
+
+The PEP admits it like any effect and dispatches a **digest-pinned** Conductor run: the definition the runtime loads must reproduce `workflow_definition_digest`, or the dispatch refuses. `effect_id(WORK_START)` is the canonical `work_run_ref` (§7.4 unchanged); Conductor's own run id is a commodity runtime locator recorded in receipts, never an identity the kernel trusts.
+
+**Step-counting semantics.** One Conductor **agent completion** is one step against `max_steps`. Internal provider turns are backend facts only, recorded (if at all) in the facade receipt — measured: a single agent emitted nine `agent_turn_start` events in one completion. Counting turns as steps would make the bound a function of a provider's internal loop shape; the bound binds what the workflow definition names.
+
+### 21.7 Conductor principal
+
+The Conductor runtime holds **zero** external provider, target, or deployment credentials — the facade and the effect-tool shims are its only reach — plus one **bounded CADP-call capability**: a run-scoped, short-lived principal minted at `WORK_START` dispatch. Every edge call (facade, `WORK_STEP` submission, effect-tool shim) authenticates as that principal, so the kernel binds each call to its admitted run and an expired or foreign run cannot submit into another run's ordinals. The principal confers no seal/admit reach beyond what the run's policy grants; it is not an operator identity.
+
+### 21.8 Rollout P0/P1/P2 and stop-loss
+
+Three levels, each with an explicit stop-loss; a domain may deliberately stay at a lower level.
+
+- **P0 — wire probe.** The facade speaks SSE plus the forced tool-call round trip — the measured failure shape — against the existing §17 adapters, driven by a real Conductor workflow with `base_url` pointed at the facade. **If P0 fails, stop**: no receipts, no governed runs, no upstream patch work.
+- **P1 — execution integration.** Receipts and attribution (§21.3), live `WORK_STEP` (§21.4), tool lanes (§21.5). At this level, decide whether the native provider patch is even needed, or whether the `base_url` facade suffices indefinitely.
+- **P2 — governed run.** §21.6 material, digest-pinned dispatch, run-scoped principal, human gate bound to `HUMAN_DECISION`.
+
+**Requires a container probe before implementation** (unmeasured; never assumed): Conductor resume mechanics after a crash or gate wait; stream-disable options (whether the wire can run without `stream: true`); the `AgentProvider` patch surface (what an upstream `cadp` provider would actually override); the human-gate wire format.
+
+### 21.9 Implementation plan
+
+Independently reviewable items, ordered P0 first. Later items may depend on earlier ones; an earlier item must not change gate meaning by itself. None of them is done by this section.
+
+1. **(P0) Model Facade wire probe.** OpenAI chat-completions face over the surface broker: SSE streaming plus a forced `final_result` tool-call round trip from a real Conductor workflow against the existing 3×3 adapters. Conformance: the structured output arrives as the tool call, byte-digested on both sides. Stop-loss: failure here ends the integration; no later item proceeds.
+2. **(P0) Executor isolation contracts.** Declare the per-class contract; script executor in the verifier-class network-none container posture. Conformance: an executor class without a declared sandbox is refused at the edge (fail-closed, no default posture); a script step observes no governed-target egress.
+3. **(P1) Execution Receipt split.** Facade backend receipt and conformance-edge step receipt as §21.3, requested ≠ observed preserved, unmeasured fields `UNKNOWN`. Conformance: neither receipt carries a field its layer did not observe.
+4. **(P1) Live `WORK_STEP` submission.** Conformance edge submits through the §7.4 ingress under `(work_run_ref, step_ordinal)` before dependent effect admission. Conformance: runtime retry/replay converges on one envelope per ordinal; a divergent resubmission is `WORK_STEP_CONFLICT`; a step present only in `events.jsonl` reconstructs as absent.
+5. **(P1) Tool lanes and runtime profile.** Effect-tool shims for every mutating tool; allowlisted runtime profile pinning `extra_mcp_servers` and provider-native loops, treated as gate-path material. Conformance: an unlisted MCP server or tool loop is refused; a mutating tool reaches no credential; the §17.2 name-based-trust control (a "read-only-sounding" mode is not trusted unprobed) passes.
+6. **(P1) Provider-seam decision.** With P0/P1 measured, decide facade-only vs upstream `AgentProvider` patch; probe the patch surface first (**requires a container probe before implementation**). No patch ships before the decision.
+7. **(P2) Governed run.** §21.6 `WORK_START` material, digest-pinned dispatch, run-scoped principal minted at dispatch, agent-completion step counting. Conformance: an unpinned or digest-mismatched definition refuses to dispatch; nine internal turns count as one step; an expired run principal cannot submit.
+8. **(P2) Human gate binding.** Conductor's wait primitive resumes only on a `HUMAN_DECISION` envelope bound to the exact run/subject/effect (probe the human-gate wire format first — **requires a container probe before implementation**). Conformance: the gate's local approval event alone resumes nothing.
+
