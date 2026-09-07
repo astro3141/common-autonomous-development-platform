@@ -139,7 +139,10 @@ function sealPrBase(h: Harness): string[] {
   const backend = h.ingress.submitEvidence(
     {
       evidence_kind: "BACKEND_EXECUTION",
-      subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000e7" }],
+      subject_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000e7" },
+        { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+      ],
       availability: "PRESENT",
       claim_schema: "cadp.backend-execution.v1",
       claim: {
@@ -157,6 +160,32 @@ function sealPrBase(h: Harness): string[] {
     PRINCIPALS.backendScan,
   ).evidence_id;
   return [verification, review, workStep, backend];
+}
+
+function sealReviewerBackend(h: Harness): string {
+  return h.ingress.submitEvidence(
+    {
+      evidence_kind: "BACKEND_EXECUTION",
+      subject_bindings: [
+        { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000e7" },
+        { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "REVIEWER" },
+      ],
+      availability: "PRESENT",
+      claim_schema: "cadp.backend-execution.v1",
+      claim: {
+        requested: { provider: "claude", model: "default" },
+        observed: {
+          provider: { availability: "PRESENT", value: "claude", locator: "t" },
+          model: { availability: "PRESENT", value: "review-model", locator: "t" },
+          version: { availability: "UNKNOWN" }, run_id: { availability: "UNKNOWN" }, effort: { availability: "UNKNOWN" },
+        },
+      },
+      producer_ref: "backend-scan:claude",
+      source_ref: `review-be-${(step += 1)}`,
+      source_relation: "SELF_REPORT",
+    },
+    { principal: "cadp-backend-scan-claude" },
+  ).evidence_id;
 }
 
 async function evalPr(h: Harness, refs: string[]): Promise<{ outcome: string; reasons: string[] }> {
@@ -186,6 +215,17 @@ test("EV4: with the param OFF (reference default), PR gates are byte-identical â
   try {
     const result = await evalPr(h, sealPrBase(h));
     assert.equal(result.outcome, "ALLOW", JSON.stringify(result));
+  } finally {
+    h.close();
+  }
+});
+
+test("REVIEWER BACKEND_EXECUTION is not an implementer and preserves legal independent review", async () => {
+  const h = await makeHarness();
+  try {
+    const result = await evalPr(h, [...sealPrBase(h), sealReviewerBackend(h)]);
+    assert.equal(result.outcome, "ALLOW", JSON.stringify(result));
+    assert.equal(result.reasons.includes("reviewer_product_not_independent"), false);
   } finally {
     h.close();
   }

@@ -86,6 +86,9 @@ implementer_refs contains p if {
 implementer_refs contains p if {
 	some e in input.evidence
 	e.evidence_kind == "BACKEND_EXECUTION"
+	some b in e.subject_bindings
+	b.namespace == "surface-role"
+	b.object_id == "WORKER"
 	p := e.producer_ref
 }
 
@@ -148,6 +151,9 @@ backend_model_present if {
 	some e in input.evidence
 	e.evidence_kind == "BACKEND_EXECUTION"
 	e.availability == "PRESENT"
+	some b in e.subject_bindings
+	b.namespace == "surface-role"
+	b.object_id == "WORKER"
 	e.claim.observed.model.availability == "PRESENT"
 }
 
@@ -155,6 +161,9 @@ backend_effort_present if {
 	some e in input.evidence
 	e.evidence_kind == "BACKEND_EXECUTION"
 	e.availability == "PRESENT"
+	some b in e.subject_bindings
+	b.namespace == "surface-role"
+	b.object_id == "WORKER"
 	e.claim.observed.effort.availability == "PRESENT"
 }
 

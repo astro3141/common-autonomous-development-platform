@@ -10,6 +10,7 @@ import { condition, defineSignal, proxyActivities, setHandler, workflowInfo } fr
 import type { ActivityOptions } from "@temporalio/workflow";
 
 import { ACTIVITY_HEARTBEAT_TIMEOUT_MS, EXTERNAL_VERIFY, KERNEL_ACTIVITY_ATTEMPT_MS, SURFACE_BUDGETS } from "./timeouts.ts";
+import { developmentEvidenceRefs } from "./developmentEvidence.ts";
 import type * as activities from "./activities.ts";
 
 export interface WorkArgs {
@@ -223,6 +224,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
     });
     priorStepDigest = reviewed.work_step_envelope_digest;
     trace["review_evidence_id"] = reviewed.review_evidence_id;
+    trace["review_backend_evidence_id"] = reviewed.backend_evidence_id;
 
     approved = reviewed.verdict === "APPROVE" && verified.conclusion === "success";
     if (!approved) {
@@ -235,6 +237,14 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
 
   const prStep = await nextStep();
   if (prStep === undefined) return { ...trace, stopped: "BOUND" };
+  const prEvidenceRefs = developmentEvidenceRefs({
+    verification_evidence_id: verified.verification_evidence_id,
+    review_evidence_id: reviewed.review_evidence_id,
+    worker_backend_evidence_id: implemented.backend_evidence_id,
+    reviewer_backend_evidence_id: reviewed.backend_evidence_id,
+    work_step_envelope_id: implemented.work_step_envelope_id,
+    ...(externalVerified === undefined ? {} : { external_verification_evidence_id: externalVerified.verification_evidence_id }),
+  });
   const pr = await acts.governedPrCreate({
     work_run_ref: workRunRef,
     step_ordinal: prStep,
@@ -242,13 +252,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
     base_ref: dev.base_ref,
     candidate_sha: implemented.candidate_sha,
     work_item: dev.work_item,
-    evidence_refs: [
-      verified.verification_evidence_id,
-      reviewed.review_evidence_id,
-      implemented.backend_evidence_id,
-      implemented.work_step_envelope_id,
-      ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : []),
-    ],
+    evidence_refs: prEvidenceRefs,
     prior_step_envelope_digest: priorStepDigest,
   });
   priorStepDigest = pr.work_step_envelope_digest;
@@ -271,7 +275,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       // input, and an input without it made the comparison vacuous (12th/13th pilots: a
       // claude-implemented run auto-merged by the claude-product delegate — twice, because only
       // the rule was fixed the first time, not this assembly).
-      evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id, ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : [])],
+      evidence_refs: prEvidenceRefs,
       prior_step_envelope_digest: priorStepDigest,
     });
     priorStepDigest = prepared.work_step_envelope_digest;
@@ -281,7 +285,7 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
       const merged = await acts.completeMergeWithHumanDecision({
         effect_id: prepared.effect_id,
         human_evidence_id: humanEvidenceId!,
-        evidence_refs: [verified.verification_evidence_id, reviewed.review_evidence_id, implemented.backend_evidence_id, implemented.work_step_envelope_id, ...(externalVerified !== undefined ? [externalVerified.verification_evidence_id] : [])],
+        evidence_refs: prEvidenceRefs,
       });
       trace["merge_outcome"] = merged.outcome;
       trace["merge_detail"] = merged.detail;

@@ -164,6 +164,36 @@ test("WORKER BACKEND_EXECUTION seals the surface role as a subject binding", asy
   }
 });
 
+test("PRESENT BACKEND_EXECUTION refuses missing, duplicate, or out-of-set surface roles", async () => {
+  const h = await makeHarness();
+  try {
+    const runRef = "cadp-v04:effect:00000000-0000-7000-8000-000000000be1";
+    const base = {
+      evidence_kind: "BACKEND_EXECUTION" as const,
+      availability: "PRESENT" as const,
+      claim_schema: "cadp.backend.v1",
+      claim: { requested: {}, observed: { model: { availability: "UNKNOWN" } } },
+      producer_ref: "backend-scan:codex",
+      source_ref: "scan",
+      source_relation: "SELF_REPORT" as const,
+    };
+    const workRun = { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: runRef };
+    const role = (object_id: string) => ({ authority_ref: "cadp-store:k04", namespace: "surface-role", object_id });
+    for (const subject_bindings of [
+      [workRun],
+      [workRun, role("WORKER"), role("REVIEWER")],
+      [workRun, role("AUDITOR")],
+    ]) {
+      assert.throws(
+        () => h.ingress.submitEvidence({ ...base, subject_bindings }, PRINCIPALS.backendScan),
+        (error: unknown) => (error as { reason?: string }).reason === "BACKEND_SURFACE_ROLE_INVALID",
+      );
+    }
+  } finally {
+    h.close();
+  }
+});
+
 test("O2: every write/evaluate method is FORBIDDEN for the observer and writes nothing (B2)", async () => {
   const h = await makeHarness();
   try {

@@ -166,7 +166,10 @@ test("C12/C28: self-review and same-product review are denied on DERIVED classes
     const backend = h.ingress.submitEvidence(
       {
         evidence_kind: "BACKEND_EXECUTION",
-        subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c012" }],
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c012" },
+          { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+        ],
         availability: "PRESENT",
         claim_schema: "cadp.backend.v1",
         claim: { requested: {}, observed: { model: { availability: "PRESENT", value: "gpt-5.3-codex", locator: "log#1" } } },
@@ -234,7 +237,10 @@ test("C13: a PRESENT observed backend fact without a locator is rejected at the 
         h.ingress.submitEvidence(
           {
             evidence_kind: "BACKEND_EXECUTION",
-            subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c013" }],
+            subject_bindings: [
+              { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c013" },
+              { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+            ],
             availability: "PRESENT",
             claim_schema: "cadp.backend.v1",
             claim: { requested: { model: "gpt-5.3-codex" }, observed: { model: { availability: "PRESENT", value: "gpt-5.3-codex" } } },
@@ -284,19 +290,40 @@ test("C14: a policy-required observed fact that is UNKNOWN denies with required_
       },
       PRINCIPALS.reviewer,
     );
-    // Backend evidence: model PRESENT, effort UNKNOWN (honest observation).
+    // First worker backend: model UNKNOWN while effort is PRESENT. The reviewer knows both, so
+    // any denial below isolates backend_model_present's WORKER role qualification.
     const backend = h.ingress.submitEvidence(
       {
         evidence_kind: "BACKEND_EXECUTION",
-        subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014" }],
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014" },
+          { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+        ],
         availability: "PRESENT",
         claim_schema: "cadp.backend.v1",
-        claim: { requested: {}, observed: { model: { availability: "PRESENT", value: "m", locator: "log#1" }, effort: { availability: "UNKNOWN" } } },
+        claim: { requested: {}, observed: { model: { availability: "UNKNOWN" }, effort: { availability: "PRESENT", value: "high", locator: "log#worker" } } },
         producer_ref: "backend-scan:codex",
         source_ref: "scan",
         source_relation: "SELF_REPORT",
       },
       PRINCIPALS.backendScan,
+    );
+    // A REVIEWER observation may know both facts, but must satisfy neither WORKER-qualified gate.
+    const reviewerBackend = h.ingress.submitEvidence(
+      {
+        evidence_kind: "BACKEND_EXECUTION",
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014" },
+          { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "REVIEWER" },
+        ],
+        availability: "PRESENT",
+        claim_schema: "cadp.backend.v1",
+        claim: { requested: {}, observed: { model: { availability: "PRESENT", value: "review-m", locator: "log#review" }, effort: { availability: "PRESENT", value: "high", locator: "log#review" } } },
+        producer_ref: "backend-scan:claude",
+        source_ref: "review-scan",
+        source_relation: "SELF_REPORT",
+      },
+      { principal: "cadp-backend-scan-claude" },
     );
     const material = { repo_id: "1", base_ref: "refs/heads/main", head_ref: "refs/heads/cadp/candidate/sha-c14", head_sha: "sha-c14", title_cas_key: h.cas.put(Buffer.from("t")), body_cas_key: h.cas.put(Buffer.from("b")) };
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
@@ -313,12 +340,37 @@ test("C14: a policy-required observed fact that is UNKNOWN denies with required_
       },
       PRINCIPALS.workflow,
     );
-    const input = h.ingress.assembleAdmissionInput(request.effect_id, [verification.evidence_id, review.evidence_id, backend.evidence_id]);
+    const input = h.ingress.assembleAdmissionInput(request.effect_id, [verification.evidence_id, review.evidence_id, backend.evidence_id, reviewerBackend.evidence_id]);
     const evaluated = await h.evaluate(input.input_digest.value);
     assert.equal(evaluated.kind, "DECISION");
     if (evaluated.kind !== "DECISION") return;
     assert.equal(evaluated.decision.outcome, "DENY");
     assert.ok(evaluated.decision.reason_codes.includes("required_fact_unknown"));
+
+    // Second worker backend reverses the observations. Even though REVIEWER effort is PRESENT,
+    // require_backend_effort=true must still deny the worker's UNKNOWN effort.
+    const workerUnknownEffort = h.ingress.submitEvidence(
+      {
+        evidence_kind: "BACKEND_EXECUTION",
+        subject_bindings: [
+          { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014" },
+          { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+        ],
+        availability: "PRESENT",
+        claim_schema: "cadp.backend.v1",
+        claim: { requested: {}, observed: { model: { availability: "PRESENT", value: "worker-m", locator: "log#worker-2" }, effort: { availability: "UNKNOWN" } } },
+        producer_ref: "backend-scan:codex",
+        source_ref: "scan-unknown-effort",
+        source_relation: "SELF_REPORT",
+      },
+      PRINCIPALS.backendScan,
+    );
+    const input2 = h.ingress.assembleAdmissionInput(request.effect_id, [verification.evidence_id, review.evidence_id, workerUnknownEffort.evidence_id, reviewerBackend.evidence_id]);
+    const evaluated2 = await h.evaluate(input2.input_digest.value);
+    assert.equal(evaluated2.kind, "DECISION");
+    if (evaluated2.kind !== "DECISION") return;
+    assert.equal(evaluated2.decision.outcome, "DENY");
+    assert.ok(evaluated2.decision.reason_codes.includes("required_fact_unknown"));
   } finally {
     h.close();
   }

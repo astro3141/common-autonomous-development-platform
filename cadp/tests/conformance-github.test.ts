@@ -114,7 +114,10 @@ async function makeGitHubHarness(options: { rego?: string; disabledChecks?: Read
       const backend = h.ingress.submitEvidence(
         {
           evidence_kind: "BACKEND_EXECUTION",
-          subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041" }],
+          subject_bindings: [
+            { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041" },
+            { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+          ],
           availability: "PRESENT",
           claim_schema: "cadp.backend.v1",
           claim: { requested: {}, observed: { model: { availability: "PRESENT", value: "gpt-5.3-codex", locator: "log#0" } } },
