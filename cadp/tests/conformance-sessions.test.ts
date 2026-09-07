@@ -63,7 +63,6 @@ test("runReviewer adds exactly one writable sessions bind and keeps the workspac
   const args = await constructedArgs((port) => runReviewer(ISOLATION, {
     workspace: "/checkout",
     auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "token" },
-    authSubdir: ".claude",
     sessionsDir: "/host/reviewer-sessions",
     sessionsContainerDir: "projects",
     argv: ["claude", "--print", "review"],
