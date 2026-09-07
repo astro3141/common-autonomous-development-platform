@@ -59,6 +59,11 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
       PLAN_PROMPT_SENTINEL,
     ],
     auth_method: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN" },
+    sessions_subdir: "claude-sessions",
+    sessions_container_dir: "projects",
+    // Measured primary path: ~/.claude/projects/<slug>/<uuid>.jsonl. Stdout is a
+    // same-shape fallback only.
+    model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' },
     identity_class_product: "claude-code",
   },
   grok: {
@@ -75,6 +80,10 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
       "read_file,list_dir,grep",
     ],
     auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
+    sessions_subdir: "grok-sessions",
+    // Measured primary path: ~/.grok/sessions/<urlencoded-cwd>/<session-id>/chat_history.jsonl.
+    // Stdout is a same-shape fallback only.
+    model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"model_id"\\s*:\\s*"([^"]+)"' },
     identity_class_product: "grok",
   },
   codex: {
@@ -83,6 +92,10 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
     // any deviation, so no extra output contract is needed here.
     argv_template: ["exec", "--sandbox", "read-only", "--skip-git-repo-check", PLAN_PROMPT_SENTINEL],
     auth_method: { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] },
+    sessions_subdir: "codex-sessions",
+    // Measured primary path: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. Stdout is a
+    // same-shape fallback only.
+    model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' },
     identity_class_product: "codex-cli",
   },
 };
