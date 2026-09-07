@@ -3,6 +3,7 @@
  *   node cadp/live/ctl.ts <dir> up                          start record/temporal/kernel/worker
  *   node cadp/live/ctl.ts <dir> stop|start <component>      kill / restart one real process
  *   node cadp/live/ctl.ts <dir> attest                      reach + immutability attestations
+ *   node cadp/live/ctl.ts <dir> attest-schedule             opt-in refresh at half reach max-age
  *   node cadp/live/ctl.ts <dir> plan "<whole intent>"       proposal-only planner → WORK_PROPOSAL evidence
  *   node cadp/live/ctl.ts <dir> work-plan <proposalEvidenceId> [maxItems]   drive items through governed WORK_START
  *   node cadp/live/ctl.ts <dir> work-dev <item> [maxSteps maxEffects] [proposalEvidenceId]
@@ -28,6 +29,10 @@ import { brokerPostJson } from "../product/brokerTransport.ts";
 import { touchesGateMachinery } from "../product/gateFiles.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { killLiveComponent, startLiveComponent } from "./componentControl.ts";
+import { startAttestRefresh } from "./attestRefresh.ts";
+import { ConstitutionalStore } from "../kernel/store.ts";
+import { Cas } from "../kernel/cas.ts";
+import { resolveActivePolicy } from "../kernel/policyState.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -536,6 +541,16 @@ async function main(): Promise<void> {
     case "attest":
       await attest(process.argv[4]);
       break;
+    case "attest-schedule": {
+      // Explicit operator concern: `up` does not enter this branch and the kernel does not own it.
+      const store = new ConstitutionalStore(join(dir, "k04.sqlite"));
+      let maxAgeS: number;
+      try { maxAgeS = resolveActivePolicy(store, new Cas(store)).config.reach_attestation_max_age_s; }
+      finally { store.close(); }
+      const schedule = startAttestRefresh(maxAgeS, () => attest());
+      console.log(JSON.stringify({ attest_schedule: "enabled", period_ms: schedule.period_ms }));
+      break;
+    }
     case "plan":
       console.log(JSON.stringify(await sealPlan(dir, process.argv[4]!, process.argv[5]), null, 2));
       break;
