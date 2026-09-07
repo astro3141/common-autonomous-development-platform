@@ -20,6 +20,7 @@ import { resolveActivePolicy } from "./policyState.ts";
 import { ConstitutionalStore } from "./store.ts";
 import { makeAdapterRegistry } from "./adapters/types.ts";
 import type { TargetAdapterV1 } from "./adapters/types.ts";
+import { DeploymentActuationAdapter } from "./adapters/deploymentActuation.ts";
 import { FindingSealAdapter } from "./adapters/findingSeal.ts";
 import { GitHubAdapter } from "./adapters/github.ts";
 import { GitHubIssuesAdapter } from "./adapters/githubIssues.ts";
@@ -72,6 +73,25 @@ export function composeTargetAdapters(
   const adapters: TargetAdapterV1[] = [
     new StorePolicyAdapter(store, cas, ingress),
     new FindingSealAdapter(ingress, store),
+    new DeploymentActuationAdapter(config.github?.repo_id, () => {
+      if (config.github === undefined) return false;
+      try {
+        const active = resolveActivePolicy(store, cas);
+        const now = Date.now();
+        const reach = store.latestEvidenceOfKind("CREDENTIAL_REACH_ATTESTATION");
+        const immutability = store.latestEvidenceOfKind(
+          "TARGET_IMMUTABILITY_ATTESTATION",
+          `github.com|GIT_REPOSITORY|${config.github.repo_id}`,
+        );
+        if (reach === undefined || immutability === undefined) return false;
+        return now - Date.parse(reach.produced_at) <= active.config.reach_attestation_max_age_s * 1000
+          && (reach.claim as { alternate_path_found?: boolean })?.alternate_path_found === false
+          && now - Date.parse(immutability.produced_at) <= active.config.target_immutability_attestation_max_age_s * 1000
+          && (immutability.claim as { write_once_enforced?: boolean })?.write_once_enforced === true;
+      } catch {
+        return false;
+      }
+    }),
   ];
   if (config.github !== undefined) {
     const token = readFileSync(config.github.token_file, "utf8").trim();
