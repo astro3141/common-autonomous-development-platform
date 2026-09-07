@@ -1,3 +1,5 @@
+import { appendRequestedEffort } from "./effortArgv.ts";
+
 /** Closed set of planner CLI profiles supported by the product. */
 export type PlanProvider = "claude" | "grok" | "codex";
 
@@ -29,6 +31,7 @@ export interface PlanProviderProfile {
   readonly effort_argv?: {
     readonly flag: string;
     readonly value_placement: "separate" | "equals";
+    readonly value_prefix?: string;
     readonly allowed_values: readonly string[];
   };
   readonly effort_scan?: { readonly session_regex: string; readonly stdout_regex: string };
@@ -102,7 +105,9 @@ export const PLAN_PROVIDERS: Record<PlanProvider, PlanProviderProfile> = {
 
 /** Build the full argv (binary + expanded template) for a provider + plan prompt. */
 export function planArgv(provider: PlanProvider, plan_prompt: string): string[] {
-  return [provider, ...PLAN_PROVIDERS[provider].argv_template.map((a) => (a === PLAN_PROMPT_SENTINEL ? plan_prompt : a))];
+  const profile = PLAN_PROVIDERS[provider];
+  const argv = [provider, ...profile.argv_template.map((a) => (a === PLAN_PROMPT_SENTINEL ? plan_prompt : a))];
+  return appendRequestedEffort(argv, profile, `plan provider ${provider}`);
 }
 
 /** Pure, fail-closed provider-name validation. Never defaults silently. */
@@ -110,9 +115,7 @@ export function resolvePlanProvider(name: string): PlanProvider {
   if (Object.prototype.hasOwnProperty.call(PLAN_PROVIDERS, name)) {
     const provider = name as PlanProvider;
     const profile = PLAN_PROVIDERS[provider];
-    if ((profile.requested_effort === undefined) !== (profile.effort_argv === undefined)) {
-      throw new Error(`plan provider ${name} has an unpaired requested_effort/effort_argv configuration`);
-    }
+    appendRequestedEffort([], profile, `plan provider ${name}`);
     return provider;
   }
   throw new Error(`unknown plan provider: ${name}`);

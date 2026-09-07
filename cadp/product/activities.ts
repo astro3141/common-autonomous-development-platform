@@ -299,13 +299,13 @@ export async function implementCandidate(input: {
   // The bounded broker clones at base_sha, runs the selected provider in the isolated worker container, commits
   // the worker-local candidate, and bundles it (TD §8.1/§6.6). It returns the candidate sha, the
   // bundle bytes, and the model scanned from the worker's own provider session log (#91).
-  const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_provider: string; backend_model?: string; backend_locator?: string }>(
+  const impl = await brokerCall<{ candidate_sha: string; bundle_b64: string; backend_provider: string; backend_model?: string; backend_locator?: string; backend_effort?: string; backend_effort_locator?: string; backend_requested_effort?: string }>(
     "/implement",
     { repo_full_name: input.repo_full_name, base_sha: input.base_sha, work_item: input.work_item, worker_product: input.worker_product },
     SURFACE_BUDGETS.implement,
   );
   const { cas_key: bundle_cas_key } = await client.putBlob(Buffer.from(impl.bundle_b64, "base64"));
-  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_provider, "WORKER", impl.backend_model, impl.backend_locator);
+  const backendEvidence = await submitBackendExecution(input.work_run_ref, input.step_ordinal, impl.backend_provider, "WORKER", impl.backend_model, impl.backend_locator, impl.backend_effort, impl.backend_effort_locator, impl.backend_requested_effort);
 
   const workStep = await submitWorkStep({
     work_run_ref: input.work_run_ref,
@@ -332,6 +332,9 @@ export async function submitBackendExecution(
   surface_role: "WORKER" | "REVIEWER" | "PLANNER",
   model?: string,
   locator?: string,
+  effort?: string,
+  effort_locator?: string,
+  requested_effort?: string,
 ): Promise<string> {
   // The BACKEND_EXECUTION producer_ref is `backend-scan:<provider>`, so the token must authenticate
   // as that exact producer (the kernel refuses a producer/principal mismatch, fail closed). Select
@@ -351,6 +354,9 @@ export async function submitBackendExecution(
     ],
     model,
     locator,
+    effort,
+    effort_locator,
+    requested_effort,
   });
 }
 
@@ -553,7 +559,7 @@ export async function reviewCandidate(input: {
   // The broker fresh-clones the candidate and runs the second-surface reviewer (measured #90:
   // claude plan-mode; #149: per-provider read-only profile) inside the isolated reviewer container
   // over the exact committed diff; it returns the verdict, a short reason, and the raw stdout.
-  const rv = await brokerCall<{ verdict: string; reason: string; stdout: string; backend_model?: string; backend_locator?: string }>(
+  const rv = await brokerCall<{ verdict: string; reason: string; stdout: string; backend_model?: string; backend_locator?: string; backend_effort?: string; backend_effort_locator?: string; backend_requested_effort?: string }>(
     "/review",
     { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item, review_product: reviewProvider },
     SURFACE_BUDGETS.review,
@@ -565,6 +571,9 @@ export async function reviewCandidate(input: {
     "REVIEWER",
     rv.backend_model,
     rv.backend_locator,
+    rv.backend_effort,
+    rv.backend_effort_locator,
+    rv.backend_requested_effort,
   );
   const envelope = await reviewer.submitEvidence({
     evidence_kind: "REVIEW",

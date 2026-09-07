@@ -108,6 +108,9 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
   bundle_b64: string;
   backend_model?: string;
   backend_locator?: string;
+  backend_effort?: string;
+  backend_effort_locator?: string;
+  backend_requested_effort?: string;
   backend_provider: WorkerProvider;
 }> {
   // Deliberately precedes even the docker availability probe: invalid/missing selection has no
@@ -172,7 +175,7 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
     const bundle_b64 = readFileSync(bundlePath).toString("base64");
 
     const backend = scanBackendModel(profile, sessionsDir, workerRun.stdout, `${provider}-worker-stdout`);
-    return { candidate_sha, bundle_b64, backend_provider: provider, backend_model: backend.model, backend_locator: backend.locator };
+    return { candidate_sha, bundle_b64, backend_provider: provider, backend_model: backend.model, backend_locator: backend.locator, backend_effort: backend.effort, backend_effort_locator: backend.effort_locator, backend_requested_effort: profile.requested_effort };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -232,36 +235,46 @@ export function preserveFailedSession(sessionsDir: string, run: { status: number
  * `"model":"…"`, grok `"model_id":"…"`), so the scan itself is surface/provider-independent.
  */
 export function scanBackendModel(
-  profile: { readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string } },
+  profile: {
+    readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string };
+    readonly effort_scan?: { readonly session_regex: string; readonly stdout_regex: string };
+  },
   sessionsDir: string,
   stdout: string,
   stdoutLocator = "surface-stdout",
-): { model?: string; locator?: string } {
-  const spec = profile.model_scan;
-  if (spec === undefined) return {}; // format not measured for this provider → UNKNOWN
-  let model: string | undefined;
-  let locator: string | undefined;
-  const sessionRe = new RegExp(spec.session_regex, "u");
-  const scan = (file: string): void => {
-    const content = readFileSync(file, "utf8");
-    const m = sessionRe.exec(content);
-    if (m !== null && m[1] !== undefined) { model = m[1]; locator = `${file}#offset=${m.index}`; }
-  };
-  try {
-    const walk = (d: string): void => {
-      for (const entry of readdirSync(d)) {
-        const p = join(d, entry);
-        if (statSync(p).isDirectory()) walk(p);
-        else if (model === undefined && (entry.endsWith(".jsonl") || entry.endsWith(".json"))) scan(p);
-      }
+): { model?: string; locator?: string; effort?: string; effort_locator?: string } {
+  const scanFact = (spec: { readonly session_regex: string; readonly stdout_regex: string } | undefined): { value?: string; locator?: string } => {
+    if (spec === undefined) return {}; // format not measured for this profile → UNKNOWN
+    let value: string | undefined;
+    let locator: string | undefined;
+    const sessionRe = new RegExp(spec.session_regex, "u");
+    const scan = (file: string): void => {
+      const content = readFileSync(file, "utf8");
+      const m = sessionRe.exec(content);
+      if (m !== null && m[1] !== undefined) { value = m[1]; locator = `${file}#offset=${m.index}`; }
     };
-    if (existsSync(sessionsDir)) walk(sessionsDir);
-  } catch { /* absent facts stay UNKNOWN */ }
-  if (model === undefined) {
-    const m = new RegExp(spec.stdout_regex, "u").exec(stdout);
-    if (m !== null) { model = m[1]; locator = `${stdoutLocator}#pattern=${spec.stdout_regex}`; }
-  }
-  return { model, locator };
+    try {
+      const walk = (d: string): void => {
+        for (const entry of readdirSync(d)) {
+          const p = join(d, entry);
+          if (statSync(p).isDirectory()) walk(p);
+          else if (value === undefined && (entry.endsWith(".jsonl") || entry.endsWith(".json"))) scan(p);
+        }
+      };
+      if (existsSync(sessionsDir)) walk(sessionsDir);
+    } catch { /* absent facts stay UNKNOWN */ }
+    if (value === undefined) {
+      const m = new RegExp(spec.stdout_regex, "u").exec(stdout);
+      if (m !== null && m[1] !== undefined) { value = m[1]; locator = `${stdoutLocator}#pattern=${spec.stdout_regex}`; }
+    }
+    return { value, locator };
+  };
+  const model = scanFact(profile.model_scan);
+  const effort = scanFact(profile.effort_scan);
+  return {
+    ...(model.value !== undefined ? { model: model.value, locator: model.locator } : {}),
+    ...(effort.value !== undefined ? { effort: effort.value, effort_locator: effort.locator } : {}),
+  };
 }
 
 // ------------------------------------------------------------------ /verify
@@ -365,6 +378,9 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
   stdout: string;
   backend_model?: string;
   backend_locator?: string;
+  backend_effort?: string;
+  backend_effort_locator?: string;
+  backend_requested_effort?: string;
 }> {
   // Unknown review_product fails closed with no filesystem, process, docker, or network side
   // effect. An omitted selection keeps the measured claude path (byte-identical argv).
@@ -409,7 +425,7 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // output glues narration to the verdict, so it runs under --json-schema instead).
     const { verdict, reason } = parseReviewVerdict(provider, review.stdout);
     const backend = scanBackendModel(profile, sessionsDir, review.stdout, `${provider}-reviewer-stdout`);
-    return { verdict, reason, stdout: review.stdout, backend_model: backend.model, backend_locator: backend.locator };
+    return { verdict, reason, stdout: review.stdout, backend_model: backend.model, backend_locator: backend.locator, backend_effort: backend.effort, backend_effort_locator: backend.effort_locator, backend_requested_effort: profile.requested_effort };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -428,6 +444,9 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
   stdout_digest: string;
   backend_model?: string;
   backend_locator?: string;
+  backend_effort?: string;
+  backend_effort_locator?: string;
+  backend_requested_effort?: string;
 }> {
   // Unknown plan_product fails closed with no filesystem, process, docker, or network side
   // effect. An omitted selection keeps the measured claude path (byte-identical argv).
@@ -464,6 +483,9 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
       stdout_digest: sha256(run.stdout),
       backend_model: backend.model,
       backend_locator: backend.locator,
+      backend_effort: backend.effort,
+      backend_effort_locator: backend.effort_locator,
+      backend_requested_effort: profile.requested_effort,
     };
   } finally {
     rmSync(base, { recursive: true, force: true });
