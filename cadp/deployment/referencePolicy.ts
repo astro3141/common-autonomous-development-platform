@@ -311,6 +311,18 @@ outcome := "REQUIRE_EVIDENCE" if {
 	not intake_nonindex_denied
 }
 
+# Deployment actuation always changes the running gate machinery and therefore always requires
+# an exactly-scoped Human decision. agent_merge_ok is deliberately merge-only (AD3).
+outcome := "ALLOW" if {
+	op == "DEPLOY"
+	human_ok
+}
+
+outcome := "REQUIRE_EVIDENCE" if {
+	op == "DEPLOY"
+	not human_ok
+}
+
 # cadp.improvement-intake.v1 index-only projection (Option A, §6): the FIRST of the two exceptions
 # to the unresolved-CONTRACT_* mutation prohibition.
 outcome := "ALLOW" if finding_project_ok
@@ -405,6 +417,11 @@ reason_codes contains "agent_merge_not_independent" if {
 
 reason_codes contains "HUMAN_DECISION" if {
 	op == "POLICY_ACTIVATE"
+	not human_ok
+}
+
+reason_codes contains "HUMAN_DECISION" if {
+	op == "DEPLOY"
 	not human_ok
 }
 
@@ -1425,7 +1442,7 @@ export function buildReferenceKernelConfig(input: ReferencePolicyInput): KernelC
     attestation_keys: [],
     identity_registry: input.identity_registry ?? REFERENCE_IDENTITIES,
     adapter_registry: input.adapter_registry ?? REFERENCE_ADAPTERS,
-    allocation_purposes: ["work-start", "git-push", "pr-create", "pr-merge", "record-write", "policy-activate", "finding-project", "finding-seal"],
+    allocation_purposes: ["work-start", "git-push", "pr-create", "pr-merge", "record-write", "policy-activate", "deploy", "finding-project", "finding-seal"],
     decision_ttl_s: 1800,
     dispatch_window_s: 120,
     identity_probe_max_age_s: 600,
