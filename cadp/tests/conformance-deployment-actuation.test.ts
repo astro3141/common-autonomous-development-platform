@@ -16,6 +16,7 @@ import { startKernelApi } from "../kernel/api.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 import { PRINCIPALS, makeHarness, stopSharedOpa } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
+import type { ComponentIdentity, ComponentRunner, DeployableComponent } from "../live/componentControl.ts";
 
 after(() => stopSharedOpa());
 
@@ -189,19 +190,66 @@ test("DEPLOY pre-K6 refuses unmerged/diverged ancestry and checkout drift withou
   } finally { h.close(); }
 });
 
-test("DEPLOY admits main itself through scripted compare and pin reads, but item 2 still cannot dispatch", async () => {
+test("DEPLOY admits main itself through scripted compare and pin reads; an unconfigured actuator fails closed", async () => {
   const h = await makeHarness();
   try {
     const adapter = pinnedAdapter(h, "identical");
     const material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
     await adapter.verify_material(DEPLOY_OPERATION, material);
     assert.equal(await adapter.dispatch_precondition_read(DEPLOY_OPERATION, material), undefined);
-    await assert.rejects(
-      adapter.dispatch("effect", 1, {
+    const result = await adapter.dispatch("effect", 1, {
         authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
-      }, DEPLOY_OPERATION, material),
-      /outside TD §20\.6 items 1-2/,
-    );
+      }, DEPLOY_OPERATION, material);
+    assert.equal(result.kind, "AMBIGUOUS");
+  } finally { h.close(); }
+});
+
+class FakeComponentRunner implements ComponentRunner {
+  readonly calls: string[] = [];
+  readonly identities = new Map<DeployableComponent, ComponentIdentity>();
+  nextPid = 9000;
+  readonly nextSha: string;
+  constructor(nextSha: string) { this.nextSha = nextSha; }
+  observe(name: DeployableComponent): ComponentIdentity { this.calls.push(`observe:${name}`); return { ...this.identities.get(name)! }; }
+  kill(name: DeployableComponent): void { this.calls.push(`kill:${name}`); }
+  start(name: DeployableComponent): void {
+    this.calls.push(`start:${name}`);
+    const old = this.identities.get(name)!;
+    this.identities.set(name, { code_sha: this.nextSha, image_digest: old.image_digest, pid: ++this.nextPid });
+  }
+}
+
+test("DEPLOY dispatch restarts each named component and binds prior and next identities in the COMMITTED receipt", async () => {
+  const h = await makeHarness();
+  try {
+    const fake = new FakeComponentRunner(SHA);
+    const brokerPrior = { code_sha: "b".repeat(40), image_digest: "sha256:surface", pid: 101 };
+    const workerPrior = { code_sha: "b".repeat(40), image_digest: "sha256:surface", pid: 102 };
+    fake.identities.set("broker", brokerPrior); fake.identities.set("worker", workerPrior);
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, fake);
+    const material = { repo_id: REPO_ID, sha: SHA, components: ["broker", "worker"], expected_prior: { broker: brokerPrior, worker: workerPrior } };
+    const result = await adapter.dispatch("effect-committed", 1, { authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live" }, DEPLOY_OPERATION, material);
+    assert.equal(result.kind, "ACCEPTED");
+    if (result.kind !== "ACCEPTED") return;
+    const rows = result.receipt_claim["components"] as Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }>;
+    assert.deepEqual(rows.map((row) => row.prior), [brokerPrior, workerPrior]);
+    assert.ok(rows.every((row) => row.next.code_sha === material.sha && row.next.pid >= 9001));
+    assert.deepEqual(fake.calls, ["observe:broker", "observe:worker", "kill:broker", "start:broker", "observe:broker", "kill:worker", "start:worker", "observe:worker"]);
+    assert.equal(adapter.receipt_binds(DEPLOY_OPERATION, material, result.receipt_claim), true);
+  } finally { h.close(); }
+});
+
+test("DEPLOY expected_prior CAS mismatch is REJECTED_NO_EFFECT and leaves every original pid running untouched", async () => {
+  const h = await makeHarness();
+  try {
+    const fake = new FakeComponentRunner(SHA);
+    fake.identities.set("broker", { code_sha: "b".repeat(40), image_digest: "sha256:surface", pid: 201 });
+    fake.identities.set("worker", { code_sha: "b".repeat(40), image_digest: "sha256:surface", pid: 202 });
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, fake);
+    const result = await adapter.dispatch("effect-rejected", 1, { authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live" }, DEPLOY_OPERATION, { repo_id: REPO_ID, sha: SHA, components: ["broker", "worker"], expected_prior: { broker: { code_sha: "c".repeat(40), image_digest: "sha256:surface", pid: 201 }, worker: fake.identities.get("worker")! } });
+    assert.equal(result.kind, "REJECTED_NO_EFFECT");
+    assert.deepEqual([...fake.identities.values()].map((identity) => identity.pid), [201, 202]);
+    assert.deepEqual(fake.calls, ["observe:broker", "observe:worker"], "all identities are CAS-checked before the first kill");
   } finally { h.close(); }
 });
 

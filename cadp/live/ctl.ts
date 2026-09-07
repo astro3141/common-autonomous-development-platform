@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 
 import { loadManifest, spawnComponent, spawnComponentSandboxed } from "./env.ts";
+import { killComponent as sharedKillComponent, startComponent as sharedStartComponent } from "./componentControl.ts";
 import { buildWorkerSandbox, workerProfileDigest, WORKER_ARGV_PREFIX } from "../product/workerProfile.ts";
 import { claudeProviderToken, createEgressBoundary, dockerAvailable, imageIdentity, runReviewer, runVerifier, runWorker } from "../product/isolation.ts";
 import type { IsolationConfig } from "../product/isolation.ts";
@@ -43,6 +44,8 @@ function client(principal: string): KernelClient {
 }
 
 function killComponent(name: string): void {
+  return sharedKillComponent(dir, name);
+  /* legacy body retained below only until the surrounding ctl surfaces are split further */
   const pidFile = join(dir, `${name}.pid`);
   if (!existsSync(pidFile)) return console.log(JSON.stringify({ [name]: "no pid file" }));
   const pid = Number(readFileSync(pidFile, "utf8").trim());
@@ -67,6 +70,9 @@ async function waitHttp(url: string, tries = 100): Promise<void> {
 }
 
 function startComponent(name: string): void {
+  sharedStartComponent(dir, name);
+  return;
+  /* legacy body retained below only until the surrounding ctl surfaces are split further */
   const m = manifest();
   const repoRoot = join(import.meta.dirname, "..", "..");
   switch (name) {

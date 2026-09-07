@@ -1,8 +1,5 @@
 /**
- * Deployment-actuation TargetAdapterV1 (TD §20.3, implementation item 1).
- *
- * This item deliberately exposes no actuator. It only declares DEPLOY, reports whether the
- * pre-deploy attestations are usable, and validates the closed cadp.deploy.v1 material.
+ * Deployment-actuation TargetAdapterV1 (TD §20.3-20.4).
  */
 
 import { execFile } from "node:child_process";
@@ -14,8 +11,9 @@ import { Cas } from "../cas.ts";
 import { ConstitutionalStore } from "../store.ts";
 import { MaterialIncomplete } from "./types.ts";
 import type {
-  AdapterOperation, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
+  AdapterOperation, DispatchResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
 } from "./types.ts";
+import type { ComponentIdentity, ComponentRunner, DeployableComponent } from "../../live/componentControl.ts";
 
 export const DEPLOY_OPERATION = "DEPLOY" as const;
 export const DEPLOY_MATERIAL_SCHEMA = "cadp.deploy.v1" as const;
@@ -83,6 +81,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
   readonly repoId: string | undefined;
   readonly clock: () => number;
   readonly preconditionReads: DeploymentPreconditionReads | undefined;
+  readonly runner: ComponentRunner | undefined;
 
   constructor(
     store: ConstitutionalStore,
@@ -90,12 +89,14 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     repoId: string | undefined,
     clock: () => number,
     preconditionReads?: DeploymentPreconditionReads,
+    runner?: ComponentRunner,
   ) {
     this.store = store;
     this.cas = cas;
     this.repoId = repoId;
     this.clock = clock;
     this.preconditionReads = preconditionReads;
+    this.runner = runner;
   }
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -219,13 +220,42 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     return undefined;
   }
 
-  async dispatch(_effect: string, _ordinal: number, _target: TargetRef, operation: string): Promise<never> {
-    throw new Error(`${operation} dispatch is outside TD §20.6 items 1-2`);
+  async dispatch(effect: string, ordinal: number, _target: TargetRef, operation: string, material: Record<string, unknown>): Promise<DispatchResult> {
+    if (operation !== DEPLOY_OPERATION || this.runner === undefined) {
+      return { kind: "AMBIGUOUS", raw_observation: `${operation} actuator unavailable` };
+    }
+    const components = material["components"] as DeployableComponent[];
+    const prior = new Map<DeployableComponent, ComponentIdentity>();
+    for (const component of components) prior.set(component, this.runner.observe(component));
+
+    const expected = material["expected_prior"] as Record<string, Record<string, unknown>> | undefined;
+    if (expected !== undefined) {
+      for (const component of components) {
+        const observed = prior.get(component)!;
+        const claimed = expected[component]!;
+        const mismatch = Object.entries(claimed).some(([key, value]) => observed[key as keyof ComponentIdentity] !== value);
+        if (mismatch) return { kind: "REJECTED_NO_EFFECT", proof_claim: { reason: "EXPECTED_PRIOR_MISMATCH", component, expected: claimed, observed } };
+      }
+    }
+
+    const receipt: Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }> = [];
+    for (const component of components) {
+      this.runner.kill(component);
+      this.runner.start(component);
+      const next = this.runner.observe(component);
+      receipt.push({ component, prior: prior.get(component)!, next });
+    }
+    return { kind: "ACCEPTED", target_operation_ref: `deploy:${effect}:${ordinal}`, receipt_claim: { components: receipt } };
   }
 
   async reconcile(): Promise<never> {
-    throw new Error("DEPLOY reconciliation is outside TD §20.6 item 1");
+    throw new Error("DEPLOY reconciliation-attest is outside TD §20.6 item 4");
   }
 
-  receipt_binds(): boolean { return false; }
+  receipt_binds(operation: string, material: Record<string, unknown>, receipt: Record<string, unknown>): boolean {
+    if (operation !== DEPLOY_OPERATION || !Array.isArray(receipt["components"])) return false;
+    const names = material["components"] as string[];
+    const rows = receipt["components"] as Array<Record<string, unknown>>;
+    return rows.length === names.length && names.every((name) => rows.some((row) => row["component"] === name && (row["next"] as Record<string, unknown> | undefined)?.["code_sha"] === material["sha"]));
+  }
 }
