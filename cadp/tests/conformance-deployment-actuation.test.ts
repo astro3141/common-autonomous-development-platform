@@ -14,7 +14,7 @@ import { resolveActivePolicy } from "../kernel/policyState.ts";
 import { nowIso } from "../kernel/canonical.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
-import { PRINCIPALS, makeHarness, stopSharedOpa } from "./support/harness.ts";
+import { PRINCIPALS, makeHarness, runChain, sealScriptedRequest, stopSharedOpa } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import type { ComponentIdentity, DeploymentComponentRunner } from "../kernel/adapters/deploymentActuation.ts";
 
@@ -53,6 +53,31 @@ function sealImmutability(h: Awaited<ReturnType<typeof makeHarness>>, passing = 
     },
     PRINCIPALS.depctlTarget,
   );
+}
+
+function sealPostDeployAttest(h: Harness, effectId: string, reachPassing = true): void {
+  h.ingress.submitEvidence({
+    evidence_kind: "CREDENTIAL_REACH_ATTESTATION",
+    subject_bindings: [
+      { authority_ref: "cadp-store:k04", namespace: "deployment", object_id: "cadp-v04-live" },
+      { authority_ref: "cadp-store:k04", namespace: "effect", object_id: effectId },
+    ],
+    availability: "PRESENT", claim_schema: "cadp.credential-reach.v1",
+    claim: { alternate_path_found: !reachPassing, probes: [{ target: "scripted", result: reachPassing ? "http 000" : "http 200" }], network_policy_digest: "scripted", secret_acl_digest: "scripted" },
+    producer_ref: "deployment-control-probe", source_ref: "scripted deployment-control probe",
+    source_relation: "INDEPENDENT_OBSERVATION",
+  }, PRINCIPALS.depctlProbe);
+  h.ingress.submitEvidence({
+    evidence_kind: "TARGET_IMMUTABILITY_ATTESTATION",
+    subject_bindings: [
+      { authority_ref: "github.com", namespace: "GIT_REPOSITORY", object_id: REPO_ID },
+      { authority_ref: "cadp-store:k04", namespace: "effect", object_id: effectId },
+    ],
+    availability: "PRESENT", claim_schema: "cadp.target-immutability.v1",
+    claim: { write_once_enforced: true, negative_probe: { scripted: true } },
+    producer_ref: "deployment-control-target", source_ref: "scripted target authority",
+    source_relation: "TARGET_AUTHORITY_OBSERVATION",
+  }, PRINCIPALS.depctlTarget);
 }
 
 let deployStep = 2000;
@@ -265,25 +290,39 @@ function fakeRunner(initial: Record<string, ComponentIdentity>, nextPid = 9000):
   };
 }
 
-test("DEPLOY dispatch restarts named components and receipts bind prior and next identities", async () => {
+test("DEPLOY dispatch remains UNKNOWN until reconcile invokes scripted post-deploy attest", async () => {
   const h = await makeHarness();
   try {
     const runner = fakeRunner({ broker: priorBroker, worker: priorWorker });
+    const effectId = "effect-committed-path";
+    const admittedAt = new Date(h.clock.now).toISOString();
+    let attestCalls = 0;
     const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, {
       compareToMain: async () => ({ status_code: 200, compare_status: "identical" }),
       checkout: async () => ({ head: SHA, porcelain: "" }),
-    }, runner);
+    }, runner, async (boundEffectId) => {
+      attestCalls += 1;
+      assert.equal(boundEffectId, effectId);
+      sealPostDeployAttest(h, boundEffectId);
+    });
     const material = deployMaterial(["broker", "worker"]);
     await adapter.verify_material(DEPLOY_OPERATION, material);
-    const result = await adapter.dispatch("effect-committed-path", 1, {
+    const result = await adapter.dispatch(effectId, 1, {
       authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
     }, DEPLOY_OPERATION, material);
-    assert.equal(result.kind, "ACCEPTED");
+    assert.equal(result.kind, "AMBIGUOUS", "pid-start is transport acceptance, never COMMITTED");
     assert.deepEqual(runner.calls, [
       "observe:broker", "observe:worker", "kill:broker", "start:broker", "observe:broker",
       "kill:worker", "start:worker", "observe:worker",
     ]);
-    const receipt = (result as { receipt_claim: Record<string, unknown> }).receipt_claim;
+    h.clock.now += 1;
+    const reconciled = await adapter.reconcile(effectId, 1, {
+      authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
+    }, DEPLOY_OPERATION, material, { admitted_at: admittedAt });
+    assert.equal(attestCalls, 1);
+    assert.equal(reconciled.kind, "COMMITTED");
+    if (reconciled.kind !== "COMMITTED") return;
+    const receipt = reconciled.receipt_claim;
     assert.equal(adapter.receipt_binds(DEPLOY_OPERATION, material, receipt), true);
     const rows = receipt.components as Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }>;
     assert.deepEqual(rows.find((row) => row.component === "broker")!.prior, priorBroker);
@@ -294,6 +333,48 @@ test("DEPLOY dispatch restarts named components and receipts bind prior and next
     }
   } finally { h.close(); }
 });
+
+test("withholding post-deploy envelopes leaves DEPLOY reconciliation not COMMITTED", async () => {
+  const h = await makeHarness();
+  try {
+    const runner = fakeRunner({ broker: priorBroker });
+    const material = deployMaterial();
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, runner, async () => {});
+    const admittedAt = new Date(h.clock.now).toISOString();
+    await adapter.dispatch("deploy-withheld", 1, adapterTarget(), DEPLOY_OPERATION, material);
+    h.clock.now += 1;
+    const result = await adapter.reconcile("deploy-withheld", 1, adapterTarget(), DEPLOY_OPERATION, material, { admitted_at: admittedAt });
+    assert.equal(result.kind, "UNKNOWN");
+  } finally { h.close(); }
+});
+
+test("a failing reach attest after restart cannot commit and recheck #8 refuses an ordinary admission", async () => {
+  const h = await makeHarness();
+  try {
+    const runner = fakeRunner({ broker: priorBroker });
+    const material = deployMaterial();
+    const admittedAt = new Date(h.clock.now).toISOString();
+    await new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, runner)
+      .dispatch("deploy-failing", 1, adapterTarget(), DEPLOY_OPERATION, material);
+    h.clock.now += 1;
+    // A new adapter instance models kernel restart; its injected invocation runs no real probe.
+    const restarted = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, runner, async (effectId) => {
+      sealPostDeployAttest(h, effectId, false);
+    });
+    const result = await restarted.reconcile("deploy-failing", 1, adapterTarget(), DEPLOY_OPERATION, material, { admitted_at: admittedAt });
+    assert.equal(result.kind, "UNKNOWN");
+
+    await h.sealTargetIdentity();
+    const { request } = sealScriptedRequest(h);
+    const ordinary = await runChain(h, request.effect_id);
+    assert.equal(ordinary.admitted?.kind, "REFUSAL");
+    if (ordinary.admitted?.kind === "REFUSAL") assert.equal(ordinary.admitted.reason, "ALTERNATE_CREDENTIAL_PATH_FOUND");
+  } finally { h.close(); }
+});
+
+function adapterTarget() {
+  return { authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live" } as const;
+}
 
 test("DEPLOY expected_prior mismatch is REJECTED_NO_EFFECT before any kill or start", async () => {
   const h = await makeHarness();
