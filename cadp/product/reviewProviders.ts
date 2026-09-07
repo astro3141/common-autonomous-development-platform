@@ -21,6 +21,18 @@ export interface ReviewProviderProfile {
    */
   readonly argv_template: readonly string[];
   readonly auth_method: ReviewAuthMethod;
+  /** Session fields stay absent until this review argv is measured in a live container probe. */
+  readonly sessions_subdir?: string;
+  readonly sessions_container_dir?: string;
+  readonly model_scan?: { readonly session_regex: string; readonly stdout_regex: string };
+  /** Requested reasoning effort; valid only when paired with a measured `effort_argv`. */
+  readonly requested_effort?: string;
+  readonly effort_argv?: {
+    readonly flag: string;
+    readonly value_placement: "separate" | "equals";
+    readonly allowed_values: readonly string[];
+  };
+  readonly effort_scan?: { readonly session_regex: string; readonly stdout_regex: string };
   /**
    * `identity_class.product` (TD §8.4). Policy independence is `identity_class.product ≠` the
    * implementer's product; this string is the product-side declaration of that class. Adapters
@@ -108,7 +120,14 @@ export function reviewArgv(provider: ReviewProvider, diff_prompt: string): strin
 
 /** Pure, fail-closed provider-name validation. Never defaults silently. */
 export function resolveReviewProvider(name: string): ReviewProvider {
-  if (Object.prototype.hasOwnProperty.call(REVIEW_PROVIDERS, name)) return name as ReviewProvider;
+  if (Object.prototype.hasOwnProperty.call(REVIEW_PROVIDERS, name)) {
+    const provider = name as ReviewProvider;
+    const profile = REVIEW_PROVIDERS[provider];
+    if ((profile.requested_effort === undefined) !== (profile.effort_argv === undefined)) {
+      throw new Error(`review provider ${name} has an unpaired requested_effort/effort_argv configuration`);
+    }
+    return provider;
+  }
   throw new Error(`unknown review provider: ${name}`);
 }
 
