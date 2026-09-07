@@ -61,16 +61,15 @@ test("DEPLOY availability uses only the injected clock and flips exactly after t
   try {
     h.sealReach();
     sealImmutability(h, true);
-    const adapter = adapterFor(h);
     const reach = h.store.latestEvidenceOfKind("CREDENTIAL_REACH_ATTESTATION")!;
     const config = resolveActivePolicy(h.store, h.cas).config;
     const boundary = Date.parse(reach.produced_at) + config.reach_attestation_max_age_s * 1000;
+    let now = boundary;
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, () => now);
 
-    // h.clock.fn advances the harness clock by one millisecond per observation. Set it one
-    // millisecond before the bound so the adapter observes the exact inclusive boundary.
-    h.clock.now = boundary - 1;
+    // The freshness predicate is inclusive at the exact boundary.
     assert.equal(adapter.describe().operations[0]!.available, true, "age == max_age is fresh");
-    h.clock.now = boundary;
+    now = boundary + 1;
     assert.equal(adapter.describe().operations[0]!.available, false, "age == max_age + 1ms is stale");
   } finally { h.close(); }
 });
