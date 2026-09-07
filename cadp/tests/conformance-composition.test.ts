@@ -21,6 +21,7 @@ import {
 } from "../product/improvement/transition.ts";
 import { nextId } from "./support/transition.ts";
 import { developmentEvidenceRefs } from "../product/developmentEvidence.ts";
+import { DEPLOYMENT_ACTUATION_TARGET_TYPE } from "../kernel/adapters/deploymentActuation.ts";
 
 after(() => stopSharedOpa());
 
@@ -49,10 +50,22 @@ const MINIMAL_CONFIG: KernelServiceConfig = {
   pep_ref: PEP_REF,
 };
 
+test("TD §20.6 item 1: production composition registers deployment actuation fail-closed", async () => {
+  const h = await makeHarness();
+  try {
+    const rows = composeTargetAdapters(MINIMAL_CONFIG, h, h.clock.fn)
+      .filter((adapter) => adapter.describe().target_type === DEPLOYMENT_ACTUATION_TARGET_TYPE);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.describe().operations[0]!.operation_kind, "DEPLOY");
+    assert.equal(rows[0]!.describe().operations[0]!.material_schema, "cadp.deploy.v1");
+    assert.equal(rows[0]!.describe().operations[0]!.available, false, "no configured repo/attestations");
+  } finally { h.close(); }
+});
+
 test("FC22: the production composition root registers the governed FINDING_SEAL target", async () => {
   const h = await makeHarness();
   try {
-    const registry = makeAdapterRegistry(composeTargetAdapters(MINIMAL_CONFIG, h));
+    const registry = makeAdapterRegistry(composeTargetAdapters(MINIMAL_CONFIG, h, h.clock.fn));
     const adapter = registry.byTarget(findingSealTargetRef());
     assert.ok(adapter !== undefined, "a deployed kernel must resolve an adapter for the EVIDENCE_SEAL target");
 
@@ -70,7 +83,7 @@ test("FC22: the governed row is always-on — no external credential block gates
   const h = await makeHarness();
   try {
     const governedRows = (config: KernelServiceConfig) =>
-      composeTargetAdapters(config, h).filter((a) => a.describe().target_type === FINDING_SEAL_TARGET_TYPE);
+      composeTargetAdapters(config, h, h.clock.fn).filter((a) => a.describe().target_type === FINDING_SEAL_TARGET_TYPE);
     // Exactly one row, with or without the optional blocks: never absent, never duplicated.
     assert.equal(governedRows(MINIMAL_CONFIG).length, 1);
     assert.equal(governedRows({ ...MINIMAL_CONFIG, temporal: { address: "localhost:7233", namespace: "cadp", horizon_s: 60 } }).length, 1);
@@ -82,7 +95,7 @@ test("FC22: the startKernelService identity probe covers the governed adapter", 
   const h = await makeHarness();
   try {
     // The probe loop body from `startKernelService`, run over the production list.
-    for (const adapter of composeTargetAdapters(MINIMAL_CONFIG, h)) {
+    for (const adapter of composeTargetAdapters(MINIMAL_CONFIG, h, h.clock.fn)) {
       await h.pep.refreshTargetIdentity(adapter);
     }
     const ref = findingSealTargetRef();
@@ -121,7 +134,7 @@ test("FC22 guard bite: dropping the governed row reproduces NO_ADAPTER_FOR_TARGE
       PRINCIPALS.workflow,
     );
 
-    const production = composeTargetAdapters(MINIMAL_CONFIG, h);
+    const production = composeTargetAdapters(MINIMAL_CONFIG, h, h.clock.fn);
     const bitten = production.filter((a) => a.describe().target_type !== FINDING_SEAL_TARGET_TYPE);
 
     // The exact pre-repair defect: a deployed kernel could not reach the governed path at all.
