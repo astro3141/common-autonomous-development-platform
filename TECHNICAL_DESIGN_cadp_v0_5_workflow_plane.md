@@ -10,7 +10,7 @@ How a workload worked is its orchestrator's business; the moment it changes the 
 | Scope | The Workflow Plane **boundary** only: effect client for external candidates, evidence submission, run-profile non-enrollment |
 | Non-scope | Everything inside any orchestrator (§2); the Authority Plane TD; the Execution Plane contract document |
 
-Probe rule: TD v0.4 §17.2's measurement-first discipline applies. Any capability claim not backed by a corpus or P0 measurement carries `[UNMEASURED — probe required]`. P0 below = the owner-run Conductor probe, run `24919dde`, 2026-09-07.
+Probe rule: TD v0.4 §17.2's measurement-first discipline applies. Any capability claim not backed by a corpus or P0 measurement carries `[UNMEASURED - probe required]`. P0 below = the owner-run Conductor probe, run `24919dde`, 2026-09-07.
 
 ## 1. Position and thinness rule
 
@@ -96,7 +96,7 @@ Non-enrollment is symmetric and policy-bound (Spec v0.5 §5.1): the active polic
 
 ### 5.3 Revisit conditions
 
-Enrollment could be revisited only on new measurement: `[UNMEASURED — probe required: a target-authoritative run receipt from the orchestrator — durable across normal completion, correlatable to a Platform-sealed WORK_START effect_id by a target-returned binding (memo-equivalent), and readable by the Reconciler after restart. Absent all three properties, K7 grading of a Conductor run scope remains impossible and non-enrollment stands.]`
+Enrollment could be revisited only on new measurement: `[UNMEASURED - probe required: a target-authoritative run receipt from the orchestrator — durable across normal completion, correlatable to a Platform-sealed WORK_START effect_id by a target-returned binding (memo-equivalent), and readable by the Reconciler after restart. Absent all three properties, K7 grading of a Conductor run scope remains impossible and non-enrollment stands.]`
 
 ## 6. Credential custody at the client (measured)
 
