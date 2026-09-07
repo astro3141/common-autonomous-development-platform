@@ -10,6 +10,10 @@
  */
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
 import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
@@ -18,7 +22,7 @@ import type { WorkProposalV1 } from "../product/planner.ts";
 import { IngressRejection } from "../kernel/ingress.ts";
 import type { KernelClient } from "../clients/kernelClient.ts";
 import type { EvidenceDraft } from "../kernel/ingress.ts";
-import { submitPlanEvidence } from "../live/ops.ts";
+import { sealPlan, submitPlanEvidence } from "../live/ops.ts";
 import { backendScanClient, backendScanPrincipal } from "../product/backendExecution.ts";
 
 after(() => stopSharedOpa());
@@ -182,5 +186,58 @@ test("PL5: planner sealing emits proposal and role-qualified backend siblings un
     });
     const observed = (backend.draft.claim as { observed: { model: { availability: string } } }).observed;
     assert.equal(observed.model.availability, "UNKNOWN", "unmeasured planner model remains UNKNOWN");
+  }
+});
+
+test("PL6: sealPlan constructs planner and backend-scan clients from the live manifest", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cadp-seal-plan-"));
+  const requests: Array<{ token: string; draft: EvidenceDraft }> = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const draft = JSON.parse(body) as EvidenceDraft;
+      requests.push({ token: req.headers.authorization?.replace("Bearer ", "") ?? "", draft });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ...draft,
+        evidence_id: `evidence-${requests.length}`,
+        envelope_digest: { alg: "sha256", value: String(requests.length).repeat(64) },
+        sealed_at: "2026-01-01T00:00:00.000Z",
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.notEqual(address, null);
+    assert.equal(typeof address, "object");
+    const api_url = `http://127.0.0.1:${(address as { port: number }).port}`;
+    mkdirSync(join(dir, "secret"));
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({
+      api_url, repo_full_name: "owner/repo", repo_id: "42", broker_port: 1, tokens: {},
+    }));
+    writeFileSync(join(dir, "secret", "workflow-token-map.json"), JSON.stringify({
+      "cadp-planner-grok": "planner-token",
+      "cadp-backend-scan-grok": "scan-token",
+    }));
+
+    const sealed = await sealPlan(dir, "split the work", "grok", {
+      resolve_base_sha: () => "a".repeat(40),
+      broker_plan: async () => ({ proposal: VALID, stdout_digest: "b".repeat(64) }),
+    });
+    assert.deepEqual(sealed, { proposal_evidence_id: "evidence-1", backend_evidence_id: "evidence-2", items: VALID.items, notes: VALID.notes });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0]!.token, "planner-token");
+    assert.equal(requests[0]!.draft.producer_ref, "planner:grok");
+    assert.equal(requests[1]!.token, "scan-token");
+    assert.equal(requests[1]!.draft.producer_ref, "backend-scan:grok");
+    assert.deepEqual(requests[1]!.draft.subject_bindings.at(-1), {
+      authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "PLANNER",
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(dir, { recursive: true, force: true });
   }
 });

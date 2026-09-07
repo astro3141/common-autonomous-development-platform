@@ -60,15 +60,23 @@ export function temporalNamespaceId(m: LiveEnvManifest): string {
  * the typed proposal as WORK_PROPOSAL evidence with exact provenance. The proposal confers no
  * authority — each item still enters through the ordinary governed WORK_START.
  */
-export async function sealPlan(dir: string, intent: string, planProduct?: string): Promise<{ proposal_evidence_id: string; backend_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
+export async function sealPlan(
+  dir: string,
+  intent: string,
+  planProduct?: string,
+  dependencies: {
+    resolve_base_sha?: typeof resolveBaseSha;
+    broker_plan?: typeof brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string }>;
+  } = {},
+): Promise<{ proposal_evidence_id: string; backend_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
   const m = loadManifest(dir);
   // plan_product select: fail closed on an unknown provider before any surface runs; omitted
   // keeps the claude default. Each provider submits under its OWN principal (honest attribution).
   const planProvider = resolvePlanProvider(planProduct !== undefined && planProduct !== "" ? planProduct : "claude");
   const planPrincipal = planProvider === "claude" ? "cadp-planner" : `cadp-planner-${planProvider}`;
   // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
-  const base_sha = resolveBaseSha(m.repo_full_name, "refs/heads/main");
-  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string }>(
+  const base_sha = (dependencies.resolve_base_sha ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main");
+  const result = await (dependencies.broker_plan ?? brokerPostJson)(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
     { repo_full_name: m.repo_full_name, base_sha, intent, plan_product: planProvider },
