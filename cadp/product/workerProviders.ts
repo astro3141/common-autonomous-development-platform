@@ -1,3 +1,5 @@
+import { appendRequestedEffort, type EffortArgvSpec } from "./effortArgv.ts";
+
 /** Closed set of worker CLI profiles supported by the product. */
 export type WorkerProvider = "codex" | "grok" | "claude";
 
@@ -48,6 +50,7 @@ export interface WorkerProviderProfile {
   readonly effort_argv?: {
     readonly flag: string;
     readonly value_placement: "separate" | "equals";
+    readonly value_prefix?: string;
     readonly allowed_values: readonly string[];
   };
   /** Measured session/stdout captures for the effort actually observed. */
@@ -65,6 +68,8 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     identity_class_product: "codex-cli",
     // Measured: codex writes rollout-*.jsonl with a "model":"..." field (#91).
     model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: "model:\\s*(\\S+)" },
+    // Measured session field; stdout uses the same-shape fallback contract as model_scan.
+    effort_scan: { session_regex: '"reasoning_effort"\\s*:\\s*"([^"]+)"', stdout_regex: '"reasoning_effort"\\s*:\\s*"([^"]+)"' },
   },
   grok: {
     // Measured live: `grok -p "<prompt>" --output-format streaming-json` authenticates from the
@@ -88,6 +93,8 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     // serving model; `updates.jsonl`'s `"modelId"` is the coarser alias). Headless stdout ends with
     // an `end` event carrying `"modelUsage":{"grok-4.6-build":{…}}` — the fallback capture.
     model_scan: { session_regex: '"model_id"\\s*:\\s*"([^"]+)"', stdout_regex: '"modelUsage":\\{"([^"]+)"' },
+    // Measured session field; stdout uses the same-shape fallback contract as model_scan.
+    effort_scan: { session_regex: '"reasoning_effort"\\s*:\\s*"([^"]+)"', stdout_regex: '"reasoning_effort"\\s*:\\s*"([^"]+)"' },
   },
   claude: {
     // Measured (2026-09-06 container probes): headless `claude -p <item> --permission-mode
@@ -104,12 +111,23 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     identity_class_product: "claude-code",
     // Measured: the session jsonl carries "model":"claude-sonnet-5" — same field shape as codex.
     model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' },
+    // Measured session field; stdout uses the same-shape fallback contract as model_scan.
+    effort_scan: { session_regex: '"effort"\\s*:\\s*"([^"]+)"', stdout_regex: '"effort"\\s*:\\s*"([^"]+)"' },
   },
+};
+
+/** Container-probe measurements available to a deployment that opts in with requested_effort. */
+export const WORKER_EFFORT_ARGV: Readonly<Record<WorkerProvider, EffortArgvSpec>> = {
+  grok: { flag: "--reasoning-effort", value_placement: "separate", allowed_values: ["high"] },
+  codex: { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] },
+  claude: { flag: "--effort", value_placement: "separate", allowed_values: ["high"] },
 };
 
 /** Build the full argv (binary + expanded template) for a provider + work item. */
 export function workerArgv(provider: WorkerProvider, work_item: string): string[] {
-  return [provider, ...WORKER_PROVIDERS[provider].argv_template.map((a) => (a === WORK_ITEM_SENTINEL ? work_item : a))];
+  const profile = WORKER_PROVIDERS[provider];
+  const argv = [provider, ...profile.argv_template.map((a) => (a === WORK_ITEM_SENTINEL ? work_item : a))];
+  return appendRequestedEffort(argv, profile, `worker provider ${provider}`);
 }
 
 /** Pure, fail-closed provider-name validation. */
@@ -117,9 +135,7 @@ export function resolveWorkerProvider(name: string): WorkerProvider {
   if (Object.prototype.hasOwnProperty.call(WORKER_PROVIDERS, name)) {
     const provider = name as WorkerProvider;
     const profile = WORKER_PROVIDERS[provider];
-    if ((profile.requested_effort === undefined) !== (profile.effort_argv === undefined)) {
-      throw new Error(`worker provider ${name} has an unpaired requested_effort/effort_argv configuration`);
-    }
+    appendRequestedEffort([], profile, `worker provider ${name}`);
     return provider;
   }
   throw new Error(`unknown worker provider: ${name}`);

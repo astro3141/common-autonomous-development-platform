@@ -29,6 +29,9 @@ export async function submitBackendExecutionEvidence(input: {
   subject_bindings: readonly SubjectBinding[];
   model?: string;
   locator?: string;
+  effort?: string;
+  effort_locator?: string;
+  requested_effort?: string;
 }): Promise<string> {
   const observed: Record<string, unknown> = {
     model:
@@ -38,7 +41,10 @@ export async function submitBackendExecutionEvidence(input: {
     provider: { availability: "PRESENT", value: input.provider, locator: "broker-response#backend_provider" },
     run_id: { availability: "UNKNOWN" },
     version: { availability: "UNKNOWN" },
-    effort: { availability: "UNKNOWN" },
+    effort:
+      input.effort !== undefined
+        ? { availability: "PRESENT", value: input.effort, locator: input.effort_locator }
+        : { availability: "UNKNOWN" },
   };
   const envelope = await input.client.submitEvidence({
     evidence_kind: "BACKEND_EXECUTION",
@@ -48,7 +54,7 @@ export async function submitBackendExecutionEvidence(input: {
     ],
     availability: "PRESENT",
     claim_schema: "cadp.backend.v1",
-    claim: { requested: { provider: input.provider, model: `${input.provider} default` }, observed },
+    claim: { requested: { provider: input.provider, model: `${input.provider} default`, ...(input.requested_effort !== undefined ? { effort: input.requested_effort } : {}) }, observed },
     producer_ref: `backend-scan:${input.provider}`,
     source_ref: `${input.provider} session log scan`,
     source_relation: "SELF_REPORT",

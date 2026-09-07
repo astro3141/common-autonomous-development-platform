@@ -83,7 +83,7 @@ export async function sealPlan(
   const planPrincipal = planProvider === "claude" ? "cadp-planner" : `cadp-planner-${planProvider}`;
   // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
   const base_sha = (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main");
-  const result = await (dependencies.broker ?? brokerPostJson)<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string }>(
+  const result = await (dependencies.broker ?? brokerPostJson)<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string; backend_effort?: string; backend_effort_locator?: string; backend_requested_effort?: string }>(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
     { repo_full_name: m.repo_full_name, base_sha, intent, plan_product: planProvider },
@@ -114,6 +114,9 @@ export async function sealPlan(
     subject_bindings: subjectBindings,
     model: result.backend_model,
     locator: result.backend_locator,
+    effort: result.backend_effort,
+    effort_locator: result.backend_effort_locator,
+    requested_effort: result.backend_requested_effort,
   });
   return {
     proposal_evidence_id: envelope.evidence_id,

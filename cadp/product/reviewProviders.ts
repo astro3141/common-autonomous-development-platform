@@ -1,3 +1,5 @@
+import { appendRequestedEffort } from "./effortArgv.ts";
+
 /** Closed set of reviewer CLI profiles supported by the product. */
 export type ReviewProvider = "claude" | "grok" | "codex";
 
@@ -30,6 +32,7 @@ export interface ReviewProviderProfile {
   readonly effort_argv?: {
     readonly flag: string;
     readonly value_placement: "separate" | "equals";
+    readonly value_prefix?: string;
     readonly allowed_values: readonly string[];
   };
   readonly effort_scan?: { readonly session_regex: string; readonly stdout_regex: string };
@@ -128,7 +131,9 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
 
 /** Build the full argv (binary + expanded template) for a provider + diff prompt. */
 export function reviewArgv(provider: ReviewProvider, diff_prompt: string): string[] {
-  return [provider, ...REVIEW_PROVIDERS[provider].argv_template.map((a) => (a === DIFF_PROMPT_SENTINEL ? diff_prompt : a))];
+  const profile = REVIEW_PROVIDERS[provider];
+  const argv = [provider, ...profile.argv_template.map((a) => (a === DIFF_PROMPT_SENTINEL ? diff_prompt : a))];
+  return appendRequestedEffort(argv, profile, `review provider ${provider}`);
 }
 
 /** Pure, fail-closed provider-name validation. Never defaults silently. */
@@ -136,9 +141,7 @@ export function resolveReviewProvider(name: string): ReviewProvider {
   if (Object.prototype.hasOwnProperty.call(REVIEW_PROVIDERS, name)) {
     const provider = name as ReviewProvider;
     const profile = REVIEW_PROVIDERS[provider];
-    if ((profile.requested_effort === undefined) !== (profile.effort_argv === undefined)) {
-      throw new Error(`review provider ${name} has an unpaired requested_effort/effort_argv configuration`);
-    }
+    appendRequestedEffort([], profile, `review provider ${name}`);
     return provider;
   }
   throw new Error(`unknown review provider: ${name}`);
