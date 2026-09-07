@@ -1287,3 +1287,142 @@ Independently reviewable items, in this order. Later items may depend on earlier
 6. **Rollback.** A second DEPLOY whose `sha` equals the first receipt's prior `code_sha` and whose `expected_prior` equals the first receipt's `next` is admitted under the same (a)(b)(c) rules and, on COMMITTED, restores that prior identity. Conformance: that sha still compare-ancestors `main`; a sha that is not an ancestor refuses.
 7. **Scheduled attest refresh.** deployment-control timer at half `reach_attestation_max_age_s` running `ctl attest`. Conformance: without the timer, #8 still refuses at `max_age` (no behaviour change if the schedule is omitted); with the timer, a new envelope appears inside the window and a failing probe is sealed as failing, not retried into a pass. Kernel `setInterval` identity probes are untouched and do not start submitting reach envelopes.
 
+---
+
+## 21. Pre-implementation work-item interrogation
+
+Product-layer design for a read-only interrogation step that sits **after `WORK_START` admission and before the first implement**. It is **not implemented here** and authorizes no production change. Implementation follows this design. This is not a kernel primitive. It does not add a K1–K7 record, does not change `identity_class` derivation (§9.1 / S2), and does not change the §8.4 independence predicate's inputs: it reuses that predicate so the interrogator product differs from the implementing worker product, the same way the reviewer already must.
+
+What this section owns is the missing cheap gate against a measured failure: ambiguity in a work item is today discovered at the most expensive point — after full implement / verify / review cycles.
+
+### 21.1 Measured failure
+
+Three live-pilot / self-host observations, same pattern, different surfaces.
+
+1. **Ambiguous README table, two full rounds, then reject.** Sequential `README.md`-only candidates on the Model providers section (`efc5779` / #168, then `8abf116` / #170 and `ba7427a` / #171) spent two complete implement → push → verify → review rounds (the P1 loop in `cadp/product/workflows.ts`) on a work item that did not say whether to extend the table, add prose, or which independence claim to write. The independent reviewer rejected the result. The question that would have changed the implementation — table vs prose, and which independence sentence — was cheap *before* any worker and expensive *after* two rounds.
+2. **CAS omit-to-skip, caught only post-implementation by the independent reviewer.** Recheck #15 / §6.6 completeness walks present `cas://` strings (`Pep.#casRefsIn`). Omitting a required CAS field is therefore not `MATERIAL_INCOMPLETE` — the walk skips it. An independent reviewer of the completeness implementation caught the hole after the worker had landed the walk. A work item that says "implement CAS completeness" without stating the omit case leaves that skip in the candidate; asking "does omitting a required CAS ref fail closed or skip?" would have changed the implementation and was not asked until review.
+3. **Wall-clock determinism, learned only from an external-verification failure.** GitHub Actions as the opt-in external verifier (§18): the 16th pilot cancelled `npm test` at the job's wall-clock ceiling; the 17th pilot failed closed because GitHub's second-precision timestamps (`…:50Z`) were not the K2 millisecond form, and `produced_at == claim.completed_at` did not hold. The requirement that verification and tests be wall-clock-deterministic (injected clock, normalized timestamps, no undeclared wall-clock ceiling) was learned from that independent-infrastructure failure, after local implement / verify / review had already passed.
+
+In all three, the work item was admitted, a worker spent a full surface budget, a candidate was pushed, and only then did an independent observer name the missing fact. Interrogation moves that observation to before the first implement.
+
+### 21.2 Design decision — the interrogation step
+
+One read-only surface invocation per opted-in development run, after `WORK_START` is `COMMITTED` and before `implementCandidate`. It is a Temporal activity, not a governed effect: like review and plan, it submits K2 evidence and consumes one `max_steps` ordinal; it never holds a credential and never reaches a governed target.
+
+**Surface.** Reviewer-class container (`runReviewer`, §8.3 / §17.2 / §19.3). Workspace is a fresh clone at the sealed `base_sha`, mounted `:ro`. Network, proxy, auth injection, and the measured read-only argv (plan-mode plus the grok `--tools` allow-list / claude `--disallowedTools` / codex `--sandbox read-only`) are the reviewer profile's, not the worker's. The grok worker `bypassPermissions` argv is forbidden here for the same reason it is forbidden on reviewer/planner. The prompt is interrogation-specific; the argv template is the selected reviewer profile's with the prompt substituted. **Requires a container probe before any new argv field is added** — guessing is the defect §17.2 exists to prevent. Unmeasured session/effort scan stays `UNKNOWN`.
+
+**Independence (§8.4, enforced twice, same machinery as review).** The interrogator product must differ from the implementing worker product. Reference this generation: reuse the run's `review_product` (already asserted independent of `worker_product` by `assertReviewIndependence` at `startWork`, before any kernel row — §17.4). No third product selection and no extra auto-dev argument for an interrogate-product. The kernel check is the same predicate on sealed evidence: `identity_class.product` of the interrogation envelope ≠ every implementer's class. A same-product pair is refused at entry when the flag is on, exactly as grok-reviews-grok is refused today. A dedicated `interrogator:<product>` principal is a later split, not this landing: reusing `reviewer:<product>` avoids the measured new-principal / already-minted-token trap (§20.1, env minted before `cadp-reviewer-grok`).
+
+**Input.** The exact admitted work item (the `WORK_START` material / workflow args `development.work_item`) plus the checkout at `base_sha`. No candidate exists yet; the surface does not see a diff.
+
+**Closed verdict.** The surface returns **exactly one** of:
+
+```text
+PROCEED
+AMBIGUOUS     { questions[1..N] }
+CONTRADICTS_TD { td_refs[1..N] }
+```
+
+Anything else — prose, mixed verdicts, unknown keys, a verdict with the wrong payload — is a parse failure, not a guessed `PROCEED` and not a fabricated `AMBIGUOUS`. Fail closed: the run stops with `INTERROGATION_UNPARSEABLE` and does not implement (the review analogue of unparseable → `REQUEST_CHANGES`, except here there is not yet a candidate to revise).
+
+**Question bound.** `N ≤ 5`. Each question is one concrete, answerable sentence, `≤ 400` characters. More than 5, or a question empty / over the character cap, is a parse failure of that payload (closed schema, same fail-closed as `MAX_PROPOSAL_ITEMS` / `MAX_WORK_ITEM_CHARS`). Questions are allowed **ONLY where the answer would change the implementation** — two different answers would produce two different files, behaviours, tests, or TD-constrained design choices. Style, preference, "could you also", and facts the checkout already determines are not questions. `CONTRADICTS_TD` carries specific TD section references as they exist at `base_sha` (e.g. `§6.6`, `§2.3`); it does not carry questions. A work item whose *purpose* is to amend the TD is not `CONTRADICTS_TD` merely because it disagrees with the current text — that would over-block every TD amendment, including this section.
+
+### 21.3 Evidence
+
+A new K2 kind, not a reuse of `REVIEW` (different subject, different closed verdict; `review_ok` must not start parsing `PROCEED`). Claim schema mirrors `cadp.review.v1`: source-native, Ingress-untouched (§9.1), closed keys.
+
+```text
+evidence_kind      = WORK_INTERROGATION
+claim_schema       = cadp.work-interrogation.v1
+claim              = {
+                       verdict: "PROCEED" | "AMBIGUOUS" | "CONTRADICTS_TD",
+                       questions?: [ { id, text } ],   // required, 1..5, iff AMBIGUOUS
+                       td_refs?:   [ string ],         // required, 1..5, iff CONTRADICTS_TD
+                       body_digest,                    // digest of the raw surface stdout
+                       interrogator_run_id?
+                     }
+subject_bindings   = work_run_ref + repo_id + base_sha
+producer_ref       = reviewer:<product>                // stamped from the authenticated principal
+provenance         = { INDEPENDENT_OBSERVATION, produced_at_source: NONE }
+```
+
+Unknown keys refused at parse, before submit. `PROCEED` with `questions` or `td_refs`, `AMBIGUOUS` without questions, `CONTRADICTS_TD` without `td_refs` — parse failure. Adapter registry: add `WORK_INTERROGATION` to each existing `reviewer:*` allowed-kinds list; no new producer this landing. `produced_at_source = NONE` (the CLI does not emit a source timestamp for this observation). The envelope is sealed on every opted-in run, including `PROCEED` — so a skipped interrogation (flag off) is distinguishable from a recorded proceed. Unparseable stdout: `availability = UNKNOWN`, `unknown_reason` present, no claim (§9.1 claim-less UNKNOWN); the run still stops and does not implement.
+
+A sibling `BACKEND_EXECUTION` with `surface-role` is **not** required by this section. If §19 has already landed role-qualified scans on the reviewer container, the same scan may attach with `surface-role = REVIEWER` (the container class); interrogation does not invent a fourth role.
+
+### 21.4 Fail-closed stop and re-admit
+
+`AMBIGUOUS` and `CONTRADICTS_TD` stop the run **before any worker compute**. The workflow does not call `implementCandidate`. Stop shape matches `EXTERNAL_VERIFY_NOT_SUCCESS` / `REVIEW_NOT_APPROVED` (a product stop, not `WORK_BOUND_STOP`):
+
+```text
+stopped = INTERROGATION_AMBIGUOUS      detail = questions[]
+stopped = INTERROGATION_CONTRADICTS_TD detail = td_refs[]
+stopped = INTERROGATION_UNPARSEABLE    detail = unknown_reason | parse error
+```
+
+The questions (or TD refs) are in the stop detail so the intent author can read them from the run snapshot (`ctl` JSON status / `cadp_run_status`) without opening a kernel row by hand. The interrogation `WORK_STEP` is emitted so the causal chain stays reconstructable from the store (§7.4).
+
+**Amended item is a new `WORK_START`, not a resumed run.** Recommended default, and the decision: `WORK_START` material is immutable (§7.2 / §7.3); `work_bindings` include the work-item identity; a changed work item is a different exact input and a different `args_digest`. Resuming the stopped run would require mutating sealed material or continuing under a work item the admission did not name. The stopped run stays stopped; its `WORK_INTERROGATION` envelope remains queryable. The author amends the work item (answers the questions, or cites a different TD amendment) and re-admits through the ordinary governed path — `ctl auto-dev "<amended item>" … interrogate` — new `effect_id`, new `work_run_ref`. Citing the prior interrogation envelope as non-authoritative provenance (the `proposal_evidence_id` pattern) is permitted and not required this generation.
+
+### 21.5 Default posture and calibration
+
+**`PROCEED` is the default.** The interrogator is a cheap filter for implementation-changing ambiguity, not a second planner and not a style reviewer.
+
+**Over-blocking risk (explicit).** A question whose answer would not change the implementation burns a full `WORK_START` — admission, evidence, Human attention to amend, a new run — for zero implementation change. That is the dual of the measured late-discovery cost in §21.1. An interrogator that asks five preference questions on every item makes the flag unusable and will be turned off. `CONTRADICTS_TD` aimed at "I would have designed this differently" is the same failure in a different verdict.
+
+**Calibration contract.**
+
+- A question is admissible only if two different answers would produce two different implementations (files, behaviour, tests, or a TD-constrained choice). If the work item plus the checkout already determine a unique implementation, the verdict is `PROCEED`.
+- Preference, style, and "could you also" are not questions.
+- `CONTRADICTS_TD` is only for a work item that cannot be implemented without violating a cited TD section *as an implementation of the current TD*. TD-amendment items are not contradictions of the text they propose to change.
+- **Automatic `AMBIGUOUS`:** missing testable acceptance criteria (§21.6). This is the one case that does not require the "would change the implementation" test — their absence *is* the defect §21.1 measured. The interrogator does not invent criteria; it asks for them, bound of 5, and stops.
+- Parse failure is never `PROCEED`.
+
+The contract is load-bearing for the opt-in: a surface that over-blocks will not be armed as a deployment default.
+
+### 21.6 Planner contract
+
+Every proposed work item **MUST** carry testable acceptance criteria in the §20.6 style: independently reviewable named items, each with an expected observation (positive and/or negative), such that a later implementer and a later reviewer can agree whether the item is done without inventing a missing fact. Vague rationale (`"single file, testable"`) is not acceptance.
+
+`cadp.work-proposal.v1` items grow a required field:
+
+```text
+acceptance: [ { name, expect } ]   // non-empty; independently reviewable; closed keys
+```
+
+The planner prompt states the shape and that an item without it is not a valid proposal. `parseWorkProposal` rejects missing, empty, unknown-keyed, or non-object `acceptance` (fail closed at plan time, same class as malformed bounds). Direct `auto-dev` / `work-dev` items that did not come through the planner have no schema to reject them at start; the **interrogator treats absence of testable acceptance criteria as automatic `AMBIGUOUS`** — defence in depth for the non-planner path, and the reason the flag still pays on a hand-written work item.
+
+This does not make `WORK_PROPOSAL` authority. Starting any item is still ordinary `WORK_START` admission (§7.2, #61). The strengthened contract is on the *content* of a proposed item, so interrogation has something falsifiable to read.
+
+### 21.7 Opt-in rollout
+
+Two independent opt-ins, matching §18.4. Neither is on by default. Off keeps the development path byte-identical: no extra step, no extra envelope, `max_steps` consumption unchanged.
+
+1. **Per-run flag first.** `development.interrogation === true`. Live `/start` and `ctl auto-dev` extra argument, **position `extra[7]`** (after `extra[6] = "external"`):
+
+   ```text
+   auto-dev <work_item> [maxSteps maxEffects] [proposalId]
+            [worker_product] [review_product] [external] [interrogate]
+   extra = [work_item, maxSteps, maxEffects, proposalId,
+            worker_product, review_product, external, interrogate]
+   ```
+
+   Only the exact literal `"interrogate"` enables it; anything else at that position fails closed rather than silently skipping (`unknown interrogation flag`, the `external` pattern in `cadp/live/ops.ts`). Omitted or empty keeps today's path. The flag is development-vertical only; the record vertical has no work item to interrogate.
+
+2. **Deployment default later.** Policy param `require_work_interrogation` in `data.policy_params`, default `false`. When `true`, `PR_CREATE` additionally requires a `PRESENT` `WORK_INTERROGATION` on the same `work_run_ref` + `base_sha` whose `verdict == "PROCEED"` (an `AMBIGUOUS` / `CONTRADICTS_TD` run never reaches PR). Unmet is reason code `work_interrogation_missing` — `DENY`. The param is not armed until the per-run flag has been measured not to over-block (§21.5). Adapter-registry / genesis-bundle change (adding the kind to `reviewer:*`) is a constitution change: the first environment that can seal the envelope is a fresh env whose genesis bundle lists the kind, or a Human-gated `POLICY_ACTIVATE` of that bundle — the live2–live8 pattern. A flag flipped on an env whose registry does not list the kind fails closed at submit, and still does not implement.
+
+The interrogation step costs one `max_steps` ordinal. Planner guidance of "at least 6" becomes at least 7 when the flag is on; bounds are not silently raised.
+
+### 21.8 Implementation plan
+
+Independently reviewable items, in this order. Later items may depend on earlier ones; an earlier item must not change gate meaning by itself. None of them is done by this section.
+
+1. **Closed verdict schema and parser.** `cadp.work-interrogation.v1` as §21.3. Parse fail-closed: unknown keys, wrong payload for the verdict, `N > 5`, empty / over-long question, missing `td_refs` on `CONTRADICTS_TD`. Conformance: each invalid shape throws / yields `UNKNOWN` and never a guessed `PROCEED`. No workflow change.
+2. **Broker surface.** `/interrogate` reuses `runReviewer` at `base_sha` with the selected reviewer profile's read-only argv and an interrogation prompt. Workspace `:ro`; no worker argv. Conformance: a write-tool prompt does not create a file (existing reviewer posture); omitted flag never calls the endpoint.
+3. **Activity + evidence.** `interrogateWorkItem` activity submits `WORK_INTERROGATION` as `reviewer:<product>` bound to `work_run + repo_id + base_sha`, plus a `WORK_STEP`. Adapter registry: `reviewer:*` allowed kinds gain `WORK_INTERROGATION`. No new principal this landing. Conformance: producer/kind mismatch is refused at Ingress; `PROCEED` still seals.
+4. **Workflow insertion and stops.** When `development.interrogation === true`, the first development step is interrogation; `PROCEED` continues into today's implement loop; `AMBIGUOUS` / `CONTRADICTS_TD` / unparseable return the §21.4 stop codes with questions / `td_refs` in `detail`, and `implementCandidate` is not called. Flag off: step sequence byte-identical to today, including `max_steps` consumption. Conformance: a flagged run whose verdict is `AMBIGUOUS` has zero `GIT_PUSH` effects.
+5. **Per-run flag in the auto-dev convention.** `WorkArgs.development.interrogation`; `startWork` reads `extra[7]`; `ctl auto-dev` passes argv after `external`. Exact literal `"interrogate"`; any other non-empty value throws before seal. Conformance: omitted `extra[7]` does not set the flag; `"Interrogate"` (wrong literal) is a refusal, not a silent skip.
+6. **Planner acceptance field.** `WorkProposalItemV1.acceptance` required, non-empty, closed keys, §20.6-style `{name, expect}`. Prompt updated. `parseWorkProposal` rejects absence. Conformance: a valid pre-change proposal that lacks `acceptance` is now a `ProposalParseError`; a well-formed `acceptance` array still parses. Interrogator automatic-`AMBIGUOUS` on missing criteria is the next item, not this one — so planner-only items do not change the development gate by themselves.
+7. **Interrogator calibration + automatic `AMBIGUOUS`.** Prompt states the §21.5 contract and the automatic-`AMBIGUOUS` rule for missing acceptance criteria (planner and hand-written items). Conformance: a work item with §20.6-style criteria and no implementation-changing fork yields parser-accepted `PROCEED` on a fixture; a work item with no criteria yields `AMBIGUOUS` with a question asking for them, and the run stops before implement. Over-blocking (questions about style on a fully determined item) is a prompt/calibration defect, reported as such, not papered over by changing the default to on.
+8. **Independence and policy opt-in.** Entry: flagged runs reuse `assertReviewIndependence(worker, review)` — already before seal. Policy param `require_work_interrogation` default `false`; when true, `PR_CREATE` requires `PRESENT` `PROCEED` interrogation evidence on the exact work run + `base_sha`. Conformance: default-off keeps PR/MERGE byte-identical; a same-product worker/review pair still throws at entry with the flag on; a `REVIEW` envelope does not satisfy the interrogation requirement.
+
