@@ -552,7 +552,7 @@ export async function reviewCandidate(input: {
   work_item: string;
   review_product?: string;
   prior_step_envelope_digest?: string;
-}): Promise<{ review_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
+}): Promise<{ review_evidence_id: string; backend_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
   // Fail closed on an unknown selection BEFORE any surface or kernel call; omitted keeps claude.
   const reviewProvider = resolveReviewProvider(input.review_product ?? "claude");
   // Honest attribution: the REVIEW evidence is authenticated as the provider that actually
@@ -564,10 +564,18 @@ export async function reviewCandidate(input: {
   // The broker fresh-clones the candidate and runs the second-surface reviewer (measured #90:
   // claude plan-mode; #149: per-provider read-only profile) inside the isolated reviewer container
   // over the exact committed diff; it returns the verdict, a short reason, and the raw stdout.
-  const rv = await brokerCall<{ verdict: string; reason: string; stdout: string }>(
+  const rv = await brokerCall<{ verdict: string; reason: string; stdout: string; backend_model?: string; backend_locator?: string }>(
     "/review",
     { repo_full_name: input.repo_full_name, candidate_sha: input.candidate_sha, work_item: input.work_item, review_product: reviewProvider },
     SURFACE_BUDGETS.review,
+  );
+  const backendEvidence = await submitBackendExecution(
+    input.work_run_ref,
+    input.step_ordinal,
+    reviewProvider,
+    "REVIEWER",
+    rv.backend_model,
+    rv.backend_locator,
   );
   const envelope = await reviewer.submitEvidence({
     evidence_kind: "REVIEW",
@@ -584,7 +592,13 @@ export async function reviewCandidate(input: {
     input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
     summary: `review ${rv.verdict}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
   });
-  return { review_evidence_id: envelope.evidence_id, verdict: rv.verdict, reason: rv.reason, work_step_envelope_digest: workStep.envelope_digest.value };
+  return {
+    review_evidence_id: envelope.evidence_id,
+    backend_evidence_id: backendEvidence,
+    verdict: rv.verdict,
+    reason: rv.reason,
+    work_step_envelope_digest: workStep.envelope_digest.value,
+  };
 }
 
 export async function governedPrCreate(input: {

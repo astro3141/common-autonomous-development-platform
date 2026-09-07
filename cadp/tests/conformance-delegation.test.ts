@@ -271,6 +271,7 @@ function sealBackendExecution(h: Harness, principal: string, producer_ref: strin
       evidence_kind: "BACKEND_EXECUTION",
       subject_bindings: [
         { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000ad" },
+        { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
       ],
       availability: "PRESENT",
       claim_schema: "cadp.backend-execution.v1",

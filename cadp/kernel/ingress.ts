@@ -283,6 +283,7 @@ export class Ingress {
 
     // Kind-specific ingress rules.
     if (draft.evidence_kind === "BACKEND_EXECUTION" && draft.availability === "PRESENT") {
+      this.assertBackendSurfaceRole(draft.subject_bindings);
       this.assertBackendObservedLocators(draft.claim);
     }
     if (draft.evidence_kind === "HUMAN_DECISION" || draft.evidence_kind === "AGENT_DECISION") {
@@ -492,6 +493,17 @@ export class Ingress {
       if (v?.availability === "PRESENT" && (typeof v.locator !== "string" || v.locator.length === 0)) {
         throw new IngressRejection("OBSERVED_WITHOUT_LOCATOR", `observed.${field} is PRESENT without a locator`);
       }
+    }
+  }
+
+  private assertBackendSurfaceRole(subjectBindings: readonly SubjectBinding[]): void {
+    const roles = subjectBindings.filter((binding) => binding.namespace === "surface-role");
+    const allowed = new Set(["WORKER", "REVIEWER", "PLANNER"]);
+    if (roles.length !== 1 || !allowed.has(roles[0]!.object_id)) {
+      throw new IngressRejection(
+        "BACKEND_SURFACE_ROLE_INVALID",
+        "PRESENT BACKEND_EXECUTION requires exactly one surface-role binding in WORKER/REVIEWER/PLANNER",
+      );
     }
   }
 

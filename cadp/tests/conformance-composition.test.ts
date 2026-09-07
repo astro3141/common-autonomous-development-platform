@@ -20,8 +20,20 @@ import {
   GOVERNED_PRODUCER_REF, GOVERNED_TRANSITION_MATERIAL_SCHEMA,
 } from "../product/improvement/transition.ts";
 import { nextId } from "./support/transition.ts";
+import { developmentEvidenceRefs } from "../product/developmentEvidence.ts";
 
 after(() => stopSharedOpa());
+
+test("development PR_CREATE and PR_MERGE evidence include the REVIEWER backend sibling", () => {
+  const refs = developmentEvidenceRefs({
+    verification_evidence_id: "verification",
+    review_evidence_id: "review",
+    worker_backend_evidence_id: "worker-backend",
+    reviewer_backend_evidence_id: "reviewer-backend",
+    work_step_envelope_id: "work-step",
+  });
+  assert.deepEqual(refs, ["verification", "review", "worker-backend", "reviewer-backend", "work-step"]);
+});
 
 /**
  * A deployment with NO external target configured. `composeTargetAdapters` reads only the three
