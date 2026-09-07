@@ -1287,3 +1287,96 @@ Independently reviewable items, in this order. Later items may depend on earlier
 6. **Rollback.** A second DEPLOY whose `sha` equals the first receipt's prior `code_sha` and whose `expected_prior` equals the first receipt's `next` is admitted under the same (a)(b)(c) rules and, on COMMITTED, restores that prior identity. Conformance: that sha still compare-ancestors `main`; a sha that is not an ancestor refuses.
 7. **Scheduled attest refresh.** deployment-control timer at half `reach_attestation_max_age_s` running `ctl attest`. Conformance: without the timer, #8 still refuses at `max_age` (no behaviour change if the schedule is omitted); with the timer, a new envelope appears inside the window and a failing probe is sealed as failing, not retried into a pass. Kernel `setInterval` identity probes are untouched and do not start submitting reach envelopes.
 
+---
+
+## 21. Product workflow runtime and the step execution edge (Conductor integration)
+
+Product-layer design. It is **not implemented here** and authorizes no production change; implementation follows this design. This is not a kernel primitive: it adds no K1–K7 record kind, does not change `identity_class` derivation (§9.1) or the §8.4 independence predicate, and does not amend §7's contracts — it composes against them. An integration capability that has not been probed live is marked **requires a container probe before implementation**, never asserted (§17.2's rule).
+
+**Measured context (container probes, 2026-09-07).** Microsoft **Conductor** (MIT) runs YAML-defined multi-agent workflows with deterministic Jinja routing between agents. Measured on the probe: custom `base_url` routing works on the OpenAI chat-completions wire with `stream: true`, and structured output arrives as a forced `final_result` tool call — so an edge that speaks that wire can interpose on every model call without forking the runtime. Conductor writes an events JSONL (`workflow_started`, `agent_started`, `agent_retry`, `checkpoint_saved`) under `TMPDIR`. The provider config `name` is a **closed pydantic literal**: a native `cadp` provider name requires an upstream patch or an upstream PR. The internal `AgentProvider` ABC — `execute(agent, context, rendered_prompt, tools, extra_mcp_servers) -> AgentOutput` — is the longer-term seam. Anything about Conductor not in this list (restart semantics, checkpoint replay, duplicate-start behaviour, run lookup) is unmeasured and marked below.
+
+### 21.1 Position: a Product Workflow Runtime outside the kernel
+
+**Decision.** Conductor is a **Product Workflow Runtime** — composition core only, entirely outside the kernel, in the same commodity position Temporal occupies in §7.1. CADP is the authority core. §7.1 applies verbatim with Conductor substituted for Temporal: orchestrator history — including Conductor's events JSONL — is never read as authority; kernel rows are. No Conductor state (events, checkpoints, run records, agent context) enters the Constitutional Store; the store continues to hold K1–K7 records, activation log, and CAS material only (§0, §3.2).
+
+### 21.2 The Step Execution Edge and executor profiles
+
+**Decision.** Every Conductor step executes through one product seam, the **Step Execution Edge**: the measured `base_url` chat-completions endpoint now, the `AgentProvider` ABC later (§21.9 P1). No step reaches a model provider, a filesystem, or a network except through an edge-selected executor.
+
+**Revised from the prior draft:** the edge does **not** use the existing §17 3×3 worker/reviewer/planner adapters as-is. It **reuses** §17's measured machinery — the closed provider registries, the argv-template discipline, the `oauth_env`/`auth_files` broker injection (§17.3), and the `model_scan` session-scanning capability (§17.2) — while defining **new executor profiles** for the edge, because the worker posture (`codex --sandbox danger-full-access`, grok/claude `bypassPermissions`) is stronger than most workflow steps need. At least four profiles, each an explicit **measured argv + isolation contract** in the same closed-registry form as §17.1:
+
+| Executor profile | Posture | Intended step class |
+|---|---|---|
+| `model-readonly` | model surface, read-only tool allow-list (§17.2 measured boundaries per provider) | analysis, routing, review-shaped steps |
+| `model-workspace-write` | model surface, writes confined to the step workspace; no governed-target egress | implementation-shaped steps |
+| `deterministic-validator` | no model; pinned script/tool over declared inputs | schema checks, digest checks, projections |
+| `script-network-none` | script under verifier-class container posture (§8.2): fresh workspace, network denied | build/test-shaped steps |
+
+An executor class without a declared sandbox is a **bypass lane** and is refused at workflow validation — a step cannot select "no profile" or a profile whose argv/isolation pair has not been measured. Each profile's exact argv per provider **requires a container probe before implementation** (the §17.2/§19 lesson: same binary, different invocation is a different measured surface).
+
+### 21.3 Execution receipt split and the WORK_STEP forward binding
+
+**Decision.** Receipts are split by owner: the **provider facade** (the edge endpoint fronting the model) asserts backend facts — it emits the `BACKEND_EXECUTION` envelope (§9.2, `SELF_REPORT`, per-field `{availability, value, locator}`, absent facts `UNKNOWN`) via the §17.2 scanning machinery; the **conformance edge** (the CADP-facing side) asserts step identity — it emits the `WORK_STEP` envelope per §7.4.
+
+**Revised to close the loop:** the `WORK_STEP` claim schema is **extended** with an `execution_evidence_ref = { evidence_id, envelope_digest }` naming the step's `BACKEND_EXECUTION` receipt. The reverse binding already exists today — `BACKEND_EXECUTION` carries a step subject binding (`work_run_ref` + step ordinal, §9.2) — so this forward reference completes an exact logical-step → execution → output binding readable from the store alone, with **no new kernel primitive** (a claim-schema field on an existing K2 kind). The field is part of the §7.4 semantic payload, so a retry must resubmit the identical reference — which the §21.9 P0.5 reuse contract guarantees.
+
+### 21.4 The live path is authoritative; events JSONL is cross-check only
+
+**Decision.** On step completion the conformance edge submits `WORK_STEP` through the existing §7.4 replay-idempotent ingress **before any dependent effect admission**. A step present only in Conductor's events JSONL is **not constitutionally evidenced** as a completed `WORK_STEP` and cannot satisfy any downstream governance requirement — no admission input may cite it, no bound may be discharged by it. This is never phrased as proof that the execution did not happen: an ordinary lookup miss is not a universal absence proof (the same rule §6.3 applies to reconcile reads). The events JSONL is recovery, reconciliation, and audit **cross-check** material only — a commodity locator source, in the same class as Temporal history under §7.1.
+
+### 21.5 Tool lanes and the human gate
+
+**Decision.** Tools presented to a step split into two lanes. **Read/pure tools** execute directly inside the executor profile's sandbox. **Mutating tools** are **credential-less effect-tool shims**: the tool call produces material that the shim seals as an `EffectRequestV1` through the kernel gate (§7.4 allocation, §3.4 admission); the shim holds no governed credential and the step observes only kernel rows and target facts, exactly as §7.5 requires. `extra_mcp_servers` and provider-native tool loops are pinned by an **allowlisted runtime profile** that is gate-path material (the `gateFiles` class, §18.4/§20.2): an unlisted MCP server or tool loop is refused at validation, not discovered at runtime. The measured grok lesson applies (§17.2: plan mode did not block `run_terminal_command`) — a named "safe mode" is never the boundary; the declared allow-list plus container isolation is.
+
+Conductor's human-gate feature is a **UI/wait primitive only**. It never carries authority: a paused run resumes only on a `HUMAN_DECISION` envelope bound to the exact run, subject, and effect (§4.4 #5, §9.3). A click in Conductor's surface that produced no such envelope resumes nothing that governance can see.
+
+### 21.6 v1 topology restriction: sequential only
+
+**Decision (new in this revision).** Integration v1 supports **sequential workflows only**. Parallel groups, `for_each` concurrency, and multi-parent joins are **refused at workflow validation**. Reason: §7.4's step identity is `(work_run_ref, step_ordinal)` with a single `claim.prior_step_envelope_digest` — a linear chain. Concurrent branches would need a DAG causal identity (`logical_step_id`, `parent_step_refs[]`), which is a change to the WORK_STEP contract itself. That identity is **explicitly deferred to a future TD section** rather than half-specified here; v1 does not emulate concurrency by ordinal tricks.
+
+### 21.7 Governed runs (P2): WORK_START target contract and pinning
+
+**Decision.** A governed Conductor run starts as a `WORK_START` governed effect (§7.2 shape) with `target_ref = { authority_ref: conductor:<deployment>, target_type: WORKFLOW, target_id: <workflow-name>@<digest> }`.
+
+**Revised pinning:** the material pins an `execution_manifest_digest` computed over the **full workflow closure** — the root YAML, every referenced subworkflow, skill, script, prompt file, and MCP config, plus the runtime profile revision (§21.5) and a `provider_binding_digest` (which executor profiles back which agents) — because a root-YAML digest alone under-pins execution semantics: the same root file with a swapped subworkflow or prompt is a different execution. The material also carries `workflow_input_digest`, `policy_ref`, and `bounds` (§7.3). `effect_id(WORK_START)` is the canonical `work_run_ref`; the Conductor run id is a commodity locator recorded as `target_operation_ref`, never an identity.
+
+**Step counting:** one Conductor **agent completion** counts as one step against `max_steps`. Internal provider turns are backend facts, not steps — measured on the probe: one agent emitted nine `agent_turn_start` events. §7.3 is unchanged: the runtime enforces `max_steps`, the PEP enforces `max_effects` and `NOT_AFTER`, and the kernel does not count steps.
+
+**New: Conductor `WORK_START` target-adapter contract**, mirroring the Temporal contract in §6.4. The adapter must prove, not declare, each element (§6.1: `describe()` is a declaration that must be proven):
+
+| Element | Contract | Status |
+|---|---|---|
+| Deterministic dispatch identity | run identifier derivable from `effect_id` (the `cadp-work-<effect_id>` pattern) so a redispatch names the same run | **requires a container probe before implementation** (whether Conductor accepts a caller-chosen run id at all) |
+| Duplicate-start semantics | a second start with the same dispatch identity must fail or provably return the existing run — the Temporal `REJECT_DUPLICATE`/`FAIL` analogue | **requires a container probe before implementation** |
+| Target-authoritative run lookup | `COMMITTED` only after a target-returned read binds the run to this effect (`execution_manifest_digest` + `workflow_input_digest` echoed back — the §6.4 memo-match analogue); the start response alone never yields `COMMITTED` | **requires a container probe before implementation** (what a run read returns and whether caller metadata round-trips) |
+| Reconcile path for `UNKNOWN` | a dispatch that crashes between send and outcome write resolves by target lookup, never by redispatch — the crash window **must not mint a second run** (§4.5, §6.5) | **requires a container probe before implementation** |
+
+Until each row is measured, the adapter declares the corresponding capability absent and the operation stays inadmissible for governed runs (the §6.1 `available = false` rule).
+
+### 21.8 The Conductor principal
+
+**Decision.** The Conductor runtime holds **zero** external provider, target, or deployment credentials — no model keys (the edge's executor profiles own provider auth per §17.3), no GitHub/record/Temporal credentials (PEP custody, §4.1), no deployment-control reach. Its only credential is a **bounded, run-scoped, short-lived CADP-call principal** minted at `WORK_START` dispatch, good for the §12 workflow-caller surface on that run only. An expired principal, or a principal minted for another run, cannot submit into another run's ordinals — the ingress binds the principal to its `work_run_ref` and refuses a mismatched tuple. Explicitly: this run principal is only the workflow **requester** identity. It never substitutes for backend producer identity in the §8.4/§17.4 independence predicates — implementer attribution continues to come from `BACKEND_EXECUTION` producers (§17), not from who ran the workflow.
+
+### 21.9 Rollout: four stages with stop-loss
+
+Each stage is a gate for the next; a domain may deliberately stay at a lower level.
+
+- **P0 — wire probe.** SSE streaming plus a forced `final_result` tool-call round trip against the Step Execution Edge, end to end. **Stop-loss: if this fails, the integration stops here** — nothing downstream is built on an unmeasured wire.
+- **P0.5 — resume/checkpoint/crash-window probe (new; prerequisite for live `WORK_STEP`).** Measure what Conductor actually does on restart mid-step (checkpoint replay? re-execute? skip?). Then implement the crash-window contract: the edge writes the step output to CAS **first**, and on retry **looks up the existing `(work_run_ref, step_ordinal)`** and reuses the recorded output instead of re-executing a nondeterministic model. Without this, every crash recovery re-runs the model, produces a different semantic payload, and becomes a `WORK_STEP_CONFLICT` incident with a scope hold under §7.4 — a self-inflicted outage class. No live `WORK_STEP` submission ships before this contract passes conformance.
+- **P1 — execution integration.** Receipts and attribution live: `BACKEND_EXECUTION` + extended `WORK_STEP` with `execution_evidence_ref` (§21.3), executor profiles measured and registered (§21.2). Decide whether a native provider is needed at all; if yes, **prefer an upstream PR for pluggable provider registration over a fork** — the closed pydantic literal is upstream's seam to open, and a fork forfeits the commodity position §21.1 depends on.
+- **P2 — governed run.** `WORK_START` through the Conductor target adapter (§21.7), full-closure pinning, run-scoped principal (§21.8), sequential-only validation (§21.6).
+
+### 21.10 Implementation plan
+
+Independently reviewable items, in order; none of them is done by this section.
+
+1. **P0 wire probe harness.** Scripted SSE + forced `final_result` round trip against the edge; sealed probe record of the measured wire. Stop-loss applies.
+2. **P0.5 restart probe + crash-window contract.** Measure mid-step restart behaviour; implement CAS-first output write and ordinal-lookup reuse; conformance: kill the edge mid-step, restart, assert one `WORK_STEP` per ordinal and zero `WORK_STEP_CONFLICT` incidents.
+3. **Executor profile registry.** The four §21.2 profiles as closed registries reusing §17 machinery; per-provider argv rows added only behind container probes; validation refuses steps without a declared profile.
+4. **Runtime profile allowlist as gate-path material.** `extra_mcp_servers`/tool-loop pinning (§21.5) wired into workflow validation and the `gateFiles` class.
+5. **Receipt split + `execution_evidence_ref`.** `BACKEND_EXECUTION` emission at the edge; `WORK_STEP` claim-schema extension; conformance for the forward/reverse binding pair.
+6. **Live-path ordering.** `WORK_STEP` submission before dependent effect admission; conformance: an events-JSONL-only step satisfies nothing downstream.
+7. **Sequential-only workflow validation.** Refuse parallel groups, `for_each` concurrency, multi-parent joins; conformance fixtures for each refused shape.
+8. **Conductor `WORK_START` target adapter (P2).** The §21.7 contract, each unmeasured row probed before its `describe()` capability is declared; full-closure `execution_manifest_digest`; run-scoped principal mint and foreign-run refusal.
+9. **Upstream provider decision (P1 exit).** Written decision: edge-only, upstream PR, or defer; a fork is not an option this section authorizes.
+
