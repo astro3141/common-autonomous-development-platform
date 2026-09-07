@@ -7,8 +7,10 @@
  * Run: node cadp/kernel/kernelService.ts <configPath>
  */
 
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { startKernelApi, startRootListener } from "./api.ts";
 import { Cas } from "./cas.ts";
@@ -82,13 +84,17 @@ export function composeTargetAdapters(
     const repoId = config.github.repo_id;
     const repoFullName = config.github.repo_full_name;
     const repoRoot = join(import.meta.dirname, "..", "..");
+    const execFileAsync = promisify(execFile);
+    const liveDir = join(config.secret_dir, "..");
     adapters.push(new DeploymentActuationAdapter(store, cas, repoId, clock, {
       compareToMain: async (sha) => {
         const result = await transport.api("GET", `/repos/${repoFullName}/compare/${encodeURIComponent(sha)}...main`);
         return { status_code: result.status, compare_status: (result.json as { status?: string })?.status };
       },
       checkout: liveCheckoutRead(repoRoot),
-    }, liveDeploymentComponentRunner(join(config.secret_dir, ".."))));
+    }, liveDeploymentComponentRunner(liveDir), async (effectId) => {
+      await execFileAsync(process.execPath, [join(repoRoot, "cadp/live/ctl.ts"), liveDir, "attest", effectId]);
+    }));
     adapters.push(
       new GitHubAdapter(transport, cas, repoId, () => freshPassingImmutabilityAttestation(store, cas, repoId, clock)),
     );

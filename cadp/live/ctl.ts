@@ -130,7 +130,7 @@ function spawnCollect(cmd: string, args: string[], env: Record<string, string>):
   });
 }
 
-async function attest(): Promise<void> {
+async function attest(effectId?: string): Promise<void> {
   const m = manifest();
   const repoRoot = join(import.meta.dirname, "..", "..");
   const payload = join(repoRoot, "cadp/live/probePayload.mjs");
@@ -237,9 +237,10 @@ async function attest(): Promise<void> {
 
   const alternateFound = probes.some((p2) => p2["reached"] === true);
   const profileDigest = workerProfileDigest(buildWorkerSandbox(join(probeBase, "digest")));
+  const effectBinding = effectId === undefined ? [] : [{ authority_ref: "cadp-store:k04", namespace: "effect", object_id: effectId }];
   const reach = await client("cadp-depctl-probe").submitEvidence({
     evidence_kind: "CREDENTIAL_REACH_ATTESTATION",
-    subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "deployment", object_id: "cadp-v04-live" }],
+    subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "deployment", object_id: "cadp-v04-live" }, ...effectBinding],
     availability: "PRESENT",
     claim_schema: "cadp.credential-reach.v1",
     claim: {
@@ -305,7 +306,7 @@ async function attest(): Promise<void> {
     moveRejected && deleteRejected;
   const immutability = await client("cadp-depctl-target").submitEvidence({
     evidence_kind: "TARGET_IMMUTABILITY_ATTESTATION",
-    subject_bindings: [{ authority_ref: "github.com", namespace: "GIT_REPOSITORY", object_id: m.repo_id }],
+    subject_bindings: [{ authority_ref: "github.com", namespace: "GIT_REPOSITORY", object_id: m.repo_id }, ...effectBinding],
     availability: "PRESENT",
     claim_schema: "cadp.target-immutability.v1",
     claim: {
@@ -533,7 +534,7 @@ async function main(): Promise<void> {
       killComponent(process.argv[4]!);
       break;
     case "attest":
-      await attest();
+      await attest(process.argv[4]);
       break;
     case "plan":
       console.log(JSON.stringify(await sealPlan(dir, process.argv[4]!, process.argv[5]), null, 2));

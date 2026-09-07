@@ -1,8 +1,7 @@
 /**
- * Deployment-actuation TargetAdapterV1 (TD §20.3, implementation item 1).
- *
- * This item deliberately exposes no actuator. It only declares DEPLOY, reports whether the
- * pre-deploy attestations are usable, and validates the closed cadp.deploy.v1 material.
+ * Deployment-actuation TargetAdapterV1 (TD §20.3–20.6).
+ * Dispatch restarts the closed component set; reconciliation owns the mandatory post-deploy
+ * deployment-control attest and is the only path that can report DEPLOY as COMMITTED.
  */
 
 import { execFile } from "node:child_process";
@@ -14,7 +13,7 @@ import { Cas } from "../cas.ts";
 import { ConstitutionalStore } from "../store.ts";
 import { MaterialIncomplete } from "./types.ts";
 import type {
-  AdapterOperation, DispatchResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
+  AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
 } from "./types.ts";
 
 export const DEPLOY_OPERATION = "DEPLOY" as const;
@@ -40,6 +39,9 @@ export interface DeploymentComponentRunner {
   kill(component: "broker" | "worker"): Promise<void>;
   start(component: "broker" | "worker"): Promise<void>;
 }
+
+/** Runs the existing deployment-control probes and seals both envelopes for this effect. */
+export type DeploymentAttestInvoker = (effectId: string) => Promise<void>;
 
 const execFileAsync = promisify(execFile);
 
@@ -91,6 +93,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
   readonly clock: () => number;
   readonly preconditionReads: DeploymentPreconditionReads | undefined;
   readonly componentRunner: DeploymentComponentRunner | undefined;
+  readonly attest: DeploymentAttestInvoker | undefined;
 
   constructor(
     store: ConstitutionalStore,
@@ -99,6 +102,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     clock: () => number,
     preconditionReads?: DeploymentPreconditionReads,
     componentRunner?: DeploymentComponentRunner,
+    attest?: DeploymentAttestInvoker,
   ) {
     this.store = store;
     this.cas = cas;
@@ -106,6 +110,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     this.clock = clock;
     this.preconditionReads = preconditionReads;
     this.componentRunner = componentRunner;
+    this.attest = attest;
   }
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -258,15 +263,64 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
       const next = await this.componentRunner.observe(component);
       receipts.push({ component, prior: prior[component]!, next });
     }
-    return {
-      kind: "ACCEPTED",
-      target_operation_ref: `deploy:${effect}:${ordinal}`,
-      receipt_claim: { components: receipts },
-    };
+    // Starting processes is transport acceptance, not proof of the DEPLOY effect.  The receipt is
+    // reconstructed from target observation during reconcile, after deployment-control attests.
+    return { kind: "AMBIGUOUS", raw_observation: `deploy:${effect}:${ordinal}:restart accepted; post-deploy attestation pending` };
   }
 
-  async reconcile(): Promise<never> {
-    throw new Error("DEPLOY reconciliation is outside TD §20.6 item 1");
+  async reconcile(
+    effectId: string,
+    ordinal: number,
+    _target: TargetRef,
+    operation: string,
+    material: Record<string, unknown>,
+    context?: { admitted_at?: string },
+  ): Promise<ReconcileResult> {
+    if (operation !== DEPLOY_OPERATION || this.componentRunner === undefined) {
+      return { kind: "UNKNOWN", unknown_reason: "DEPLOY component observation unavailable" };
+    }
+    if (this.attest !== undefined) {
+      try { await this.attest(effectId); }
+      catch (error) {
+        return { kind: "UNKNOWN", unknown_reason: `post-deploy attest failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+
+    const admittedAt = context?.admitted_at === undefined ? Number.NaN : Date.parse(context.admitted_at);
+    const effectSubject = `cadp-store:k04|effect|${effectId}`;
+    const hasEffect = (envelope: { subject_bindings: readonly SubjectBinding[] }) =>
+      envelope.subject_bindings.some((s) => `${s.authority_ref}|${s.namespace}|${s.object_id}` === effectSubject);
+    const reach = this.store.latestEvidenceOfKind(
+      "CREDENTIAL_REACH_ATTESTATION", "cadp-store:k04|deployment|cadp-v04-live",
+    );
+    const immutable = this.store.latestEvidenceOfKind(
+      "TARGET_IMMUTABILITY_ATTESTATION", `github.com|GIT_REPOSITORY|${String(material["repo_id"])}`,
+    );
+    const postAdmission = (envelope: { produced_at: string }) => Date.parse(envelope.produced_at) > admittedAt;
+    const failingReachWasSealed = this.store.evidenceBySubjectKey(effectSubject).some((envelope) =>
+      envelope.evidence_kind === "CREDENTIAL_REACH_ATTESTATION"
+      && postAdmission(envelope)
+      && (envelope.claim as { alternate_path_found?: boolean } | undefined)?.alternate_path_found !== false);
+    if (reach === undefined || immutable === undefined || !hasEffect(reach) || !hasEffect(immutable)
+      || !postAdmission(reach) || !postAdmission(immutable)
+      || reach.availability !== "PRESENT" || immutable.availability !== "PRESENT"
+      || failingReachWasSealed
+      || (reach.claim as { alternate_path_found?: boolean }).alternate_path_found !== false
+      || (immutable.claim as { write_once_enforced?: boolean }).write_once_enforced !== true) {
+      return { kind: "UNKNOWN", unknown_reason: "post-deploy attestations absent, unbound, pre-admission, or failing" };
+    }
+
+    const components = material["components"] as Array<"broker" | "worker">;
+    const expected = material["expected_prior"] as Record<string, ComponentIdentity>;
+    const rows = [] as Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }>;
+    for (const component of components) {
+      const next = await this.componentRunner.observe(component);
+      if (next.pid <= 0 || next.code_sha !== material["sha"]) {
+        return { kind: "UNKNOWN", unknown_reason: `DEPLOY component ${component} is not alive at the deployed identity` };
+      }
+      rows.push({ component, prior: expected[component]!, next });
+    }
+    return { kind: "COMMITTED", target_operation_ref: `deploy:${effectId}:${ordinal}`, receipt_claim: { components: rows } };
   }
 
   receipt_binds(operation: string, material: Record<string, unknown>, receipt: Record<string, unknown>): boolean {
