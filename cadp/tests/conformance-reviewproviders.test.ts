@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
+import type { EvidenceDraft } from "../kernel/ingress.ts";
+import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 import { brokerReview } from "../product/surfaceBroker.ts";
+import { scanBackendModel } from "../product/surfaceBroker.ts";
+import { submitBackendExecutionEvidence } from "../product/backendExecution.ts";
 import { reviewerAuthArgs } from "../product/isolation.ts";
 import {
   assertReviewIndependence,
@@ -28,6 +32,31 @@ const HISTORICAL_CLAUDE_ARGV = (prompt: string): string[] => [
   "--disallowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit",
   prompt,
 ];
+
+test("§19 effort_argv omission preserves every reviewer argv byte-for-byte", () => {
+  for (const profile of Object.values(REVIEW_PROVIDERS)) assert.equal(profile.effort_argv, undefined);
+  assert.deepEqual(reviewArgv("claude", "PROMPT"), HISTORICAL_CLAUDE_ARGV("PROMPT"));
+  assert.deepEqual(reviewArgv("grok", "PROMPT"), ["grok", "-p", "PROMPT", "--permission-mode", "plan", "--disable-web-search", "--tools", "read_file,list_dir,grep", "--json-schema", '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","REQUEST_CHANGES"]},"reason":{"type":"string"}},"required":["verdict","reason"]}']);
+  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT"]);
+});
+
+test("unmeasured reviewer scans stay UNKNOWN through broker output and sealed BACKEND_EXECUTION", async () => {
+  for (const [provider, profile] of Object.entries(REVIEW_PROVIDERS)) {
+    assert.equal(profile.model_scan, undefined);
+    assert.equal(profile.effort_scan, undefined);
+    const brokerFact = scanBackendModel(profile, "/unmeasured/reviewer-sessions", '{"model":"guessed","effort":"high"}');
+    assert.deepEqual(brokerFact, {}, `${provider}: broker must not guess from unmeasured output`);
+    let draft: EvidenceDraft | undefined;
+    await submitBackendExecutionEvidence({
+      client: { submitEvidence: async (value) => { draft = value; return { evidence_id: "backend-review" } as EvidenceEnvelopeV1; } },
+      provider, surface_role: "REVIEWER", subject_bindings: [], model: brokerFact.model, locator: brokerFact.locator,
+    });
+    assert.ok(draft !== undefined);
+    const observed = (draft.claim as { observed: Record<string, unknown> }).observed;
+    assert.deepEqual(observed["model"], { availability: "UNKNOWN" });
+    assert.deepEqual(observed["effort"], { availability: "UNKNOWN" });
+  }
+});
 
 test("claude reviewer retains the byte-identical argv, auth method, and identity class", () => {
   assert.equal(DEFAULT_REVIEW_PROVIDER, "claude");

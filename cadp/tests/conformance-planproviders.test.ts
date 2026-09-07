@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
 import { brokerPlan } from "../product/surfaceBroker.ts";
+import { scanBackendModel } from "../product/surfaceBroker.ts";
 import { sealPlan } from "../live/ops.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
 import type { EvidenceDraft } from "../kernel/ingress.ts";
@@ -29,6 +30,21 @@ const HISTORICAL_CLAUDE_PLAN_ARGV = (prompt: string): string[] => [
   "--disallowedTools=Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task",
   prompt,
 ];
+
+test("§19 effort_argv omission preserves every planner argv byte-for-byte", () => {
+  for (const profile of Object.values(PLAN_PROVIDERS)) assert.equal(profile.effort_argv, undefined);
+  assert.deepEqual(planArgv("claude", "PROMPT"), HISTORICAL_CLAUDE_PLAN_ARGV("PROMPT"));
+  assert.deepEqual(planArgv("grok", "PROMPT"), ["grok", "-p", "PROMPT", "--permission-mode", "plan", "--disable-web-search", "--tools", "read_file,list_dir,grep"]);
+  assert.deepEqual(planArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT"]);
+});
+
+test("unmeasured planner scan cannot guess a broker model or effort", () => {
+  for (const [provider, profile] of Object.entries(PLAN_PROVIDERS)) {
+    assert.equal(profile.model_scan, undefined);
+    assert.equal(profile.effort_scan, undefined);
+    assert.deepEqual(scanBackendModel(profile, "/unmeasured/planner-sessions", '{"model_id":"guessed","effort":"high"}'), {}, provider);
+  }
+});
 
 test("claude planner retains the byte-identical argv, auth method, and identity class", () => {
   assert.equal(DEFAULT_PLAN_PROVIDER, "claude");
