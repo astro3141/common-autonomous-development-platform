@@ -2,7 +2,7 @@
  * Shared live-composition operations (#61): the plan / governed-WORK_START / run-polling glue
  * used by both the CLI (`ctl.ts`) and the MCP tool surface (`mcpServer.ts`).
  *
- * Nothing here is authority: `sealPlan` produces proposal evidence, `startWork` goes through the
+ * Nothing here is authority: `sealPlan` produces proposal plus planner-observation evidence, `startWork` goes through the
  * ordinary governed admission (policy gates every start), and `pollRun`/`runSnapshot` are
  * observations. Callers own presentation; `log` defaults to silent so a protocol server's stdout
  * stays clean.
@@ -29,6 +29,9 @@ import { devEffectFloorViolation } from "../product/workBounds.ts";
 import { classifyRun, nextAction } from "../product/driver.ts";
 import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
 import { attribution, collectRun, humanWait } from "../product/observationProjection.ts";
+import { backendScanClient, backendScanPrincipal, submitBackendExecutionEvidence } from "../product/backendExecution.ts";
+import type { EvidenceDraft } from "../kernel/ingress.ts";
+import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 export type Log = (line: Record<string, unknown>) => void;
 const SILENT: Log = () => {};
@@ -56,35 +59,61 @@ export function temporalNamespaceId(m: LiveEnvManifest): string {
 
 /**
  * Proposal-only planning (#61): run the commodity planner surface over the whole intent and seal
- * the typed proposal as WORK_PROPOSAL evidence with exact provenance. The proposal confers no
- * authority — each item still enters through the ordinary governed WORK_START.
+ * the typed proposal as WORK_PROPOSAL evidence with exact provenance, plus its role-qualified
+ * BACKEND_EXECUTION sibling. Neither confers authority — each item still enters through the
+ * ordinary governed WORK_START, without either planner envelope in gate evidence.
  */
-export async function sealPlan(dir: string, intent: string, planProduct?: string): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
-  const m = loadManifest(dir);
+interface SealPlanDependencies {
+  manifest?: LiveEnvManifest;
+  resolveBase?: (repoFullName: string, baseRef: string) => string;
+  broker?: <T>(url: string, path: string, body: unknown, options: { rpc_ms: number }) => Promise<T>;
+  clientForPrincipal?: (principal: string) => { submitEvidence(draft: EvidenceDraft): Promise<EvidenceEnvelopeV1> };
+}
+
+export async function sealPlan(
+  dir: string,
+  intent: string,
+  planProduct?: string,
+  dependencies: SealPlanDependencies = {},
+): Promise<{ proposal_evidence_id: string; items: WorkProposalV1["items"]; notes?: string }> {
+  const m = dependencies.manifest ?? loadManifest(dir);
   // plan_product select: fail closed on an unknown provider before any surface runs; omitted
   // keeps the claude default. Each provider submits under its OWN principal (honest attribution).
   const planProvider = resolvePlanProvider(planProduct !== undefined && planProduct !== "" ? planProduct : "claude");
   const planPrincipal = planProvider === "claude" ? "cadp-planner" : `cadp-planner-${planProvider}`;
   // The planner reads the base it proposes against — resolved fresh, same rationale as WORK_START.
-  const base_sha = resolveBaseSha(m.repo_full_name, "refs/heads/main");
-  const result = await brokerPostJson<{ proposal: WorkProposalV1; stdout_digest: string }>(
+  const base_sha = (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main");
+  const result = await (dependencies.broker ?? brokerPostJson)<{ proposal: WorkProposalV1; stdout_digest: string; backend_model?: string; backend_locator?: string }>(
     `http://127.0.0.1:${m.broker_port}`,
     "/plan",
     { repo_full_name: m.repo_full_name, base_sha, intent, plan_product: planProvider },
     { rpc_ms: SURFACE_BUDGETS.plan.rpc_ms },
   );
-  const envelope = await liveClient(dir, planPrincipal).submitEvidence({
+  const clientForPrincipal = dependencies.clientForPrincipal ?? ((principal: string) => liveClient(dir, principal));
+  const subjectBindings = [
+    { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
+    { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${base_sha}` },
+  ];
+  const envelope = await clientForPrincipal(planPrincipal).submitEvidence({
     evidence_kind: "WORK_PROPOSAL",
-    subject_bindings: [
-      { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
-      { authority_ref: "github.com", namespace: "repo-base", object_id: `${m.repo_id}@${base_sha}` },
-    ],
+    subject_bindings: subjectBindings,
     availability: "PRESENT",
     claim_schema: "cadp.work-proposal.v1",
     claim: { ...result.proposal, intent, stdout_digest: result.stdout_digest },
     producer_ref: planProvider === "claude" ? "planner:claude-code" : `planner:${planProvider}`,
     source_ref: `planner:${base_sha}:${sha256Hex(intent).slice(0, 16)}`,
     source_relation: "SELF_REPORT",
+  });
+  const scanClient = dependencies.clientForPrincipal !== undefined
+    ? clientForPrincipal(backendScanPrincipal(planProvider))
+    : backendScanClient(m.api_url, planProvider, (principal) => m.tokens[principal]);
+  await submitBackendExecutionEvidence({
+    client: scanClient,
+    provider: planProvider,
+    surface_role: "PLANNER",
+    subject_bindings: subjectBindings,
+    model: result.backend_model,
+    locator: result.backend_locator,
   });
   return {
     proposal_evidence_id: envelope.evidence_id,

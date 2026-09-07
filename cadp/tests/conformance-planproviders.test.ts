@@ -6,6 +6,10 @@ import { join } from "node:path";
 
 import { REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
 import { brokerPlan } from "../product/surfaceBroker.ts";
+import { sealPlan } from "../live/ops.ts";
+import { sha256Hex } from "../kernel/canonical.ts";
+import type { EvidenceDraft } from "../kernel/ingress.ts";
+import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 import {
   DEFAULT_PLAN_PROVIDER,
   PLAN_PROMPT_SENTINEL,
@@ -108,6 +112,62 @@ test("/plan rejects an unknown provider before creating its workspace", async ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("sealPlan seals proposal and PLANNER execution siblings under their distinct principals", async () => {
+  const expectedPlanner = {
+    claude: ["cadp-planner", "planner:claude-code"],
+    grok: ["cadp-planner-grok", "planner:grok"],
+    codex: ["cadp-planner-codex", "planner:codex"],
+  } as const;
+  const intent = "split the policy-qualified planner change into bounded work";
+  const baseSha = "a".repeat(40);
+
+  for (const provider of ["claude", "grok", "codex"] as const) {
+    const submissions: Array<{ principal: string; draft: EvidenceDraft }> = [];
+    const result = await sealPlan("unused", intent, provider, {
+      manifest: {
+        dir: "unused", api_url: "http://kernel.invalid", root_url: "http://root.invalid",
+        api_port: 1, root_port: 2, record_port: 3, temporal_port: 4, temporal_ui_port: 5, broker_port: 6,
+        repo_full_name: "owner/repo", repo_id: "123", base_sha: baseSha, tokens: {},
+        root_key_id: "root", kernel_config_path: "unused", policy_content_digest: "digest",
+      },
+      resolveBase: () => baseSha,
+      broker: async <T>() => ({ proposal: VALID_PROPOSAL, stdout_digest: "stdout" } as T),
+      clientForPrincipal: (principal) => ({
+        submitEvidence: async (draft) => {
+          submissions.push({ principal, draft });
+          return { evidence_id: `evidence-${submissions.length}` } as EvidenceEnvelopeV1;
+        },
+      }),
+    });
+
+    assert.equal(submissions.length, 2);
+    const [proposal, backend] = submissions;
+    assert.equal(proposal!.principal, expectedPlanner[provider][0]);
+    assert.equal(proposal!.draft.evidence_kind, "WORK_PROPOSAL");
+    assert.equal(proposal!.draft.producer_ref, expectedPlanner[provider][1], "WORK_PROPOSAL producer_ref stays unchanged");
+    assert.equal(backend!.principal, provider === "codex" ? "cadp-backend-scan" : `cadp-backend-scan-${provider}`);
+    assert.equal(backend!.draft.evidence_kind, "BACKEND_EXECUTION");
+    assert.equal(backend!.draft.producer_ref, `backend-scan:${provider}`);
+    assert.deepEqual(backend!.draft.subject_bindings.slice(0, 2), proposal!.draft.subject_bindings);
+    assert.deepEqual(backend!.draft.subject_bindings, [
+      { authority_ref: "cadp-store:k04", namespace: "work-intent", object_id: sha256Hex(intent) },
+      { authority_ref: "github.com", namespace: "repo-base", object_id: `123@${baseSha}` },
+      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "PLANNER" },
+    ]);
+    assert.deepEqual((backend!.draft.claim as Record<string, unknown>)["observed"], {
+      model: { availability: "UNKNOWN" },
+      provider: { availability: "PRESENT", value: provider, locator: "broker-response#backend_provider" },
+      run_id: { availability: "UNKNOWN" }, version: { availability: "UNKNOWN" }, effort: { availability: "UNKNOWN" },
+    });
+    assert.deepEqual(Object.keys(result).sort(), ["items", "proposal_evidence_id"], "planner execution stays out of downstream gate evidence APIs");
+  }
+});
+
+const VALID_PROPOSAL = {
+  schema: "cadp.work-proposal.v1" as const,
+  items: [{ work_item: "make the planner evidence change", max_steps: 4, max_effects: 2, rationale: "bounded" }],
+};
 
 // ---------------------------------------------------------------- grok planner (#149, measured)
 

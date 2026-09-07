@@ -20,6 +20,7 @@ import { resolveReviewProvider } from "./reviewProviders.ts";
 import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, EXTERNAL_VERIFY, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { SurfaceOperationBudget } from "./timeouts.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
+import { backendScanClient, submitBackendExecutionEvidence } from "./backendExecution.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -335,34 +336,22 @@ export async function submitBackendExecution(
   // The BACKEND_EXECUTION producer_ref is `backend-scan:<provider>`, so the token must authenticate
   // as that exact producer (the kernel refuses a producer/principal mismatch, fail closed). Select
   // the per-provider scan token (CADP_BACKEND_SCAN_TOKEN_<PROVIDER>), defaulting to the codex token.
-  const providerTokenVar = `CADP_BACKEND_SCAN_TOKEN_${provider.toUpperCase()}`;
-  const scanToken = process.env[providerTokenVar] ?? env("CADP_BACKEND_SCAN_TOKEN");
-  const scanClient = new KernelClient(env("CADP_KERNEL_URL"), scanToken);
-  const observed: Record<string, unknown> = {
-    model:
-      model !== undefined
-        ? { availability: "PRESENT", value: model, locator }
-        : { availability: "UNKNOWN" },
-    provider: { availability: "PRESENT", value: provider, locator: "broker-response#backend_provider" },
-    run_id: { availability: "UNKNOWN" },
-    version: { availability: "UNKNOWN" },
-    effort: { availability: "UNKNOWN" },
-  };
-  const envelope = await scanClient.submitEvidence({
-    evidence_kind: "BACKEND_EXECUTION",
+  const scanClient = backendScanClient(
+    env("CADP_KERNEL_URL"),
+    provider,
+    () => process.env[`CADP_BACKEND_SCAN_TOKEN_${provider.toUpperCase()}`] ?? process.env["CADP_BACKEND_SCAN_TOKEN"],
+  );
+  return submitBackendExecutionEvidence({
+    client: scanClient,
+    provider,
+    surface_role,
     subject_bindings: [
       { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: work_run_ref },
       { authority_ref: "cadp-store:k04", namespace: "step", object_id: `${work_run_ref}#${step_ordinal}` },
-      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: surface_role },
     ],
-    availability: "PRESENT",
-    claim_schema: "cadp.backend.v1",
-    claim: { requested: { provider, model: `${provider} default` }, observed },
-    producer_ref: `backend-scan:${provider}`,
-    source_ref: `${provider} session log scan`,
-    source_relation: "SELF_REPORT",
+    model,
+    locator,
   });
-  return envelope.evidence_id;
 }
 
 export async function governedGitPush(input: {
