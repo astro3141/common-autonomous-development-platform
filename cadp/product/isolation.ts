@@ -746,7 +746,7 @@ export function runReviewer(
   },
   options: SurfaceRunOptions = {},
 ): Promise<RunResult> {
-  const authSubdir = input.authSubdir ?? ".codex";
+  const authSubdir = input.authSubdir ?? ".claude";
   const sessionsMount = input.sessionsDir !== undefined ? ["-v", `${input.sessionsDir}:/root/${authSubdir}/${input.sessionsContainerDir ?? "sessions"}`] : [];
   return runBoundedSurface({
     kind: "reviewer",

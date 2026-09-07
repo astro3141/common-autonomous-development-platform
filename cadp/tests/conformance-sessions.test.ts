@@ -62,7 +62,6 @@ test("runReviewer sessionsDir adds exactly one writable session bind and keeps w
   await runReviewer(ISOLATION, {
     workspace: "/checkout",
     auth: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN", token: "token" },
-    authSubdir: ".claude",
     sessionsDir: "/host/reviewer-sessions",
     sessionsContainerDir: "projects",
     argv: ["claude", "--print"],
