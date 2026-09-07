@@ -25,6 +25,8 @@ Cross-product delegation remains intact: a run implemented by one model product 
 
 Verification can additionally run on independent infrastructure: a repository-owned GitHub Actions workflow re-tests the exact candidate sha and its result is sealed as authoritative evidence.
 
+Every model surface records its observed execution identity: worker, reviewer and planner runs each seal a role-bound backend-execution fact with the measured serving model.
+
 ## What the kernel guarantees (Spec v0.4 K1–K7)
 
 - A policy decision binds to one exact effect identity, input digest and
