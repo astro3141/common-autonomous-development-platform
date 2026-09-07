@@ -4,7 +4,8 @@
  *
  *   PT1  a short single-line item passes through unchanged;
  *   PT2  a long item is truncated at a word boundary within 80 chars with a trailing ellipsis;
- *   PT3  a multi-line item contributes only its first line.
+ *   PT3  a multi-line item contributes only its first line;
+ *   PT4  an oversized leading word is dropped entirely — never sliced mid-word.
  */
 
 import assert from "node:assert/strict";
@@ -32,4 +33,9 @@ test("PT2: long work item truncates at a word boundary with a trailing ellipsis"
 test("PT3: multi-line work item uses only the first line", () => {
   const item = "Tighten broker RPC timeouts\n\nDetails: undici's implicit timeout is shorter than the declared budget.";
   assert.equal(prTitleFromWorkItem(item), "Tighten broker RPC timeouts");
+});
+
+test("PT4: an oversized leading word is dropped, never sliced mid-word", () => {
+  const item = `${"x".repeat(100)} trailing context`;
+  assert.equal(prTitleFromWorkItem(item), "…");
 });

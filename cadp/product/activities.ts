@@ -609,10 +609,11 @@ const PR_TITLE_WORK_ITEM_MAX = 80;
 export function prTitleFromWorkItem(workItem: string): string {
   const firstLine = workItem.split("\n", 1)[0]!.trim();
   if (firstLine.length <= PR_TITLE_WORK_ITEM_MAX) return firstLine;
-  // Reserve one char for the ellipsis; back off to the last space unless the head is one long word.
-  const head = firstLine.slice(0, PR_TITLE_WORK_ITEM_MAX - 1);
+  // Back off to the last word boundary that leaves room for the ellipsis; a head with no
+  // boundary (one oversized leading word) keeps nothing rather than fall back to a mid-word slice.
+  const head = firstLine.slice(0, PR_TITLE_WORK_ITEM_MAX);
   const lastSpace = head.lastIndexOf(" ");
-  return `${(lastSpace > 0 ? head.slice(0, lastSpace) : head).trimEnd()}…`;
+  return `${(lastSpace > 0 ? head.slice(0, lastSpace) : "").trimEnd()}…`;
 }
 
 export async function governedPrCreate(input: {
