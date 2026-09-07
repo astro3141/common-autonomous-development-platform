@@ -599,6 +599,22 @@ export async function reviewCandidate(input: {
   };
 }
 
+const PR_TITLE_WORK_ITEM_MAX = 80;
+
+/**
+ * Derive the PR-title fragment from a work item: first line only, truncated at a word boundary
+ * within PR_TITLE_WORK_ITEM_MAX chars, with a trailing ellipsis when shortened (a bare slice cut
+ * long items mid-word with no marker).
+ */
+export function prTitleFromWorkItem(workItem: string): string {
+  const firstLine = workItem.split("\n", 1)[0]!.trim();
+  if (firstLine.length <= PR_TITLE_WORK_ITEM_MAX) return firstLine;
+  // Reserve one char for the ellipsis; back off to the last space unless the head is one long word.
+  const head = firstLine.slice(0, PR_TITLE_WORK_ITEM_MAX - 1);
+  const lastSpace = head.lastIndexOf(" ");
+  return `${(lastSpace > 0 ? head.slice(0, lastSpace) : head).trimEnd()}…`;
+}
+
 export async function governedPrCreate(input: {
   work_run_ref: string;
   step_ordinal: number;
@@ -610,7 +626,7 @@ export async function governedPrCreate(input: {
   prior_step_envelope_digest?: string;
 }): Promise<GovernedResult & { pr_number?: number; work_step_envelope_digest: string }> {
   const client = workflowClient();
-  const title = Buffer.from(`CADP candidate: ${input.work_item.slice(0, 80)}`, "utf8");
+  const title = Buffer.from(`CADP candidate: ${prTitleFromWorkItem(input.work_item)}`, "utf8");
   const body = Buffer.from(
     `Autonomous candidate \`${input.candidate_sha}\` for work run.\n\nGoverned by CADP v0.4 kernel: verification + independent review evidence sealed before admission.`,
     "utf8",
