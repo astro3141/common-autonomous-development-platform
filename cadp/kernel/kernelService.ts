@@ -29,6 +29,7 @@ import { RecordServiceAdapter } from "./adapters/record.ts";
 import { StorePolicyAdapter } from "./adapters/storePolicy.ts";
 import { TemporalAdapter } from "./adapters/temporal.ts";
 import { LiveTemporalTransport } from "./adapters/temporalLive.ts";
+import { liveDeploymentComponentRunner } from "../live/componentControl.ts";
 
 export interface KernelServiceConfig {
   db_path: string;
@@ -87,7 +88,7 @@ export function composeTargetAdapters(
         return { status_code: result.status, compare_status: (result.json as { status?: string })?.status };
       },
       checkout: liveCheckoutRead(repoRoot),
-    }));
+    }, liveDeploymentComponentRunner(join(config.secret_dir, ".."))));
     adapters.push(
       new GitHubAdapter(transport, cas, repoId, () => freshPassingImmutabilityAttestation(store, cas, repoId, clock)),
     );

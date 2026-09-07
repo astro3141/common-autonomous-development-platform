@@ -16,6 +16,7 @@ import { startKernelApi } from "../kernel/api.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
 import { PRINCIPALS, makeHarness, stopSharedOpa } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
+import type { ComponentIdentity, DeploymentComponentRunner } from "../kernel/adapters/deploymentActuation.ts";
 
 after(() => stopSharedOpa());
 
@@ -56,7 +57,14 @@ function sealImmutability(h: Awaited<ReturnType<typeof makeHarness>>, passing = 
 
 let deployStep = 2000;
 
-function sealDeploy(h: Harness, material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] }): string {
+const priorBroker = { code_sha: "b".repeat(40), image_digest: "sha256:broker", pid: 123 };
+const priorWorker = { code_sha: "b".repeat(40), image_digest: "sha256:worker", pid: 124 };
+
+function deployMaterial(components = ["broker"]) {
+  return { repo_id: REPO_ID, sha: SHA, components, expected_prior: Object.fromEntries(components.map((c) => [c, c === "broker" ? priorBroker : priorWorker])) };
+}
+
+function sealDeploy(h: Harness, material = deployMaterial()): string {
   const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1",
@@ -144,8 +152,9 @@ test("DEPLOY closed material refuses unknown keys, empty components, and every o
   try {
     const adapter = adapterFor(h);
     let processDelta = 0; // Item 1 exposes no process transport and verify_material cannot mutate it.
-    const base = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
+    const base = deployMaterial();
     const invalid: Array<Record<string, unknown>> = [
+      { repo_id: REPO_ID, sha: SHA, components: ["broker"] },
       { ...base, operator_note: "smuggled" },
       { ...base, components: [] },
       ...["kernel", "record", "temporal", "anything-else"].map((component) => ({ ...base, components: [component] })),
@@ -173,7 +182,7 @@ test("DEPLOY closed material refuses unknown keys, empty components, and every o
 test("DEPLOY pre-K6 refuses unmerged/diverged ancestry and checkout drift without process effects", async () => {
   const h = await makeHarness();
   try {
-    const material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
+    const material = deployMaterial();
     const cases = [
       { adapter: pinnedAdapter(h, "behind"), detail: /status behind/ },
       { adapter: pinnedAdapter(h, "diverged"), detail: /status diverged/ },
@@ -189,19 +198,16 @@ test("DEPLOY pre-K6 refuses unmerged/diverged ancestry and checkout drift withou
   } finally { h.close(); }
 });
 
-test("DEPLOY admits main itself through scripted compare and pin reads, but item 2 still cannot dispatch", async () => {
+test("DEPLOY admits main itself through scripted compare and pin reads", async () => {
   const h = await makeHarness();
   try {
     const adapter = pinnedAdapter(h, "identical");
-    const material = { repo_id: REPO_ID, sha: SHA, components: ["broker"] };
+    const material = deployMaterial();
     await adapter.verify_material(DEPLOY_OPERATION, material);
     assert.equal(await adapter.dispatch_precondition_read(DEPLOY_OPERATION, material), undefined);
-    await assert.rejects(
-      adapter.dispatch("effect", 1, {
+    assert.equal((await adapter.dispatch("effect", 1, {
         authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
-      }, DEPLOY_OPERATION, material),
-      /outside TD §20\.6 items 1-2/,
-    );
+      }, DEPLOY_OPERATION, material)).kind, "AMBIGUOUS");
   } finally { h.close(); }
 });
 
@@ -214,7 +220,7 @@ test("DEPLOY is AD3-shaped: only an exactly-scoped HUMAN_DECISION clears the gat
     assert.equal(delegated.outcome, "REQUIRE_EVIDENCE", "agent_merge_ok must remain merge-only");
     assert.deepEqual(delegated.reason_codes, ["HUMAN_DECISION"]);
 
-    const otherDeploy = sealDeploy(h, { repo_id: REPO_ID, sha: "b".repeat(40), components: ["worker"] });
+    const otherDeploy = sealDeploy(h, { ...deployMaterial(["worker"]), sha: "b".repeat(40) });
     const otherHuman = h.humanApprove(otherDeploy);
     const wrongEffect = await deployDecision(h, deploy, [otherHuman.evidence_id]);
     assert.equal(wrongEffect.outcome, "REQUIRE_EVIDENCE", "a decision for another effect cannot clear DEPLOY");
@@ -242,6 +248,65 @@ test("DEPLOY is AD3-shaped: only an exactly-scoped HUMAN_DECISION clears the gat
     const exactHuman = h.humanApprove(deploy);
     const allowed = await deployDecision(h, deploy, [exactHuman.evidence_id]);
     assert.equal(allowed.outcome, "ALLOW");
+  } finally { h.close(); }
+});
+
+function fakeRunner(initial: Record<string, ComponentIdentity>, nextPid = 9000): DeploymentComponentRunner & { calls: string[] } {
+  const identities = structuredClone(initial);
+  const calls: string[] = [];
+  return {
+    calls,
+    async observe(component) { calls.push(`observe:${component}`); return { ...identities[component]! }; },
+    async kill(component) { calls.push(`kill:${component}`); },
+    async start(component) {
+      calls.push(`start:${component}`);
+      identities[component] = { ...identities[component]!, code_sha: SHA, pid: nextPid += 1 };
+    },
+  };
+}
+
+test("DEPLOY dispatch restarts named components and receipts bind prior and next identities", async () => {
+  const h = await makeHarness();
+  try {
+    const runner = fakeRunner({ broker: priorBroker, worker: priorWorker });
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, {
+      compareToMain: async () => ({ status_code: 200, compare_status: "identical" }),
+      checkout: async () => ({ head: SHA, porcelain: "" }),
+    }, runner);
+    const material = deployMaterial(["broker", "worker"]);
+    await adapter.verify_material(DEPLOY_OPERATION, material);
+    const result = await adapter.dispatch("effect-committed-path", 1, {
+      authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
+    }, DEPLOY_OPERATION, material);
+    assert.equal(result.kind, "ACCEPTED");
+    assert.deepEqual(runner.calls, [
+      "observe:broker", "observe:worker", "kill:broker", "start:broker", "observe:broker",
+      "kill:worker", "start:worker", "observe:worker",
+    ]);
+    const receipt = (result as { receipt_claim: Record<string, unknown> }).receipt_claim;
+    assert.equal(adapter.receipt_binds(DEPLOY_OPERATION, material, receipt), true);
+    const rows = receipt.components as Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }>;
+    assert.deepEqual(rows.find((row) => row.component === "broker")!.prior, priorBroker);
+    assert.deepEqual(rows.find((row) => row.component === "worker")!.prior, priorWorker);
+    for (const row of rows) {
+      assert.equal(row.next.code_sha, SHA);
+      assert.notEqual(row.next.pid, row.prior.pid);
+    }
+  } finally { h.close(); }
+});
+
+test("DEPLOY expected_prior mismatch is REJECTED_NO_EFFECT before any kill or start", async () => {
+  const h = await makeHarness();
+  try {
+    const runner = fakeRunner({ broker: priorBroker, worker: priorWorker });
+    const adapter = new DeploymentActuationAdapter(h.store, h.cas, REPO_ID, h.clock.fn, undefined, runner);
+    const material = deployMaterial(["broker", "worker"]);
+    material.expected_prior.worker = { ...priorWorker, pid: 999 };
+    const result = await adapter.dispatch("effect-cas-mismatch", 1, {
+      authority_ref: "cadp-host", target_type: DEPLOYMENT_ACTUATION_TARGET_TYPE, target_id: "cadp-v04-live",
+    }, DEPLOY_OPERATION, material);
+    assert.equal(result.kind, "REJECTED_NO_EFFECT");
+    assert.deepEqual(runner.calls, ["observe:broker", "observe:worker"]);
   } finally { h.close(); }
 });
 

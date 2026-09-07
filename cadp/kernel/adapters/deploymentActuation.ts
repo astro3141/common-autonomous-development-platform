@@ -14,7 +14,7 @@ import { Cas } from "../cas.ts";
 import { ConstitutionalStore } from "../store.ts";
 import { MaterialIncomplete } from "./types.ts";
 import type {
-  AdapterOperation, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
+  AdapterOperation, DispatchResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
 } from "./types.ts";
 
 export const DEPLOY_OPERATION = "DEPLOY" as const;
@@ -32,6 +32,13 @@ export interface DeploymentPreconditionReads {
   compareToMain(sha: string): Promise<{ status_code: number; compare_status?: string }>;
   /** Observation of the exact checkout from which broker/worker would be spawned. */
   checkout(): Promise<{ head: string; porcelain: string }>;
+}
+
+export interface ComponentIdentity { code_sha: string; image_digest: string; pid: number }
+export interface DeploymentComponentRunner {
+  observe(component: "broker" | "worker"): Promise<ComponentIdentity>;
+  kill(component: "broker" | "worker"): Promise<void>;
+  start(component: "broker" | "worker"): Promise<void>;
 }
 
 const execFileAsync = promisify(execFile);
@@ -83,6 +90,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
   readonly repoId: string | undefined;
   readonly clock: () => number;
   readonly preconditionReads: DeploymentPreconditionReads | undefined;
+  readonly componentRunner: DeploymentComponentRunner | undefined;
 
   constructor(
     store: ConstitutionalStore,
@@ -90,12 +98,14 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     repoId: string | undefined,
     clock: () => number,
     preconditionReads?: DeploymentPreconditionReads,
+    componentRunner?: DeploymentComponentRunner,
   ) {
     this.store = store;
     this.cas = cas;
     this.repoId = repoId;
     this.clock = clock;
     this.preconditionReads = preconditionReads;
+    this.componentRunner = componentRunner;
   }
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -167,7 +177,7 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     }
 
     const expected = material["expected_prior"];
-    if (expected === undefined) return; // First-ever DEPLOY may omit it (§20.4).
+    if (expected === undefined) throw new MaterialIncomplete("expected_prior missing");
     if (!object(expected)) throw new MaterialIncomplete("expected_prior must be an object");
     for (const component of components) {
       if (!(component in expected)) throw new MaterialIncomplete(`expected_prior.${component} missing`);
@@ -219,13 +229,54 @@ export class DeploymentActuationAdapter implements TargetAdapterV1 {
     return undefined;
   }
 
-  async dispatch(_effect: string, _ordinal: number, _target: TargetRef, operation: string): Promise<never> {
-    throw new Error(`${operation} dispatch is outside TD §20.6 items 1-2`);
+  async dispatch(effect: string, ordinal: number, _target: TargetRef, operation: string, material: Record<string, unknown>): Promise<DispatchResult> {
+    if (operation !== DEPLOY_OPERATION || this.componentRunner === undefined) {
+      return { kind: "AMBIGUOUS", raw_observation: `${operation} component runner unavailable` };
+    }
+    const components = material["components"] as Array<"broker" | "worker">;
+    const expected = material["expected_prior"] as Record<string, Record<string, unknown>>;
+    const prior: Record<string, ComponentIdentity> = {};
+
+    // Observe and compare the whole named set before touching any component.
+    for (const component of components) prior[component] = await this.componentRunner.observe(component);
+    for (const component of components) {
+      const want = expected[component]!;
+      const got = prior[component]!;
+      const matches = want["code_sha"] === got.code_sha
+        && (want["image_digest"] === undefined || want["image_digest"] === got.image_digest)
+        && (want["pid"] === undefined || want["pid"] === got.pid);
+      if (!matches) return {
+        kind: "REJECTED_NO_EFFECT",
+        proof_claim: { reason: "expected_prior_mismatch", component, expected_prior: want, observed_prior: got },
+      };
+    }
+
+    const receipts: Array<{ component: string; prior: ComponentIdentity; next: ComponentIdentity }> = [];
+    for (const component of components) {
+      await this.componentRunner.kill(component);
+      await this.componentRunner.start(component);
+      const next = await this.componentRunner.observe(component);
+      receipts.push({ component, prior: prior[component]!, next });
+    }
+    return {
+      kind: "ACCEPTED",
+      target_operation_ref: `deploy:${effect}:${ordinal}`,
+      receipt_claim: { components: receipts },
+    };
   }
 
   async reconcile(): Promise<never> {
     throw new Error("DEPLOY reconciliation is outside TD §20.6 item 1");
   }
 
-  receipt_binds(): boolean { return false; }
+  receipt_binds(operation: string, material: Record<string, unknown>, receipt: Record<string, unknown>): boolean {
+    if (operation !== DEPLOY_OPERATION || !Array.isArray(receipt["components"])) return false;
+    const wanted = material["components"] as string[];
+    const rows = receipt["components"] as Array<Record<string, unknown>>;
+    return rows.length === wanted.length && wanted.every((component) => {
+      const row = rows.find((candidate) => candidate["component"] === component);
+      const next = row?.["next"] as Record<string, unknown> | undefined;
+      return next?.["code_sha"] === material["sha"];
+    });
+  }
 }

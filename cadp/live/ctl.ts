@@ -27,6 +27,7 @@ import { sealPlan, startWork, workPlan, runSnapshot } from "./ops.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
 import { touchesGateMachinery } from "../product/gateFiles.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
+import { killLiveComponent, startLiveComponent } from "./componentControl.ts";
 
 const dir = process.argv[2]!;
 const command = process.argv[3]!;
@@ -43,6 +44,7 @@ function client(principal: string): KernelClient {
 }
 
 function killComponent(name: string): void {
+  if (name === "broker" || name === "worker") return killLiveComponent(dir, name);
   const pidFile = join(dir, `${name}.pid`);
   if (!existsSync(pidFile)) return console.log(JSON.stringify({ [name]: "no pid file" }));
   const pid = Number(readFileSync(pidFile, "utf8").trim());
@@ -67,6 +69,11 @@ async function waitHttp(url: string, tries = 100): Promise<void> {
 }
 
 function startComponent(name: string): void {
+  if (name === "broker" || name === "worker") {
+    startLiveComponent(dir, name);
+    console.log(JSON.stringify({ started: name }));
+    return;
+  }
   const m = manifest();
   const repoRoot = join(import.meta.dirname, "..", "..");
   switch (name) {
@@ -87,57 +94,6 @@ function startComponent(name: string): void {
     case "kernel":
       spawnComponent(dir, "kernel", "node", [join(repoRoot, "cadp/kernel/kernelService.ts"), m.kernel_config_path]);
       break;
-    case "broker": {
-      const egress = JSON.parse(readFileSync(join(dir, "egress.json"), "utf8")) as { network: string; proxy: string };
-      const brokerEnv = {
-        CADP_BROKER_PORT: String(m.broker_port),
-        // The broker owns the surface isolation: pinned image + internal-network egress boundary.
-        CADP_WORKER_IMAGE: readFileSync(join(dir, "worker-image"), "utf8").trim(),
-        CADP_EGRESS_NETWORK: egress.network,
-        CADP_EGRESS_PROXY: egress.proxy,
-        // Failure-only session retention (bounded): a failed worker run's session log is its only
-        // postmortem record. Wired here (not a hand-set env var) so every broker restart keeps it.
-        CADP_FAILED_SESSIONS_DIR: join(dir, "failed-sessions"),
-      };
-      // The bounded surface launcher (TD §4.1): it clones (public read) and drives Docker, so it
-      // keeps network + daemon access, but it holds NO Kernel token and its Seatbelt profile
-      // denies the PEP secret path — it can neither read the secret nor forge a governed effect.
-      spawnComponentSandboxed(dir, "broker", "node", [join(repoRoot, "cadp/product/surfaceBroker.ts")], brokerEnv, [join(dir, "secret")]);
-      break;
-    }
-    case "worker": {
-      mkdirSync(join(dir, "worker-tmp"), { recursive: true });
-      const workerEnv = {
-        CADP_KERNEL_URL: m.api_url,
-        CADP_WORKFLOW_TOKEN: m.tokens["cadp-workflow"]!,
-        CADP_VERIFIER_TOKEN: m.tokens["cadp-verifier"]!,
-        CADP_REVIEWER_TOKEN: m.tokens["cadp-reviewer-claude"]!,
-        // Per-provider reviewer principal (#149). Conditional: an env minted before this principal
-        // existed still starts; selecting the grok reviewer there fails closed in the activity.
-        ...(m.tokens["cadp-reviewer-grok"] !== undefined ? { CADP_REVIEWER_TOKEN_GROK: m.tokens["cadp-reviewer-grok"]! } : {}),
-        ...(m.tokens["cadp-reviewer-codex"] !== undefined ? { CADP_REVIEWER_TOKEN_CODEX: m.tokens["cadp-reviewer-codex"]! } : {}),
-        ...(m.tokens["cadp-backend-scan-claude"] !== undefined ? { CADP_BACKEND_SCAN_TOKEN_CLAUDE: m.tokens["cadp-backend-scan-claude"]! } : {}),
-        ...(m.tokens["cadp-verifier-actions"] !== undefined ? { CADP_VERIFIER_ACTIONS_TOKEN: m.tokens["cadp-verifier-actions"]! } : {}),
-        CADP_BACKEND_SCAN_TOKEN: m.tokens["cadp-backend-scan"]!,
-        CADP_BACKEND_SCAN_TOKEN_GROK: m.tokens["cadp-backend-scan-grok"]!,
-        CADP_TEMPORAL_ADDRESS: `127.0.0.1:${m.temporal_port}`,
-        CADP_TEMPORAL_NAMESPACE: "cadp-v04",
-        CADP_TASK_QUEUE: "cadp-worker",
-        // Surface work is delegated to the bounded broker over its localhost port.
-        CADP_BROKER_URL: `http://127.0.0.1:${m.broker_port}`,
-      };
-      // Activity-host isolation (TD §4.1; re-review 5101871379): the Temporal activity worker holds
-      // the Kernel workflow tokens, so its Seatbelt profile (a) denies the PEP secret path and (b)
-      // pins network egress to ONLY the Kernel/Temporal/broker localhost ports. It therefore has no
-      // direct GitHub or record-service reach (governed targets are http-000) and no Docker daemon
-      // socket — it cannot be a confused deputy for a secret-path mount. All GitHub/Docker work is
-      // delegated to the broker.
-      spawnComponentSandboxed(
-        dir, "worker", "node", [join(repoRoot, "cadp/product/worker.ts")], workerEnv,
-        [join(dir, "secret")], [m.api_port, m.temporal_port, m.broker_port],
-      );
-      break;
-    }
     default:
       throw new Error(`unknown component ${name}`);
   }
