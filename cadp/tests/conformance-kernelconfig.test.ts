@@ -422,7 +422,8 @@ test("v1 validation is unchanged: schema string, wildcard principals, unknown to
     /^identity_registry principal must be exact \(no patterns\)$/u,
     "wildcard principal under v1",
   );
-  refuseInvalid({ ...v1Config(), schema: "cadp.kernel-config.v3" }, /^schema must be cadp\.kernel-config\.v1 or cadp\.kernel-config\.v2$/u, "unknown schema");
+  // v2 widens acceptance and nothing else: an unknown schema string keeps v1's exact refusal text.
+  refuseInvalid({ ...v1Config(), schema: "cadp.kernel-config.v3" }, /^schema must be cadp\.kernel-config\.v1$/u, "unknown schema");
   // Every v1 rule still runs under v2.
   refuseInvalid(
     v2Config({ identity_registry: [{ ...clone(IDENTITY), principal: "spiffe://cadp/*" }] }),
@@ -470,16 +471,22 @@ test("a descriptor whose fields list is empty is expressible (B2(5): ENTROPY is 
 
 // ------------------------------------------------------- B2(2)(iii)/B2(5) — projection coverage
 
-test("every allocation_schemas entry needs a descriptor, and every descriptor an entry", () => {
+test("every allocation_schemas entry needs a descriptor to be validated against", () => {
   refuse(v2Config({
     allocation_schema_descriptors: [],
     allocation_schemas: [V1_ALLOCATION_SCHEMA],
   }), "ALLOCATION_SCHEMA_UNREGISTERED", "mapping with no descriptor");
+});
 
-  refuse(v2Config({
+test("a descriptor with no allocation_schemas entry is unallocatable, not an invalid bundle", () => {
+  // B2(5)'s "both entries" is a condition on ALLOCATABILITY — the refusal is at
+  // `allocate_effect_id` — and B2(8) lists no bundle-level refusal for an unmapped descriptor.
+  const cfg = validateKernelConfig(v2Config({
     allocation_schema_descriptors: [V1_DESCRIPTOR],
     allocation_schemas: [],
-  }), "ALLOCATION_SCHEMA_UNREGISTERED", "descriptor with no mapping entry (B2(5): a schema needs BOTH)");
+  }));
+  assert.equal(cfg.allocation_schema_descriptors?.length, 1);
+  assert.equal(cfg.allocation_schemas?.length, 0);
 });
 
 test("projection-vs-descriptor: every PROJECTED field mapped exactly once, no ENTROPY field mapped", () => {

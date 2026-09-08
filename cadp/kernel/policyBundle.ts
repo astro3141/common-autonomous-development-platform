@@ -357,8 +357,10 @@ export function validateKernelConfig(dataCadp: unknown): KernelConfig {
   for (const key of Object.keys(cfg)) {
     if (!allowed.has(key)) throw new KernelConfigInvalid(`unknown key data.cadp.${key} (closed schema)`);
   }
+  // v2 is accepted here and refused nowhere else; every other schema string keeps v1's refusal
+  // BYTE-IDENTICALLY, message included — widening acceptance is the only v1 change v2 may make.
   if (schema !== SCHEMA_V1 && schema !== SCHEMA_V2) {
-    throw new KernelConfigInvalid(`schema must be ${SCHEMA_V1} or ${SCHEMA_V2}`);
+    throw new KernelConfigInvalid(`schema must be ${SCHEMA_V1}`);
   }
 
   const schemes = cfg["approved_digest_schemes"];
@@ -594,8 +596,16 @@ function parseAllocationSchemas(cfg: Record<string, unknown>): ParsedAllocationS
 }
 
 /**
- * AP B2(5) + B2(2)(iii): every allocation schema carries BOTH entries, and each mapping is
- * validated against that schema's descriptor at activation — never discovered at runtime.
+ * AP B2(2)(iii): each mapping is validated against that schema's descriptor at activation, never
+ * discovered at runtime allocation. A mapping with no descriptor has nothing to be validated
+ * against, so it is refused `ALLOCATION_SCHEMA_UNREGISTERED` here.
+ *
+ * The converse is NOT a validation rule: B2(5)'s "both entries" is a condition on ALLOCATABILITY
+ * — a schema missing either is refused `ALLOCATION_SCHEMA_UNREGISTERED` at `allocate_effect_id`
+ * (a later lane) — and B2(8) does not list a descriptor without a mapping among the bundle-level
+ * refusals. A carried-but-unmapped descriptor is therefore an inert, unallocatable schema, not an
+ * invalid bundle; the one bundle-level "entry required" rule the TD does state is v1's static
+ * `purpose_relation` totality below.
  */
 function assertProjectionCoverage(descriptors: readonly ParsedDescriptor[], schemas: readonly ParsedAllocationSchema[]): void {
   for (const entry of schemas) {
@@ -628,14 +638,6 @@ function assertProjectionCoverage(descriptors: readonly ParsedDescriptor[], sche
           "ALLOCATION_SCHEMA_PROJECTION_INCOMPLETE",
         );
       }
-    }
-  }
-  for (const descriptor of descriptors) {
-    if (!schemas.some((s) => s.schema === descriptor.schema)) {
-      throw new KernelConfigInvalid(
-        `allocation_schema_descriptors entry ${descriptor.schema} has no allocation_schemas entry`,
-        "ALLOCATION_SCHEMA_UNREGISTERED",
-      );
     }
   }
 }
