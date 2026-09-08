@@ -141,7 +141,7 @@ async function makeGitHubHarness(options: { rego?: string; disabledChecks?: Read
       const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
       const request = h.ingress.sealEffectRequest(
         {
-          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-create" }),
+          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-create" }, PRINCIPALS.workflow),
           requester_ref: "workflow:cadp-work",
           work_bindings: [],
           target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: repo.repo_id },
@@ -165,7 +165,7 @@ async function makeGitHubHarness(options: { rego?: string; disabledChecks?: Read
       const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
       const request = h.ingress.sealEffectRequest(
         {
-          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "git-push" }),
+          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "git-push" }, PRINCIPALS.workflow),
           requester_ref: "workflow:cadp-work",
           work_bindings: [],
           target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: repo.repo_id },
@@ -436,7 +436,7 @@ test("C41: review-to-effect provenance — positive chain + falsifications 1/1b/
         const materialRefA = gh.h.ingress.putBlob(Buffer.from(JSON.stringify(mergeMaterialA), "utf8"));
         const mergeA = gh.h.ingress.sealEffectRequest(
           {
-            effect_id: gh.h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-merge" }),
+            effect_id: gh.h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-merge" }, PRINCIPALS.workflow),
             requester_ref: "workflow:cadp-work",
             work_bindings: [],
             target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: gh.repo.repo_id },
@@ -454,7 +454,7 @@ test("C41: review-to-effect provenance — positive chain + falsifications 1/1b/
         const evidenceB2 = gh.sealEvidence(SHA_B);
         const mergeB = gh.h.ingress.sealEffectRequest(
           {
-            effect_id: gh.h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-merge" }),
+            effect_id: gh.h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c041", step_ordinal: (stepCounter += 1), purpose: "pr-merge" }, PRINCIPALS.workflow),
             requester_ref: "workflow:cadp-work",
             work_bindings: [],
             target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: gh.repo.repo_id },

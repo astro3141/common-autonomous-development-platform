@@ -99,7 +99,7 @@ test("C26: a bundle whose manifest.revision does not match its payload digest is
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
     const request = h.ingress.sealEffectRequest(
       {
-        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c026", step_ordinal: 1, purpose: "policy-activate" }),
+        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c026", step_ordinal: 1, purpose: "policy-activate" }, PRINCIPALS.workflow),
         requester_ref: "workflow:cadp-work",
         work_bindings: [],
         target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },
@@ -175,7 +175,7 @@ test("C30: missing/corrupt CAS material refuses before K6 — no admission, no p
         const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(activateMaterial), "utf8"));
         const activateRequest = h.ingress.sealEffectRequest(
           {
-            effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c030", step_ordinal: 1, purpose: "policy-activate" }),
+            effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c030", step_ordinal: 1, purpose: "policy-activate" }, PRINCIPALS.workflow),
             requester_ref: "workflow:cadp-work",
             work_bindings: [],
             target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },
@@ -256,7 +256,7 @@ test("C35: publication happens only inside POLICY_ACTIVATE dispatch; conflicts r
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(badMaterial), "utf8"));
     const request = h.ingress.sealEffectRequest(
       {
-        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c035", step_ordinal: 1, purpose: "policy-activate" }),
+        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c035", step_ordinal: 1, purpose: "policy-activate" }, PRINCIPALS.workflow),
         requester_ref: "workflow:cadp-work",
         work_bindings: [],
         target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },

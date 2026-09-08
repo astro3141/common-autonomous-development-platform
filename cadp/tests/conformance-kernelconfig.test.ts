@@ -14,7 +14,7 @@ import test, { after } from "node:test";
 
 import { validateKernelConfig, KernelConfigInvalid } from "../kernel/policyBundle.ts";
 import { buildReferenceKernelConfig, REFERENCE_ADAPTERS, REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
-import { makeHarness, stopSharedOpa } from "./support/harness.ts";
+import { makeHarness, stopSharedOpa, V2_ALLOCATION_SCHEMAS, V2_ALLOCATION_SCHEMA_DESCRIPTORS } from "./support/harness.ts";
 
 after(() => stopSharedOpa());
 
@@ -614,13 +614,20 @@ test("kernel_subject_namespaces entries carry both components as exact strings",
 
 // ------------------------------------------------------------------ A1 on the activation path
 
-/** The five v2 registries, empty — the minimum a bundle needs to carry `cadp.kernel-config.v2`. */
-const V2_EMPTY_REGISTRIES = {
+/**
+ * The five v2 registries as a DEPLOYABLE v2 bundle carries them. The allocation contract is
+ * non-empty here, and must be: once such a bundle is active, `allocate_effect_id` resolves every
+ * tuple through its schema's descriptor and `allocation_schemas` entries and refuses
+ * `ALLOCATION_SCHEMA_UNREGISTERED` without both (AP B2(5)) — so a bundle carrying no
+ * `cadp.allocation-key.v1` entry activates but can allocate no internal effect, including the next
+ * `POLICY_ACTIVATE`. The empty-registry case is the validation-layer positive control above.
+ */
+const V2_REGISTRIES = {
   schema: "cadp.kernel-config.v2",
-  allocation_schema_descriptors: [],
-  allocation_schemas: [],
+  allocation_schema_descriptors: V2_ALLOCATION_SCHEMA_DESCRIPTORS,
+  allocation_schemas: V2_ALLOCATION_SCHEMAS,
   subject_complete_assembly: [],
-  kernel_subject_namespaces: [],
+  kernel_subject_namespaces: [{ namespace: "work-run", authority_ref: "cadp-store:k04" }],
   run_profile_enrolled_requester_refs: [],
 } as const;
 
@@ -632,7 +639,7 @@ test("A1 end to end: a duplicate-principal v2 bundle is refused at recheck #17; 
 
     // Positive control first, so the refusal below is attributed to the duplicate row and not to
     // the v2 schema string: the same bundle without it activates.
-    const clean = await h.activatePolicy({ revision: 2, configOverrides: { ...V2_EMPTY_REGISTRIES } as never });
+    const clean = await h.activatePolicy({ revision: 2, configOverrides: { ...V2_REGISTRIES } as never });
     assert.equal((clean.admitted as { kind: string }).kind, "ADMITTED", JSON.stringify(clean.admitted));
     assert.equal(h.store.activeActivation()!.revision, 2);
 
@@ -640,7 +647,7 @@ test("A1 end to end: a duplicate-principal v2 bundle is refused at recheck #17; 
     const refused = await h.activatePolicy({
       revision: 3,
       configOverrides: {
-        ...V2_EMPTY_REGISTRIES,
+        ...V2_REGISTRIES,
         identity_registry: [
           ...REFERENCE_IDENTITIES,
           { ...first, producer_ref: "workflow:cadp-work-shadow", identity_class: { ...first.identity_class, process_class: "worker" } },

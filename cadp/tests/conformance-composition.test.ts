@@ -118,7 +118,7 @@ test("FC22 guard bite: dropping the governed row reproduces NO_ADAPTER_FOR_TARGE
     const effect_id = h.ingress.allocateEffectId({
       schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
       step_ordinal: nextId(), purpose: "finding-seal",
-    });
+    }, PRINCIPALS.workflow);
     const material_ref = h.ingress.putBlob(
       Buffer.from(JSON.stringify({ schema: GOVERNED_TRANSITION_MATERIAL_SCHEMA, idempotency_key: `cadp-v04:${effect_id}` }), "utf8"),
     );

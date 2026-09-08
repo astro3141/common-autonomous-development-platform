@@ -17,6 +17,7 @@ import type { EvaluateOutcome } from "../../kernel/evaluator.ts";
 import { Pep } from "../../kernel/pep.ts";
 import { Reconciler } from "../../kernel/reconciler.ts";
 import { runGenesis } from "../../kernel/genesis.ts";
+import { resolveActivePolicy } from "../../kernel/policyState.ts";
 import { generateRootKey } from "../../kernel/sig.ts";
 import { ConstitutionalStore } from "../../kernel/store.ts";
 import { makeAdapterRegistry } from "../../kernel/adapters/types.ts";
@@ -31,6 +32,87 @@ import { buildReferenceBundle, buildReferenceKernelConfig } from "../../deployme
 import type { ReferencePolicyInput } from "../../deployment/referencePolicy.ts";
 
 export const PEP_REF = "spiffe://cadp-v04/cadp/pep";
+
+/** The work run every harness-sealed internal effect is allocated under unless a test names one. */
+export const DEFAULT_WORK_RUN_REF = "cadp-v04:effect:00000000-0000-7000-8000-000000000000";
+
+/**
+ * AP B2(2)(i) composition data for a `cadp.kernel-config.v2` harness. The two descriptors are the
+ * Workflow-Plane-owned definitions (AP B1(4), WP §3.3) carried — not authored — by the bundle:
+ * `cadp.allocation-key.v1` is `{work_run_ref: PROJECTED/EFFECT_ID, step_ordinal:
+ * ENTROPY/POSITIVE_INTEGER}` and `cadp.allocation-key.external.v1` is WP §3.3's three exact
+ * strings, each PROJECTED/NONEMPTY_STRING.
+ */
+export const V2_ALLOCATION_SCHEMA_DESCRIPTORS = [
+  {
+    schema: "cadp.allocation-key.v1",
+    fields: [
+      { field: "work_run_ref", role: "PROJECTED", value_contract: "EFFECT_ID" },
+      { field: "step_ordinal", role: "ENTROPY", value_contract: "POSITIVE_INTEGER" },
+    ],
+  },
+  {
+    schema: "cadp.allocation-key.external.v1",
+    fields: [
+      { field: "repo_id", role: "PROJECTED", value_contract: "NONEMPTY_STRING" },
+      { field: "candidate_base_sha", role: "PROJECTED", value_contract: "NONEMPTY_STRING" },
+      { field: "candidate_sha", role: "PROJECTED", value_contract: "NONEMPTY_STRING" },
+    ],
+  },
+] as const;
+
+/**
+ * AP B2(2)(iii)/B2(6) composition data: projection targets and purpose relations, every string
+ * supplied by the bundle and none of it kernel vocabulary. v1's `purpose_relation` is TOTAL over
+ * the reference `allocation_purposes`, which B2(5) requires of a bundle carrying a v1 entry.
+ */
+export const V2_ALLOCATION_SCHEMAS = [
+  {
+    schema: "cadp.allocation-key.v1",
+    binding_projection: [{ tuple_field: "work_run_ref", authority_ref: "cadp-store:k04", namespace: "work-run" }],
+    purpose_relation: [
+      { purpose: "work-start", operation_kind: "WORK_START" },
+      { purpose: "git-push", operation_kind: "GIT_PUSH" },
+      { purpose: "pr-create", operation_kind: "PR_CREATE" },
+      { purpose: "pr-merge", operation_kind: "PR_MERGE" },
+      { purpose: "record-write", operation_kind: "SCRIPTED_WRITE" },
+      { purpose: "policy-activate", operation_kind: "POLICY_ACTIVATE" },
+      { purpose: "deploy", operation_kind: "DEPLOY" },
+      { purpose: "finding-project", operation_kind: "FINDING_PROJECT" },
+      { purpose: "finding-seal", operation_kind: "FINDING_SEAL" },
+    ],
+  },
+  {
+    schema: "cadp.allocation-key.external.v1",
+    binding_projection: [
+      { tuple_field: "repo_id", authority_ref: "github.com", namespace: "repository" },
+      { tuple_field: "candidate_base_sha", authority_ref: "github.com", namespace: "base-commit" },
+      { tuple_field: "candidate_sha", authority_ref: "github.com", namespace: "commit" },
+    ],
+    purpose_relation: [
+      { purpose: "git-push", operation_kind: "GIT_PUSH" },
+      { purpose: "pr-create", operation_kind: "PR_CREATE" },
+      { purpose: "pr-merge", operation_kind: "PR_MERGE" },
+    ],
+  },
+] as const;
+
+/**
+ * The five v2-only registries of `cadp.kernel-config.v2` (AP B3(5)), carrying the allocation
+ * contract above. `run_profile_enrolled_requester_refs` stays empty: the run capability is a
+ * later lane, and B3(4)(c)'s cross-field invariant binds only a non-empty enrollment.
+ */
+export function v2ConfigOverrides(overrides: object = {}): Record<string, unknown> {
+  return {
+    schema: "cadp.kernel-config.v2",
+    allocation_schema_descriptors: V2_ALLOCATION_SCHEMA_DESCRIPTORS,
+    allocation_schemas: V2_ALLOCATION_SCHEMAS,
+    subject_complete_assembly: [],
+    kernel_subject_namespaces: [{ namespace: "work-run", authority_ref: "cadp-store:k04" }],
+    run_profile_enrolled_requester_refs: [],
+    ...overrides,
+  };
+}
 
 export const PRINCIPALS = {
   workflow: { principal: "cadp-workflow" },
@@ -311,22 +393,28 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
         },
       };
       const material_ref = ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
-      const effect_id = ingress.allocateEffectId({
+      const allocation_tuple = {
         schema: "cadp.allocation-key.v1",
-        work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
+        work_run_ref: DEFAULT_WORK_RUN_REF,
         step_ordinal: (allocationCounter += 1),
         purpose: "policy-activate",
-      });
+      };
+      const effect_id = ingress.allocateEffectId(allocation_tuple, PRINCIPALS.workflow);
+      // Under a `cadp.kernel-config.v2` deployment the first seal is bound to the allocation
+      // (AP B2(3)): the tuple rides as transport and the v1 descriptor's PROJECTED `work_run_ref`
+      // must be the sealed work-run subject. Under v1 the call is exactly what it was.
+      const v2 = resolveActivePolicy(store, cas).config.schema === "cadp.kernel-config.v2";
       ingress.sealEffectRequest(
         {
           effect_id,
           requester_ref: "workflow:cadp-work",
-          work_bindings: [],
+          work_bindings: v2 ? [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: DEFAULT_WORK_RUN_REF }] : [],
           target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },
           operation_kind: "POLICY_ACTIVATE",
           material_schema: "cadp.policy-activate.v1",
           material_ref,
           prior_effect_refs: [],
+          ...(v2 ? { allocation_tuple } : {}),
         },
         PRINCIPALS.workflow,
       );
@@ -366,14 +454,13 @@ export function sealScriptedRequest(
   const bodyBytes = Buffer.from(options.body ?? "scripted-body", "utf8");
   const body_digest = require_sha(bodyBytes);
   const body_cas_key = h.ingress.putBlob(bodyBytes);
-  const effect_id =
-    options.effect_id ??
-    h.ingress.allocateEffectId({
-      schema: "cadp.allocation-key.v1",
-      work_run_ref: options.work_run_ref ?? "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-      step_ordinal: allocationCounter += 1,
-      purpose: "record-write",
-    });
+  const allocation_tuple = {
+    schema: "cadp.allocation-key.v1",
+    work_run_ref: options.work_run_ref ?? DEFAULT_WORK_RUN_REF,
+    step_ordinal: allocationCounter += 1,
+    purpose: "record-write",
+  };
+  const effect_id = options.effect_id ?? h.ingress.allocateEffectId(allocation_tuple, PRINCIPALS.workflow);
   const material: Record<string, unknown> = {
     tenant: "scripted-1",
     resource_id: "r-1",
@@ -385,9 +472,14 @@ export function sealScriptedRequest(
   }
   const materialBytes = Buffer.from(JSON.stringify(material), "utf8");
   const material_ref = h.ingress.putBlob(materialBytes);
-  const work_bindings = options.work_run_ref === undefined
-    ? []
-    : [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: options.work_run_ref }];
+  // Under v2 the allocation's PROJECTED `work_run_ref` must be the sealed work-run subject
+  // (AP B2(3.4)), so the binding is always carried there; under v1 the caller decides, as before.
+  const v2 = resolveActivePolicy(h.store, h.cas).config.schema === "cadp.kernel-config.v2";
+  const work_bindings = v2
+    ? [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: allocation_tuple.work_run_ref }]
+    : options.work_run_ref === undefined
+      ? []
+      : [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: options.work_run_ref }];
   const request = h.ingress.sealEffectRequest(
     {
       effect_id,
@@ -398,6 +490,7 @@ export function sealScriptedRequest(
       material_schema: "test.scripted-write.v1",
       material_ref,
       prior_effect_refs: options.prior_effect_refs ?? [],
+      ...(v2 && options.effect_id === undefined ? { allocation_tuple } : {}),
     },
     PRINCIPALS.workflow,
   );

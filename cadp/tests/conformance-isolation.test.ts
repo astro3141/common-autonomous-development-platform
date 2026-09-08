@@ -146,7 +146,7 @@ test("F4: recheck #7 — the prior's LATEST outcome must be presented truthfully
       const ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
       return h.ingress.sealEffectRequest(
         {
-          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000f004", step_ordinal: step, purpose: "record-write" }),
+          effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000f004", step_ordinal: step, purpose: "record-write" }, PRINCIPALS.workflow),
           requester_ref: "workflow:cadp-work",
           work_bindings: [],
           target_ref: h.target.targetRef(),

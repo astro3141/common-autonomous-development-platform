@@ -60,7 +60,7 @@ async function recordSetup(options: { wrapReconcile?: (r: ReconcileResult) => Re
         work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c010",
         step_ordinal: (allocation += 1),
         purpose: "record-write",
-      });
+      }, PRINCIPALS.workflow);
       const material = {
         tenant: "cadp-disposable",
         resource_id: `r-${allocation}`,

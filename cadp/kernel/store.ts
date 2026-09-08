@@ -141,6 +141,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS governed_edge_unique
   WHERE producer_ref = 'governed:reclassification' AND edge_evidence_id IS NOT NULL;
 `;
 
+/**
+ * AP B2(1): the allocation binding every `cadp.kernel-config.v2` allocation row carries — one
+ * GENERIC shape for every tuple schema, so a new schema changes no DDL and no column is ever
+ * domain-named. All five are NOT NULL for a v2 row (enforced at write below); they are null for
+ * the v1 rows a `cadp.kernel-config.v1` deployment writes, whose insert path is unchanged.
+ */
+export interface AllocationBinding {
+  readonly requester_ref: string;
+  readonly allocation_schema: string;
+  /** sha256 over the `cadp-jcs-1` form of the allocated wire tuple AS RECEIVED (B2(1)). */
+  readonly allocation_binding_digest: string;
+  /** sha256 over the `cadp-jcs-1` form of `allocation_contract_payload.v1` (B2(1)). */
+  readonly allocation_contract_digest: string;
+  readonly purpose: string;
+}
+
+export interface AllocationRow {
+  readonly allocation_key: string;
+  readonly effect_id: string;
+  /** Undefined exactly for a row written under a `cadp.kernel-config.v1` deployment. */
+  readonly binding?: AllocationBinding;
+}
+
+const ALLOCATION_BINDING_COLUMNS: readonly (keyof AllocationBinding)[] = [
+  "requester_ref", "allocation_schema", "allocation_binding_digest", "allocation_contract_digest", "purpose",
+];
+
 export interface ActivationRow {
   readonly seq: number;
   readonly expected_prev_seq: number;
@@ -201,6 +228,17 @@ export class ConstitutionalStore {
     for (const column of ["producer_ref", "source_ref", "edge_evidence_id", "edge_envelope_digest"]) {
       if (!columns.has(column)) this.db.exec(`ALTER TABLE evidence_envelope ADD COLUMN ${column} TEXT`);
     }
+    // AP B2(1): the allocation binding columns, added by the same append-only migration pattern —
+    // nullable at the DDL level so a pre-existing v1 row stays valid, NOT NULL in effect for every
+    // v2 row (`insertAllocation` refuses a partial binding). The `effect_id` index is what lets a
+    // seal resolve the row from the `effect_id` it names (B2(1), B2(3)).
+    const allocationColumns = new Set(
+      (this.db.prepare("SELECT name FROM pragma_table_info('effect_allocation')").all() as Array<{ name: string }>).map((r) => r.name),
+    );
+    for (const column of ALLOCATION_BINDING_COLUMNS) {
+      if (!allocationColumns.has(column)) this.db.exec(`ALTER TABLE effect_allocation ADD COLUMN ${column} TEXT`);
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS effect_allocation_effect_idx ON effect_allocation (effect_id);");
     this.db.exec(GOVERNED_DDL);
   }
 
@@ -371,9 +409,31 @@ export class ConstitutionalStore {
 
   // -------------------------------------------------------------- allocation / request
 
-  insertAllocation(allocation_key: string, effect_id: string): void {
+  /**
+   * The v1 insert path is unchanged: called with no `binding`, exactly the two columns of the
+   * v0.4 row are written. A v2 allocation passes the binding, and every one of its five members is
+   * required here — the write-time enforcement of AP B2(1)'s NOT NULL, which the nullable columns
+   * of the append-only migration cannot express at the DDL level.
+   */
+  insertAllocation(allocation_key: string, effect_id: string, binding?: AllocationBinding): void {
+    if (binding !== undefined) {
+      for (const column of ALLOCATION_BINDING_COLUMNS) {
+        const value = binding[column];
+        if (typeof value !== "string" || value.length === 0) {
+          throw new Error(`effect_allocation.${column} is NOT NULL for a v2 allocation row`);
+        }
+      }
+    }
     mapSqliteError(() =>
-      this.db.prepare("INSERT INTO effect_allocation (allocation_key, effect_id) VALUES (?, ?)").run(allocation_key, effect_id),
+      this.db
+        .prepare(
+          `INSERT INTO effect_allocation (allocation_key, effect_id, requester_ref, allocation_schema, allocation_binding_digest, allocation_contract_digest, purpose)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          allocation_key, effect_id, binding?.requester_ref ?? null, binding?.allocation_schema ?? null,
+          binding?.allocation_binding_digest ?? null, binding?.allocation_contract_digest ?? null, binding?.purpose ?? null,
+        ),
     );
   }
 
@@ -382,6 +442,30 @@ export class ConstitutionalStore {
       | { effect_id: string }
       | undefined;
     return row?.effect_id;
+  }
+
+  /** AP B2(1)/B2(3): the row a seal resolves from the `effect_id` it names, over the new index. */
+  allocationByEffectId(effect_id: string): AllocationRow | undefined {
+    const row = this.db.prepare("SELECT * FROM effect_allocation WHERE effect_id = ?").get(effect_id) as
+      | (Record<keyof AllocationBinding, string | null> & { allocation_key: string; effect_id: string })
+      | undefined;
+    if (row === undefined) return undefined;
+    const complete = ALLOCATION_BINDING_COLUMNS.every((column) => typeof row[column] === "string" && row[column]!.length > 0);
+    return {
+      allocation_key: row.allocation_key,
+      effect_id: row.effect_id,
+      ...(complete
+        ? {
+            binding: {
+              requester_ref: row.requester_ref!,
+              allocation_schema: row.allocation_schema!,
+              allocation_binding_digest: row.allocation_binding_digest!,
+              allocation_contract_digest: row.allocation_contract_digest!,
+              purpose: row.purpose!,
+            },
+          }
+        : {}),
+    };
   }
 
   insertEffectRequest(request: EffectRequestV1, material_cas_key: string, work_run_ref?: string): void {

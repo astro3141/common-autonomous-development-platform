@@ -193,7 +193,7 @@ async function evalPr(h: Harness, refs: string[]): Promise<{ outcome: string; re
   const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
   const request = h.ingress.sealEffectRequest(
     {
-      effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-0000000000e7", step_ordinal: (step += 1), purpose: "pr-create" }),
+      effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-0000000000e7", step_ordinal: (step += 1), purpose: "pr-create" }, PRINCIPALS.workflow),
       requester_ref: "workflow:cadp-work",
       work_bindings: [],
       target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "r-1" },
