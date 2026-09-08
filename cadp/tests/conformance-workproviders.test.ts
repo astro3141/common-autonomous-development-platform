@@ -162,7 +162,7 @@ test("codex backend scan leaves absent facts UNKNOWN", () => {
 // ------------------------------------------------ claude worker (2026-09-07 container probes)
 
 test("claude worker carries the MEASURED headless-edit argv, env auth, and session layout", () => {
-  assert.deepEqual(workerArgv("claude", "do it"), ["claude", "-p", "do it", "--model", "claude-fable-5", "--permission-mode", "bypassPermissions"]);
+  assert.deepEqual(workerArgv("claude", "do it"), ["claude", "-p", "do it", "--model", "claude-opus-5", "--permission-mode", "bypassPermissions"]);
   const p = WORKER_PROVIDERS.claude;
   // Measured: as root claude refuses bypassPermissions unless IS_SANDBOX=1 acknowledges the container.
   assert.deepEqual(p.auth_env, { env_var: "CLAUDE_CODE_OAUTH_TOKEN", static_env: { IS_SANDBOX: "1" } });
