@@ -6,9 +6,11 @@
  *
  * Under `cadp.kernel-config.v2` it additionally implements AP B1/B2: requester- and
  * contract-scoped allocation over descriptor-driven tuple validation, the allocation binding
- * storage, and the allocation-to-first-seal contract that closes the pre-K3 window (WP §3.3).
+ * storage, and the allocation-to-first-seal contract that closes the pre-K3 window (WP §3.3), and
+ * AP B4(2)-(4): assembly completeness, which makes the K4 evidence set the Platform's complete
+ * query result unioned with the caller's list rather than the caller's list alone.
  * Every one of those rules is gated on the ACTIVE CONFIG's schema string, so a running v0.4
- * (`cadp.kernel-config.v1`) deployment keeps its allocation and seal behaviour unchanged.
+ * (`cadp.kernel-config.v1`) deployment keeps its allocation, seal and assembly behaviour unchanged.
  */
 
 import { Cas } from "./cas.ts";
@@ -18,6 +20,7 @@ import { newId } from "./ids.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
 import { resolvePointer } from "./policyBundle.ts";
+import type { KernelConfig, SubjectCompleteAssemblyEntry } from "./policyBundle.ts";
 import { validateAdmissionInput, validateEffectRequest, validateEvidenceEnvelope } from "./records.ts";
 import type { AdmissionInputV1, EffectRequestV1, EvidenceEnvelopeV1, EvidenceKind, Provenance, SubjectBinding, TargetRef } from "./records.ts";
 import { ConstitutionalStore, UniqueViolation } from "./store.ts";
@@ -224,6 +227,61 @@ function bindingContentDigests(bindings: readonly SubjectBinding[]): Digest[] {
  */
 export function allocationContractDigest(descriptor: unknown, allocation_schema: unknown): string {
   return sha256Hex(jcs({ descriptor, allocation_schema }));
+}
+
+/**
+ * The store's subject key, `<authority_ref>|<namespace>|<object_id>` — the exact string
+ * `insertEvidence` writes into `evidence_subject` and the one AP B4(2) names. One function so the
+ * assembly-time computation and the commit-time recheck #18 can never key differently.
+ */
+export function subjectKey(binding: SubjectBinding): string {
+  return `${binding.authority_ref}|${binding.namespace}|${binding.object_id}`;
+}
+
+/**
+ * AP B4(1)/B4(2): the declared `subject_complete_assembly` entries whose `operation_kinds` list
+ * this sealed request's `operation_kind`. Gated on the ACTIVE CONFIG's schema string, so under a
+ * `cadp.kernel-config.v1` deployment the list is always empty and assembly is byte-identical to
+ * v0.4's — the v2 registry cannot even be carried by a v1 bundle (`policyBundle.ts`).
+ */
+export function declaredAssemblyEntries(config: KernelConfig, operation_kind: string): readonly SubjectCompleteAssemblyEntry[] {
+  if (config.schema !== "cadp.kernel-config.v2") return [];
+  return (config.subject_complete_assembly ?? []).filter((entry) => entry.operation_kinds.includes(operation_kind));
+}
+
+/**
+ * AP B4(2): every subject key the SEALED request's OWN `work_bindings` name in the entry's
+ * `subject_namespace`, deduplicated. The subject set is the sealed record's, never the caller's
+ * assembly-time choice and never a policy-supplied object id — the entry supplies the namespace
+ * and the kind, and nothing else. An empty result is the `ASSEMBLY_SUBJECT_UNBOUND` case: the rule
+ * is never vacuously satisfied by a request that binds no such subject.
+ */
+export function assemblySubjectKeys(
+  entry: SubjectCompleteAssemblyEntry,
+  work_bindings: readonly SubjectBinding[],
+): string[] {
+  const keys: string[] = [];
+  for (const binding of work_bindings) {
+    if (binding.namespace !== entry.subject_namespace) continue;
+    const key = subjectKey(binding);
+    if (!keys.includes(key)) keys.push(key);
+  }
+  return keys;
+}
+
+/**
+ * Verify-on-read for a row the completeness QUERY matched (AP B4(4), TD v0.4 §2.5): the stored
+ * envelope must recompute to its own `envelope_digest`, and a PRESENT claim to its `claim_digest`.
+ * A matched row that fails is the corruption path — no partial set is ever sealed.
+ */
+function envelopeVerifies(envelope: EvidenceEnvelopeV1): boolean {
+  if (recordDigest(envelope as unknown as Record<string, unknown>, "envelope_digest").value !== envelope.envelope_digest.value) {
+    return false;
+  }
+  if (envelope.availability === "PRESENT" && jcsDigest(envelope.claim).value !== envelope.claim_digest?.value) {
+    return false;
+  }
+  return true;
 }
 
 export class Ingress {
@@ -937,32 +995,118 @@ export class Ingress {
 
   // ---------------------------------------------------------------- assemble_admission_input
 
+  /**
+   * AP B4(2)-(4): assembly is the Platform's, not the caller's. Under a `cadp.kernel-config.v2`
+   * deployment carrying `subject_complete_assembly` entries, the K4 evidence set is the UNION of
+   * the caller's `evidence_refs` and, for every declared entry whose `operation_kinds` list this
+   * request's `operation_kind`, EVERY sealed envelope of that `evidence_kind` bound to each exact
+   * subject key the request's OWN `work_bindings` name in the entry's namespace. The caller may
+   * add; the caller can never subtract. The whole computation and the K4 insert are ONE
+   * transaction (B4(3)), so the sealed set is complete as of a single read of the store.
+   *
+   * Under a `cadp.kernel-config.v1` config — and under v2 for an `operation_kind` no entry lists —
+   * `declaredAssemblyEntries` is empty and this method's behaviour is v0.4's, byte for byte:
+   * the caller's refs, in the caller's order, undeduplicated.
+   */
   assembleAdmissionInput(effect_id: string, evidence_refs: readonly string[]): AdmissionInputV1 {
     const active = this.active();
-    const request = this.store.effectRequest(effect_id);
-    if (request === undefined) throw new IngressRejection("EFFECT_NOT_FOUND", effect_id);
-    const refs: Array<{ evidence_id: string; envelope_digest: Digest }> = [];
-    for (const id of evidence_refs) {
-      const envelope = this.store.evidenceById(id);
-      if (envelope === undefined) throw new IngressRejection("EVIDENCE_NOT_FOUND", id);
-      refs.push({ evidence_id: id, envelope_digest: envelope.envelope_digest });
+    type Assembled =
+      | { kind: "input"; input: AdmissionInputV1 }
+      | { kind: "corrupt"; evidence_id: string; subject_key: string };
+    const outcome = this.store.withImmediate((): Assembled => {
+      const request = this.store.effectRequest(effect_id);
+      if (request === undefined) throw new IngressRejection("EFFECT_NOT_FOUND", effect_id);
+      const refs: Array<{ evidence_id: string; envelope_digest: Digest }> = [];
+      for (const id of evidence_refs) {
+        const envelope = this.store.evidenceById(id);
+        if (envelope === undefined) throw new IngressRejection("EVIDENCE_NOT_FOUND", id);
+        refs.push({ evidence_id: id, envelope_digest: envelope.envelope_digest });
+      }
+      // B4(2)/B4(3). The guard-bite knob removes the completeness rule ONLY; every other leg of
+      // this method is untouched, so the disabled run is exactly the pre-B4 assembly (TD §13.1).
+      const declared = this.#ruleEnabled("assembly_completeness")
+        ? declaredAssemblyEntries(active.config, request.operation_kind)
+        : [];
+      let sealed_refs = refs;
+      if (declared.length > 0) {
+        // Keyed by evidence_id: the union is deduplicated by identity, and a caller ref that the
+        // query also matches contributes once. The stored envelope's own digest is authority.
+        const union = new Map<string, Digest>(refs.map((r) => [r.evidence_id, r.envelope_digest]));
+        for (const entry of declared) {
+          const keys = assemblySubjectKeys(entry, request.work_bindings);
+          if (keys.length === 0) {
+            throw new IngressRejection(
+              "ASSEMBLY_SUBJECT_UNBOUND",
+              `${request.operation_kind} declares ${entry.evidence_kind} over ${entry.subject_namespace}, which this request binds nowhere`,
+            );
+          }
+          for (const key of keys) {
+            for (const envelope of this.#completeEvidenceOfKind(entry.evidence_kind, key)) {
+              // B4(4): a matched row that fails verify-on-read refuses. A partial set is never sealed.
+              if (!envelopeVerifies(envelope)) return { kind: "corrupt", evidence_id: envelope.evidence_id, subject_key: key };
+              union.set(envelope.evidence_id, envelope.envelope_digest);
+            }
+          }
+        }
+        // Canonical order by `evidence_id` so `input_digest` is deterministic: the same complete
+        // set assembles to the same K4 whatever order the caller listed its own refs in.
+        sealed_refs = [...union]
+          .map(([evidence_id, envelope_digest]) => ({ evidence_id, envelope_digest }))
+          .sort((a, b) => (a.evidence_id < b.evidence_id ? -1 : a.evidence_id > b.evidence_id ? 1 : 0));
+      }
+      const base: Record<string, unknown> = {
+        policy_ref: active.policy_ref,
+        effect_request_ref: effect_id,
+        effect_request_digest: request.request_digest,
+        evidence_refs: sealed_refs,
+        assembled_at: nowIso(this.clock),
+      };
+      const input = { ...base, input_digest: recordDigest(base, "input_digest") } as unknown as AdmissionInputV1;
+      validateAdmissionInput(input);
+      try {
+        this.store.insertAdmissionInput(input);
+      } catch (error) {
+        // Content-addressed PK: an identical assembly in the same millisecond is the same record.
+        // The statement aborts, the transaction does not (SQLite ON CONFLICT ABORT).
+        if (!(error instanceof UniqueViolation)) throw error;
+      }
+      return { kind: "input", input };
+    });
+    if (outcome.kind === "corrupt") {
+      // The incident must survive the refusal: sealed in its OWN transaction, exactly as the K3
+      // conflict path does. No `AdmissionInputV1` row was written (B4(4)).
+      this.sealIncident(
+        "DIGEST_CORRUPTION",
+        `assembly matched evidence ${outcome.evidence_id} on ${outcome.subject_key}, which does not recompute`,
+        [
+          { authority_ref: "cadp-store:k04", namespace: "effect", object_id: effect_id },
+          { authority_ref: "cadp-store:k04", namespace: "evidence", object_id: outcome.evidence_id },
+        ],
+        [outcome.evidence_id],
+      );
+      throw new IngressRejection("DIGEST_CORRUPTION", outcome.evidence_id);
     }
-    const base: Record<string, unknown> = {
-      policy_ref: active.policy_ref,
-      effect_request_ref: effect_id,
-      effect_request_digest: request.request_digest,
-      evidence_refs: refs,
-      assembled_at: nowIso(this.clock),
-    };
-    const input = { ...base, input_digest: recordDigest(base, "input_digest") } as unknown as AdmissionInputV1;
-    validateAdmissionInput(input);
+    return outcome.input;
+  }
+
+  /**
+   * AP B4(2): the complete set — EVERY sealed envelope of `evidence_kind` bound to this EXACT
+   * subject key, over the existing `(evidence_kind, subject_key)` join. `latestEvidenceOfKind`
+   * MUST NOT be used here: "latest" is not authority in sealed history (Spec v0.5 §2.6, TD v0.4
+   * §6.6). A query that cannot be executed is `ASSEMBLY_QUERY_FAILED` (B4(4)) — thrown inside the
+   * assembly transaction, so no `AdmissionInputV1` row survives it.
+   */
+  #completeEvidenceOfKind(evidence_kind: string, subject_key: string): EvidenceEnvelopeV1[] {
+    let bound: EvidenceEnvelopeV1[];
     try {
-      this.store.withImmediate(() => this.store.insertAdmissionInput(input));
+      bound = this.store.evidenceBySubjectKey(subject_key);
     } catch (error) {
-      // Content-addressed PK: an identical assembly in the same millisecond is the same record.
-      if (!(error instanceof UniqueViolation)) throw error;
+      throw new IngressRejection(
+        "ASSEMBLY_QUERY_FAILED",
+        `${evidence_kind} on ${subject_key}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    return input;
+    return bound.filter((envelope) => envelope.evidence_kind === evidence_kind);
   }
 
   // ---------------------------------------------------------------- incidents / scope hold
