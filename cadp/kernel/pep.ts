@@ -1,8 +1,8 @@
 /**
  * PEP (TD §3.4, §4): the only component that writes `EffectAdmissionV1` and dispatches.
  * Serialization lock D spans precondition → admission → dispatch → outcome; the admission
- * row is the reservation; rechecks #1–#17 run against rows read inside the transaction;
- * K7 truth stays target-authoritative (§6.3).
+ * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18, run against rows read inside the
+ * transaction; K7 truth stays target-authoritative (§6.3).
  *
  * `disabledChecks` is a TEST-ONLY guard-bite harness knob (TD §13.1): the production
  * composition never passes it, and the conformance suite proves each listed check is
@@ -12,7 +12,8 @@
 import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
-import { Ingress } from "./ingress.ts";
+// `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
+import { Ingress, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
 import { adapterEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
 import { resolvePointer } from "./policyBundle.ts";
@@ -229,7 +230,7 @@ export class Pep {
     return binding.authority_ref === adapter.describe().authority_ref;
   }
 
-  // ---------------------------------------------------------------- the 17 rechecks
+  // ------------------------------------------------- the 17 rechecks, plus AP B4(5)'s #18
 
   #admissionTransaction(
     requestPre: EffectRequestV1,
@@ -508,6 +509,48 @@ export class Pep {
       }
       if ((attestation.claim as { write_once_enforced?: boolean })?.write_once_enforced !== true) {
         throw new Refuse("MUTABLE_TARGET_WITHOUT_PRECONDITION", "attestation reports enforcement failure");
+      }
+    }
+
+    // #18 — assembly completeness is as-of a transaction, so it is RE-PROVEN here (AP B4(5)).
+    // The complete set for every declared (evidence_kind, subject-key) pair is recomputed from
+    // rows read INSIDE this transaction and compared against the set the bound `AdmissionInputV1`
+    // carries; any difference refuses. Without it a producer could seal a contrary envelope after
+    // assembly and the decision would be silently stale (Spec v0.5 §2.7). The honest cost is
+    // stated in B4(5): a producer that keeps sealing envelopes for a subject can keep admission
+    // failing — a liveness cost of a safety rule, resolved by a fresh assembly and evaluation.
+    // Gated on the v2 config by `declaredAssemblyEntries`, so a v1 deployment's recheck list is
+    // exactly items #1–#17.
+    if (this.#enabled("recheck18_assembly_complete")) {
+      for (const entry of declaredAssemblyEntries(active.config, request.operation_kind)) {
+        const keys = assemblySubjectKeys(entry, request.work_bindings);
+        if (keys.length === 0) {
+          // Unreachable through `assemble_admission_input`, which refuses the same request
+          // `ASSEMBLY_SUBJECT_UNBOUND` before any K4 row exists; kept fail-closed rather than
+          // vacuously satisfied, because "never vacuously satisfied" (B4(2)) is the rule, not a
+          // property of one entry point.
+          throw new Refuse(
+            "ASSEMBLY_INCOMPLETE_AT_COMMIT",
+            `${entry.evidence_kind} is declared over ${entry.subject_namespace}, which this request binds nowhere`,
+          );
+        }
+        for (const key of keys) {
+          const complete = new Set(
+            store.evidenceBySubjectKey(key).filter((e) => e.evidence_kind === entry.evidence_kind).map((e) => e.evidence_id),
+          );
+          const carried = new Set(
+            evidence
+              .filter((e) => e.evidence_kind === entry.evidence_kind && e.subject_bindings.some((b) => subjectKeyOf(b) === key))
+              .map((e) => e.evidence_id),
+          );
+          const missing = [...complete].filter((evidence_id) => !carried.has(evidence_id));
+          if (missing.length > 0 || carried.size !== complete.size) {
+            throw new Refuse(
+              "ASSEMBLY_INCOMPLETE_AT_COMMIT",
+              `${entry.evidence_kind} on ${key}: the bound input carries ${carried.size} of ${complete.size}${missing.length > 0 ? ` (missing ${missing.join(", ")})` : ""}`,
+            );
+          }
+        }
       }
     }
 
