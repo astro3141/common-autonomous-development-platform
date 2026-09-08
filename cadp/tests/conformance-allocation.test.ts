@@ -761,6 +761,41 @@ test("B6(1)/B2(3.2): a malformed allocation_tuple on a seal is refused, never a 
   }
 });
 
+/** Every non-object a `JSON.parse` seal body can be. `null` is the one that used to destructure. */
+const MALFORMED_BODIES: readonly unknown[] = [null, [], 42, "external", true];
+
+test("B6(1): a malformed seal BODY is refused by the draft legs, never a server error", async () => {
+  const h = await v2Harness();
+  try {
+    const effect_id = h.ingress.allocateEffectId(externalTuple(), PRINCIPALS.workflow);
+
+    // The body arrives from `JSON.parse` under a cast exactly as the allocation tuple does, and
+    // B6(1)'s strip — `const { allocation_tuple, ...draft } = body` — is itself a dereference of it.
+    // Rest-destructuring `null` is a `TypeError` raised before any refusal leg, which `api.ts` turns
+    // into a 500; every other non-object destructures to an empty draft and is refused by S3. All of
+    // them must land on that same refusal: a body carrying no `requester_ref` is not the caller's.
+    for (const body of MALFORMED_BODIES) {
+      shapeRefusal(
+        () => h.ingress.sealEffectRequest(body, PRINCIPALS.workflow),
+        "REQUESTER_REF_MISMATCH",
+        `seal body ${JSON.stringify(body) ?? "undefined"}`,
+      );
+      assert.equal(countRows(h, "effect_request"), 0, `${JSON.stringify(body)}: zero effect_request rows`);
+      assert.equal(incidents(h), 0, `${JSON.stringify(body)}: zero KERNEL_INCIDENT rows`);
+    }
+    // An object body with no draft keys was already refused there; the guard maps the others onto it.
+    shapeRefusal(() => h.ingress.sealEffectRequest({}, PRINCIPALS.workflow), "REQUESTER_REF_MISMATCH", "seal body {}");
+
+    // Positive control: the refusals above are attributed to the shapes, not to a broken harness,
+    // and the allocated identity is still sealable afterwards.
+    const sealed = seal(h, PRINCIPALS.workflow, { effect_id, allocation_tuple: externalTuple() });
+    assert.equal(sealed.effect_id, effect_id);
+    assert.equal(countRows(h, "effect_request"), 1);
+  } finally {
+    h.close();
+  }
+});
+
 test("B1/B6 over the wire: malformed bodies at both v2 entry points answer 422, never 500", async () => {
   const h = await v2Harness();
   try {
@@ -813,6 +848,13 @@ test("B1/B6 over the wire: malformed bodies at both v2 entry points answer 422, 
         const res = await call("seal_effect_request", `{"allocation_tuple":${malformed},${JSON.stringify(draft).slice(1)}`);
         assert.equal(res.status, 422, `seal with allocation_tuple ${malformed}: ${JSON.stringify(res.json)}`);
         assert.equal(res.json.error, "ALLOCATION_BINDING_MISMATCH", `seal with allocation_tuple ${malformed}`);
+      }
+      // ...and the WHOLE body malformed, which is the strip's own dereference rather than the
+      // sibling's. `null` is the shape that used to leave `api.ts` as a 500 before any leg ran.
+      for (const body of MALFORMED_BODIES.map((b) => JSON.stringify(b))) {
+        const res = await call("seal_effect_request", body);
+        assert.equal(res.status, 422, `seal body ${body}: ${JSON.stringify(res.json)}`);
+        assert.equal(res.json.error, "REQUESTER_REF_MISMATCH", `seal body ${body}`);
       }
       assert.equal(countRows(h, "effect_request"), 0, "no K3 row from any malformed seal body");
       assert.equal(incidents(h), 0);

@@ -112,6 +112,20 @@ export interface SealRequestBody extends RequestDraft {
 }
 
 /**
+ * INPUT-SHAPE GUARD for the `seal_effect_request` body, the allocation path's other new entry point
+ * and the same hazard: `api.ts` casts a `JSON.parse` result to `SealRequestBody`, so `null` arrives
+ * typed as a body and is not one. `sealEffectRequest` strips `allocation_tuple` by rest-
+ * destructuring, and rest-destructuring `null` or `undefined` is a `TypeError` — raised BEFORE any
+ * refusal leg runs, so it escapes as a 500. Every other non-object destructures to an empty draft
+ * already, so normalising to `{}` puts `null` on that identical path rather than inventing an
+ * outcome for it: the draft legs below refuse it as the draft-less body it is.
+ */
+function sealBodyShape(body: unknown): SealRequestBody {
+  const shaped = typeof body === "object" && body !== null && !Array.isArray(body) ? body : {};
+  return shaped as SealRequestBody;
+}
+
+/**
  * A presented allocation tuple (AP B1, B2(5)). `schema` and `purpose` are the two RESERVED kernel
  * fields and the only tuple vocabulary the Kernel holds; every other member is the schema owner's,
  * named only in that schema's descriptor and never in kernel code. Under a `cadp.kernel-config.v1`
@@ -366,11 +380,18 @@ export class Ingress {
 
   // ---------------------------------------------------------------- seal_effect_request
 
-  sealEffectRequest(body: SealRequestBody, principal: Principal): EffectRequestV1 {
+  sealEffectRequest(body: unknown, principal: Principal): EffectRequestV1 {
     const active = this.active();
     // B6(1): the tuple is stripped HERE, before anything reads the draft, so "transport, never a
     // draft field" is true of the implemented parse rather than merely asserted against it.
-    const { allocation_tuple, ...draft } = body;
+    // The strip is itself a dereference of caller data, so the SHAPE is settled one line earlier:
+    // `api.ts` hands us whatever `JSON.parse` returned under a `SealRequestBody` cast, and rest-
+    // destructuring `null` throws a `TypeError` that escapes as a 500 where the contract mandates a
+    // refusal. A non-object body carries no draft key, which is exactly what an empty draft carries,
+    // so `null` now takes the very path `42`, `[]`, `"x"` and `true` already take today — the
+    // generic draft refusals below, reached with `allocation_tuple` absent. No other input observes
+    // a change. The parameter is `unknown` so the compiler refuses any read that skips this line.
+    const { allocation_tuple, ...draft } = sealBodyShape(body);
     const identity = identityEntry(active.config, principal.principal);
     if (identity === undefined) throw new IngressRejection("FORBIDDEN_FOR_PRINCIPAL", "unregistered principal");
     // S3: requester_ref is stamped from the authenticated caller; a differing declared ref is rejected.
