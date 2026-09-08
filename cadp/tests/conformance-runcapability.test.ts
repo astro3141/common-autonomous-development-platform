@@ -488,6 +488,42 @@ test("B5(4): a WORK_START bound to another holder's REAL run is a run-bound requ
   }
 });
 
+test("B5(4): a run whose capability is not yet minted is GATED, never exempt — the origin carve-out is the run's own identity", async () => {
+  const rh = await runHarness();
+  const { h } = rh;
+  try {
+    const r1 = await startRun(rh, PRINCIPALS.workflow, REQUESTER_A);
+    // B's run, SEALED but never dispatched: its `effect_request` row exists and no capability has
+    // been minted for it. Absence of a `run_capability` row is NOT origin — were it exempt, A could
+    // bind this run with nothing presented and land its effects on B's `MAX_EFFECTS_IN_WORK_RUN`
+    // budget the moment B dispatches, which is the Spec v0.5 §5.3 borrowing B5 exists to prevent.
+    const pending = sealWorkStart(h, PRINCIPAL_B, REQUESTER_B);
+    assert.equal(h.store.runCapability(pending), undefined, "nothing has been minted for that run");
+    const before = count(h, "effect_request");
+
+    for (const [leg, seal, reason] of [
+      ["an ordinary request bound to it, presenting none",
+        () => sealRunBound(h, PRINCIPALS.workflow, REQUESTER_A, { work_run_ref: pending }), "RUN_CAPABILITY_REQUIRED"],
+      ["an ordinary request bound to it, presenting another run's capability",
+        () => sealRunBound(h, PRINCIPALS.workflow, REQUESTER_A, { work_run_ref: pending, capability: r1.capability }), "RUN_CAPABILITY_INVALID"],
+      ["a minting WORK_START bound to it, presenting none",
+        () => sealWorkStart(h, PRINCIPALS.workflow, REQUESTER_A, pending), "RUN_CAPABILITY_REQUIRED"],
+      ["a minting WORK_START bound to it, presenting another run's capability",
+        () => sealWorkStart(h, PRINCIPALS.workflow, REQUESTER_A, pending, r1.capability), "RUN_CAPABILITY_INVALID"],
+      // Not even that run's own requester: no capability exists for it yet, so none can be shown.
+      ["its own requester's minting WORK_START bound to it",
+        () => sealWorkStart(h, PRINCIPAL_B, REQUESTER_B, pending), "RUN_CAPABILITY_REQUIRED"],
+    ] as const) {
+      refusalOf(seal, reason, leg);
+    }
+    assert.equal(count(h, "effect_request"), before, "zero effect_request rows on every refused leg");
+    assert.equal(count(h, "run_membership"), 0, "and no refusal proved a membership");
+    assert.equal(incidents(h), 0);
+  } finally {
+    h.close();
+  }
+});
+
 // ================================================================ B5(2) — K7-gated usability
 
 test("B5(2): an UNKNOWN WORK_START refuses RUN_SCOPE_UNRESOLVED, and a reconciled COMMITTED flips the SAME capability", async () => {
@@ -595,6 +631,35 @@ test("B5(5): recheck #19 refuses RUN_MEMBERSHIP_UNPROVEN when the durable row is
     assert.equal((admitted as { reason: string }).reason, "RUN_MEMBERSHIP_UNPROVEN");
     assert.equal(h.store.admissionsByEffect(effect_id).length, 0, "no admission row, no dispatch");
     assert.equal(h.target.effects.length, 0, "external-effect delta 0");
+  } finally {
+    h.close();
+  }
+});
+
+test("B5(5): recheck #19 reads the SAME origin predicate — a WORK_START bound to another's run is not origin", async () => {
+  // The PEP half of the seal-time leg above: even with the seal-time rule guard-bitten away, a
+  // minting `WORK_START` bound to a run that is NOT its own — here one sealed but never dispatched,
+  // so no capability row exists for it — has no origin exemption at admission either. Were the two
+  // predicates to disagree, the PEP would admit into another requester's run exactly what the seal
+  // refuses, and recheck #19 would be unreachable for the minting operation.
+  const rh = await runHarness({ disabledIngressRules: new Set(["run_membership"]) });
+  const { h } = rh;
+  try {
+    const pending = sealWorkStart(h, PRINCIPAL_B, REQUESTER_B);
+    const borrowed = sealWorkStart(h, PRINCIPALS.workflow, REQUESTER_A, pending);
+    assert.equal(h.store.runMembership(borrowed), undefined, "the guard-bite removed the proof");
+
+    const admitted = await admit(h, borrowed, PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "REFUSAL", JSON.stringify(admitted));
+    assert.equal((admitted as { reason: string }).reason, "RUN_MEMBERSHIP_UNPROVEN");
+    assert.equal(h.store.admissionsByEffect(borrowed).length, 0, "no admission row, no dispatch");
+    assert.equal(count(h, "run_capability"), 0, "and the refused dispatch minted nothing");
+
+    // The run's OWN origin is unaffected: the same requester's `WORK_START` on its own run admits,
+    // mints and delivers, so the fix closes the borrowing leg without closing the bootstrap.
+    const own = await admit(h, pending, PRINCIPAL_B);
+    assert.equal(own.kind, "ADMITTED", JSON.stringify(own));
+    assert.equal(typeof (own as { run_capability?: string }).run_capability, "string");
   } finally {
     h.close();
   }

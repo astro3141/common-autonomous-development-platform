@@ -282,15 +282,54 @@ export function isEnrolledRequester(config: KernelConfig, requester_ref: string)
  * by an enrolled requester at all (its run's capability does not yet exist), leaving enrollment
  * unbootstrappable and A4's own setup — enrolled requester A with a *sealed* `WORK_START` whose
  * dispatch delivers the capability — unconstructible. The minting request is therefore treated as
- * the run's ORIGIN, and the carve-out is kept as narrow as it can be made: it holds only where
- * there is no membership to prove, i.e. the request binds no work run, or binds an identity for
- * which no `run_capability` row was ever minted. A minting request bound to a REAL run consumes
- * that run's `MAX_EFFECTS_IN_WORK_RUN` budget like any other effect and is graded by the full
- * B5(4) gate, with the TD's exact codes. Every non-minting request of an enrolled requester is
- * graded exactly as B5(3)–(5) state, with no exception.
+ * the run's ORIGIN by `isRunOrigin` below, whose predicate is what keeps the carve-out from being
+ * a bypass. Every non-minting request of an enrolled requester is graded exactly as B5(3)–(5)
+ * state, with no exception.
  */
 export function isRunCapabilityMinting(config: KernelConfig, operation_kind: string): boolean {
   return runProfileEnabled(config) && operation_kind === RUN_PROFILE_WORK_START;
+}
+
+/**
+ * AP B5(3)/B5(4): the ORIGIN predicate — the exact and only shape of the minting `WORK_START`
+ * carve-out, defined ONCE and read identically by the seal gate and by recheck #19 so the two can
+ * never drift into admitting what the seal refused.
+ *
+ * A minting `WORK_START` is the origin of the run it STARTS — its own `effect_id` (Spec v0.5 §5.2)
+ * — and that run's capability does not exist until this very effect's initial dispatch mints it.
+ * Origin therefore holds in exactly two shapes, both about THIS request's own run and neither
+ * about anyone else's: the request binds no work run at all, or it binds its own `effect_id`.
+ *
+ * A minting `WORK_START` that binds a work run OTHER than its own is a run-bound request like any
+ * other and is graded by the full B5(4) gate — with ONE bootstrap exception, kept as narrow as it
+ * can be made and stated rather than buried: an identity that is **not an effect of this Platform
+ * at all** — no `effect_request` row and no `run_capability` row for it, both read in the calling
+ * transaction — is not a run, has no holder, and can never become one, because minting requires a
+ * sealed `WORK_START` of that exact `effect_id` first. That is the allocation root a first run is
+ * allocated under (the tuple's `work_run_ref`, projected onto the work-run subject by B2(3.4)),
+ * without which an enrolled requester could start no run at all.
+ *
+ * The earlier "no `run_capability` row" reading of this carve-out was a BYPASS and is gone: a run
+ * whose `WORK_START` is sealed but not yet dispatched has no capability row, so under it an
+ * enrolled requester could bind ANOTHER requester's real run with no capability presented and land
+ * its effects on that run's `MAX_EFFECTS_IN_WORK_RUN` budget — precisely the Spec v0.5 §5.3
+ * borrowing this mechanism exists to prevent. The `effect_request` leg is what closes it: the run
+ * is a sealed effect from its seal onward, so the full gate applies from that moment, and the
+ * predicate is monotone in the direction that matters (an identity only ever gains rows). The one
+ * ordering left — binding an identity BEFORE anyone seals it — is closed by construction rather
+ * than by this read: an `effect_id` is minted by `allocate_effect_id` and returned to its allocator
+ * alone, so no caller can name another's unsealed effect to bind ahead of it.
+ */
+export function isRunOrigin(
+  store: {
+    effectRequest(effect_id: string): EffectRequestV1 | undefined;
+    runCapability(work_run_ref: string): { readonly work_run_ref: string } | undefined;
+  },
+  effect_id: string,
+  work_run_ref: string | undefined,
+): boolean {
+  if (work_run_ref === undefined || work_run_ref === effect_id) return true;
+  return store.effectRequest(work_run_ref) === undefined && store.runCapability(work_run_ref) === undefined;
 }
 
 /**
@@ -643,7 +682,7 @@ export class Ingress {
       // B2(3)'s first-seal legs, so a refused seal writes nothing at all. The membership row it
       // authorises is inserted below, in this same transaction as the `effect_request` row.
       const proven = runProfile && this.#ruleEnabled("run_membership")
-        ? this.#assertRunMembership(identity.producer_ref, work_run_ref, enrolled, minting, transport)
+        ? this.#assertRunMembership(sealed.effect_id, identity.producer_ref, work_run_ref, enrolled, minting, transport)
         : false;
       const existing = this.store.effectRequest(sealed.effect_id);
       if (existing !== undefined) {
@@ -712,6 +751,7 @@ export class Ingress {
    * `run_membership` row recheck #19 reads (B5(5)).
    */
   #assertRunMembership(
+    effect_id: string,
     requester_ref: string,
     work_run_ref: string | undefined,
     enrolled: boolean,
@@ -723,15 +763,14 @@ export class Ingress {
       if (work_run_ref !== undefined) throw new IngressRejection("NOT_RUN_ENROLLED", requester_ref);
       return false;
     }
-    // The ORIGIN case, and the ONLY departure from B5(3)/B5(4) as literally worded — kept as narrow
-    // as it can be made. A minting request binding NO run, or binding an identity that is not a
-    // minted run (no `run_capability` row), is the start of a run and has no membership to prove:
-    // its own capability is minted by its own dispatch, so requiring one here would make enrollment
-    // unbootstrappable and A4's own setup (enrolled A with a sealed `WORK_START`) unconstructible.
-    // A minting request binding a REAL run is NOT exempt: it consumes that run's
-    // `MAX_EFFECTS_IN_WORK_RUN` budget exactly as any other effect does, so it presents the
-    // capability like any other run-bound request and is refused with the same codes.
-    if (minting && (work_run_ref === undefined || this.store.runCapability(work_run_ref) === undefined)) {
+    // The ORIGIN case (`isRunOrigin`), the ONLY departure from B5(3)/B5(4) as literally worded:
+    // the minting `WORK_START` binding no run, its OWN run, or the allocation root that is no
+    // effect of this Platform, has no membership to prove — its own capability is minted by its own
+    // dispatch. A minting request binding ANY OTHER run — including one whose `WORK_START` is
+    // sealed but not yet dispatched, so no capability row exists for it yet — is NOT exempt: it
+    // consumes that run's `MAX_EFFECTS_IN_WORK_RUN` budget exactly as any other effect does, so it
+    // presents the capability like any other run-bound request and is refused with the same codes.
+    if (minting && isRunOrigin(this.store, effect_id, work_run_ref)) {
       return false;
     }
     // B5(3): an enrolled requester's unbound effect is REFUSED, not merely uncounted (Spec §5.1).

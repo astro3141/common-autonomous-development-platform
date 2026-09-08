@@ -22,7 +22,7 @@ import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
 import {
   Ingress, assemblySubjectKeys, declaredAssemblyEntries, isEnrolledRequester, isRunCapabilityMinting,
-  subjectKey as subjectKeyOf,
+  isRunOrigin, subjectKey as subjectKeyOf,
 } from "./ingress.ts";
 import type { Principal } from "./ingress.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
@@ -637,17 +637,20 @@ export class Pep {
     // the PEP requires the `run_membership` row, with a matching `work_run_ref`, read INSIDE this
     // transaction. Authority after restart is reconstructed from rows, never from process memory
     // (TD v0.4 §4.5), and the secret is not needed at admission time. The minting `WORK_START` is
-    // the run's origin and has no membership to prove (`isRunCapabilityMinting`). Gated on the v2
+    // the run's origin and has no membership to prove (`isRunOrigin`). Gated on the v2
     // config with a non-empty enrollment, so a v1 deployment's recheck list is exactly #1–#18.
     if (this.#enabled("recheck19_run_membership") && isEnrolledRequester(active.config, request.requester_ref)) {
       const workRun = request.work_bindings.find((b) => b.namespace === "work-run")?.object_id;
-      // The same ORIGIN predicate the seal gate applies, read from the same rows: a minting
-      // `WORK_START` that binds no run, or one that binds an identity no capability was ever
-      // minted for, starts a run rather than joining one and has no membership to prove. A minting
-      // request bound to a REAL run proved membership at seal like any other and must show it here.
+      // The same ORIGIN predicate the seal gate applies — the SAME function over the same rows, so
+      // the two can never drift into admitting what the seal refused: a minting `WORK_START` that
+      // binds no run, binds its OWN run, or binds an identity that is no effect of this Platform
+      // (neither an `effect_request` nor a `run_capability` row) starts a run rather than joining
+      // one and has no membership to prove. A minting request bound to ANY OTHER run — a real run
+      // of another requester's, dispatched or not — proved membership at seal like any other
+      // run-bound request and must show the row here.
       const origin =
         isRunCapabilityMinting(active.config, request.operation_kind) &&
-        (workRun === undefined || store.runCapability(workRun) === undefined);
+        isRunOrigin(store, request.effect_id, workRun);
       if (!origin) {
         const membership = store.runMembership(request.effect_id);
         if (workRun === undefined || membership === undefined || membership.work_run_ref !== workRun) {
