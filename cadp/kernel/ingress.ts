@@ -193,6 +193,29 @@ function valueSatisfies(value: unknown, value_contract: string): boolean {
 }
 
 /**
+ * Every `content_digest` present on a draft's subject bindings, for the inherited §2.1 approved-
+ * scheme check in `submitEvidence`. Generic: the binding's authority, namespace and object_id are
+ * never read, so no field name or namespace decides whether a digest is checked — only whether one
+ * EXISTS. A `content_digest` that is not a scheme-bearing object (absent, null, a non-object, or
+ * missing either scheme member) is passed over rather than refused here: shape is `records.ts`'s
+ * `validSubjectBindings` to own, and it refuses those at seal exactly as it does today. A digest
+ * whose members are strings is returned even if the rest of it is malformed, so an unapproved
+ * scheme is refused as an unapproved scheme rather than reported as a shape violation.
+ */
+function bindingContentDigests(bindings: readonly SubjectBinding[]): Digest[] {
+  const digests: Digest[] = [];
+  if (!Array.isArray(bindings)) return digests; // a non-array is `validSubjectBindings`'s refusal, not this one's
+  for (const binding of bindings) {
+    const candidate = (binding as { content_digest?: unknown } | null | undefined)?.content_digest;
+    if (typeof candidate !== "object" || candidate === null) continue;
+    const d = candidate as Record<string, unknown>;
+    if (typeof d["algorithm"] !== "string" || typeof d["canonicalization"] !== "string") continue;
+    digests.push(candidate as Digest);
+  }
+  return digests;
+}
+
+/**
  * AP B2(1): `allocation_contract_payload.v1` — an object with EXACTLY the two member names
  * `descriptor` and `allocation_schema`, each the schema's registry entry verbatim as active at
  * allocation time. Pinned as one function because the same preimage must be computed by all three
@@ -635,6 +658,29 @@ export class Ingress {
     if (draft.availability === "UNKNOWN" && ((draft as { claim?: unknown }).claim !== undefined)) {
       throw new IngressRejection("UNKNOWN_WITH_CLAIM", "UNKNOWN forbids claim/claim_digest (Spec K2)");
     }
+
+    // Inherited §2.1 (AP Part A §2 row; the gap Execution TD B1(3) NAMES): `approved_digest_schemes`
+    // in the ACTIVE policy content governs EVERY new write, and "a digest with an unapproved scheme
+    // is invalid input, never a different-but-equal identity". `validSubjectBindings` (`records.ts`)
+    // types a binding's `content_digest` SHAPE only and has no policy to compare against; this is the
+    // policy-bound half, and it runs BEFORE the envelope is sealed, so a refused draft leaves no row.
+    //
+    // COVERED FIELDS, audited across the whole evidence-submission path, and why:
+    //  - `subject_bindings[].content_digest` — checked for every binding that carries one. It is the
+    //    ONLY caller-supplied digest-typed field on this path: `EvidenceDraft`'s other members are
+    //    strings, an availability enum, and the opaque `claim`.
+    //  - `claim_digest` and `envelope_digest` — NOT covered here because they are not caller values:
+    //    `sealEnvelope` computes both itself under `cadp-jcs-1` (`jcsDigest` / `recordDigest`), a
+    //    bootstrap scheme every active config must retain (`policyBundle.ts`), so no unapproved
+    //    scheme can reach them and a draft key of either name is dropped rather than read.
+    //  - `claim` — NOT walked for digest-shaped members. It is product content under `claim_schema`,
+    //    which this ingress does not interpret; deciding that some member is a digest would need
+    //    exactly the schema/namespace knowledge the kernel must not hold.
+    // K3 (`material_digest`, `request_digest`) is checked on its own path at `sealEffectRequest` and
+    // is untouched here. Nothing about REQUIRED-ness is imported: digests that EXIST are validated,
+    // none is demanded, and no namespace or field name is consulted — per Execution TD B1(3),
+    // required-ness is owned by product construction and the composition gate, not by the ingress.
+    this.assertSchemesApproved(bindingContentDigests(draft.subject_bindings), active);
 
     // Kind-specific ingress rules.
     if (draft.evidence_kind === "BACKEND_EXECUTION" && draft.availability === "PRESENT") {
