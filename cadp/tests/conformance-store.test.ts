@@ -135,13 +135,13 @@ test("C23: allocation tuples are canonical JSON — no concatenation ambiguity; 
   const h = await makeHarness();
   try {
     const run = "cadp-v04:effect:00000000-0000-7000-8000-00000000c023";
-    const a = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 12, purpose: "record-write" });
+    const a = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 12, purpose: "record-write" }, PRINCIPALS.workflow);
     // The raw-concatenation collision candidate {run, 1, "2record-write"} is simply an unknown
     // purpose (closed vocabulary) — and even a known-purpose pair cannot collide because the
     // tuple is typed canonical JSON.
-    const b = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 1, purpose: "record-write" });
+    const b = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 1, purpose: "record-write" }, PRINCIPALS.workflow);
     assert.notEqual(a, b);
-    const aAgain = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 12, purpose: "record-write" });
+    const aAgain = h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: 12, purpose: "record-write" }, PRINCIPALS.workflow);
     assert.equal(a, aAgain, "idempotent on the canonical tuple");
 
     for (const bad of [
@@ -152,7 +152,7 @@ test("C23: allocation tuples are canonical JSON — no concatenation ambiguity; 
       { schema: "cadp.allocation-key.v1", work_run_ref: "not-an-effect-id", step_ordinal: 1, purpose: "record-write" },
     ]) {
       assert.throws(
-        () => h.ingress.allocateEffectId(bad as never),
+        () => h.ingress.allocateEffectId(bad as never, PRINCIPALS.workflow),
         (error: unknown) => (error as { reason?: string }).reason === "ALLOCATION_TUPLE_INVALID",
         JSON.stringify(bad),
       );

@@ -96,7 +96,7 @@ function sealDeploy(h: Harness, material = deployMaterial()): string {
     work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: (deployStep += 1),
     purpose: "deploy",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest({
     effect_id,
     requester_ref: "workflow:cadp-work",

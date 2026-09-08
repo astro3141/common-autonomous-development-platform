@@ -108,7 +108,7 @@ test("PL4: a sealed proposal changes nothing about WORK_START admission (proposa
         work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
         step_ordinal: (ordinal += 1),
         purpose: "work-start",
-      });
+      }, PRINCIPALS.workflow);
       h.ingress.sealEffectRequest(
         {
           effect_id,

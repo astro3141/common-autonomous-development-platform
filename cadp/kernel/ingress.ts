@@ -3,6 +3,12 @@
  * canonicalization + digest + store insert. Stamps `requester_ref`/`producer_ref` from the
  * authenticated principal; enforces the produced_at source rule, WORK_STEP replay idempotency,
  * allocation-key canonicalization, and request-digest conflict handling.
+ *
+ * Under `cadp.kernel-config.v2` it additionally implements AP B1/B2: requester- and
+ * contract-scoped allocation over descriptor-driven tuple validation, the allocation binding
+ * storage, and the allocation-to-first-seal contract that closes the pre-K3 window (WP §3.3).
+ * Every one of those rules is gated on the ACTIVE CONFIG's schema string, so a running v0.4
+ * (`cadp.kernel-config.v1`) deployment keeps its allocation and seal behaviour unchanged.
  */
 
 import { Cas } from "./cas.ts";
@@ -15,6 +21,7 @@ import { resolvePointer } from "./policyBundle.ts";
 import { validateAdmissionInput, validateEffectRequest, validateEvidenceEnvelope } from "./records.ts";
 import type { AdmissionInputV1, EffectRequestV1, EvidenceEnvelopeV1, EvidenceKind, Provenance, SubjectBinding, TargetRef } from "./records.ts";
 import { ConstitutionalStore, UniqueViolation } from "./store.ts";
+import type { AllocationBinding } from "./store.ts";
 
 export class IngressRejection extends Error {
   readonly reason: string;
@@ -90,11 +97,110 @@ export interface RequestDraft {
   readonly prior_effect_refs: readonly string[];
 }
 
+/**
+ * The `seal_effect_request` body (AP B6(1)): the `RequestDraft` keys unchanged, plus ONE optional
+ * top-level sibling carrying the allocated wire tuple verbatim. It is TRANSPORT, never a draft
+ * field: the Ingress strips it below before the draft is used, so it is never a `RequestDraft`
+ * key, never reaches `EffectRequestV1` and never enters `request_digest`. REQUIRED on a first
+ * seal; on a re-seal ignored-if-identical and refused-if-different (B6(2)).
+ *
+ * Typed `unknown` because it is exactly that on arrival — an unvalidated `JSON.parse` member — so
+ * the compiler refuses any read of it that has not passed `#assertTupleDigest`'s shape guard.
+ */
+export interface SealRequestBody extends RequestDraft {
+  readonly allocation_tuple?: unknown;
+}
+
+/**
+ * INPUT-SHAPE GUARD for the `seal_effect_request` body, the allocation path's other new entry point
+ * and the same hazard: `api.ts` casts a `JSON.parse` result to `SealRequestBody`, so `null` arrives
+ * typed as a body and is not one. `sealEffectRequest` strips `allocation_tuple` by rest-
+ * destructuring, and rest-destructuring `null` or `undefined` is a `TypeError` — raised BEFORE any
+ * refusal leg runs, so it escapes as a 500. Every other non-object destructures to an empty draft
+ * already, so normalising to `{}` puts `null` on that identical path rather than inventing an
+ * outcome for it: the draft legs below refuse it as the draft-less body it is.
+ */
+function sealBodyShape(body: unknown): SealRequestBody {
+  const shaped = typeof body === "object" && body !== null && !Array.isArray(body) ? body : {};
+  return shaped as SealRequestBody;
+}
+
+/**
+ * A presented allocation tuple (AP B1, B2(5)). `schema` and `purpose` are the two RESERVED kernel
+ * fields and the only tuple vocabulary the Kernel holds; every other member is the schema owner's,
+ * named only in that schema's descriptor and never in kernel code. Under a `cadp.kernel-config.v1`
+ * deployment the v0.4 shape `cadp.allocation-key.v1` is still the only one accepted, by the
+ * unchanged hard-coded checks of `#allocateV04`.
+ */
 export interface AllocationTuple {
-  readonly schema: "cadp.allocation-key.v1";
-  readonly work_run_ref: string;
-  readonly step_ordinal: number;
+  readonly schema: string;
   readonly purpose: string;
+  readonly [field: string]: unknown;
+}
+
+/** AP B2(5): the two reserved fields, present in every schema's key set and in no descriptor. */
+const RESERVED_TUPLE_FIELDS: readonly string[] = ["schema", "purpose"];
+
+/**
+ * INPUT-SHAPE GUARD for the v2 allocation path. `api.ts` hands the Ingress whatever `JSON.parse`
+ * returned under a `AllocationTuple` cast, so `null`, `[]`, `42` and `{}` all arrive here typed as
+ * a tuple and are none of one. Every member read below — the requester-field sweep, `Object.keys`,
+ * `tuple.purpose`, the descriptor field sweep — would dereference caller data, and a `TypeError`
+ * out of any of them escapes `api.ts`'s `IngressRejection` arm as a 500. B2(5) makes a malformed
+ * tuple a REFUSAL, so the shape is settled here BEFORE the first member is read: a presented tuple
+ * is a JSON object (not null, not an array) whose reserved `schema` is a non-empty string.
+ * The detail strings are the ones the member checks already emit for these same inputs, so the
+ * guard moves the refusal earlier without changing what any reachable caller observes.
+ */
+function assertTupleShape(tuple: unknown): void {
+  if (typeof tuple !== "object" || tuple === null || Array.isArray(tuple)) {
+    throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "tuple must be a JSON object");
+  }
+  const schema = (tuple as Record<string, unknown>)["schema"];
+  if (typeof schema !== "string" || schema.length === 0) {
+    throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "schema");
+  }
+}
+
+/**
+ * AP B1(1): the requester is STAMPED from the authenticated principal, never accepted from the
+ * body — the same rule §9.1 S3 already applies to `requester_ref` on the seal draft. A tuple
+ * presenting one of these is refused rather than silently out-scoped by the stamped value.
+ */
+const REQUESTER_TUPLE_FIELDS: readonly string[] = ["requester_ref", "requester", "principal"];
+
+/** The platform effect-id shape the kernel already validates on this path (AP B2(2)(i)). */
+const EFFECT_ID_PREFIX = "cadp-v04:effect:";
+
+/**
+ * AP B2(2)(i): the closed, GENERIC `value_contract` vocabulary — the v0.4 typed-tuple rules
+ * re-homed out of kernel field names. Every contract is a constraint on the PARSED JSON value,
+ * never on the wire lexeme: `api.ts` parses the body before any validation runs, so `1`, `1.0` and
+ * `1e0` are already one value here and converge on one `effect_id`, which is the retry convergence
+ * of B1(2). The kernel dispatches on the descriptor string and never learns the field's name.
+ */
+function valueSatisfies(value: unknown, value_contract: string): boolean {
+  switch (value_contract) {
+    case "POSITIVE_INTEGER":
+      return typeof value === "number" && Number.isInteger(value) && value >= 1;
+    case "NONEMPTY_STRING":
+      return typeof value === "string" && value.length > 0;
+    case "EFFECT_ID":
+      return typeof value === "string" && value.length > 0 && value.startsWith(EFFECT_ID_PREFIX);
+    default:
+      return false; // closed vocabulary; activation validation already refuses anything else
+  }
+}
+
+/**
+ * AP B2(1): `allocation_contract_payload.v1` — an object with EXACTLY the two member names
+ * `descriptor` and `allocation_schema`, each the schema's registry entry verbatim as active at
+ * allocation time. Pinned as one function because the same preimage must be computed by all three
+ * of its uses — B1(2)'s key derivation, B2(3.3)'s first-seal contract integrity and B2(9)'s drift
+ * recovery — which cannot agree otherwise.
+ */
+export function allocationContractDigest(descriptor: unknown, allocation_schema: unknown): string {
+  return sha256Hex(jcs({ descriptor, allocation_schema }));
 }
 
 export class Ingress {
@@ -104,8 +210,11 @@ export class Ingress {
   readonly clock: () => number;
   /**
    * TEST-ONLY guard-bite harness knob (TD §13.1), the same shape the PEP already carries: the
-   * production composition never passes it, and the conformance suite proves each §5.3 rule is
-   * load-bearing by disabling it and observing the prohibited effect (a second governed edge).
+   * production composition never passes it, and the conformance suite proves each rule is
+   * load-bearing by disabling it and observing the prohibited effect — a second governed edge for
+   * the §5.3 rules, and for the AP B2/B3 rules a cross-principal `REQUEST_DIGEST_CONFLICT`
+   * (`allocation_principal_gate`) or a sealed request whose kernel-namespace subject is ambiguous
+   * (`kernel_namespace_lock`).
    */
   readonly disabledRules: ReadonlySet<string>;
 
@@ -140,14 +249,50 @@ export class Ingress {
 
   // ---------------------------------------------------------------- allocation
 
-  /** Idempotent allocation on the canonical tuple (TD §7.4, C23). */
-  allocateEffectId(tuple: AllocationTuple): string {
+  /**
+   * Idempotent allocation on the canonical tuple (TD §7.4, C23), taking the stamped principal the
+   * API layer already resolves for `seal_effect_request` and `submit_evidence` (AP B1(1)).
+   *
+   * The two paths are gated on the ACTIVE KERNEL CONFIG's schema, not on the tuple's: a running
+   * `cadp.kernel-config.v1` (v0.4) deployment keeps the hard-coded v1 validation and the unscoped
+   * key it has today, byte for byte; a `cadp.kernel-config.v2` (v0.5) deployment runs the
+   * descriptor-driven validation and the requester- and contract-scoped key of B1(2). Spec v0.5
+   * §10 requires a v0.5 genesis in a new store namespace, so no stored row is ever re-keyed.
+   *
+   * B1(1)'s two STAMPING rules — resolve the principal through the active `identity_registry`
+   * (unregistered ⇒ `FORBIDDEN_FOR_PRINCIPAL`) and refuse a tuple presenting a requester field —
+   * belong to the v0.5 contract and therefore run ONLY on the v2 path, INSIDE the gate. Under a v1
+   * config this method's observable behaviour is exactly v0.4's: the principal is unused (the key
+   * is unscoped, so there is nothing to resolve it for) and an extra tuple member is ignored by the
+   * hard-coded checks, as it is today. Neither rule is weakened where it applies: B1's requester
+   * scoping and B2's binding storage exist only under `cadp.kernel-config.v2`, which is a
+   * generation boundary (B3(5)), and the API layer independently refuses an unregistered principal
+   * on every method under every config (`api.ts` reach matrix).
+   */
+  allocateEffectId(tuple: AllocationTuple, principal: Principal): string {
     const active = this.active();
+    if (active.config.schema !== "cadp.kernel-config.v2") return this.#allocateV04(tuple, active);
+    const identity = identityEntry(active.config, principal.principal);
+    if (identity === undefined) throw new IngressRejection("FORBIDDEN_FOR_PRINCIPAL", "unregistered principal");
+    // Shape before members: everything below this line dereferences caller-supplied data.
+    assertTupleShape(tuple);
+    for (const field of REQUESTER_TUPLE_FIELDS) {
+      if ((tuple as Record<string, unknown>)[field] !== undefined) {
+        throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `${field} is stamped from the caller, never presented`);
+      }
+    }
+    return this.#allocateDescriptorDriven(tuple, identity.producer_ref, active);
+  }
+
+  /** The v0.4 path, unchanged: one hard-coded schema, typed fields, and an unscoped key. */
+  #allocateV04(tuple: AllocationTuple, active: ActivePolicy): string {
     if (tuple.schema !== "cadp.allocation-key.v1") throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "schema");
-    if (typeof tuple.work_run_ref !== "string" || !tuple.work_run_ref.startsWith("cadp-v04:effect:")) {
+    const work_run_ref = tuple["work_run_ref"];
+    const step_ordinal = tuple["step_ordinal"];
+    if (typeof work_run_ref !== "string" || !work_run_ref.startsWith(EFFECT_ID_PREFIX)) {
       throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "work_run_ref");
     }
-    if (!Number.isInteger(tuple.step_ordinal) || tuple.step_ordinal < 1) {
+    if (!Number.isInteger(step_ordinal) || (step_ordinal as number) < 1) {
       throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "step_ordinal must be an integer ≥ 1");
     }
     if (!active.config.allocation_purposes.includes(tuple.purpose)) {
@@ -155,8 +300,8 @@ export class Ingress {
     }
     const canonical = jcs({
       schema: tuple.schema,
-      work_run_ref: tuple.work_run_ref,
-      step_ordinal: tuple.step_ordinal,
+      work_run_ref,
+      step_ordinal,
       purpose: tuple.purpose,
     });
     const key = `cadp-v04:alloc:${sha256Hex(canonical)}`;
@@ -169,10 +314,84 @@ export class Ingress {
     });
   }
 
+  /**
+   * AP B1(2)/B1(4)/B2(5): one generic path for EVERY schema. The tuple's key set is
+   * `{schema, purpose}` ∪ the descriptor's fields and each non-reserved value is checked against
+   * its field's `value_contract` — both axes compared against descriptor strings, so no schema's
+   * field name lives in kernel code. The derived key carries the stamped `requester_ref` and the
+   * `allocation_contract_digest`, which is what makes retries converge per principal, keeps two
+   * principals' identical tuples on distinct effect identities, and makes contract drift
+   * RECOVERABLE by re-allocation instead of stranding the tuple on an unrefreshable row (B2(9);
+   * the store has no runtime UPDATE).
+   */
+  #allocateDescriptorDriven(tuple: AllocationTuple, requester_ref: string, active: ActivePolicy): string {
+    const schema = tuple.schema;
+    if (typeof schema !== "string" || schema.length === 0) throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "schema");
+    // B2(5): both entries or nothing — no allocation may come to exist that a first seal would
+    // have to check against nothing, and the key is not derivable without the contract it pins.
+    const descriptor = (active.config.allocation_schema_descriptors ?? []).find((entry) => entry.schema === schema);
+    const mapping = (active.config.allocation_schemas ?? []).find((entry) => entry.schema === schema);
+    if (descriptor === undefined || mapping === undefined) {
+      throw new IngressRejection("ALLOCATION_SCHEMA_UNREGISTERED", schema);
+    }
+    const declared = new Set<string>([...RESERVED_TUPLE_FIELDS, ...descriptor.fields.map((f) => f.field)]);
+    for (const key of Object.keys(tuple)) {
+      if (!declared.has(key)) throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `${schema} has no field ${key}`);
+    }
+    if (typeof tuple.purpose !== "string" || tuple.purpose.length === 0) {
+      throw new IngressRejection("ALLOCATION_TUPLE_INVALID", "purpose");
+    }
+    for (const field of descriptor.fields) {
+      const value = (tuple as Record<string, unknown>)[field.field];
+      if (value === undefined) throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `${schema} requires ${field.field}`);
+      if (!valueSatisfies(value, field.value_contract)) {
+        throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `${field.field} violates ${field.value_contract}`);
+      }
+    }
+    // The v0.4 `allocation_purposes` membership check is UNCHANGED and keeps its refusal code
+    // (B2(5)); the entry's totality over the purposes this schema may allocate is the new one.
+    if (!active.config.allocation_purposes.includes(tuple.purpose)) {
+      throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `unknown purpose ${tuple.purpose}`);
+    }
+    if (!mapping.purpose_relation.some((relation) => relation.purpose === tuple.purpose)) {
+      throw new IngressRejection("ALLOCATION_PURPOSE_NOT_REGISTERED", `${schema} pairs no operation_kind with ${tuple.purpose}`);
+    }
+    const binding: AllocationBinding = {
+      requester_ref,
+      allocation_schema: schema,
+      // The tuple is an object, so `cadp-jcs-1` alone fixes these bytes (B1(3)).
+      allocation_binding_digest: sha256Hex(jcs(tuple)),
+      allocation_contract_digest: allocationContractDigest(descriptor, mapping),
+      purpose: tuple.purpose,
+    };
+    const key = `cadp-v04:alloc:${sha256Hex(jcs({
+      requester_ref,
+      tuple,
+      allocation_contract_digest: binding.allocation_contract_digest,
+    }))}`;
+    return this.store.withImmediate(() => {
+      const existing = this.store.allocationByKey(key);
+      if (existing !== undefined) return existing;
+      const effect_id = newId("effect", this.clock);
+      this.store.insertAllocation(key, effect_id, binding);
+      return effect_id;
+    });
+  }
+
   // ---------------------------------------------------------------- seal_effect_request
 
-  sealEffectRequest(draft: RequestDraft, principal: Principal): EffectRequestV1 {
+  sealEffectRequest(body: unknown, principal: Principal): EffectRequestV1 {
     const active = this.active();
+    // B6(1): the tuple is stripped HERE, before anything reads the draft, so "transport, never a
+    // draft field" is true of the implemented parse rather than merely asserted against it.
+    // The strip is itself a dereference of caller data, so the SHAPE is settled one line earlier:
+    // `api.ts` hands us whatever `JSON.parse` returned under a `SealRequestBody` cast, and rest-
+    // destructuring `null` throws a `TypeError` that escapes as a 500 where the contract mandates a
+    // refusal. A non-object body carries no draft key, which is exactly what an empty draft carries,
+    // so `null` now takes the very path `42`, `[]`, `"x"` and `true` already take today — the
+    // generic draft refusals below, reached with `allocation_tuple` absent. No other input observes
+    // a change. The parameter is `unknown` so the compiler refuses any read that skips this line.
+    const { allocation_tuple, ...draft } = sealBodyShape(body);
     const identity = identityEntry(active.config, principal.principal);
     if (identity === undefined) throw new IngressRejection("FORBIDDEN_FOR_PRINCIPAL", "unregistered principal");
     // S3: requester_ref is stamped from the authenticated caller; a differing declared ref is rejected.
@@ -206,9 +425,35 @@ export class Ingress {
     validateEffectRequest(sealed);
     this.assertSchemesApproved([sealed.material_digest, sealed.request_digest], active);
 
+    // AP B2: under a v0.5 (`cadp.kernel-config.v2`) deployment the allocation row is authority for
+    // this seal. Its read, the equality legs and the `effect_request` insert are ONE transaction
+    // with the allocation row locked for the duration (BEGIN IMMEDIATE, the §3.4 SQLite variant),
+    // so a mismatching first seal is refused deterministically before any K3 record exists under
+    // every interleaving — the check is against the immutable allocation row, never against a
+    // race-visible request row. Under a v1 config none of it runs and the path is v0.4's.
+    const allocationBound = active.config.schema === "cadp.kernel-config.v2";
     const outcome = this.store.withImmediate((): { kind: "row"; row: EffectRequestV1 } | { kind: "conflict" } => {
+      // B2(10): EVERY seal — first seal and re-seal alike — resolves the allocation row and
+      // compares the stamped principal BEFORE the existing-row lookup and before any K3
+      // comparison. No KERNEL_INCIDENT and no scope hold: a mismatching seal is a caller error
+      // against an effect identity the caller does not own, and holding the owner's scope on it
+      // would let any principal freeze another's effect scope with one bad seal. Only the
+      // allocation's own requester ever reaches the K3 identical/conflict semantics.
+      const allocation = allocationBound ? this.#allocationOf(sealed.effect_id) : undefined;
+      if (allocation !== undefined && this.#ruleEnabled("allocation_principal_gate")) {
+        if (allocation.requester_ref !== identity.producer_ref) {
+          throw new IngressRejection("ALLOCATION_PRINCIPAL_MISMATCH", sealed.effect_id);
+        }
+      }
       const existing = this.store.effectRequest(sealed.effect_id);
       if (existing !== undefined) {
+        // B6(2): a re-seal MAY omit the tuple and MAY repeat it; a DIFFERENT tuple is the same
+        // falsehood about the same allocation a first seal refuses, under the same code. The K3
+        // semantic payload is untouched, so this can never turn an idempotent re-seal into a
+        // REQUEST_DIGEST_CONFLICT.
+        if (allocation !== undefined && allocation_tuple !== undefined) {
+          this.#assertTupleDigest(allocation, allocation_tuple);
+        }
         // Same effect_id: identical semantic content → idempotent no-op returning the stored
         // row (TD §3.3); any difference → REQUEST_DIGEST_CONFLICT incident + scope hold (C8).
         const semantic = (r: EffectRequestV1) =>
@@ -220,6 +465,9 @@ export class Ingress {
         if (semantic(existing) === semantic(sealed)) return { kind: "row", row: existing };
         return { kind: "conflict" };
       }
+      // FIRST seal (no `effect_request` row): B2(3)'s legs, all of them generic equalities over
+      // bundle data and the caller's own tuple, every one refusing BEFORE any K3 record exists.
+      if (allocation !== undefined) this.#assertFirstSealBinding(sealed, allocation, allocation_tuple, active);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
       return { kind: "row", row: sealed };
     });
@@ -232,6 +480,113 @@ export class Ingress {
       throw new IngressRejection("REQUEST_DIGEST_CONFLICT");
     }
     return outcome.row;
+  }
+
+  /**
+   * AP B2(3): the allocation row this `effect_id` names, read inside the sealing transaction.
+   * Absent ⇒ `ALLOCATION_NOT_FOUND`, which closes caller-invented effect identities (Spec v0.5 K3).
+   * A row carrying no v2 binding is the mixed-generation case Spec v0.5 §10 forbids (a v0.5
+   * deployment is a v0.5 genesis in a new store namespace); it is refused the same way, closed.
+   */
+  #allocationOf(effect_id: string): AllocationBinding {
+    const row = this.store.allocationByEffectId(effect_id);
+    if (row?.binding === undefined) throw new IngressRejection("ALLOCATION_NOT_FOUND", effect_id);
+    return row.binding;
+  }
+
+  /**
+   * B2(3.2): the re-presented tuple must digest to the stored binding. Nothing inverts the digest.
+   *
+   * `allocation_tuple` is caller data straight off `JSON.parse`, so the shape is settled here too,
+   * in the SAME refusal: an allocated tuple is always a JSON object (`assertTupleShape` gates every
+   * v2 allocation), so `null`, an array and a scalar can never digest-equal a stored binding and
+   * were already `ALLOCATION_BINDING_MISMATCH` — this states it structurally instead of resting on
+   * `jcs` tolerating a scalar, and lets the caller's members be read below without a `TypeError`.
+   */
+  #assertTupleDigest(allocation: AllocationBinding, tuple: unknown): Record<string, unknown> {
+    if (
+      typeof tuple !== "object" || tuple === null || Array.isArray(tuple) ||
+      sha256Hex(jcs(tuple)) !== allocation.allocation_binding_digest
+    ) {
+      throw new IngressRejection("ALLOCATION_BINDING_MISMATCH", "re-presented tuple is not the allocated one");
+    }
+    return tuple as Record<string, unknown>;
+  }
+
+  /**
+   * The first-seal legs of AP B2(3), in the order the TD stages them, all inside the sealing
+   * transaction and all before any K3 record exists. Every string compared is either bundle-
+   * authored data or the caller's own tuple: the core reads none of them for meaning.
+   */
+  #assertFirstSealBinding(
+    sealed: EffectRequestV1,
+    allocation: AllocationBinding,
+    tuple: unknown,
+    active: ActivePolicy,
+  ): void {
+    // B3(4)(b): the kernel-namespace ambiguity lock runs before B2(3)'s legs, so binding order can
+    // never decide what any kernel reader sees — including a reader still selecting by namespace
+    // alone. More than one binding in a DECLARED namespace, regardless of authority_ref.
+    if (this.#ruleEnabled("kernel_namespace_lock")) {
+      for (const declared of active.config.kernel_subject_namespaces ?? []) {
+        const bound = sealed.work_bindings.filter((b) => b.namespace === declared.namespace);
+        if (bound.length > 1) {
+          throw new IngressRejection("KERNEL_NAMESPACE_AMBIGUOUS", `${bound.length} bindings in ${declared.namespace}`);
+        }
+      }
+    }
+    // B6(1): the allocated tuple is re-presented as transport and is REQUIRED here.
+    if (tuple === undefined) throw new IngressRejection("ALLOCATION_TUPLE_REQUIRED", sealed.effect_id);
+    // The guard returns the tuple narrowed to an object, so B2(3.4) below reads members of a value
+    // whose shape has been established rather than of whatever the caller happened to send.
+    const bound_tuple = this.#assertTupleDigest(allocation, tuple);
+    // B2(3.3): contract integrity gates the two legs below it. Without it a byte-identical tuple
+    // could be re-presented under a bundle that swapped which tuple_field projects onto which
+    // target, and every other equality would still pass while the sealed material is the inverse
+    // of what was allocated. Either entry withdrawn fails this leg too — there is no digest to
+    // equal. The recovery is a re-allocation, which B1(2)'s contract-scoped key makes converge on
+    // a FRESH effect_id rather than back onto this row.
+    const schema = allocation.allocation_schema;
+    const descriptor = (active.config.allocation_schema_descriptors ?? []).find((entry) => entry.schema === schema);
+    const mapping = (active.config.allocation_schemas ?? []).find((entry) => entry.schema === schema);
+    if (
+      descriptor === undefined || mapping === undefined ||
+      allocationContractDigest(descriptor, mapping) !== allocation.allocation_contract_digest
+    ) {
+      throw new IngressRejection("ALLOCATION_CONTRACT_CHANGED", schema);
+    }
+    // B2(3.4): EXACTLY ONE sealed binding per projected (authority_ref, namespace) pair, carrying
+    // the allocated tuple field's value. Zero or a value mismatch is a MISMATCH; two or more —
+    // including two carrying the same object_id — is AMBIGUOUS, because `records.ts` imposes no
+    // SubjectBinding uniqueness and an exists-based check would leave the projected target
+    // ambiguous with the check already passed. The full pair is matched, never the namespace
+    // alone, so an identically-named subject under a different authority never satisfies it.
+    for (const projection of mapping.binding_projection) {
+      const bound = sealed.work_bindings.filter(
+        (b) => b.authority_ref === projection.authority_ref && b.namespace === projection.namespace,
+      );
+      if (bound.length > 1) {
+        throw new IngressRejection(
+          "ALLOCATION_BINDING_AMBIGUOUS",
+          `${bound.length} bindings on ${projection.authority_ref}|${projection.namespace}`,
+        );
+      }
+      if (bound.length === 0 || bound[0]!.object_id !== bound_tuple[projection.tuple_field]) {
+        throw new IngressRejection(
+          "ALLOCATION_BINDING_MISMATCH",
+          `${projection.authority_ref}|${projection.namespace} does not bind ${projection.tuple_field}`,
+        );
+      }
+    }
+    // B2(3.5): for EVERY allocation schema without exception, the sealed operation_kind is the one
+    // the registered purpose_relation pairs with the allocated purpose; no pair is itself a refusal.
+    const pair = mapping.purpose_relation.find((relation) => relation.purpose === allocation.purpose);
+    if (pair === undefined || pair.operation_kind !== sealed.operation_kind) {
+      throw new IngressRejection(
+        "ALLOCATION_PURPOSE_MISMATCH",
+        `${allocation.purpose} pairs with ${pair?.operation_kind ?? "no operation_kind"}, sealed ${sealed.operation_kind}`,
+      );
+    }
   }
 
   // ---------------------------------------------------------------- submit_evidence

@@ -12,7 +12,7 @@ import { Cas } from "./cas.ts";
 import { evaluateAndSeal } from "./evaluator.ts";
 import type { EvaluatorPort } from "./evaluator.ts";
 import { Ingress, IngressRejection } from "./ingress.ts";
-import type { AllocationTuple, EvidenceDraft, RequestDraft } from "./ingress.ts";
+import type { AllocationTuple, EvidenceDraft, SealRequestBody } from "./ingress.ts";
 import { Pep } from "./pep.ts";
 import { Reconciler } from "./reconciler.ts";
 import { executeRootOperation, RootRejection } from "./rootListener.ts";
@@ -111,12 +111,16 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         return send(200, { cas_key: key });
       }
       case "allocate_effect_id": {
+        // AP B1(1): the allocation branch now passes the same authenticated principal the seal and
+        // submit branches already do; the Ingress resolves it to the stamped `requester_ref`.
         const tuple = JSON.parse(raw.toString("utf8")) as AllocationTuple;
-        return send(200, { effect_id: deps.ingress.allocateEffectId(tuple) });
+        return send(200, { effect_id: deps.ingress.allocateEffectId(tuple, { principal }) });
       }
       case "seal_effect_request": {
-        const draft = JSON.parse(raw.toString("utf8")) as RequestDraft;
-        return send(200, deps.ingress.sealEffectRequest(draft, { principal }));
+        // AP B6(1): `allocation_tuple` rides as one optional top-level sibling of the draft keys;
+        // the Ingress strips it, so it never reaches `EffectRequestV1` or `request_digest`.
+        const body = JSON.parse(raw.toString("utf8")) as SealRequestBody;
+        return send(200, deps.ingress.sealEffectRequest(body, { principal }));
       }
       case "submit_evidence": {
         const draft = JSON.parse(raw.toString("utf8")) as EvidenceDraft;

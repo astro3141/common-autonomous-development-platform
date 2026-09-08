@@ -73,7 +73,7 @@ function sealOp(h: Harness, operation_kind: "PR_MERGE" | "POLICY_ACTIVATE"): str
         work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
         step_ordinal: (step += 1),
         purpose: operation_kind === "PR_MERGE" ? "pr-merge" : "policy-activate",
-      }),
+      }, PRINCIPALS.workflow),
       requester_ref: "workflow:cadp-work",
       work_bindings: [],
       target_ref: operation_kind === "PR_MERGE"
