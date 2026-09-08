@@ -4,7 +4,9 @@
  * - `payload_digest` = sha256 `cadp-bundle-payload-1`: for every tar entry except `.manifest`,
  *   ordered by path (bytewise), concat of path || 0x00 || uint64-BE(len) || bytes.
  * - `.manifest.revision` = "cadp-v04:policy:<policy_id>@<revision>#<payload_digest hex>".
- * Also: `cadp.kernel-config.v1` validation (TD §5.4) — closed schema, bounds, no defaults.
+ * Also: `cadp.kernel-config.v1` validation (TD §5.4) — closed schema, bounds, no defaults —
+ * and `cadp.kernel-config.v2` (AP B3), which adds registry uniqueness, closed entry keys and
+ * the five v0.5 registries on top of exactly that v1 rule set.
  */
 
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -155,8 +157,38 @@ export function buildPolicyBundle(input: {
 
 // ------------------------------------------------------------------ cadp.kernel-config.v1
 
+/** AP B2(2)(i): the schema owner's immutable field-role/value-contract declaration. */
+export interface AllocationSchemaDescriptor {
+  readonly schema: string;
+  readonly fields: ReadonlyArray<{
+    field: string;
+    role: "PROJECTED" | "ENTROPY";
+    value_contract: "POSITIVE_INTEGER" | "NONEMPTY_STRING" | "EFFECT_ID";
+  }>;
+}
+
+/** AP B2(2)(iii): policy/composition projection targets and purpose relations. */
+export interface AllocationSchemaEntry {
+  readonly schema: string;
+  readonly binding_projection: ReadonlyArray<{ tuple_field: string; authority_ref: string; namespace: string }>;
+  readonly purpose_relation: ReadonlyArray<{ purpose: string; operation_kind: string }>;
+}
+
+/** AP B4(1): the declared subject-complete assembly set. */
+export interface SubjectCompleteAssemblyEntry {
+  readonly evidence_kind: string;
+  readonly subject_namespace: string;
+  readonly operation_kinds: readonly string[];
+}
+
+/** AP B3(4)(a): the exact subject identity of every namespace the KERNEL itself consumes. */
+export interface KernelSubjectNamespaceEntry {
+  readonly namespace: string;
+  readonly authority_ref: string;
+}
+
 export interface KernelConfig {
-  readonly schema: "cadp.kernel-config.v1";
+  readonly schema: "cadp.kernel-config.v1" | "cadp.kernel-config.v2";
   readonly approved_digest_schemes: ReadonlyArray<{ algorithm: string; canonicalization: string }>;
   readonly root_public_keys: ReadonlyArray<{ key_id: string; alg: "Ed25519"; public_key: string; valid_from: string; valid_to?: string }>;
   readonly attestation_keys: ReadonlyArray<{ key_id: string; alg: string; public_key: string; purpose: string; valid_from: string; valid_to?: string }>;
@@ -191,6 +223,16 @@ export interface KernelConfig {
   readonly temporal_idempotency_horizon_s: number;
   readonly cas_upload_max_bytes: number;
   readonly break_glass_max_lifetime_s: number;
+  /**
+   * The five keys `cadp.kernel-config.v2` adds (AP B3(3)'s inventory audit). Each is REQUIRED
+   * under v2 and MAY be `[]`; each is absent under v1, whose closed top-level key set is
+   * unchanged — a v1 bundle carrying any of them is refused `unknown key` exactly as before.
+   */
+  readonly allocation_schema_descriptors?: ReadonlyArray<AllocationSchemaDescriptor>;
+  readonly allocation_schemas?: ReadonlyArray<AllocationSchemaEntry>;
+  readonly subject_complete_assembly?: ReadonlyArray<SubjectCompleteAssemblyEntry>;
+  readonly kernel_subject_namespaces?: ReadonlyArray<KernelSubjectNamespaceEntry>;
+  readonly run_profile_enrolled_requester_refs?: readonly string[];
 }
 
 const INT_BOUNDS: ReadonlyArray<[keyof KernelConfig & string, number, number]> = [
@@ -213,7 +255,28 @@ const ALLOWED_KEYS = new Set<string>([
   ...INT_BOUNDS.map(([k]) => k),
 ]);
 
-export class KernelConfigInvalid extends Error {}
+export const KERNEL_CONFIG_V1 = "cadp.kernel-config.v1";
+export const KERNEL_CONFIG_V2 = "cadp.kernel-config.v2";
+
+/**
+ * AP B3(3), inventory audit: exactly five keys extend the closed top-level set, and only for v2.
+ * Nothing else in the Authority Plane TD extends `ALLOWED_KEYS`.
+ */
+const V2_ONLY_KEYS: readonly string[] = [
+  "allocation_schema_descriptors", "allocation_schemas", "subject_complete_assembly",
+  "kernel_subject_namespaces", "run_profile_enrolled_requester_refs",
+];
+
+const ALLOWED_KEYS_V2 = new Set<string>([...ALLOWED_KEYS, ...V2_ONLY_KEYS]);
+
+export class KernelConfigInvalid extends Error {
+  /** The TD reason code this refusal carries, for the refusals AP B2/B3 name one for. */
+  readonly reason: string;
+  constructor(detail: string, reason = "KERNEL_CONFIG_INVALID") {
+    super(reason === "KERNEL_CONFIG_INVALID" ? detail : `${reason}: ${detail}`);
+    this.reason = reason;
+  }
+}
 
 /**
  * Invariant P (#117 §5.2): the reserved governed-writer producer identity. It is a permanent
@@ -227,14 +290,24 @@ const GOVERNED_PRODUCER_CONSTANT = "governed:reclassification";
 /**
  * Closed-schema validation (TD §5.4, C31): unknown keys rejected, bounds inclusive,
  * exact-match registries only (no wildcard/glob/regex principals).
+ *
+ * Two schemas are accepted. `cadp.kernel-config.v1` is validated by exactly the rules below and
+ * by nothing else — its behaviour is unchanged. `cadp.kernel-config.v2` (AP B3(5)) is validated
+ * by the same rules PLUS the strictly narrower `validateKernelConfigV2` block: registry
+ * uniqueness (B3(1)), closed entry keys (B3(2)–(3)), the five new registries (B2(2), B3(4),
+ * B4(1), B5(3)) and the work-run declaration invariant (B3(4)(c)).
  */
 export function validateKernelConfig(dataCadp: unknown): KernelConfig {
   if (typeof dataCadp !== "object" || dataCadp === null) throw new KernelConfigInvalid("data.cadp missing or not an object");
   const cfg = dataCadp as Record<string, unknown>;
+  const isV2 = cfg["schema"] === KERNEL_CONFIG_V2;
+  const allowed = isV2 ? ALLOWED_KEYS_V2 : ALLOWED_KEYS;
   for (const key of Object.keys(cfg)) {
-    if (!ALLOWED_KEYS.has(key)) throw new KernelConfigInvalid(`unknown key data.cadp.${key} (closed schema)`);
+    if (!allowed.has(key)) throw new KernelConfigInvalid(`unknown key data.cadp.${key} (closed schema)`);
   }
-  if (cfg["schema"] !== "cadp.kernel-config.v1") throw new KernelConfigInvalid("schema must be cadp.kernel-config.v1");
+  if (!isV2 && cfg["schema"] !== KERNEL_CONFIG_V1) {
+    throw new KernelConfigInvalid(`schema must be ${KERNEL_CONFIG_V1} or ${KERNEL_CONFIG_V2}`);
+  }
 
   const schemes = cfg["approved_digest_schemes"];
   if (!Array.isArray(schemes) || schemes.length === 0) throw new KernelConfigInvalid("approved_digest_schemes required");
@@ -331,7 +404,270 @@ export function validateKernelConfig(dataCadp: unknown): KernelConfig {
     }
   }
 
+  if (isV2) validateKernelConfigV2(cfg);
+
   return cfg as unknown as KernelConfig;
+}
+
+// ------------------------------------------------------------------ cadp.kernel-config.v2 (AP B2/B3)
+
+/**
+ * AP B3(3): the closed entry-key sets, exactly as that clause lists them. Nested sets are closed
+ * identically and for the identical reason — "an inert key is not a declared binding" (B3(2))
+ * does not weaken with nesting depth. A trailing-optional member (`valid_to`, `claim_pointer`,
+ * the two governed-writer opt-ins) is a member of the set; its REQUIRED-ness is the concern of
+ * the shape rules above, not of key closure.
+ */
+const V2_ENTRY_KEYS: Readonly<Record<string, readonly string[]>> = {
+  approved_digest_schemes: ["algorithm", "canonicalization"],
+  root_public_keys: ["key_id", "alg", "public_key", "valid_from", "valid_to"],
+  attestation_keys: ["key_id", "alg", "public_key", "purpose", "valid_from", "valid_to"],
+  identity_registry: ["principal", "producer_ref", "identity_class"],
+  "identity_registry.identity_class": ["vendor", "product", "account", "process_class"],
+  adapter_registry: ["producer_ref", "evidence_kinds", "source_relation", "produced_at_source", "replay_idempotency", "governed_edge"],
+  "adapter_registry.produced_at_source": ["kind", "claim_pointer"],
+  allocation_schema_descriptors: ["schema", "fields"],
+  "allocation_schema_descriptors.fields": ["field", "role", "value_contract"],
+  allocation_schemas: ["schema", "binding_projection", "purpose_relation"],
+  "allocation_schemas.binding_projection": ["tuple_field", "authority_ref", "namespace"],
+  "allocation_schemas.purpose_relation": ["purpose", "operation_kind"],
+  subject_complete_assembly: ["evidence_kind", "subject_namespace", "operation_kinds"],
+  kernel_subject_namespaces: ["namespace", "authority_ref"],
+};
+
+/** AP B2(2)(i): the two closed vocabularies of a descriptor field entry. */
+const DESCRIPTOR_ROLES: readonly string[] = ["PROJECTED", "ENTROPY"];
+const DESCRIPTOR_VALUE_CONTRACTS: readonly string[] = ["POSITIVE_INTEGER", "NONEMPTY_STRING", "EFFECT_ID"];
+
+/** AP B2(5): the two reserved kernel tuple fields; a descriptor naming either is refused. */
+const RESERVED_TUPLE_FIELDS: readonly string[] = ["schema", "purpose"];
+
+/**
+ * AP B3(4)(c): the kernel-consumed namespace list is CODE, not bundle content — today exactly the
+ * work-run namespace, which the kernel itself consumes (the `effect_request` index in
+ * `ingress.ts`; recheck #5's decision scope, `REQUIRE_NO_PRIOR_UNKNOWN_IN_SCOPE` and
+ * `MAX_EFFECTS_IN_WORK_RUN` in `pep.ts`). A namespace the kernel reads is not a tuple field name.
+ */
+const KERNEL_CONSUMED_NAMESPACE_WORK_RUN = "work-run";
+
+/** Resolve `container[key]` as an array of objects, refusing anything else. */
+function v2ObjectEntries(container: Record<string, unknown>, key: string, where: string): Array<Record<string, unknown>> {
+  const value = container[key];
+  if (!Array.isArray(value)) throw new KernelConfigInvalid(`${where} required (may be [])`);
+  return value.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new KernelConfigInvalid(`${where}[${index}] must be an object`);
+    }
+    return entry as Record<string, unknown>;
+  });
+}
+
+/** AP B3(2)/(3): an unknown key INSIDE an entry is refused, at any nesting depth. */
+function assertClosedEntryKeys(where: string, entry: Record<string, unknown>): void {
+  const allowed = V2_ENTRY_KEYS[where]!;
+  for (const key of Object.keys(entry)) {
+    if (!allowed.includes(key)) {
+      throw new KernelConfigInvalid(`unknown key ${key} in ${where} entry (closed entry keys)`, "REGISTRY_UNKNOWN_ENTRY_KEY");
+    }
+  }
+}
+
+/** AP B3(1), B2(2): a first-match lookup must never be decided by bundle authoring order. */
+function assertUniqueKeys(where: string, keyName: string, values: readonly string[]): void {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) {
+      throw new KernelConfigInvalid(`two ${where} entries share ${keyName} ${value}`, "REGISTRY_DUPLICATE_KEY");
+    }
+    seen.add(value);
+  }
+}
+
+function v2String(where: string, entry: Record<string, unknown>, key: string): string {
+  const value = entry[key];
+  if (typeof value !== "string") throw new KernelConfigInvalid(`${where} ${key} must be a string`);
+  return value;
+}
+
+/**
+ * The v2-only rule set (AP B3(5)): registry uniqueness (B3(1)), closed entry keys (B3(2)–(3)),
+ * the five new registries with their shapes and vocabularies (B2(2), B3(4), B4(1), B5(3)),
+ * descriptor-vs-projection coverage (B2(2)(iii), B2(5)) and the work-run declaration invariant
+ * (B3(4)(c)). Runs only for `cadp.kernel-config.v2`; v1 reaches none of it.
+ *
+ * NOT enforced here, and deliberately: B2(2)(ii)'s cross-activation descriptor immutability
+ * (`SCHEMA_DESCRIPTOR_CHANGED`) compares against the SEALED STORE and so is not a function of one
+ * bundle, and B2(5)'s allocation-time refusals (`ALLOCATION_TUPLE_INVALID`,
+ * `ALLOCATION_PURPOSE_NOT_REGISTERED`) are ingress rules — including its v1 corollary that a
+ * bundle carry a `cadp.allocation-key.v1` entry whose `purpose_relation` is total over
+ * `allocation_purposes`, which lands with the ingress migration off this registry.
+ */
+function validateKernelConfigV2(cfg: Record<string, unknown>): void {
+  // --- B3(2)/(3): closed entry keys over the registries the v1 rules already shape-checked.
+  for (const registry of ["approved_digest_schemes", "root_public_keys", "attestation_keys"]) {
+    for (const entry of v2ObjectEntries(cfg, registry, registry)) assertClosedEntryKeys(registry, entry);
+  }
+  const identity = v2ObjectEntries(cfg, "identity_registry", "identity_registry");
+  for (const entry of identity) {
+    assertClosedEntryKeys("identity_registry", entry);
+    assertClosedEntryKeys("identity_registry.identity_class", entry["identity_class"] as Record<string, unknown>);
+  }
+  const adapters = v2ObjectEntries(cfg, "adapter_registry", "adapter_registry");
+  for (const entry of adapters) {
+    assertClosedEntryKeys("adapter_registry", entry);
+    assertClosedEntryKeys("adapter_registry.produced_at_source", entry["produced_at_source"] as Record<string, unknown>);
+  }
+
+  // --- B3(1): the three uniqueness legs of conformance control A1.
+  assertUniqueKeys("identity_registry", "principal", identity.map((e) => e["principal"] as string));
+  assertUniqueKeys("identity_registry", "producer_ref", identity.map((e) => e["producer_ref"] as string));
+  assertUniqueKeys("adapter_registry", "producer_ref", adapters.map((e) => e["producer_ref"] as string));
+
+  // --- B2(2)(i): the schema-owner descriptor registry.
+  const descriptors = v2ObjectEntries(cfg, "allocation_schema_descriptors", "allocation_schema_descriptors");
+  for (const entry of descriptors) {
+    assertClosedEntryKeys("allocation_schema_descriptors", entry);
+    const schema = v2String("allocation_schema_descriptors", entry, "schema");
+    const fields = v2ObjectEntries(entry, "fields", "allocation_schema_descriptors.fields");
+    for (const fieldEntry of fields) {
+      assertClosedEntryKeys("allocation_schema_descriptors.fields", fieldEntry);
+      // Exactly three members, all required (B2(2)(i)).
+      const field = v2String("allocation_schema_descriptors.fields", fieldEntry, "field");
+      const role = v2String("allocation_schema_descriptors.fields", fieldEntry, "role");
+      const valueContract = v2String("allocation_schema_descriptors.fields", fieldEntry, "value_contract");
+      if (RESERVED_TUPLE_FIELDS.includes(field)) {
+        throw new KernelConfigInvalid(
+          `allocation_schema_descriptors ${schema} names reserved kernel field ${field} (schema and purpose are reserved)`,
+        );
+      }
+      if (!DESCRIPTOR_ROLES.includes(role)) {
+        throw new KernelConfigInvalid(`allocation_schema_descriptors ${schema} field ${field} role must be one of ${DESCRIPTOR_ROLES.join(", ")}`);
+      }
+      if (!DESCRIPTOR_VALUE_CONTRACTS.includes(valueContract)) {
+        throw new KernelConfigInvalid(
+          `allocation_schema_descriptors ${schema} field ${field} value_contract must be one of ${DESCRIPTOR_VALUE_CONTRACTS.join(", ")}`,
+        );
+      }
+    }
+    assertUniqueKeys(`allocation_schema_descriptors ${schema} fields`, "field", fields.map((f) => f["field"] as string));
+  }
+  assertUniqueKeys("allocation_schema_descriptors", "schema", descriptors.map((e) => e["schema"] as string));
+
+  // --- B2(2)(iii): the policy/composition projection registry.
+  const schemas = v2ObjectEntries(cfg, "allocation_schemas", "allocation_schemas");
+  for (const entry of schemas) {
+    assertClosedEntryKeys("allocation_schemas", entry);
+    const schema = v2String("allocation_schemas", entry, "schema");
+    const projections = v2ObjectEntries(entry, "binding_projection", "allocation_schemas.binding_projection");
+    for (const projection of projections) {
+      assertClosedEntryKeys("allocation_schemas.binding_projection", projection);
+      v2String("allocation_schemas.binding_projection", projection, "tuple_field");
+      v2String("allocation_schemas.binding_projection", projection, "authority_ref");
+      v2String("allocation_schemas.binding_projection", projection, "namespace");
+    }
+    assertUniqueKeys(`allocation_schemas ${schema} binding_projection`, "tuple_field", projections.map((p) => p["tuple_field"] as string));
+    // The authoring-side half of B2(3.4)'s exactly-one rule: two tuple_fields projected onto one
+    // target pair is an unsatisfiable contract, refused here rather than at every conforming seal.
+    assertUniqueKeys(
+      `allocation_schemas ${schema} binding_projection`,
+      "(authority_ref, namespace) target",
+      projections.map((p) => JSON.stringify([p["authority_ref"], p["namespace"]])),
+    );
+    const relations = v2ObjectEntries(entry, "purpose_relation", "allocation_schemas.purpose_relation");
+    for (const relation of relations) {
+      assertClosedEntryKeys("allocation_schemas.purpose_relation", relation);
+      v2String("allocation_schemas.purpose_relation", relation, "purpose");
+      v2String("allocation_schemas.purpose_relation", relation, "operation_kind");
+    }
+    assertUniqueKeys(`allocation_schemas ${schema} purpose_relation`, "purpose", relations.map((r) => r["purpose"] as string));
+  }
+  assertUniqueKeys("allocation_schemas", "schema", schemas.map((e) => e["schema"] as string));
+
+  // --- B2(5): every allocation schema has BOTH entries. B2(8) raises ALLOCATION_SCHEMA_UNREGISTERED
+  // for a missing descriptor or a missing allocation_schemas entry "again at genesis/activation
+  // validation against the bundle itself".
+  const descriptorBySchema = new Map(descriptors.map((d) => [d["schema"] as string, d]));
+  const projectedSchemas = new Set(schemas.map((e) => e["schema"] as string));
+  for (const schema of projectedSchemas) {
+    if (!descriptorBySchema.has(schema)) {
+      throw new KernelConfigInvalid(`allocation_schemas ${schema} has no allocation_schema_descriptors entry`, "ALLOCATION_SCHEMA_UNREGISTERED");
+    }
+  }
+  for (const schema of descriptorBySchema.keys()) {
+    if (!projectedSchemas.has(schema)) {
+      throw new KernelConfigInvalid(`allocation_schema_descriptors ${schema} has no allocation_schemas entry`, "ALLOCATION_SCHEMA_UNREGISTERED");
+    }
+  }
+
+  // --- B2(2)(iii): every PROJECTED field has exactly one mapping, no ENTROPY field has any, and
+  // no mapping names a field outside the descriptor (which disposes of the reserved names too).
+  for (const entry of schemas) {
+    const schema = entry["schema"] as string;
+    const fields = (descriptorBySchema.get(schema)!["fields"] as Array<Record<string, unknown>>);
+    const projections = entry["binding_projection"] as Array<Record<string, unknown>>;
+    for (const projection of projections) {
+      const tupleField = projection["tuple_field"] as string;
+      if (!fields.some((f) => f["field"] === tupleField)) {
+        throw new KernelConfigInvalid(
+          `allocation_schemas ${schema} binding_projection names ${tupleField}, which is not a descriptor field`,
+          "ALLOCATION_SCHEMA_PROJECTION_INCOMPLETE",
+        );
+      }
+    }
+    for (const fieldEntry of fields) {
+      const field = fieldEntry["field"] as string;
+      const mapped = projections.filter((p) => p["tuple_field"] === field).length;
+      const expected = fieldEntry["role"] === "PROJECTED" ? 1 : 0;
+      if (mapped !== expected) {
+        throw new KernelConfigInvalid(
+          `allocation_schemas ${schema} field ${field} is ${String(fieldEntry["role"])} and has ${mapped} binding_projection entries (expected ${expected})`,
+          "ALLOCATION_SCHEMA_PROJECTION_INCOMPLETE",
+        );
+      }
+    }
+  }
+
+  // --- B4(1): the subject-complete assembly declaration.
+  for (const entry of v2ObjectEntries(cfg, "subject_complete_assembly", "subject_complete_assembly")) {
+    assertClosedEntryKeys("subject_complete_assembly", entry);
+    v2String("subject_complete_assembly", entry, "evidence_kind");
+    v2String("subject_complete_assembly", entry, "subject_namespace");
+    const kinds = entry["operation_kinds"];
+    // An array of exact strings, never an entry object (B3(3)).
+    if (!Array.isArray(kinds) || !kinds.every((k) => typeof k === "string")) {
+      throw new KernelConfigInvalid("subject_complete_assembly operation_kinds must be an array of strings");
+    }
+  }
+
+  // --- B3(4)(a): the declared exact subject identity of every kernel-consumed namespace.
+  const namespaces = v2ObjectEntries(cfg, "kernel_subject_namespaces", "kernel_subject_namespaces");
+  for (const entry of namespaces) {
+    assertClosedEntryKeys("kernel_subject_namespaces", entry);
+    v2String("kernel_subject_namespaces", entry, "namespace");
+    v2String("kernel_subject_namespaces", entry, "authority_ref");
+  }
+  assertUniqueKeys("kernel_subject_namespaces", "namespace", namespaces.map((e) => e["namespace"] as string));
+
+  // --- B5(3): enrollment in the requester_ref domain. No entry object, so no entry-key set to
+  // close; the exact-string/no-pattern rule that governs identity_registry.principal governs its
+  // members instead (B3(3)).
+  const enrolled = cfg["run_profile_enrolled_requester_refs"];
+  if (!Array.isArray(enrolled)) throw new KernelConfigInvalid("run_profile_enrolled_requester_refs required (may be [])");
+  for (const ref of enrolled) {
+    if (typeof ref !== "string" || /[*?[\]]/u.test(ref)) {
+      throw new KernelConfigInvalid("run_profile_enrolled_requester_refs members must be exact requester_refs (no patterns)");
+    }
+  }
+
+  // --- B3(4)(c): the safeguard reachable by mere OMISSION. A bundle enabling the run profile while
+  // declaring no work-run namespace would activate with the ambiguity lock and the exact-pair
+  // lookups silently absent. Exactly-one is (1)'s per-namespace uniqueness plus this existence rule.
+  if (enrolled.length > 0 && !namespaces.some((e) => e["namespace"] === KERNEL_CONSUMED_NAMESPACE_WORK_RUN)) {
+    throw new KernelConfigInvalid(
+      `run_profile_enrolled_requester_refs is non-empty but no kernel_subject_namespaces entry declares ${KERNEL_CONSUMED_NAMESPACE_WORK_RUN}`,
+      "KERNEL_NAMESPACE_UNDECLARED",
+    );
+  }
 }
 
 /** RFC 6901 pointer resolution for produced_at_source claim pointers. */
