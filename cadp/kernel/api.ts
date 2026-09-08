@@ -120,7 +120,14 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         // AP B6(1): `allocation_tuple` rides as one optional top-level sibling of the draft keys;
         // the Ingress strips it, so it never reaches `EffectRequestV1` or `request_digest`.
         const body = JSON.parse(raw.toString("utf8")) as SealRequestBody;
-        return send(200, deps.ingress.sealEffectRequest(body, { principal }));
+        // AP B6(3): the run capability travels as the header `x-cadp-run-capability` — never a body
+        // field, never a draft field, never a record field. It is read here, handed to the Ingress
+        // in its own transport argument, and written to nothing else: no log line, no trace, no
+        // error detail. A repeated header (`string[]` from Node) is not one presented capability
+        // and is treated as none, which fails closed at `RUN_CAPABILITY_REQUIRED`.
+        const presented = req.headers["x-cadp-run-capability"];
+        const transport = typeof presented === "string" ? { run_capability: presented } : {};
+        return send(200, deps.ingress.sealEffectRequest(body, { principal }, transport));
       }
       case "submit_evidence": {
         const draft = JSON.parse(raw.toString("utf8")) as EvidenceDraft;
@@ -136,8 +143,12 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         return send(200, outcome);
       }
       case "admit_and_dispatch": {
+        // AP B5(1)/B6(4): the request body is unchanged at `{ effect_id, decision_id }`; the
+        // principal is the one already resolved from `authorization`, never a body field. The
+        // result carries the optional `run_capability` field EXACTLY on the verified initial
+        // dispatch of a minting `WORK_START` (B6(4)) — and this response is its only channel.
         const body = JSON.parse(raw.toString("utf8")) as { effect_id: string; decision_id: string };
-        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id);
+        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id, { principal });
         return send(200, result);
       }
       case "get_effect_state": {

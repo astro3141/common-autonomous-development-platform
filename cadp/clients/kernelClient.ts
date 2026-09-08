@@ -32,13 +32,14 @@ export class KernelClient {
     this.token = token;
   }
 
-  async #call<T>(method: string, body: Uint8Array | unknown): Promise<T> {
+  async #call<T>(method: string, body: Uint8Array | unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
     const isRaw = body instanceof Uint8Array;
     const res = await fetch(`${this.baseUrl}/${method}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": isRaw ? "application/octet-stream" : "application/json",
+        ...extraHeaders,
       },
       body: isRaw ? (body as Uint8Array<ArrayBuffer>) : JSON.stringify(body),
     });
@@ -55,9 +56,14 @@ export class KernelClient {
     return this.#call("allocate_effect_id", tuple);
   }
 
-  /** AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field. */
-  sealEffectRequest(body: SealRequestBody): Promise<EffectRequestV1> {
-    return this.#call("seal_effect_request", body);
+  /**
+   * AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field.
+   * AP B6(3): the run capability rides as the `x-cadp-run-capability` HEADER — base64url unpadded
+   * of the raw 32 secret bytes — and never as a body or draft field. It is passed in its own
+   * argument for exactly that reason, and this client writes it nowhere else.
+   */
+  sealEffectRequest(body: SealRequestBody, run_capability?: string): Promise<EffectRequestV1> {
+    return this.#call("seal_effect_request", body, run_capability === undefined ? {} : { "x-cadp-run-capability": run_capability });
   }
 
   submitEvidence(draft: EvidenceDraft): Promise<EvidenceEnvelopeV1> {
@@ -76,8 +82,14 @@ export class KernelClient {
     return this.#call("evaluate", { input_digest });
   }
 
+  /**
+   * AP B5(1)/B6(4): the body is unchanged at `{ effect_id, decision_id }` — the principal is the
+   * bearer token's, resolved by the kernel. `run_capability` is present on the result EXACTLY on
+   * the verified initial dispatch of a run-capability-minting `WORK_START`, and this result is its
+   * ONLY delivery: nothing re-delivers it, so a caller that drops it cannot recover it (B5(7)).
+   */
   admitAndDispatch(effect_id: string, decision_id: string): Promise<
-    | { kind: "ADMITTED"; admission: EffectAdmissionV1; outcome: EffectOutcomeV1 }
+    | { kind: "ADMITTED"; admission: EffectAdmissionV1; outcome: EffectOutcomeV1; run_capability?: string }
     | { kind: "REFUSAL"; reason: string; detail?: string }
   > {
     return this.#call("admit_and_dispatch", { effect_id, decision_id });

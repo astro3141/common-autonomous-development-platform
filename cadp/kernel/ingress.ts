@@ -8,10 +8,16 @@
  * contract-scoped allocation over descriptor-driven tuple validation, the allocation binding
  * storage, and the allocation-to-first-seal contract that closes the pre-K3 window (WP §3.3), and
  * AP B4(2)-(4): assembly completeness, which makes the K4 evidence set the Platform's complete
- * query result unioned with the caller's list rather than the caller's list alone.
- * Every one of those rules is gated on the ACTIVE CONFIG's schema string, so a running v0.4
- * (`cadp.kernel-config.v1`) deployment keeps its allocation, seal and assembly behaviour unchanged.
+ * query result unioned with the caller's list rather than the caller's list alone; and AP B5(3)-(5):
+ * the seal-time run-membership gate over the Platform-minted run capability, which the caller
+ * presents as a transport header and never as a draft field, and the durable `run_membership` row
+ * the PEP's recheck #19 reads.
+ * Every one of those rules is gated on the ACTIVE CONFIG's schema string — B5's additionally on a
+ * non-empty enrollment — so a running v0.4 (`cadp.kernel-config.v1`) deployment keeps its
+ * allocation, seal and assembly behaviour unchanged.
  */
+
+import { timingSafeEqual } from "node:crypto";
 
 import { Cas } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, schemeApproved, sha256Hex } from "./canonical.ts";
@@ -37,6 +43,22 @@ export class IngressRejection extends Error {
 export interface Principal {
   /** Exact authenticated identity string (SPIFFE id / IdP subject). */
   readonly principal: string;
+}
+
+/**
+ * AP B6(3): the transport-level sidecar of `seal_effect_request`. The run capability travels as the
+ * HTTP header `x-cadp-run-capability` (base64url, unpadded, of the raw 256-bit secret) and is
+ * NEVER a body field, a draft field, a record field or a subject binding. It is carried in its own
+ * parameter — not folded into `Principal` and not into `SealRequestBody` — so no code path can
+ * reach it while constructing `EffectRequestV1`, and so nothing that serializes a draft or a
+ * principal can serialize it.
+ *
+ * LOGGING PROHIBITION (B6(3), normative): this value MUST NOT reach any log, trace, metric label,
+ * incident detail, error message or `KERNEL_INCIDENT` claim. Every refusal below names the reason
+ * code and at most the `work_run_ref`, never the presented secret or any prefix of it.
+ */
+export interface SealTransport {
+  readonly run_capability?: string;
 }
 
 /**
@@ -219,6 +241,87 @@ function bindingContentDigests(bindings: readonly SubjectBinding[]): Digest[] {
 }
 
 /**
+ * AP B5: the run profile's own operation kind. It is NOT new domain vocabulary imported by this
+ * contract — the kernel already names it on this exact seam, deriving a `WORK_START`'s run scope
+ * from its own `effect_id` in recheck #5 (`cadp/kernel/pep.ts`), because `work_run_ref` IS the
+ * `WORK_START` effect_id (Spec v0.5 §5.2; TD v0.4 §7.4).
+ */
+const RUN_PROFILE_WORK_START = "WORK_START";
+
+/** The raw secret is 256 bits (B5(1)); the transport encodes exactly these bytes (B6(3)). */
+const RUN_CAPABILITY_BYTES = 32;
+
+/**
+ * AP B5(3): the run profile is live only under a `cadp.kernel-config.v2` config that enrolls at
+ * least one `requester_ref`. Every rule of B5 hangs off this one predicate, so a running v0.4
+ * (`cadp.kernel-config.v1`) deployment — and a v2 one that enrolls nobody — executes not a line of
+ * the mechanism: no seal-time gate, no membership row, no minting, no recheck #19.
+ */
+export function runProfileEnabled(config: KernelConfig): boolean {
+  return config.schema === "cadp.kernel-config.v2" && (config.run_profile_enrolled_requester_refs ?? []).length > 0;
+}
+
+/**
+ * AP B5(3): enrollment is in the STAMPED `requester_ref` domain — never the raw authenticated
+ * principal's — at the seal (stamped from `identity_registry`) and at the PEP (read off the sealed
+ * `EffectRequestV1.requester_ref`, the same domain, never re-derived).
+ */
+export function isEnrolledRequester(config: KernelConfig, requester_ref: string): boolean {
+  return runProfileEnabled(config) && (config.run_profile_enrolled_requester_refs ?? []).includes(requester_ref);
+}
+
+/**
+ * AP B5(1): "run-capability-minting" — the run profile's `WORK_START`, under a config that enables
+ * the profile. Such a request STARTS a run: `work_run_ref` IS its own `effect_id` (Spec v0.5 §5.2)
+ * and the capability for that run is minted by THIS effect's initial dispatch, so no capability for
+ * it can exist at its seal.
+ *
+ * THE ONE INTERPRETIVE DEPARTURE IN THIS LANE, stated here rather than buried: B5(3)'s
+ * `RUN_BINDING_REQUIRED` and B5(4)'s presentation legs, read literally, apply to every request of
+ * an enrolled requester — including the `WORK_START` that mints, which could then never be sealed
+ * by an enrolled requester at all (its run's capability does not yet exist), leaving enrollment
+ * unbootstrappable and A4's own setup — enrolled requester A with a *sealed* `WORK_START` whose
+ * dispatch delivers the capability — unconstructible. The minting request is therefore treated as
+ * the run's ORIGIN, and the carve-out is kept as narrow as it can be made: it holds only where
+ * there is no membership to prove, i.e. the request binds no work run, or binds an identity for
+ * which no `run_capability` row was ever minted. A minting request bound to a REAL run consumes
+ * that run's `MAX_EFFECTS_IN_WORK_RUN` budget like any other effect and is graded by the full
+ * B5(4) gate, with the TD's exact codes. Every non-minting request of an enrolled requester is
+ * graded exactly as B5(3)–(5) state, with no exception.
+ */
+export function isRunCapabilityMinting(config: KernelConfig, operation_kind: string): boolean {
+  return runProfileEnabled(config) && operation_kind === RUN_PROFILE_WORK_START;
+}
+
+/**
+ * AP B6(3): decode the presented header to the RAW secret bytes. `capability_digest` is sha256 over
+ * those bytes and never over this text, so the decode happens before any digest is computed. The
+ * alphabet check refuses padding (`=`) and the standard-base64 characters (`+`, `/`) outright, and
+ * a decoded length other than 32 bytes is not a 256-bit secret — neither can match a stored digest,
+ * and both are therefore `RUN_CAPABILITY_INVALID` at the caller (B5(4)), never a thrown TypeError.
+ */
+function decodeRunCapability(presented: string): Buffer | undefined {
+  if (!/^[A-Za-z0-9_-]+$/u.test(presented)) return undefined;
+  const raw = Buffer.from(presented, "base64url");
+  return raw.length === RUN_CAPABILITY_BYTES ? raw : undefined;
+}
+
+/**
+ * AP B5(4): CONSTANT-TIME digest comparison, so a refusal leaks no prefix information about the
+ * stored digest. The presented text is decoded to raw bytes, digested, and compared through
+ * `crypto.timingSafeEqual` over equal-length buffers; a malformed presentation short-circuits to
+ * `false` before any comparison, which leaks only that it was malformed and nothing about the row.
+ */
+function capabilityDigestMatches(presented: string, capability_digest: string): boolean {
+  const raw = decodeRunCapability(presented);
+  if (raw === undefined) return false;
+  const computed = Buffer.from(sha256Hex(raw), "hex");
+  const stored = Buffer.from(capability_digest, "hex");
+  if (stored.length !== computed.length) return false;
+  return timingSafeEqual(computed, stored);
+}
+
+/**
  * AP B2(1): `allocation_contract_payload.v1` — an object with EXACTLY the two member names
  * `descriptor` and `allocation_schema`, each the schema's registry entry verbatim as active at
  * allocation time. Pinned as one function because the same preimage must be computed by all three
@@ -293,9 +396,10 @@ export class Ingress {
    * TEST-ONLY guard-bite harness knob (TD §13.1), the same shape the PEP already carries: the
    * production composition never passes it, and the conformance suite proves each rule is
    * load-bearing by disabling it and observing the prohibited effect — a second governed edge for
-   * the §5.3 rules, and for the AP B2/B3 rules a cross-principal `REQUEST_DIGEST_CONFLICT`
-   * (`allocation_principal_gate`) or a sealed request whose kernel-namespace subject is ambiguous
-   * (`kernel_namespace_lock`).
+   * the §5.3 rules, and for the AP B2/B3/B5 rules a cross-principal `REQUEST_DIGEST_CONFLICT`
+   * (`allocation_principal_gate`), a sealed request whose kernel-namespace subject is ambiguous
+   * (`kernel_namespace_lock`), or a run-bound request sealed with neither a presented capability
+   * nor the durable membership row recheck #19 demands (`run_membership`).
    */
   readonly disabledRules: ReadonlySet<string>;
 
@@ -461,7 +565,7 @@ export class Ingress {
 
   // ---------------------------------------------------------------- seal_effect_request
 
-  sealEffectRequest(body: unknown, principal: Principal): EffectRequestV1 {
+  sealEffectRequest(body: unknown, principal: Principal, transport: SealTransport = {}): EffectRequestV1 {
     const active = this.active();
     // B6(1): the tuple is stripped HERE, before anything reads the draft, so "transport, never a
     // draft field" is true of the implemented parse rather than merely asserted against it.
@@ -506,6 +610,13 @@ export class Ingress {
     validateEffectRequest(sealed);
     this.assertSchemesApproved([sealed.material_digest, sealed.request_digest], active);
 
+    // AP B5(3)/B5(4): the run-profile membership gate, computed from the ACTIVE config and the
+    // STAMPED requester. All three are false under a `cadp.kernel-config.v1` config and under a v2
+    // config enrolling nobody, which is what keeps v1 behaviour byte-identical (B5(3)).
+    const runProfile = runProfileEnabled(active.config);
+    const enrolled = isEnrolledRequester(active.config, identity.producer_ref);
+    const minting = isRunCapabilityMinting(active.config, sealed.operation_kind);
+
     // AP B2: under a v0.5 (`cadp.kernel-config.v2`) deployment the allocation row is authority for
     // this seal. Its read, the equality legs and the `effect_request` insert are ONE transaction
     // with the allocation row locked for the duration (BEGIN IMMEDIATE, the §3.4 SQLite variant),
@@ -526,6 +637,14 @@ export class Ingress {
           throw new IngressRejection("ALLOCATION_PRINCIPAL_MISMATCH", sealed.effect_id);
         }
       }
+      // AP B5(3)/B5(4): the run-profile gate runs on EVERY seal — B5(4) grades the presentation
+      // "on every presentation", and B5(2)'s one-way K7 flip is re-read here each time — inside
+      // the sealing transaction, in the TD's order, and BEFORE the existing-row lookup and
+      // B2(3)'s first-seal legs, so a refused seal writes nothing at all. The membership row it
+      // authorises is inserted below, in this same transaction as the `effect_request` row.
+      const proven = runProfile && this.#ruleEnabled("run_membership")
+        ? this.#assertRunMembership(identity.producer_ref, work_run_ref, enrolled, minting, transport)
+        : false;
       const existing = this.store.effectRequest(sealed.effect_id);
       if (existing !== undefined) {
         // B6(2): a re-seal MAY omit the tuple and MAY repeat it; a DIFFERENT tuple is the same
@@ -550,6 +669,11 @@ export class Ingress {
       // bundle data and the caller's own tuple, every one refusing BEFORE any K3 record exists.
       if (allocation !== undefined) this.#assertFirstSealBinding(sealed, allocation, allocation_tuple, active);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
+      // B5(5): the durable proof the PEP's recheck #19 reads, inserted in the SAME transaction as
+      // the `effect_request` row — authority after restart is reconstructed from rows, never from
+      // process memory, and the secret is not needed at admission time. Written exactly when the
+      // gate above PROVED membership, so the row means what recheck #19 reads it to mean.
+      if (proven && work_run_ref !== undefined) this.store.insertRunMembership(sealed.effect_id, work_run_ref);
       return { kind: "row", row: sealed };
     });
     if (outcome.kind === "conflict") {
@@ -573,6 +697,90 @@ export class Ingress {
     const row = this.store.allocationByEffectId(effect_id);
     if (row?.binding === undefined) throw new IngressRejection("ALLOCATION_NOT_FOUND", effect_id);
     return row.binding;
+  }
+
+  /**
+   * AP B5(3)/B5(4): the seal-time run-membership gate, in the TD's exact order and with its exact
+   * codes, entirely inside the sealing transaction. Every leg is a refusal that writes nothing —
+   * no `effect_request` row, no `run_membership` row, no `KERNEL_INCIDENT`, no scope hold.
+   *
+   * NOTHING here — no detail string, no reason code, no incident — carries the presented secret or
+   * any prefix of it (B6(3)). The only value a refusal names is the `work_run_ref`, which is a
+   * public effect identity the caller already sent.
+   *
+   * Returns whether membership was PROVEN, which is exactly when the caller writes the durable
+   * `run_membership` row recheck #19 reads (B5(5)).
+   */
+  #assertRunMembership(
+    requester_ref: string,
+    work_run_ref: string | undefined,
+    enrolled: boolean,
+    minting: boolean,
+    transport: SealTransport,
+  ): boolean {
+    if (!enrolled) {
+      // B5(3): enrollment cannot be acquired by presenting a binding (WP §5.2; WP control 5).
+      if (work_run_ref !== undefined) throw new IngressRejection("NOT_RUN_ENROLLED", requester_ref);
+      return false;
+    }
+    // The ORIGIN case, and the ONLY departure from B5(3)/B5(4) as literally worded — kept as narrow
+    // as it can be made. A minting request binding NO run, or binding an identity that is not a
+    // minted run (no `run_capability` row), is the start of a run and has no membership to prove:
+    // its own capability is minted by its own dispatch, so requiring one here would make enrollment
+    // unbootstrappable and A4's own setup (enrolled A with a sealed `WORK_START`) unconstructible.
+    // A minting request binding a REAL run is NOT exempt: it consumes that run's
+    // `MAX_EFFECTS_IN_WORK_RUN` budget exactly as any other effect does, so it presents the
+    // capability like any other run-bound request and is refused with the same codes.
+    if (minting && (work_run_ref === undefined || this.store.runCapability(work_run_ref) === undefined)) {
+      return false;
+    }
+    // B5(3): an enrolled requester's unbound effect is REFUSED, not merely uncounted (Spec §5.1).
+    if (work_run_ref === undefined) throw new IngressRejection("RUN_BINDING_REQUIRED", requester_ref);
+    // B5(4): distinct from RUN_BINDING_REQUIRED, which covers only the missing-binding case above.
+    const presented = transport.run_capability;
+    if (presented === undefined) throw new IngressRejection("RUN_CAPABILITY_REQUIRED", work_run_ref);
+    // B5(4) leg 1 — digest match against the row for THIS request's exact work_run_ref, the case
+    // of no row for it included: presenting run R2's capability on an R1-bound request fails here.
+    const capability = this.store.runCapability(work_run_ref);
+    if (capability === undefined || !capabilityDigestMatches(presented, capability.capability_digest)) {
+      throw new IngressRejection("RUN_CAPABILITY_INVALID", work_run_ref);
+    }
+    // B5(4) leg 2 — possession never suffices: the row binds one capability to one holder, so an
+    // exfiltrated capability presented by anyone else fails here.
+    if (capability.holder_ref !== requester_ref) {
+      throw new IngressRejection("RUN_CAPABILITY_HOLDER_MISMATCH", work_run_ref);
+    }
+    // B5(4) leg 3 / B5(2) — usability grades on the WORK_START's LATEST conclusive K7 state, read
+    // in THIS transaction: not on when the capability was minted and not on its first outcome.
+    const scope = this.#runScopeState(work_run_ref);
+    if (scope !== "COMMITTED") {
+      throw new IngressRejection(scope === "NO_EFFECT_CONFIRMED" ? "RUN_SCOPE_REFUSED" : "RUN_SCOPE_UNRESOLVED", work_run_ref);
+    }
+    return true; // membership PROVEN — the caller writes the durable row for recheck #19 (B5(5)).
+  }
+
+  /**
+   * AP B5(2): the run scope's CURRENT validity, graded by K7 and never by K6.
+   *
+   *  - `COMMITTED` is read EXISTENTIALLY and is absorbing: recheck #12 admits no further ordinal
+   *    once one exists, so "latest conclusive" cannot diverge from "present", and the existential
+   *    read additionally survives a late reconciler write against an earlier ordinal's still-open
+   *    admission. The flip is one-way: refused/unresolved → usable, never the reverse.
+   *  - otherwise the LATEST ADMITTED DISPATCH decides: a conclusive `NO_EFFECT_CONFIRMED` on it is
+   *    `RUN_SCOPE_REFUSED` **while that remains the latest state** — the PEP permits the next
+   *    admission of the same effect_id after one, and that dispatch can reach `COMMITTED` — and no
+   *    conclusive outcome on it at all is `RUN_SCOPE_UNRESOLVED`, which is exactly why a re-admitted
+   *    ordinal that is still open reads UNRESOLVED rather than the earlier REFUSED.
+   */
+  #runScopeState(work_run_ref: string): "COMMITTED" | "NO_EFFECT_CONFIRMED" | "UNKNOWN" {
+    if (this.store.outcomesByEffect(work_run_ref).some((o) => o.result === "COMMITTED")) return "COMMITTED";
+    const latest = this.store.admissionsByEffect(work_run_ref).at(-1);
+    if (latest === undefined) return "UNKNOWN";
+    const conclusive = this.store
+      .outcomesByAdmissionDigest(latest.admission_digest.value)
+      .filter((o) => o.result === "NO_EFFECT_CONFIRMED" || o.result === "COMMITTED")
+      .at(-1);
+    return conclusive?.result === "NO_EFFECT_CONFIRMED" ? "NO_EFFECT_CONFIRMED" : "UNKNOWN";
   }
 
   /**
