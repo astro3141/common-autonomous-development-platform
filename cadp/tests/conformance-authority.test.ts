@@ -185,7 +185,7 @@ test("C12/C28: self-review and same-product review are denied on DERIVED classes
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
     const request = h.ingress.sealEffectRequest(
       {
-        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c012", step_ordinal: 99, purpose: "pr-create" }),
+        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c012", step_ordinal: 99, purpose: "pr-create" }, PRINCIPALS.workflow),
         requester_ref: "workflow:cadp-work",
         work_bindings: [],
         target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "1" },
@@ -329,7 +329,7 @@ test("C14: a policy-required observed fact that is UNKNOWN denies with required_
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
     const request = h.ingress.sealEffectRequest(
       {
-        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014", step_ordinal: 1, purpose: "pr-create" }),
+        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c014", step_ordinal: 1, purpose: "pr-create" }, PRINCIPALS.workflow),
         requester_ref: "workflow:cadp-work",
         work_bindings: [],
         target_ref: { authority_ref: "github.com", target_type: "GIT_REPOSITORY", target_id: "1" },
@@ -384,7 +384,7 @@ test("C17: a target the credential does not prove is refused as TARGET_MISMATCH"
     const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ body_digest: "x" }), "utf8"));
     const request = h.ingress.sealEffectRequest(
       {
-        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c017", step_ordinal: 1, purpose: "record-write" }),
+        effect_id: h.ingress.allocateEffectId({ schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-00000000c017", step_ordinal: 1, purpose: "record-write" }, PRINCIPALS.workflow),
         requester_ref: "workflow:cadp-work",
         work_bindings: [],
         target_ref: { authority_ref: "scripted:target", target_type: "SCRIPTED", target_id: "scripted-2" }, // same name shape, different id

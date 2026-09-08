@@ -109,7 +109,7 @@ export async function startRun(h: Harness): Promise<{ run: string; outcome: stri
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: "work-start",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work", work_bindings: [],
@@ -316,7 +316,7 @@ export async function sealTransition(h: Harness, input: SealInput): Promise<Seal
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: "finding-seal",
-  });
+  }, PRINCIPALS.workflow);
   const base = buildGovernedTransitionMaterial({
     effect_id,
     transition_kind: input.transition_kind ?? "RECLASSIFICATION",

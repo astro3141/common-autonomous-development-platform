@@ -100,7 +100,7 @@ async function evalWorkStart(h: Harness, input: {
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: (counter += 1), purpose: "work-start",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",
@@ -129,7 +129,7 @@ async function evalNonIndexMutation(h: Harness, finding: EvidenceEnvelopeV1 | Ev
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: (counter += 1), purpose: "git-push",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",
@@ -424,7 +424,7 @@ async function evalBoundOp(h: Harness, op: "PR_MERGE" | "POLICY_ACTIVATE", findi
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: (counter += 1), purpose: spec.purpose,
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",
@@ -633,7 +633,7 @@ async function admitProjection(h: Harness, adapter: GitHubIssuesAdapter, f: Evid
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: (counter += 1), purpose: "finding-project",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",

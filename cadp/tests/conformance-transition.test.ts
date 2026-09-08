@@ -37,7 +37,7 @@ async function evalWorkStart(h: Harness, finding: EvidenceEnvelopeV1, evidence: 
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: "work-start",
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",
@@ -73,7 +73,7 @@ async function evalBoundMutation(
   const effect_id = h.ingress.allocateEffectId({
     schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
     step_ordinal: nextId(), purpose: spec.purpose,
-  });
+  }, PRINCIPALS.workflow);
   h.ingress.sealEffectRequest(
     {
       effect_id, requester_ref: "workflow:cadp-work",
@@ -1016,7 +1016,7 @@ test("FC18 / R8-1: replay idempotency and edge uniqueness are two separated, ind
     const strayEffect = h.ingress.allocateEffectId({
       schema: "cadp.allocation-key.v1", work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
       step_ordinal: nextId(), purpose: "finding-seal",
-    });
+    }, PRINCIPALS.workflow);
     assert.throws(() => h.ingress.sealEffectRequest(
       {
         effect_id: strayEffect, requester_ref: "workflow:cadp-work",

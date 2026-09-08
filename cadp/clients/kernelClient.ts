@@ -1,6 +1,6 @@
 /** HTTP client for the Kernel API (TD §12) used by workflow activities, adapters and tests. */
 
-import type { AllocationTuple, EvidenceDraft, RequestDraft } from "../kernel/ingress.ts";
+import type { AllocationTuple, EvidenceDraft, SealRequestBody } from "../kernel/ingress.ts";
 import type {
   AdmissionInputV1, EffectAdmissionV1, EffectOutcomeV1, EffectRequestV1, EvidenceEnvelopeV1, PolicyDecisionV1,
 } from "../kernel/records.ts";
@@ -55,8 +55,9 @@ export class KernelClient {
     return this.#call("allocate_effect_id", tuple);
   }
 
-  sealEffectRequest(draft: RequestDraft): Promise<EffectRequestV1> {
-    return this.#call("seal_effect_request", draft);
+  /** AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field. */
+  sealEffectRequest(body: SealRequestBody): Promise<EffectRequestV1> {
+    return this.#call("seal_effect_request", body);
   }
 
   submitEvidence(draft: EvidenceDraft): Promise<EvidenceEnvelopeV1> {
