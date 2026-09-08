@@ -221,14 +221,19 @@ export class Ingress {
    * descriptor-driven validation and the requester- and contract-scoped key of B1(2). Spec v0.5
    * §10 requires a v0.5 genesis in a new store namespace, so no stored row is ever re-keyed.
    *
-   * B1(1)'s two STAMPING rules are properties of this entry point rather than of either key
-   * derivation, so they run on both paths: the principal is resolved through the active
-   * `identity_registry` (unregistered ⇒ `FORBIDDEN_FOR_PRINCIPAL`, which the API layer already
-   * enforces one level up) and a tuple presenting a requester field is refused. Neither is
-   * reachable under the reference v0.4 deployment, whose caller presents no such field.
+   * B1(1)'s two STAMPING rules — resolve the principal through the active `identity_registry`
+   * (unregistered ⇒ `FORBIDDEN_FOR_PRINCIPAL`) and refuse a tuple presenting a requester field —
+   * belong to the v0.5 contract and therefore run ONLY on the v2 path, INSIDE the gate. Under a v1
+   * config this method's observable behaviour is exactly v0.4's: the principal is unused (the key
+   * is unscoped, so there is nothing to resolve it for) and an extra tuple member is ignored by the
+   * hard-coded checks, as it is today. Neither rule is weakened where it applies: B1's requester
+   * scoping and B2's binding storage exist only under `cadp.kernel-config.v2`, which is a
+   * generation boundary (B3(5)), and the API layer independently refuses an unregistered principal
+   * on every method under every config (`api.ts` reach matrix).
    */
   allocateEffectId(tuple: AllocationTuple, principal: Principal): string {
     const active = this.active();
+    if (active.config.schema !== "cadp.kernel-config.v2") return this.#allocateV04(tuple, active);
     const identity = identityEntry(active.config, principal.principal);
     if (identity === undefined) throw new IngressRejection("FORBIDDEN_FOR_PRINCIPAL", "unregistered principal");
     for (const field of REQUESTER_TUPLE_FIELDS) {
@@ -236,10 +241,7 @@ export class Ingress {
         throw new IngressRejection("ALLOCATION_TUPLE_INVALID", `${field} is stamped from the caller, never presented`);
       }
     }
-    if (active.config.schema === "cadp.kernel-config.v2") {
-      return this.#allocateDescriptorDriven(tuple, identity.producer_ref, active);
-    }
-    return this.#allocateV04(tuple, active);
+    return this.#allocateDescriptorDriven(tuple, identity.producer_ref, active);
   }
 
   /** The v0.4 path, unchanged: one hard-coded schema, typed fields, and an unscoped key. */

@@ -647,6 +647,18 @@ test("v1 config: allocation and seal keep the v0.4 behaviour exactly — unscope
     const row = h.store.allocationByEffectId(a)!;
     assert.equal(row.binding, undefined, "a v1 row carries no allocation binding");
 
+    // B1(1)'s two stamping rules are v0.5 contract and stay INSIDE the v2 gate: under a v1 config
+    // the principal is unused and an extra tuple member is ignored by the hard-coded checks, both
+    // exactly as in v0.4 — the same tuple, the same key, the same one row. (Over the wire an
+    // unregistered principal is still refused by `api.ts`'s reach matrix, under every config.)
+    assert.equal(h.ingress.allocateEffectId(tuple, { principal: "cadp-not-registered" }), a, "v1 ignores the principal");
+    assert.equal(
+      h.ingress.allocateEffectId({ ...tuple, requester_ref: REQUESTER_B }, PRINCIPALS.workflow),
+      a,
+      "v1 derives its key from the four hard-coded fields, ignoring any extra member",
+    );
+    assert.equal(countRows(h, "effect_allocation"), 1, "neither call minted a second allocation");
+
     // A v1 seal needs no allocation_tuple, binds nothing to the allocation, and — as in v0.4 — an
     // effect_id that was never allocated is still accepted.
     const { request } = sealScriptedRequest(h);
