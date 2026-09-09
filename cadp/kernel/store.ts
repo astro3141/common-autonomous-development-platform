@@ -123,6 +123,18 @@ CREATE TABLE IF NOT EXISTS cas_blob (
   size INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS run_capability (
+  work_run_ref TEXT PRIMARY KEY,
+  holder_ref TEXT NOT NULL,
+  capability_digest TEXT NOT NULL,
+  minted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_membership (
+  effect_id TEXT PRIMARY KEY,
+  work_run_ref TEXT NOT NULL
+);
 `;
 
 /**
@@ -167,6 +179,35 @@ export interface AllocationRow {
 const ALLOCATION_BINDING_COLUMNS: readonly (keyof AllocationBinding)[] = [
   "requester_ref", "allocation_schema", "allocation_binding_digest", "allocation_contract_digest", "purpose",
 ];
+
+/**
+ * AP B5(1): the run capability, a NON-CONSTITUTIONAL implementation table in the same store —
+ * in no K-record, no digest and no `ResolvedAdmissionBundle`. `work_run_ref` is the minting
+ * `WORK_START`'s own `effect_id`, so the primary key makes minting once-and-only-once by
+ * construction rather than by caller discipline (B5(7)). `capability_digest` is SHA-256 over the
+ * RAW 32 secret bytes and never over any transport encoding of them (B5(1), B6(3)); the secret
+ * itself is stored nowhere. There is deliberately NO `revoked_at` column: the store contract
+ * forbids runtime UPDATE/DELETE, so a mutable flag would be a field no append-only path could
+ * ever set — revocation, if ever wanted, is a future append-only row (B5(4)).
+ */
+export interface RunCapabilityRow {
+  readonly work_run_ref: string;
+  readonly holder_ref: string;
+  readonly capability_digest: string;
+  readonly minted_at: string;
+}
+
+/**
+ * AP B5(5): the durable membership proof, written in the same transaction as the `effect_request`
+ * row. For a run ORIGIN the two columns are equal — `run_membership(E, E)` — and that
+ * self-referential row IS B5(1)(b)'s minting witness: proof that `E` passed the seal-time
+ * `is_run_origin` adjudication of B5(9), read at dispatch instead of re-deriving minting-ness
+ * from the sealed record's shape under whatever config is active by then.
+ */
+export interface RunMembershipRow {
+  readonly effect_id: string;
+  readonly work_run_ref: string;
+}
 
 export interface ActivationRow {
   readonly seq: number;
@@ -490,6 +531,36 @@ export class ConstitutionalStore {
       effect_id: string;
     }>;
     return rows.map((r) => r.effect_id);
+  }
+
+  // -------------------------------------------------------------- run capability / membership
+
+  /**
+   * AP B5(1): written inside the admission transaction, once per run. A second insert for the same
+   * `work_run_ref` raises `UniqueViolation` on the primary key — the store, not caller discipline,
+   * is what makes "exactly once" true (B5(7)).
+   */
+  insertRunCapability(row: RunCapabilityRow): void {
+    mapSqliteError(() =>
+      this.db
+        .prepare("INSERT INTO run_capability (work_run_ref, holder_ref, capability_digest, minted_at) VALUES (?, ?, ?, ?)")
+        .run(row.work_run_ref, row.holder_ref, row.capability_digest, row.minted_at),
+    );
+  }
+
+  runCapability(work_run_ref: string): RunCapabilityRow | undefined {
+    return this.db.prepare("SELECT * FROM run_capability WHERE work_run_ref = ?").get(work_run_ref) as RunCapabilityRow | undefined;
+  }
+
+  /** AP B5(5): written in the SAME transaction as the `effect_request` row it proves membership for. */
+  insertRunMembership(effect_id: string, work_run_ref: string): void {
+    mapSqliteError(() =>
+      this.db.prepare("INSERT INTO run_membership (effect_id, work_run_ref) VALUES (?, ?)").run(effect_id, work_run_ref),
+    );
+  }
+
+  runMembership(effect_id: string): RunMembershipRow | undefined {
+    return this.db.prepare("SELECT * FROM run_membership WHERE effect_id = ?").get(effect_id) as RunMembershipRow | undefined;
   }
 
   // -------------------------------------------------------------- input / decision
