@@ -57,6 +57,7 @@ test("absent or unmatched effort_scan preserves UNKNOWN", async () => {
 test("measured effort argv encodings expand only when the pair is set", () => {
   assert.deepEqual(appendRequestedEffort(["grok", "-p", "x"], { requested_effort: "high", effort_argv: WORKER_EFFORT_ARGV.grok }, "grok"), ["grok", "-p", "x", "--reasoning-effort", "high"]);
   assert.deepEqual(appendRequestedEffort(["codex", "exec", "x"], { requested_effort: "high", effort_argv: WORKER_EFFORT_ARGV.codex }, "codex"), ["codex", "exec", "x", "-c", "model_reasoning_effort=high"]);
+  assert.deepEqual(appendRequestedEffort(["codex", "exec", "PROMPT"], REVIEW_PROVIDERS.codex, "codex reviewer"), ["codex", "exec", "PROMPT", "-c", "model_reasoning_effort=high"]);
   assert.deepEqual(appendRequestedEffort(["claude", "-p", "x"], { requested_effort: "high", effort_argv: WORKER_EFFORT_ARGV.claude }, "claude"), ["claude", "-p", "x", "--effort", "high"]);
   assert.throws(() => appendRequestedEffort([], { requested_effort: "high" }, "test"), /unpaired/u);
   assert.throws(() => appendRequestedEffort([], { effort_argv: WORKER_EFFORT_ARGV.grok }, "test"), /unpaired/u);
