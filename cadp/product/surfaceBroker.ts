@@ -40,6 +40,24 @@ import type { IsolationConfig, ReviewerAuth, RunResult } from "./isolation.ts";
 
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
+/**
+ * Make external text safe to pass as a `spawn()` argv element.
+ *
+ * Node rejects an argv containing U+0000 outright ("must be a string without null bytes"), so a
+ * single NUL anywhere in text the broker embeds kills the whole run before the surface starts.
+ * That is reachable from ordinary committed content: git's binary heuristic only inspects the
+ * first 8 KiB of a blob, so a file whose first NUL sits past that window is diffed as text and
+ * `git diff --patch` hands back raw NUL bytes, which then land in the reviewer prompt.
+ *
+ * Replacing each NUL with the two-character visible escape `\0` keeps the reviewer able to see
+ * WHERE the binary content sits instead of losing the run. The transform is identity on
+ * NUL-free input — every normal diff, work item, and plan prompt is passed through byte-for-byte,
+ * so no existing verdict can change — and idempotent, since its own output contains no NUL.
+ */
+export function spawnSafeText(text: string): string {
+  return text.replace(/\u0000/gu, "\\0");
+}
+
 function sha256(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -50,7 +68,9 @@ function nowMs(): string {
 
 async function git(args: string[], cwd?: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    // Every element is spawn-bound, and some carry caller text (the commit message embeds the
+    // work item), so the same NUL guard applies here — identity for every real git invocation.
+    const child = spawn("git", args.map(spawnSafeText), { cwd, stdio: ["ignore", "pipe", "pipe"] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     child.stdout.on("data", (c: Buffer) => out.push(c));
@@ -145,7 +165,7 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
         : {}),
       sessionsDir,
       ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
-      argv: workerArgv(provider, body.work_item),
+      argv: workerArgv(provider, spawnSafeText(body.work_item)),
       timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
     });
     // Opt-in worker session preservation for debugging (default OFF so runs don't accumulate).
@@ -402,9 +422,16 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // Diff from the candidate's fork point off main to the candidate.
     const mb = await git(["merge-base", "origin/main", body.candidate_sha], workspace);
     const forkBase = mb.status === 0 && mb.stdout.trim().length > 0 ? mb.stdout.trim() : "origin/main";
-    const diff = (await git(["diff", "--stat", "--patch", forkBase, body.candidate_sha], workspace)).stdout.slice(0, 60_000);
+    // A committed file whose first NUL byte sits past git's 8 KiB binary-detection window is
+    // diffed as TEXT, so the patch carries raw NULs — which Node refuses to accept as an argv
+    // element, failing the whole review. Escape them before the 60 000-char cap so the bound
+    // still holds on exactly the text that gets embedded (measured live: one such file killed a
+    // run outright). NUL-free diffs — every ordinary one — pass through byte-for-byte.
+    const diff = spawnSafeText((await git(["diff", "--stat", "--patch", forkBase, body.candidate_sha], workspace)).stdout).slice(0, 60_000);
 
-    const prompt = `You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`;
+    // The caller's work item and sha are spawn-bound too; the outer pass covers them (and is
+    // identity over the already-escaped diff).
+    const prompt = spawnSafeText(`You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`);
     const reviewWs = join(base, "review-ws");
     mkdirSync(reviewWs, { recursive: true });
     const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
@@ -471,7 +498,7 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
       sessionsDir,
       ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
-      argv: planArgv(provider, prompt),
+      argv: planArgv(provider, spawnSafeText(prompt)),
       timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
     });
     if (run.status !== 0 || run.stdout.trim().length === 0) {
