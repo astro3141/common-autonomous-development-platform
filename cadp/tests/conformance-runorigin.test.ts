@@ -395,12 +395,19 @@ test("A5 o-iv: a change to EITHER run-origin entry, or removal of either, is ref
 });
 
 test("A5 o-iv end to end: the immutability refusal happens at recheck #17; active policy unchanged", async () => {
-  const { h } = await runProfileHarness();
+  // The run-origin CONTRACT's immutability is what this control falsifies, and it holds whether or
+  // not the run profile is switched on — so the store here enrolls NOBODY. That is not a weakening
+  // of anything asserted elsewhere in this file: with an enrolled requester, the harness's own
+  // `POLICY_ACTIVATE` (sealed by that requester, bound to the sentinel work run) would be refused
+  // `RUN_CAPABILITY_REQUIRED` by AP B5(4), which is the correct behaviour and would simply prevent
+  // this control from reaching recheck #17 at all. The enrollment-bearing legs are the A4 tests.
+  const { h } = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
   try {
     const before = h.store.activeActivation()!.seq;
     const refused = await h.activatePolicy({
       revision: 2,
       configOverrides: runProfileConfig({
+        run_profile_enrolled_requester_refs: [],
         allocation_schemas: [...V2_ALLOCATION_SCHEMAS, { ...clone(RUN_ORIGIN_MAPPING), purpose_relation: [{ purpose: "work-start", operation_kind: "SCRIPTED_WRITE" }] }],
       }) as never,
     });
@@ -414,7 +421,7 @@ test("A5 o-iv end to end: the immutability refusal happens at recheck #17; activ
     // carrying an unrelated registry change, ACTIVATES.
     const activated = await h.activatePolicy({
       revision: 3,
-      configOverrides: runProfileConfig({ identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
+      configOverrides: runProfileConfig({ run_profile_enrolled_requester_refs: [], identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
         principal: "cadp-workflow-c",
         producer_ref: "workflow:cadp-work-c",
         identity_class: { vendor: "temporalio", product: "temporal-workflow", account: "cadp-v04", process_class: "workflow" },
@@ -428,7 +435,10 @@ test("A5 o-iv end to end: the immutability refusal happens at recheck #17; activ
 });
 
 test("A5 o-ii: one origin_key derives ONE effect_id across an unrelated POLICY_ACTIVATE", async () => {
-  const { h } = await runProfileHarness();
+  // Enrollment is irrelevant to allocation convergence and is left empty for the same reason as
+  // the o-iv end-to-end control above: the harness's `POLICY_ACTIVATE` is itself a run-bound seal
+  // by `workflow:cadp-work`, which an enrolled store correctly refuses `RUN_CAPABILITY_REQUIRED`.
+  const { h } = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
   try {
     const tuple = { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key: "origin-stable", purpose: "work-start" };
     const first = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
@@ -436,7 +446,7 @@ test("A5 o-ii: one origin_key derives ONE effect_id across an unrelated POLICY_A
 
     const activated = await h.activatePolicy({
       revision: 2,
-      configOverrides: runProfileConfig({ identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
+      configOverrides: runProfileConfig({ run_profile_enrolled_requester_refs: [], identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
         principal: "cadp-workflow-c",
         producer_ref: "workflow:cadp-work-c",
         identity_class: { vendor: "temporalio", product: "temporal-workflow", account: "cadp-v04", process_class: "workflow" },
@@ -514,10 +524,15 @@ test("A4 o2: a WORK_START binding ANOTHER run is REFUSED RUN_CAPABILITY_INVALID,
       (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
     );
     // And an OFF-AUTHORITY self-binding is not a kernel work-run subject at all (B3(4)(a)): leg 2
-    // matches the DECLARED exact pair, so this fails adjudication rather than satisfying it.
+    // matches the DECLARED exact pair, so this fails adjudication rather than satisfying it. The
+    // request therefore carries NO work-run binding in the kernel's sense, which is B5(9) leg 2's
+    // "none" case — refused `RUN_BINDING_REQUIRED` by B5(3), the exact code the TD stages AHEAD of
+    // the origin adjudication (before B5(3) existed this same request was refused one step later,
+    // under the less exact `RUN_CAPABILITY_INVALID`; the claim asserted is unchanged and the
+    // off-authority binding still buys nothing).
     assert.throws(
       () => sealWorkStart(rp, { origin_key: "origin-fourth", authority_ref: "other" }),
-      (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
+      (error: unknown) => (error as IngressRejection).reason === "RUN_BINDING_REQUIRED",
     );
     assert.equal(count(rp.h, "effect_request"), requestsBefore);
     assert.equal(count(rp.h, "run_membership"), membershipBefore);

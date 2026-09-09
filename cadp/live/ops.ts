@@ -9,13 +9,15 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadManifest } from "./env.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
-import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { jcs, jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { RUN_ORIGIN_ALLOCATION_SCHEMA } from "../kernel/policyBundle.ts";
 import { workerProfileDigest } from "../product/workerProfile.ts";
 import { assertReviewIndependence, resolveReviewProvider } from "../product/reviewProviders.ts";
 import { resolvePlanProvider } from "../product/planProviders.ts";
@@ -161,17 +163,84 @@ export function resolveBaseSha(
   return sha;
 }
 
-/** One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly logged. */
+/**
+ * WP §3.6 — the `origin_key` for a `workPlan`-driven origin, derived canonically from the STABLE
+ * pair already present at origin creation: the sealed `WORK_PROPOSAL`'s `evidence_id` and the item's
+ * index. Decided ONCE per logical origin (this pair does not move under retry) and reproduced
+ * VERBATIM on every retry, under a collision-resistant encoding.
+ *
+ * It identifies ONE LOGICAL ORIGIN, never the work's content: two distinct origins over byte-
+ * identical work carry distinct keys (different proposals, or different indices), so they receive
+ * distinct `effect_id`s and neither can collide the other onto one identity. Nothing about the work
+ * is digested to name it — there is no `work_item` and no `repo_id` in the preimage.
+ */
+export function workPlanOriginKey(proposal_evidence_id: string, item_index: number): string {
+  return `cadp.run-origin.work-plan.v1:${sha256Hex(jcs({ item_index, proposal_evidence_id }))}`;
+}
+
+/**
+ * WP §3.6 origin-path MATERIAL REPLAY STABILITY: the record vertical's `resource_prefix` is a
+ * function of the STABLE `origin_key` and never of the wall clock. The prohibited shape it
+ * replaces, named exactly, was `live-${Date.now() % 100000}`: two attempts at ONE origin sealed
+ * different `args`, hence a different `args_digest` and `material_ref`, so the retry re-presented
+ * the converged `effect_id` with drifted semantic payload — `REQUEST_DIGEST_CONFLICT`, a K3
+ * incident and a scope hold, leaving the origin unretryable for the store's lifetime.
+ */
+export function recordResourcePrefix(origin_key: string): string {
+  return `live-${sha256Hex(origin_key).slice(0, 10)}`;
+}
+
+/** Seams a test can substitute for the live environment's own (the `sealPlan` pattern). */
+export interface StartWorkDependencies {
+  manifest?: LiveEnvManifest;
+  client?: KernelClient;
+  namespaceId?: (m: LiveEnvManifest) => string;
+  resolveBase?: (repoFullName: string, baseRef: string) => string;
+  /** Resolves the built image's immutable identity (a `docker inspect` at the live seam). */
+  imageIdentity?: (image: string) => { image: string; image_digest: string; tool_versions: Record<string, string> };
+  /** The contents of the deployment's `worker-image` file, read from `dir` when absent. */
+  workerImage?: string;
+}
+
+/**
+ * One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly
+ * logged.
+ *
+ * THE v0.5 RUN-ORIGIN PATH (WP §3.6, AP B1(5), AP B5(9)). The allocation is
+ * `cadp.allocation-key.run-origin.v1` = `{schema, origin_key, purpose}` — the v0.4 zero-sentinel
+ * `work_run_ref` tuple is gone from this path — and the seal binds EXACTLY ONE work-run subject,
+ * the Platform-issued `effect_id` this very allocation returned, which is the self-binding
+ * `is_run_origin` requires (leg 3). Caller obligations, discharged here:
+ *  (1) `origin_key` is decided ONCE per logical origin and reproduced VERBATIM across retries —
+ *      threaded in by `workPlan` from the proposal pair, or MINTED ONCE here for a direct start;
+ *  (2) the origin binds its own `effect_id`, the allocation having already returned it; and
+ *  (3) the sealed material carries NO wall-clock-derived field (the record vertical's
+ *      `resource_prefix` is now a function of `origin_key`).
+ *
+ * TWO HONEST RESIDUALS, neither in this lane's scope and both stated rather than hidden:
+ *  - a deployment must be a `cadp.kernel-config.v2` (v0.5) genesis carrying the run-origin
+ *    contract; a `cadp.kernel-config.v1` (v0.4) store refuses this tuple `ALLOCATION_TUPLE_INVALID`
+ *    at allocation, which is Spec v0.5 §10's generation boundary, not a fallback to design around;
+ *  - `base_sha` is still resolved by a live `ls-remote` AT SEAL TIME (`resolveBaseSha`), so a retry
+ *    of one development origin after the base branch moves still seals drifted material. WP §3.6
+ *    names that as the same replay-stability obligation and requires the first-creation value to be
+ *    pinned; doing so needs first-creation args the caller does not durably hold today, so it stays
+ *    outstanding here and is NOT discharged by this change.
+ */
 export async function startWork(
   dir: string,
   vertical: "development" | "record",
   extra: string[],
-  options: { ordinalArg?: string; log?: Log } = {},
+  options: { originKey?: string; log?: Log; dependencies?: StartWorkDependencies } = {},
 ): Promise<{ effect_id: string; workflow_id: string } | undefined> {
   const log = options.log ?? SILENT;
-  const m = loadManifest(dir);
-  const c = liveClient(dir, "cadp-workflow");
-  const namespaceId = temporalNamespaceId(m);
+  const dependencies = options.dependencies ?? {};
+  const m = dependencies.manifest ?? loadManifest(dir);
+  const c = dependencies.client ?? liveClient(dir, "cadp-workflow");
+  const namespaceId = (dependencies.namespaceId ?? temporalNamespaceId)(m);
+  // WP §3.6 caller obligation (1). A direct CLI/MCP start has no stable pair to derive from, so it
+  // MINTS one collision-resistant key ONCE, at this invocation, and preserves it for this origin.
+  const origin_key = options.originKey ?? randomUUID();
 
   if (vertical === "development") {
     const floor = devEffectFloorViolation(boundArg(extra[2], 6));
@@ -199,7 +268,10 @@ export async function startWork(
             base_ref: "refs/heads/main",
             // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
             // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
-            base_sha: resolveBaseSha(m.repo_full_name, "refs/heads/main"),
+            // WP §3.6 RESIDUAL, named at the line it lives on: for ONE ORIGIN this is still a
+            // seal-time read, so a retry after the base branch moves seals drifted material. The
+            // origin path owes a first-creation pin here; it is not discharged by this lane.
+            base_sha: (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main"),
             work_item: extra[0]!,
             worker_product: workerProduct,
             review_product: reviewProduct,
@@ -212,22 +284,25 @@ export async function startWork(
           bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
           record: {
             tenant: "cadp-disposable",
-            resource_prefix: `live-${Date.now() % 100000}`,
+            // WP §3.6: a function of the stable origin_key, never of the wall clock.
+            resource_prefix: recordResourcePrefix(origin_key),
             payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
           },
         };
 
-  const ordinal = options.ordinalArg !== undefined ? Number(options.ordinalArg) : Math.floor(Date.now() / 1000) % 1000000;
-  const { effect_id } = await c.allocateEffectId({
-    schema: "cadp.allocation-key.v1",
-    work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-    step_ordinal: ordinal,
-    purpose: "work-start",
-  });
+  // AP B1(5)/WP §3.6: the run-origin tuple carries EXACTLY the three keys and no `work_run_ref` —
+  // a tuple naming the identity would have to contain the value it is being derived to produce.
+  // The Date.now-based `step_ordinal` fallback this replaces is gone from the origin path: it made
+  // one logical origin allocate a FRESH identity on every retry (other verticals and paths that
+  // legitimately key steps under `cadp.allocation-key.v1` are untouched).
+  const allocation_tuple = { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key, purpose: "work-start" };
+  const { effect_id } = await c.allocateEffectId(allocation_tuple);
   const { cas_key: args_cas_key } = await c.putBlob(Buffer.from(JSON.stringify(args), "utf8"));
   // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
   // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
-  const image = imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim());
+  const image = (dependencies.imageIdentity ?? imageIdentity)(
+    (dependencies.workerImage ?? readFileSync(join(dir, "worker-image"), "utf8")).trim(),
+  );
   const worker_profile_digest = jcsDigest({
     profile: workerProfileDigest(),
     surface_image: image.image,
@@ -250,6 +325,9 @@ export async function startWork(
     effect_id,
     requester_ref: "workflow:cadp-work",
     work_bindings: [
+      // AP B5(9) leg 3: the origin ORIGINATES its run scope's identity by binding its own
+      // Platform-issued `effect_id` as its one work-run subject, on the exact declared kernel pair.
+      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: effect_id },
       { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
       // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
       ...(vertical === "development" && extra[3] !== undefined && extra[3] !== ""
@@ -261,6 +339,9 @@ export async function startWork(
     material_schema: "cadp.work-start.v1",
     material_ref,
     prior_effect_refs: [],
+    // AP B6(1): the allocated tuple re-presented as TRANSPORT on the first seal. The Ingress strips
+    // it before the draft is used, so it is never a draft field and never enters `request_digest`.
+    allocation_tuple,
   });
   const input = await c.assembleAdmissionInput(effect_id, []);
   const evaluated = await c.evaluate(input.input_digest.value);
@@ -337,7 +418,15 @@ export async function workPlan(dir: string, proposalEvidenceId: string, maxItems
   const results: Array<Record<string, unknown>> = [];
   for (const [index, item] of proposal.items.slice(0, maxItems).entries()) {
     log({ driver: "starting", index, work_item: item.work_item, bounds: { max_steps: item.max_steps, max_effects: item.max_effects } });
-    const started = await startWork(dir, "development", [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId], { log });
+    // WP §3.6: the origin's identity discriminator, derived from the pair that is already stable at
+    // origin creation — so a retry of this driver over the same proposal converges on the SAME
+    // `effect_id` per item instead of originating a second run for one logical origin.
+    const started = await startWork(
+      dir,
+      "development",
+      [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId],
+      { log, originKey: workPlanOriginKey(proposalEvidenceId, index) },
+    );
     if (started === undefined) {
       results.push({ index, work_item: item.work_item, status: "NOT_ADMITTED" });
       break; // fail closed: an item the gate refused halts the loop

@@ -32,13 +32,14 @@ export class KernelClient {
     this.token = token;
   }
 
-  async #call<T>(method: string, body: Uint8Array | unknown): Promise<T> {
+  async #call<T>(method: string, body: Uint8Array | unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
     const isRaw = body instanceof Uint8Array;
     const res = await fetch(`${this.baseUrl}/${method}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": isRaw ? "application/octet-stream" : "application/json",
+        ...extraHeaders,
       },
       body: isRaw ? (body as Uint8Array<ArrayBuffer>) : JSON.stringify(body),
     });
@@ -55,9 +56,18 @@ export class KernelClient {
     return this.#call("allocate_effect_id", tuple);
   }
 
-  /** AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field. */
-  sealEffectRequest(body: SealRequestBody): Promise<EffectRequestV1> {
-    return this.#call("seal_effect_request", body);
+  /**
+   * AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field.
+   * AP B6(3): a run capability rides as the `x-cadp-run-capability` HEADER — never in the body, so
+   * a caller cannot put it in a draft field even by mistake, and it enters no digest. The value is
+   * the holder's secret: it belongs in the caller's secret custody and in no log or trace.
+   */
+  sealEffectRequest(body: SealRequestBody, transport: { run_capability?: string } = {}): Promise<EffectRequestV1> {
+    return this.#call(
+      "seal_effect_request",
+      body,
+      transport.run_capability === undefined ? {} : { "x-cadp-run-capability": transport.run_capability },
+    );
   }
 
   submitEvidence(draft: EvidenceDraft): Promise<EvidenceEnvelopeV1> {

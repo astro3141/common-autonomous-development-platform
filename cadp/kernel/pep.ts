@@ -1,8 +1,8 @@
 /**
  * PEP (TD §3.4, §4): the only component that writes `EffectAdmissionV1` and dispatches.
  * Serialization lock D spans precondition → admission → dispatch → outcome; the admission
- * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18, run against rows read inside the
- * transaction; K7 truth stays target-authoritative (§6.3).
+ * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18 and AP B5(5)'s #19, run against rows
+ * read inside the transaction; K7 truth stays target-authoritative (§6.3).
  *
  * It is also where AP B5(1) mints: a run capability is minted in the SAME transaction as the
  * admission, at the INITIAL dispatch of a `WORK_START` whose seal-time origin WITNESS exists, and
@@ -19,7 +19,10 @@ import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import {
+  Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, kernelWorkRunBindings,
+  runProfileEnrolled, subjectKey as subjectKeyOf,
+} from "./ingress.ts";
 import type { Principal } from "./ingress.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
@@ -329,7 +332,7 @@ export class Pep {
     return binding.authority_ref === adapter.describe().authority_ref;
   }
 
-  // ------------------------------------------------- the 17 rechecks, plus AP B4(5)'s #18
+  // ------------------------------ the 17 rechecks, plus AP B4(5)'s #18 and AP B5(5)'s #19
 
   #admissionTransaction(
     requestPre: EffectRequestV1,
@@ -650,6 +653,31 @@ export class Pep {
               `${entry.evidence_kind} on ${key}: the bound input carries ${carried.size} of ${complete.size}${missing.length > 0 ? ` (missing ${missing.join(", ")})` : ""}`,
             );
           }
+        }
+      }
+    }
+
+    // #19 — AP B5(5): the DURABLE MEMBERSHIP PROOF. For a request whose SEALED `requester_ref` is
+    // enrolled and which is bound to a run, the PEP requires the `run_membership(effect_id)` row
+    // with a MATCHING `work_run_ref`, read inside this transaction — refusing
+    // `RUN_MEMBERSHIP_UNPROVEN` otherwise. Authority after restart is reconstructed from rows,
+    // never from process memory (TD v0.4 §4.5), and the secret is not needed at admission time.
+    //
+    // The identity compared is `EffectRequestV1.requester_ref`, which is the STAMPED domain that
+    // B5(3) declares enrollment in — read off the sealed record, never re-derived from a principal.
+    // Gated on the run profile being in force, so a `cadp.kernel-config.v1` deployment's recheck
+    // list is exactly items #1-#18 and a v2 deployment that has not enrolled anyone is unchanged.
+    //
+    // What #19 is NOT: it does not, and cannot, close the retroactive-promotion fork of B5(1)(α) —
+    // a follow-up's own membership row is inserted by its OWN seal, so #19 finds it and passes.
+    // The WITNESSED minting predicate closes that one step earlier, at the mint. #19's job is the
+    // one it states: no effect is admitted into a run it never proved membership in at seal.
+    if (this.#enabled("recheck19_run_membership")) {
+      const bound = kernelWorkRunBindings(request.work_bindings, active.config);
+      if (bound.length > 0 && runProfileEnrolled(active.config, request.requester_ref)) {
+        const proven = store.runMembership(request.effect_id);
+        if (bound.length !== 1 || proven === undefined || proven.work_run_ref !== bound[0]!.object_id) {
+          throw new Refuse("RUN_MEMBERSHIP_UNPROVEN", `${request.effect_id} has no membership proof for its bound run`);
         }
       }
     }

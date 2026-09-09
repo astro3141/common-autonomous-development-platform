@@ -120,7 +120,19 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         // AP B6(1): `allocation_tuple` rides as one optional top-level sibling of the draft keys;
         // the Ingress strips it, so it never reaches `EffectRequestV1` or `request_digest`.
         const body = JSON.parse(raw.toString("utf8")) as SealRequestBody;
-        return send(200, deps.ingress.sealEffectRequest(body, { principal }));
+        // AP B6(3): the run capability travels as the `x-cadp-run-capability` HEADER on this
+        // authenticated channel and is passed on as request metadata — never read from the body,
+        // never a draft field, and never logged (the refusal below names a reason code only).
+        // A repeated header arrives as an array; joining it produces a value the Ingress's strict
+        // canonical decode refuses like any other malformed presentation, rather than silently
+        // selecting one occurrence.
+        const header = req.headers["x-cadp-run-capability"];
+        const run_capability = Array.isArray(header) ? header.join(",") : header;
+        return send(200, deps.ingress.sealEffectRequest(
+          body,
+          { principal },
+          run_capability === undefined ? {} : { run_capability },
+        ));
       }
       case "submit_evidence": {
         const draft = JSON.parse(raw.toString("utf8")) as EvidenceDraft;
