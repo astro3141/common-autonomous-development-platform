@@ -10,7 +10,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadManifest } from "./env.ts";
@@ -163,6 +163,72 @@ export function resolveBaseSha(
   return sha;
 }
 
+/** The composition's own durable first-creation record for one run origin (WP §3.6). */
+export const ORIGIN_PIN_SCHEMA = "cadp.run-origin-pin.v1";
+
+function originPinPath(dir: string, origin_key: string): string {
+  // The key is opaque (a derived digest on the `workPlan` path, a minted UUID on a direct start), so
+  // it is hashed into the filename rather than trusted as one.
+  return join(dir, "run-origins", `${sha256Hex(origin_key)}.json`);
+}
+
+function readOriginPin(path: string, origin_key: string): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    // ENOENT is the FIRST attempt at this origin. Any other read failure is not evidence of that,
+    // and treating it as one would resolve a fresh base for an origin that may already have sealed.
+    if ((e as { code?: string }).code === "ENOENT") return undefined;
+    throw e;
+  }
+  let pinned: { schema?: unknown; origin_key?: unknown; base_sha?: unknown };
+  try {
+    pinned = JSON.parse(raw) as typeof pinned;
+  } catch {
+    throw new Error(`unreadable run-origin pin at ${path} — refusing to re-seal this origin on an unpinned base`);
+  }
+  if (pinned.schema !== ORIGIN_PIN_SCHEMA || pinned.origin_key !== origin_key || typeof pinned.base_sha !== "string" || !/^[0-9a-f]{40}$/u.test(pinned.base_sha)) {
+    throw new Error(`damaged run-origin pin at ${path} — refusing to re-seal this origin on an unpinned base`);
+  }
+  return pinned.base_sha;
+}
+
+/**
+ * WP §3.6 origin-path first-creation PIN of the one sealed-material field this composition resolves
+ * live. `resolveBaseSha` reads a MUTABLE remote ref, so a retry of an origin after `main` moves would
+ * resolve a different tip and re-present the converged `effect_id` with drifted `args` — a different
+ * `args_digest`, hence `REQUEST_DIGEST_CONFLICT` (Spec v0.5 K3), an incident and a scope hold, and
+ * the origin unretryable for the store's lifetime. WP §3.6 requires the origin path to pin the
+ * FIRST-CREATION value, so the first attempt at an origin resolves once and records it durably under
+ * the live directory, and EVERY later attempt at that same `origin_key` reads it back verbatim and
+ * never resolves again. A damaged or foreign pin fails closed: re-sealing an origin on an unpinned
+ * base is exactly the drift this exists to prevent.
+ *
+ * Only the live-resolved field is pinned, deliberately. The rest of an origin's args — `bounds`, the
+ * provider selections, each vertical's own fields — are fixed by the caller's own inputs under WP
+ * §3.6 caller obligations (1)/(3) and are already pure functions of them; pinning those too would
+ * silently overwrite a caller that changed them instead of letting the re-seal refuse honestly.
+ */
+export function pinOriginBaseSha(dir: string, origin_key: string, resolve: () => string): string {
+  const path = originPinPath(dir, origin_key);
+  const pinned = readOriginPin(path, origin_key);
+  if (pinned !== undefined) return pinned;
+  const base_sha = resolve();
+  mkdirSync(join(dir, "run-origins"), { recursive: true });
+  try {
+    // `wx`: the first writer wins. A concurrent attempt at the SAME origin must adopt that value
+    // rather than overwrite it — two attempts sealing two bases is the drift, whichever wrote last.
+    writeFileSync(path, `${JSON.stringify({ schema: ORIGIN_PIN_SCHEMA, origin_key, base_sha })}\n`, { flag: "wx" });
+  } catch (e) {
+    if ((e as { code?: string }).code !== "EEXIST") throw e;
+    const raced = readOriginPin(path, origin_key);
+    if (raced === undefined) throw new Error(`run-origin pin at ${path} vanished mid-write — refusing to seal an unpinned base`);
+    return raced;
+  }
+  return base_sha;
+}
+
 /**
  * WP §3.6 — the `workPlan` path's `origin_key`, decided ONCE per logical run origin and reproduced
  * VERBATIM on every retry of that origin. Derived canonically (`cadp-jcs-1` preimage, SHA-256) from
@@ -202,8 +268,8 @@ export function recordResourcePrefix(origin_key: string): string {
 /**
  * The `WORK_START` sealed args for one origin — a PURE function of the origin's fixed inputs, so
  * one logical origin re-seals BYTE-IDENTICAL material (WP §3.6). Every clock-derived field is gone
- * from it; `base_sha` is supplied by the caller, which is where the remaining replay obligation
- * sits (see `startWork`).
+ * from it, and the one field the composition resolves from a MUTABLE remote (`base_sha`) is supplied
+ * by the caller already pinned to the origin's first creation (see `pinOriginBaseSha`).
  */
 export function workStartArgs(
   vertical: "development" | "record",
@@ -264,12 +330,12 @@ export function workStartArgs(
  * `cadp.kernel-config.v1` deployment refuses the allocation `ALLOCATION_TUPLE_INVALID` — v0.5 is a
  * new genesis in a new store namespace (Spec v0.5 §10), not an in-place upgrade of a v0.4 store.
  *
- * REMAINING REPLAY OBLIGATION, named exactly rather than papered over: `base_sha` is still resolved
- * by a live `ls-remote` at seal time on the development vertical, so a retry after the base branch
- * moves seals different material for the same origin. WP §3.6 requires the origin path to pin the
- * FIRST-CREATION value; doing that needs a durable first-creation record this composition does not
- * yet keep, and it is not this lane's change. The record vertical's clock-derived field, which WP
- * §3.6 names as the checked-out consequence to remove, IS removed above.
+ * MATERIAL REPLAY STABILITY, both instances WP §3.6 names: the record vertical's clock-derived
+ * `resource_prefix` is a function of `origin_key` (see `recordResourcePrefix`), and the development
+ * vertical's `base_sha` — resolved from a MUTABLE remote ref, so live-varying rather than
+ * clock-varying — is resolved ONCE at the origin's first creation and read back verbatim on every
+ * later attempt at that `origin_key` (see `pinOriginBaseSha`). Every other sealed field is already a
+ * pure function of the origin's fixed inputs, so one logical origin re-seals byte-identical material.
  */
 export async function startWork(
   dir: string,
@@ -305,9 +371,12 @@ export async function startWork(
   const args = workStartArgs(vertical, extra, origin_key, {
     repo_id: m.repo_id,
     repo_full_name: m.repo_full_name,
-    // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
-    // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
-    base_sha: vertical === "development" ? resolveBaseSha(m.repo_full_name, "refs/heads/main") : "",
+    // Resolved fresh at the origin's FIRST creation — the manifest's setup-time snapshot goes stale
+    // (see resolveBaseSha) — and PINNED to that origin, so a retry of it after `main` moves seals
+    // the same base rather than drifting the converged effect_id's material (WP §3.6).
+    base_sha: vertical === "development"
+      ? pinOriginBaseSha(dir, origin_key, () => resolveBaseSha(m.repo_full_name, "refs/heads/main"))
+      : "",
     worker_product: workerProduct,
     review_product: reviewProduct,
     external_verification: externalVerification,
