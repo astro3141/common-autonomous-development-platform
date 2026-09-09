@@ -251,6 +251,8 @@ For an enrolled principal, every `EffectRequestV1` MUST carry the work-run bindi
 
 Distinct from scope validity: an enrolled requester MUST present an **authenticated run scope proving that THIS request belongs to that exact `work_run_ref`**. Possession or knowledge of another valid run identifier is never sufficient — a stable principal serving many concurrent runs could otherwise attach a drained run's work to a fresh run's budget, and `max_effects` would stop being a constitutional guarantee.
 
+**Bootstrap semantics of the run profile.** Read together, §§5.1–5.3 require every enrolled requester's request to carry a work-run binding with an authenticated membership proof — yet the `work_run_ref` IS the `effect_id` of the run's own `WORK_START` (§5.2), so the `WORK_START` that originates a run would otherwise have to prove membership in a scope that only it can establish. That circularity is resolved here as run-profile semantics, not as an exemption from them: the `WORK_START` request that originates a run does not join a pre-existing run scope; it CREATES one. It MUST bind its own Platform-issued `effect_id` as `work_run_ref`, and the Technical Design MUST authenticate that self-origin relation without requiring a membership proof that can exist only after that `WORK_START` establishes the run. All subsequent run-bound requests require the ordinary authenticated membership proof.
+
 This Specification locks ONLY the invariant — *a requester cannot self-select or borrow another valid run scope* — and delegates the mechanism to the Technical Design, which must choose one (a run capability minted at `COMMITTED` `WORK_START` dispatch, a per-run principal, or another authenticated channel) and prove it under falsification obligations in the spirit of §9. `[UNMEASURED — probe required: no such mechanism exists or has been probed in the v0.4 corpus; today the binding is caller-asserted content of work_bindings.]`
 
 ### 5.4 Bisection of run mechanics (Design D3)
@@ -315,6 +317,7 @@ A deployment claiming the run profile additionally proves:
 - enrollment is policy-bound: an enrolled principal's unbound effect is REFUSED, and a non-enrolled principal cannot opt in by inventing a binding (§5.1);
 - run scope validity grades by K7: an `UNKNOWN` `WORK_START` scope admits nothing until reconciled, and a `NO_EFFECT_CONFIRMED` scope is refused (§5.2);
 - run membership is authenticated: a request presenting another valid run's identifier is refused, under the TD-chosen mechanism's falsification controls (§5.3);
+- bootstrap is semantics, not an exemption: the origin `WORK_START` is provable without a pre-existing membership proof, and a non-`WORK_START` request binding its own `effect_id` as `work_run_ref` acquires nothing by it (§5.3);
 - `max_effects` bounds hold under the above — including the negative control that formerly-escaping unbound requests now fail admission.
 
 ### 9.3 Reference compositions (additional proof)
