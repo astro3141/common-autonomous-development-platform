@@ -19,7 +19,12 @@ import type { Digest } from "./canonical.ts";
 import { newId } from "./ids.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
-import { resolvePointer } from "./policyBundle.ts";
+// `KERNEL_WORK_RUN_NAMESPACE` is B3(4)(c)'s kernel-consumed namespace — CODE, not bundle content,
+// and imported from its ONE definition so the activation-time declaration rule and B5(9)'s
+// seal-time lookup can never name different namespaces. It is not a tuple field name: no schema's
+// field set lives in kernel code, and the (authority_ref, namespace) PAIR the origin rule matches
+// on is the bundle's, read from `kernel_subject_namespaces`.
+import { KERNEL_WORK_RUN_NAMESPACE, resolvePointer } from "./policyBundle.ts";
 import type { KernelConfig, SubjectCompleteAssemblyEntry } from "./policyBundle.ts";
 import { validateAdmissionInput, validateEffectRequest, validateEvidenceEnvelope } from "./records.ts";
 import type { AdmissionInputV1, EffectRequestV1, EvidenceEnvelopeV1, EvidenceKind, Provenance, SubjectBinding, TargetRef } from "./records.ts";
@@ -174,6 +179,15 @@ const REQUESTER_TUPLE_FIELDS: readonly string[] = ["requester_ref", "requester",
 
 /** The platform effect-id shape the kernel already validates on this path (AP B2(2)(i)). */
 const EFFECT_ID_PREFIX = "cadp-v04:effect:";
+
+/**
+ * AP B5(9) leg 1 / B5(1)(a): the run profile's `WORK_START`, the SHAPE leg of the minting
+ * predicate and EXACTLY that leg. It is deliberately not the whole predicate: leg (b) is the
+ * `run_membership(E,E)` row this very rule decides whether to write, so reading the witnessed
+ * predicate here would be circular and no origin could ever be adjudicated. Already kernel
+ * vocabulary at this checkout (`pep.ts`'s counting scope for an unbound `WORK_START`).
+ */
+const RUN_PROFILE_WORK_START = "WORK_START";
 
 /**
  * AP B2(2)(i): the closed, GENERIC `value_contract` vocabulary — the v0.4 typed-tuple rules
@@ -549,7 +563,14 @@ export class Ingress {
       // FIRST seal (no `effect_request` row): B2(3)'s legs, all of them generic equalities over
       // bundle data and the caller's own tuple, every one refusing BEFORE any K3 record exists.
       if (allocation !== undefined) this.#assertFirstSealBinding(sealed, allocation, allocation_tuple, active);
+      // B5(9): ORIGIN-OR-REFUSED, adjudicated here and nowhere else. Under a v1 config this does
+      // not run at all and the seal path is byte-identical to v0.4's.
+      const isOrigin = allocationBound && this.#adjudicateRunOrigin(sealed, active);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
+      // B5(5): the membership row is inserted in the SAME transaction as the `effect_request`
+      // row — for an origin, `run_membership(effect_id, effect_id)`, which is B5(1)(b)'s durable
+      // minting witness and is written on this path and on no other.
+      if (isOrigin) this.store.insertRunMembership(sealed.effect_id, sealed.effect_id);
       return { kind: "row", row: sealed };
     });
     if (outcome.kind === "conflict") {
@@ -561,6 +582,59 @@ export class Ingress {
       throw new IngressRejection("REQUEST_DIGEST_CONFLICT");
     }
     return outcome.row;
+  }
+
+  /**
+   * AP B5(9) — `is_run_origin(request)`, evaluated inside the sealing transaction, and the
+   * ORIGIN-OR-REFUSED adjudication that hangs off it. The circularity it resolves: an enrolled
+   * requester must present an authenticated membership proof for the run it names, and a run's
+   * `work_run_ref` IS the `effect_id` of the run's own `WORK_START` — so that `WORK_START` would
+   * have to prove membership in a scope only it can establish. Spec v0.5 §5.3 resolves it as run-
+   * profile SEMANTICS, not an exemption: the origin does not join a pre-existing scope, it
+   * ORIGINATES THAT SCOPE'S IDENTITY, and identity only.
+   *
+   * The three legs, exactly:
+   *   1. the sealed `operation_kind` is the run profile's `WORK_START` (the shape leg, and only it);
+   *   2. the request's `work_bindings` carry EXACTLY ONE binding on the exact `(authority_ref,
+   *      namespace)` pair `kernel_subject_namespaces` declares for the work-run namespace — the
+   *      full pair, so an off-authority `{other, work-run, …}` binding is not a kernel work-run
+   *      subject at all and cannot stand in for the self-binding; and
+   *   3. that binding's `object_id` equals the request's own `effect_id`.
+   *
+   * Returns `true` for an origin (the caller writes the witness row). Leg 3 failing is REFUSED
+   * `RUN_CAPABILITY_INVALID` — the existing code, no new one — EVEN WHEN the request presents a
+   * genuinely valid, holder-matching capability for the run it names: possession is exactly what
+   * would otherwise carry a `WORK_START`-shaped request down the ordinary member path and let one
+   * requester originate a second run's identity inside another run's scope. It never falls
+   * through to the member path, and on that refusal no `effect_request` row, no `run_membership`
+   * row and no membership proof of any kind comes to exist.
+   *
+   * SCOPE NOTE, so this is not read as more than it is: a `WORK_START` binding NO kernel work-run
+   * subject is not adjudicated here at all. Making that case a refusal is B5(3)'s
+   * `RUN_BINDING_REQUIRED` for an enrolled requester, which is a separate lane; unadjudicated
+   * means simply that no witness row exists, and B5(1)(α) then makes such an effect permanently
+   * non-minting — at its initial dispatch and at every later one.
+   */
+  #adjudicateRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
+    if (sealed.operation_kind !== RUN_PROFILE_WORK_START) return false; // leg 1
+    const declared = (active.config.kernel_subject_namespaces ?? []).find(
+      (entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE,
+    );
+    if (declared === undefined) return false; // no declared work-run subject identity: nothing to match
+    const bound = sealed.work_bindings.filter(
+      (binding) => binding.authority_ref === declared.authority_ref && binding.namespace === declared.namespace,
+    );
+    if (bound.length === 0) return false; // not run-bound: see the scope note above
+    // Leg 2's "more than one" case is already refused `KERNEL_NAMESPACE_AMBIGUOUS` pre-K3 by
+    // B3(4)(b) above; it is re-stated here as a refusal rather than a fall-through so that
+    // disabling that rule cannot turn an ambiguous request into an unadjudicated one.
+    if (bound.length !== 1 || bound[0]!.object_id !== sealed.effect_id) {
+      throw new IngressRejection(
+        "RUN_CAPABILITY_INVALID",
+        `a ${RUN_PROFILE_WORK_START} bound to a run other than its own effect_id is refused, never admitted as a member`,
+      );
+    }
+    return true; // leg 3
   }
 
   /**

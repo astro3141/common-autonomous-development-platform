@@ -8,6 +8,7 @@ import { Cas } from "./cas.ts";
 import { sha256Hex } from "./canonical.ts";
 import type { Digest } from "./canonical.ts";
 import { dataJsonOf, manifestOf, manifestRevisionString, parseManifestRevision, payloadDigestOf, validateKernelConfig } from "./policyBundle.ts";
+import { sealedAllocationContracts } from "./policyState.ts";
 import { ConstitutionalStore } from "./store.ts";
 
 export interface ProposedPolicyRef {
@@ -55,7 +56,12 @@ export function verifyProposedBundle(cas: Cas, store: ConstitutionalStore, propo
   }
   const data = dataJsonOf(bundleBytes) as { cadp?: unknown } | undefined;
   try {
-    validateKernelConfig(data?.cadp);
+    // AP B2(2)(ii): the proposed config is validated AGAINST THE SEALED STORE's allocation-contract
+    // history, not against the active bundle alone. It is passed as a thunk the validator invokes
+    // only for a `cadp.kernel-config.v2` bundle, so a v1 activation reads no extra row; and it is
+    // inside this try on purpose, so a history that cannot be established refuses the activation
+    // rather than activating as though nothing were pinned.
+    validateKernelConfig(data?.cadp, () => sealedAllocationContracts(store, cas));
   } catch (error) {
     throw new PublicationRefusal("KERNEL_CONFIG_INVALID", error instanceof Error ? error.message : String(error));
   }

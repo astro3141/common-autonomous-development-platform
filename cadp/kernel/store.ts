@@ -126,6 +126,39 @@ CREATE TABLE IF NOT EXISTS cas_blob (
 `;
 
 /**
+ * AP B5(1)/B5(5): the run-membership mechanism's two NON-CONSTITUTIONAL implementation tables —
+ * in no K-record, no digest and no `ResolvedAdmissionBundle`, exactly as `effect_allocation`
+ * already is (B5(10): "not a K8"). Both are append-only like every other table here: this module
+ * contains no UPDATE and no DELETE statement against either.
+ *
+ * `run_capability` has **NO `revoked_at` column and no revocation state in this generation**
+ * (B5(4)): the store contract forbids a runtime UPDATE, so a mutable flag would be a field no
+ * append-only path could ever set. Revocation, if it is ever wanted, is a future append-only
+ * `run_capability_revocation` row consumed at seal time — out of scope here.
+ * `capability_digest` is SHA-256 over the RAW 32 secret bytes and never over any transport
+ * encoding of them (B5(1)); the secret itself is stored nowhere.
+ *
+ * `run_membership`'s primary key is the member effect's own `effect_id`, so one effect proves
+ * membership in at most one run. The self-referential row `run_membership(E, E)` is the durable
+ * seal-time witness that `E` was adjudicated a run ORIGIN (B5(9)), which is the only thing that
+ * makes `E` minting-eligible at its own initial dispatch (B5(1)(b)).
+ */
+const RUN_PROFILE_DDL = `
+CREATE TABLE IF NOT EXISTS run_capability (
+  work_run_ref TEXT PRIMARY KEY,
+  holder_ref TEXT NOT NULL,
+  capability_digest TEXT NOT NULL,
+  minted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_membership (
+  effect_id TEXT PRIMARY KEY,
+  work_run_ref TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_membership_run_idx ON run_membership (work_run_ref);
+`;
+
+/**
  * v1.1 governed-writer constraints (TD §3.2 delta, #117 §5.3): the constraint-level backstop to the
  * two transactional lookups, exactly as `work_step_unique` backstops `insertWorkStep` (C33).
  * (a) replay idempotency on the effect-bound `source_ref`; (b) at most ONE governed outgoing edge
@@ -167,6 +200,20 @@ export interface AllocationRow {
 const ALLOCATION_BINDING_COLUMNS: readonly (keyof AllocationBinding)[] = [
   "requester_ref", "allocation_schema", "allocation_binding_digest", "allocation_contract_digest", "purpose",
 ];
+
+/**
+ * AP B5(1): one minted run capability. `work_run_ref` is the originating `WORK_START`'s own
+ * `effect_id`, and its PRIMARY KEY is what makes minting once-and-only-once by construction — a
+ * repeat dispatch finds the row and mints nothing. No `revoked_at`: see `RUN_PROFILE_DDL`.
+ */
+export interface RunCapabilityRow {
+  readonly work_run_ref: string;
+  /** The stamped `requester_ref` of the sealed `WORK_START`, i.e. the one caller the secret went to. */
+  readonly holder_ref: string;
+  /** Hex SHA-256 over the RAW 32 secret bytes (B5(1)); never over any transport encoding. */
+  readonly capability_digest: string;
+  readonly minted_at: string;
+}
 
 export interface ActivationRow {
   readonly seq: number;
@@ -239,6 +286,7 @@ export class ConstitutionalStore {
       if (!allocationColumns.has(column)) this.db.exec(`ALTER TABLE effect_allocation ADD COLUMN ${column} TEXT`);
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS effect_allocation_effect_idx ON effect_allocation (effect_id);");
+    this.db.exec(RUN_PROFILE_DDL);
     this.db.exec(GOVERNED_DDL);
   }
 
@@ -295,6 +343,16 @@ export class ConstitutionalStore {
 
   activationBySeq(seq: number): ActivationRow | undefined {
     return this.db.prepare("SELECT * FROM policy_activation WHERE seq = ?").get(seq) as ActivationRow | undefined;
+  }
+
+  /**
+   * Every activation this store has ever sealed, oldest first. AP B2(2)(ii)'s cross-activation
+   * comparison is against the SEALED STORE and not against the currently active bundle, so a
+   * contract cannot be laundered by withdrawing it in one activation and re-adding a different
+   * one in the next — which is exactly the read this accessor exists for.
+   */
+  activations(): ActivationRow[] {
+    return this.db.prepare("SELECT * FROM policy_activation ORDER BY seq").all() as ActivationRow[];
   }
 
   // -------------------------------------------------------------- evidence
@@ -490,6 +548,44 @@ export class ConstitutionalStore {
       effect_id: string;
     }>;
     return rows.map((r) => r.effect_id);
+  }
+
+  // -------------------------------------------------------------- run membership / capability
+
+  /**
+   * AP B5(5): written in the SAME transaction as the `effect_request` row it proves membership
+   * for. For a run origin the two columns are equal, and that self-referential row is B5(1)(b)'s
+   * durable minting witness — written on the origin seal path and on no other.
+   */
+  insertRunMembership(effect_id: string, work_run_ref: string): void {
+    mapSqliteError(() =>
+      this.db.prepare("INSERT INTO run_membership (effect_id, work_run_ref) VALUES (?, ?)").run(effect_id, work_run_ref),
+    );
+  }
+
+  /** The run this effect proved membership in at seal, or undefined if it proved none. */
+  runMembership(effect_id: string): string | undefined {
+    const row = this.db.prepare("SELECT work_run_ref FROM run_membership WHERE effect_id = ?").get(effect_id) as
+      | { work_run_ref: string }
+      | undefined;
+    return row?.work_run_ref;
+  }
+
+  /**
+   * AP B5(1): written in the SAME transaction as the admission that mints it. The primary key is
+   * the enforcement of "exactly once" — a second insert for the same run raises `UniqueViolation`
+   * rather than minting a second capability.
+   */
+  insertRunCapability(row: RunCapabilityRow): void {
+    mapSqliteError(() =>
+      this.db
+        .prepare("INSERT INTO run_capability (work_run_ref, holder_ref, capability_digest, minted_at) VALUES (?, ?, ?, ?)")
+        .run(row.work_run_ref, row.holder_ref, row.capability_digest, row.minted_at),
+    );
+  }
+
+  runCapability(work_run_ref: string): RunCapabilityRow | undefined {
+    return this.db.prepare("SELECT * FROM run_capability WHERE work_run_ref = ?").get(work_run_ref) as RunCapabilityRow | undefined;
   }
 
   // -------------------------------------------------------------- input / decision

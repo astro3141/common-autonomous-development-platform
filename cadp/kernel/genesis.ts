@@ -46,6 +46,8 @@ export function runGenesis(store: ConstitutionalStore, cas: Cas, input: GenesisI
   if (parsed === undefined || parsed.policy_id !== input.policy_id || parsed.revision !== 1 || parsed.payloadHex !== payload.value) {
     throw new Error("genesis bundle manifest.revision does not match its payload identity");
   }
+  // No sealed allocation-contract history is passed (AP B2(2)(ii)): genesis refuses above unless
+  // `policy_activation` is empty, so the history is necessarily empty and nothing is pinned yet.
   const config = validateKernelConfig((dataJsonOf(input.bundleBytes) as { cadp?: unknown } | undefined)?.cadp);
   if (config.root_public_keys.length === 0) throw new Error("genesis bundle must carry root_public_keys");
 

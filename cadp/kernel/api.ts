@@ -136,8 +136,13 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         return send(200, outcome);
       }
       case "admit_and_dispatch": {
+        // AP B5(1)/B6(4): the REQUEST body is unchanged at `{ effect_id, decision_id }` — the
+        // principal is the one this layer already resolved from `authorization`, never a body
+        // field. The RESPONSE carries B6(4)'s optional `run_capability` exactly when the PEP
+        // minted one on this call: this send is that secret's ONE delivery channel, to the caller
+        // the PEP verified as the sealed requester, and it is written to no log or trace here.
         const body = JSON.parse(raw.toString("utf8")) as { effect_id: string; decision_id: string };
-        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id);
+        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id, { principal });
         return send(200, result);
       }
       case "get_effect_state": {
