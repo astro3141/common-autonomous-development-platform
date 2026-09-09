@@ -63,11 +63,17 @@ test("measured effort argv encodings expand only when the pair is set", () => {
   assert.throws(() => appendRequestedEffort([], { requested_effort: "max", effort_argv: WORKER_EFFORT_ARGV.grok }, "test"), /measured allowed values/u);
 });
 
-test("no current profile requests effort or changes live argv", () => {
-  for (const registries of [WORKER_PROVIDERS, REVIEW_PROVIDERS, PLAN_PROVIDERS]) {
+test("only the measured codex reviewer pins requested effort; other profiles leave live argv unchanged", () => {
+  for (const registries of [WORKER_PROVIDERS, PLAN_PROVIDERS]) {
     for (const profile of Object.values(registries)) {
       assert.equal(profile.requested_effort, undefined);
       assert.equal(profile.effort_argv, undefined);
     }
   }
+  assert.equal(REVIEW_PROVIDERS.claude.requested_effort, undefined);
+  assert.equal(REVIEW_PROVIDERS.claude.effort_argv, undefined);
+  assert.equal(REVIEW_PROVIDERS.grok.requested_effort, undefined);
+  assert.equal(REVIEW_PROVIDERS.grok.effort_argv, undefined);
+  assert.equal(REVIEW_PROVIDERS.codex.requested_effort, "high");
+  assert.deepEqual(REVIEW_PROVIDERS.codex.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] });
 });

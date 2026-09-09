@@ -105,7 +105,7 @@ export const WORKER_PROVIDERS: Record<WorkerProvider, WorkerProviderProfile> = {
     // session records the pinned id): an unpinned argv rode the CLI default, so requested was not a
     // deterministic fact. Owner directive 2026-09-08: the claude worker seat runs Opus (lowered
     // from Fable for cost; claude-opus-5 headless probe-verified same day).
-    argv_template: ["-p", WORK_ITEM_SENTINEL, "--model", "claude-opus-5", "--permission-mode", "bypassPermissions"],
+    argv_template: ["-p", WORK_ITEM_SENTINEL, "--model", "claude-fable-5", "--permission-mode", "bypassPermissions"],
     auth_files: [], // no file auth — the operator-extracted token is injected by env
     auth_subdir: ".claude",
     auth_env: { env_var: "CLAUDE_CODE_OAUTH_TOKEN", static_env: { IS_SANDBOX: "1" } },
