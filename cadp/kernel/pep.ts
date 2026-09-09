@@ -1,8 +1,8 @@
 /**
  * PEP (TD §3.4, §4): the only component that writes `EffectAdmissionV1` and dispatches.
  * Serialization lock D spans precondition → admission → dispatch → outcome; the admission
- * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18, run against rows read inside the
- * transaction; K7 truth stays target-authoritative (§6.3).
+ * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18 and AP B5(5)'s #19, run against rows
+ * read inside the transaction; K7 truth stays target-authoritative (§6.3).
  *
  * It is also where AP B5(1) mints: a run capability is minted in the SAME transaction as the
  * admission, at the INITIAL dispatch of a `WORK_START` whose seal-time origin WITNESS exists, and
@@ -19,7 +19,10 @@ import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import {
+  Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, kernelWorkRunRef,
+  runProfileActive, runProfileEnrolled, subjectKey as subjectKeyOf,
+} from "./ingress.ts";
 import type { Principal } from "./ingress.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
@@ -329,7 +332,7 @@ export class Pep {
     return binding.authority_ref === adapter.describe().authority_ref;
   }
 
-  // ------------------------------------------------- the 17 rechecks, plus AP B4(5)'s #18
+  // -------------------------- the 17 rechecks, plus AP B4(5)'s #18 and AP B5(5)'s #19
 
   #admissionTransaction(
     requestPre: EffectRequestV1,
@@ -651,6 +654,39 @@ export class Pep {
             );
           }
         }
+      }
+    }
+
+    // #19 — DURABLE RUN MEMBERSHIP (AP B5(5)). For a request whose SEALED `requester_ref` is
+    // enrolled, the PEP requires the `run_membership(effect_id, work_run_ref)` row the seal wrote,
+    // with a `work_run_ref` matching this request's own kernel work-run subject, READ INSIDE THIS
+    // TRANSACTION — refusing `RUN_MEMBERSHIP_UNPROVEN` otherwise. Authority after restart is
+    // reconstructed from rows, never from process memory (TD v0.4 §4.5), and the secret is not
+    // needed at admission time: the digest-bearing `run_capability` row is not read here at all.
+    //
+    // The identity is `EffectRequestV1.requester_ref` — the same STAMPED domain enrollment is
+    // declared in (B5(3)) — read off the sealed record rather than re-derived from a caller.
+    //
+    // Fail-closed on a request with no kernel work-run subject: B5(3) makes such a request from an
+    // enrolled requester unsealable, so there is nothing for a row to match and nothing legitimate
+    // to admit. Gated on the run profile being enabled, so a `cadp.kernel-config.v1` deployment's
+    // recheck list is exactly items #1-#17 and a v2 deployment that has not switched the profile on
+    // is exactly #1-#18.
+    //
+    // What it is NOT: it is no defence against the retroactive-promotion fork of B5(1)(α). That
+    // fork's follow-up seal writes its OWN `run_membership(follow_up, E)` row, so #19 finds it and
+    // passes; the WITNESSED minting predicate closes it one step earlier, at the mint.
+    if (
+      this.#enabled("recheck19_run_membership") && runProfileActive(active.config) &&
+      runProfileEnrolled(active.config, request.requester_ref)
+    ) {
+      const work_run_ref = kernelWorkRunRef(request, active.config);
+      const proof = store.runMembership(request.effect_id);
+      if (work_run_ref === undefined || proof === undefined || proof.work_run_ref !== work_run_ref) {
+        throw new Refuse(
+          "RUN_MEMBERSHIP_UNPROVEN",
+          `${request.effect_id} has no durable run_membership row for ${work_run_ref ?? "any kernel work-run subject"}`,
+        );
       }
     }
 

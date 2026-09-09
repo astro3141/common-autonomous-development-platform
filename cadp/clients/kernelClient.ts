@@ -1,5 +1,6 @@
 /** HTTP client for the Kernel API (TD §12) used by workflow activities, adapters and tests. */
 
+import { RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { AllocationTuple, EvidenceDraft, SealRequestBody } from "../kernel/ingress.ts";
 import type {
   AdmissionInputV1, EffectAdmissionV1, EffectOutcomeV1, EffectRequestV1, EvidenceEnvelopeV1, PolicyDecisionV1,
@@ -32,13 +33,14 @@ export class KernelClient {
     this.token = token;
   }
 
-  async #call<T>(method: string, body: Uint8Array | unknown): Promise<T> {
+  async #call<T>(method: string, body: Uint8Array | unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
     const isRaw = body instanceof Uint8Array;
     const res = await fetch(`${this.baseUrl}/${method}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": isRaw ? "application/octet-stream" : "application/json",
+        ...extraHeaders,
       },
       body: isRaw ? (body as Uint8Array<ArrayBuffer>) : JSON.stringify(body),
     });
@@ -55,9 +57,18 @@ export class KernelClient {
     return this.#call("allocate_effect_id", tuple);
   }
 
-  /** AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field. */
-  sealEffectRequest(body: SealRequestBody): Promise<EffectRequestV1> {
-    return this.#call("seal_effect_request", body);
+  /**
+   * AP B6(1): `allocation_tuple` rides as an optional top-level sibling, never as a draft field.
+   * AP B6(3): the run capability rides as the `x-cadp-run-capability` HEADER — base64url (unpadded)
+   * of the raw 256-bit secret — and never as a body member, so it enters no record and no digest.
+   * The value belongs in the caller's secret custody: this client neither stores nor logs it.
+   */
+  sealEffectRequest(body: SealRequestBody, options: { runCapability?: string } = {}): Promise<EffectRequestV1> {
+    return this.#call(
+      "seal_effect_request",
+      body,
+      options.runCapability === undefined ? {} : { [RUN_CAPABILITY_HEADER]: options.runCapability },
+    );
   }
 
   submitEvidence(draft: EvidenceDraft): Promise<EvidenceEnvelopeV1> {

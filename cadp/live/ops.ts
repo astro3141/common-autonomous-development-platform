@@ -9,13 +9,15 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadManifest } from "./env.ts";
 import type { LiveEnvManifest } from "./env.ts";
 import { KernelClient } from "../clients/kernelClient.ts";
-import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { jcs, jcsDigest, sha256Hex } from "../kernel/canonical.ts";
+import { RUN_ORIGIN_ALLOCATION_SCHEMA } from "../kernel/policyBundle.ts";
 import { workerProfileDigest } from "../product/workerProfile.ts";
 import { assertReviewIndependence, resolveReviewProvider } from "../product/reviewProviders.ts";
 import { resolvePlanProvider } from "../product/planProviders.ts";
@@ -161,12 +163,119 @@ export function resolveBaseSha(
   return sha;
 }
 
-/** One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly logged. */
+/**
+ * WP §3.6 — the `workPlan` path's `origin_key`, decided ONCE per logical run origin and reproduced
+ * VERBATIM on every retry of that origin. Derived canonically (`cadp-jcs-1` preimage, SHA-256) from
+ * the pair already present at origin creation: the sealed proposal's `evidence_id` and the item's
+ * INDEX in it. It identifies ONE LOGICAL ORIGIN, never the work's content — two items whose work
+ * text is byte-identical sit at different indices and therefore carry different `origin_key`s, so
+ * the identity-vs-content collision WP §3.6 exists to survive is unconstructible rather than
+ * merely unlikely. Nothing about the item's content enters the preimage, deliberately.
+ */
+export function planOriginKey(proposal_evidence_id: string, item_index: number): string {
+  return sha256Hex(jcs({ schema: "cadp.run-origin-key.v1", proposal_evidence_id, item_index }));
+}
+
+/**
+ * WP §3.6's wire tuple, exactly these three keys: `schema` and `purpose` are the two reserved kernel
+ * fields (AP B2(5)) and `origin_key` is the schema's single non-reserved field. It carries NO
+ * `work_run_ref` — a tuple naming the identity would have to contain the value it is being derived
+ * to produce (AP B5(9)) — and projects nothing onto any subject binding, the origin's self-binding
+ * being verified at seal by the Authority Plane's run-origin rule rather than by a projection.
+ */
+export function runOriginTuple(origin_key: string): { schema: string; origin_key: string; purpose: string } {
+  return { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key, purpose: "work-start" };
+}
+
+/**
+ * WP §3.6 origin-path material replay stability. The record vertical's `resource_prefix` was
+ * `live-${Date.now() % 100000}` — replay-UNSTABLE sealed material: one logical origin converges on
+ * one `effect_id`, so a retry re-presents that id with a different `args_digest`, which is a
+ * `REQUEST_DIGEST_CONFLICT` (Spec v0.5 K3), an incident and a scope hold rather than a retry, and
+ * the origin is then unretryable for the store's lifetime. It is now a pure function of the stable
+ * `origin_key` and of nothing else — in particular, of no clock.
+ */
+export function recordResourcePrefix(origin_key: string): string {
+  return `live-${sha256Hex(origin_key).slice(0, 8)}`;
+}
+
+/**
+ * The `WORK_START` sealed args for one origin — a PURE function of the origin's fixed inputs, so
+ * one logical origin re-seals BYTE-IDENTICAL material (WP §3.6). Every clock-derived field is gone
+ * from it; `base_sha` is supplied by the caller, which is where the remaining replay obligation
+ * sits (see `startWork`).
+ */
+export function workStartArgs(
+  vertical: "development" | "record",
+  extra: string[],
+  origin_key: string,
+  resolved: {
+    repo_id: string;
+    repo_full_name: string;
+    base_sha: string;
+    worker_product: string;
+    review_product: string;
+    external_verification: boolean;
+  },
+): Record<string, unknown> {
+  if (vertical === "development") {
+    return {
+      vertical,
+      bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
+      development: {
+        repo_id: resolved.repo_id,
+        repo_full_name: resolved.repo_full_name,
+        base_ref: "refs/heads/main",
+        base_sha: resolved.base_sha,
+        work_item: extra[0]!,
+        worker_product: resolved.worker_product,
+        review_product: resolved.review_product,
+        external_verification: resolved.external_verification,
+        require_human_merge: true,
+      },
+    };
+  }
+  return {
+    vertical,
+    bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
+    record: {
+      tenant: "cadp-disposable",
+      resource_prefix: recordResourcePrefix(origin_key),
+      payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
+    },
+  };
+}
+
+/**
+ * One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly
+ * logged.
+ *
+ * This is the v0.5 RUN-ORIGIN path (WP §3.6, AP B5(9)): the allocation is
+ * `cadp.allocation-key.run-origin.v1` keyed on a stable `origin_key` — supplied by `workPlan` for
+ * a plan item, MINTED ONCE here for a direct CLI/MCP start — and the seal binds exactly one
+ * `work-run` subject whose `object_id` is the allocated `effect_id` itself, which is the
+ * self-binding `is_run_origin` requires. The wall-clock `step_ordinal` and the all-zero placeholder
+ * `work_run_ref` of the old `cadp.allocation-key.v1` tuple are gone from this path: they made two
+ * attempts at one logical origin mint two effect identities and made one attempt unreplayable onto
+ * its own.
+ *
+ * DEPLOYMENT REQUIREMENT, stated rather than discovered at runtime: this path needs an active
+ * `cadp.kernel-config.v2` bundle registering `cadp.allocation-key.run-origin.v1`. A
+ * `cadp.kernel-config.v1` deployment refuses the allocation `ALLOCATION_TUPLE_INVALID` — v0.5 is a
+ * new genesis in a new store namespace (Spec v0.5 §10), not an in-place upgrade of a v0.4 store.
+ *
+ * REMAINING REPLAY OBLIGATION, named exactly rather than papered over: `base_sha` is still resolved
+ * by a live `ls-remote` at seal time on the development vertical, so a retry after the base branch
+ * moves seals different material for the same origin. WP §3.6 requires the origin path to pin the
+ * FIRST-CREATION value; doing that needs a durable first-creation record this composition does not
+ * yet keep, and it is not this lane's change. The record vertical's clock-derived field, which WP
+ * §3.6 names as the checked-out consequence to remove, IS removed above.
+ */
 export async function startWork(
   dir: string,
   vertical: "development" | "record",
   extra: string[],
-  options: { ordinalArg?: string; log?: Log } = {},
+  options: { originKey?: string; log?: Log } = {},
 ): Promise<{ effect_id: string; workflow_id: string } | undefined> {
   const log = options.log ?? SILENT;
   const m = loadManifest(dir);
@@ -188,42 +297,23 @@ export async function startWork(
   // anything else fails closed rather than silently running without the second verifier.
   if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
   const externalVerification = extra[6] === "external";
-  const args =
-    vertical === "development"
-      ? {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
-          development: {
-            repo_id: m.repo_id,
-            repo_full_name: m.repo_full_name,
-            base_ref: "refs/heads/main",
-            // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
-            // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
-            base_sha: resolveBaseSha(m.repo_full_name, "refs/heads/main"),
-            work_item: extra[0]!,
-            worker_product: workerProduct,
-            review_product: reviewProduct,
-            external_verification: externalVerification,
-            require_human_merge: true,
-          },
-        }
-      : {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
-          record: {
-            tenant: "cadp-disposable",
-            resource_prefix: `live-${Date.now() % 100000}`,
-            payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
-          },
-        };
-
-  const ordinal = options.ordinalArg !== undefined ? Number(options.ordinalArg) : Math.floor(Date.now() / 1000) % 1000000;
-  const { effect_id } = await c.allocateEffectId({
-    schema: "cadp.allocation-key.v1",
-    work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-000000000000",
-    step_ordinal: ordinal,
-    purpose: "work-start",
+  // WP §3.6 caller obligation (1): the discriminator is decided ONCE per logical origin and
+  // reproduced verbatim on retry, never re-derived per attempt and never derived from the wall
+  // clock. `workPlan` supplies the stable one for a plan item; a direct start has no such pair and
+  // mints one here, collision-resistantly, for this invocation.
+  const origin_key = options.originKey ?? randomUUID();
+  const args = workStartArgs(vertical, extra, origin_key, {
+    repo_id: m.repo_id,
+    repo_full_name: m.repo_full_name,
+    // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
+    // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
+    base_sha: vertical === "development" ? resolveBaseSha(m.repo_full_name, "refs/heads/main") : "",
+    worker_product: workerProduct,
+    review_product: reviewProduct,
+    external_verification: externalVerification,
   });
+
+  const { effect_id } = await c.allocateEffectId(runOriginTuple(origin_key));
   const { cas_key: args_cas_key } = await c.putBlob(Buffer.from(JSON.stringify(args), "utf8"));
   // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
   // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
@@ -250,6 +340,11 @@ export async function startWork(
     effect_id,
     requester_ref: "workflow:cadp-work",
     work_bindings: [
+      // WP §3.6 caller obligation (2) / AP B5(9) leg 3: EXACTLY ONE binding on the declared kernel
+      // work-run pair, naming this request's OWN Platform-issued `effect_id`. The allocation
+      // returned it before the seal, so the caller re-presents it and the core compares it against
+      // the `effect_id` the request names — which is the whole of what makes leg 3 checkable.
+      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: effect_id },
       { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
       // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
       ...(vertical === "development" && extra[3] !== undefined && extra[3] !== ""
@@ -261,6 +356,10 @@ export async function startWork(
     material_schema: "cadp.work-start.v1",
     material_ref,
     prior_effect_refs: [],
+    // AP B6(1): the allocated tuple, verbatim, as one optional top-level sibling of the draft keys.
+    // REQUIRED on a first seal; ignored-if-identical and refused-if-different on an idempotent
+    // re-seal, which is exactly what a retry of one origin is.
+    allocation_tuple: runOriginTuple(origin_key),
   });
   const input = await c.assembleAdmissionInput(effect_id, []);
   const evaluated = await c.evaluate(input.input_digest.value);
@@ -337,7 +436,16 @@ export async function workPlan(dir: string, proposalEvidenceId: string, maxItems
   const results: Array<Record<string, unknown>> = [];
   for (const [index, item] of proposal.items.slice(0, maxItems).entries()) {
     log({ driver: "starting", index, work_item: item.work_item, bounds: { max_steps: item.max_steps, max_effects: item.max_effects } });
-    const started = await startWork(dir, "development", [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId], { log });
+    // WP §3.6: the item's `origin_key` is derived from the stable pair already present at origin
+    // creation — this proposal's `evidence_id` and this item's index — and is therefore the SAME
+    // value on every retry of this origin, which is what makes the retry converge on one
+    // `effect_id` instead of minting a second logical run.
+    const started = await startWork(
+      dir,
+      "development",
+      [item.work_item, String(item.max_steps), String(item.max_effects), proposalEvidenceId],
+      { log, originKey: planOriginKey(proposalEvidenceId, index) },
+    );
     if (started === undefined) {
       results.push({ index, work_item: item.work_item, status: "NOT_ADMITTED" });
       break; // fail closed: an item the gate refused halts the loop

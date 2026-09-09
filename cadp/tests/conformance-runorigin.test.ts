@@ -9,8 +9,9 @@
  * legs o1/o2 and the dispatch-requester equality) and A5 (one `origin_key` → one `effect_id` for
  * the store's lifetime, and the o-iv/o-vi immutability legs). The capability-PRESENTATION half of
  * A4 — `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`,
- * `RUN_CAPABILITY_REQUIRED`, the `x-cadp-run-capability` header and recheck #19 — is a later lane
- * and is asserted nowhere here.
+ * `RUN_CAPABILITY_REQUIRED`, the `x-cadp-run-capability` header and recheck #19 — is asserted in
+ * `conformance-runcapability.test.ts`, against the SAME fixtures (`support/runProfile.ts`), and
+ * nowhere here.
  *
  * Every rule below is gated on the active config's schema string and, for the seal adjudication,
  * on `run_profile_enrolled_requester_refs` membership. The last two tests are the complementary
@@ -25,206 +26,22 @@ import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
 import { IngressRejection } from "../kernel/ingress.ts";
-import type { Principal } from "../kernel/ingress.ts";
 import { RUN_ORIGIN_ALLOCATION_SCHEMA, KernelConfigInvalid, validateKernelConfig } from "../kernel/policyBundle.ts";
 import type { ActivatedAllocationContracts } from "../kernel/policyBundle.ts";
-import type { AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim } from "../kernel/adapters/types.ts";
-import type { SubjectBinding, TargetRef } from "../kernel/records.ts";
 import { REFERENCE_IDENTITIES, buildReferenceKernelConfig } from "../deployment/referencePolicy.ts";
 import {
   DEFAULT_WORK_RUN_REF, PRINCIPALS, V2_ALLOCATION_SCHEMAS, V2_ALLOCATION_SCHEMA_DESCRIPTORS,
-  makeHarness, stopSharedOpa, v2ConfigOverrides,
+  makeHarness, stopSharedOpa,
 } from "./support/harness.ts";
-import type { Harness } from "./support/harness.ts";
+import {
+  IDENTITY_B, PRINCIPAL_B, REQUESTER_A, RUN_ORIGIN_DESCRIPTOR, RUN_ORIGIN_MAPPING, WORK_RUN_AUTHORITY,
+  WorkStartTarget, count, dispatch, originRun, runProfileConfig, runProfileHarness, sealWorkStart,
+} from "./support/runProfile.ts";
 
 after(() => stopSharedOpa());
 
-const REQUESTER_A = "workflow:cadp-work";
-const REQUESTER_B = "workflow:cadp-work-b";
-const PRINCIPAL_B: Principal = { principal: "cadp-workflow-b" };
-const IDENTITY_B = {
-  principal: "cadp-workflow-b",
-  producer_ref: REQUESTER_B,
-  identity_class: { vendor: "temporalio", product: "temporal-workflow", account: "cadp-v04", process_class: "workflow" },
-};
-
-/**
- * WP §3.6's wire shape as bundle data: exactly `{schema, origin_key, purpose}`, `origin_key` the
- * single non-reserved field with role ENTROPY and value contract NONEMPTY_STRING. The Kernel holds
- * no canonical copy of this — it is the schema owner's, carried by the bundle (AP B2(2)(i)).
- */
-const RUN_ORIGIN_DESCRIPTOR = {
-  schema: RUN_ORIGIN_ALLOCATION_SCHEMA,
-  fields: [{ field: "origin_key", role: "ENTROPY", value_contract: "NONEMPTY_STRING" }],
-};
-
-/** `binding_projection: []` (nothing is PROJECTED) and the one fixed `work-start`↔`WORK_START` pair. */
-const RUN_ORIGIN_MAPPING = {
-  schema: RUN_ORIGIN_ALLOCATION_SCHEMA,
-  binding_projection: [] as ReadonlyArray<{ tuple_field: string; authority_ref: string; namespace: string }>,
-  purpose_relation: [{ purpose: "work-start", operation_kind: "WORK_START" }],
-};
-
-const WORK_RUN_AUTHORITY = "cadp-store:k04";
-
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
-}
-
-/** A `WORK_START`-capable target, so an origin can be admitted and dispatched through the real PEP. */
-class WorkStartTarget implements TargetAdapterV1 {
-  readonly target_type = "WORKFLOW";
-
-  readonly authority_ref = "temporal:cadp-v04";
-
-  onDispatch: ((effect_id: string, ordinal: number) => DispatchResult) | undefined;
-
-  describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
-    return {
-      target_type: this.target_type,
-      authority_ref: this.authority_ref,
-      operations: [
-        {
-          operation_kind: "WORK_START", material_schema: "cadp.work-start.v1", available: true,
-          idempotency: "NONE", dispatch_precondition: "NONE", reconcile: "BY_QUERY_PREDICATE",
-          no_effect_proof_supported: true,
-        },
-      ],
-    };
-  }
-
-  serialization_domain(): string {
-    return "work-start-domain";
-  }
-
-  async prove_identity(): Promise<TargetIdentityClaim> {
-    return { target_ref: this.targetRef(), claim: { namespace: "cadp-v04" } };
-  }
-
-  async current_revision(subject: SubjectBinding): Promise<RevisionRead> {
-    return { revision_or_version: subject.revision_or_version, availability: "PRESENT" };
-  }
-
-  async verify_material(): Promise<void> {}
-
-  async dispatch_precondition_read(): Promise<string | undefined> {
-    return undefined;
-  }
-
-  async dispatch(effect_id: string, ordinal: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<DispatchResult> {
-    return this.onDispatch?.(effect_id, ordinal) ?? {
-      kind: "ACCEPTED",
-      target_operation_ref: `wf-${effect_id}-${ordinal}`,
-      receipt_claim: { workflow_id: material["workflow_id"], started: true },
-    };
-  }
-
-  async reconcile(effect_id: string, _o: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<ReconcileResult> {
-    return { kind: "COMMITTED", target_operation_ref: `wf-${effect_id}`, receipt_claim: { workflow_id: material["workflow_id"], started: true } };
-  }
-
-  receipt_binds(_op: string, material: Record<string, unknown>, receipt: Record<string, unknown>): boolean {
-    return receipt["workflow_id"] === material["workflow_id"];
-  }
-
-  targetRef(): TargetRef {
-    return { authority_ref: this.authority_ref, target_type: this.target_type, target_id: "cadp-v04" };
-  }
-}
-
-/** The v2 config this lane needs: the run-origin contract registered, requester A enrolled. */
-function runProfileConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return v2ConfigOverrides({
-    allocation_schema_descriptors: [...V2_ALLOCATION_SCHEMA_DESCRIPTORS, RUN_ORIGIN_DESCRIPTOR],
-    allocation_schemas: [...V2_ALLOCATION_SCHEMAS, RUN_ORIGIN_MAPPING],
-    run_profile_enrolled_requester_refs: [REQUESTER_A],
-    ...overrides,
-  });
-}
-
-interface RunProfileHarness {
-  h: Harness;
-  target: WorkStartTarget;
-}
-
-async function runProfileHarness(
-  configOverrides: Record<string, unknown> = runProfileConfig(),
-  disabledChecks?: ReadonlySet<string>,
-): Promise<RunProfileHarness> {
-  const target = new WorkStartTarget();
-  const h = await makeHarness({
-    identityRegistry: [...REFERENCE_IDENTITIES, IDENTITY_B],
-    extraAdapters: [target],
-    configOverrides: configOverrides as never,
-    ...(disabledChecks === undefined ? {} : { disabledChecks }),
-  });
-  h.sealReach();
-  await h.sealTargetIdentity();
-  await h.pep.refreshTargetIdentity(target);
-  return { h, target };
-}
-
-let originCounter = 0;
-
-/** Allocate under `run-origin.v1` and seal the `WORK_START` it names, self-bound unless told otherwise. */
-function sealWorkStart(
-  rp: RunProfileHarness,
-  options: {
-    origin_key?: string;
-    principal?: Principal;
-    requester_ref?: string;
-    /** The `work-run` binding's `object_id`; defaults to the request's OWN effect_id (leg 3). */
-    work_run_ref?: string;
-    authority_ref?: string;
-  } = {},
-): { effect_id: string; tuple: Record<string, unknown> } {
-  const { h, target } = rp;
-  const principal = options.principal ?? PRINCIPALS.workflow;
-  const tuple = {
-    schema: RUN_ORIGIN_ALLOCATION_SCHEMA,
-    origin_key: options.origin_key ?? `origin-${(originCounter += 1)}`,
-    purpose: "work-start",
-  };
-  const effect_id = h.ingress.allocateEffectId(tuple, principal);
-  const material = {
-    workflow_id: `cadp-work-${effect_id}`,
-    workflow_type: "cadpWork",
-    task_queue: "cadp-worker",
-    bounds: { max_steps: 8, max_effects: 6 },
-  };
-  h.ingress.sealEffectRequest(
-    {
-      effect_id,
-      requester_ref: options.requester_ref ?? REQUESTER_A,
-      work_bindings: [{
-        authority_ref: options.authority_ref ?? WORK_RUN_AUTHORITY,
-        namespace: "work-run",
-        object_id: options.work_run_ref ?? effect_id,
-      }],
-      target_ref: target.targetRef(),
-      operation_kind: "WORK_START",
-      material_schema: "cadp.work-start.v1",
-      material_ref: h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8")),
-      prior_effect_refs: [],
-      allocation_tuple: tuple,
-    },
-    principal,
-  );
-  return { effect_id, tuple };
-}
-
-/** assemble → evaluate → admit, with the caller the dispatch equality of B5(1) is checked against. */
-async function dispatch(h: Harness, effect_id: string, caller?: Principal) {
-  const input = h.ingress.assembleAdmissionInput(effect_id, []);
-  const evaluated = await h.evaluate(input.input_digest.value);
-  assert.equal(evaluated.kind, "DECISION", `expected a decision for ${effect_id}`);
-  const decision = (evaluated as { decision: { decision_id: string; outcome: string } }).decision;
-  assert.equal(decision.outcome, "ALLOW", `expected ALLOW for ${effect_id}`);
-  return h.pep.admitAndDispatch(effect_id, decision.decision_id, caller);
-}
-
-function count(h: Harness, table: string): number {
-  return (h.store.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 }
 
 function refuseConfig(
@@ -395,11 +212,17 @@ test("A5 o-iv: a change to EITHER run-origin entry, or removal of either, is ref
 });
 
 test("A5 o-iv end to end: the immutability refusal happens at recheck #17; active policy unchanged", async () => {
-  const { h } = await runProfileHarness();
+  const rp = await runProfileHarness();
+  const { h } = rp;
   try {
+    // The bundle enrols the activating `requester_ref`, so its `POLICY_ACTIVATE` is a run-bound
+    // request like any other and presents a capability for a real, COMMITTED run (B5(3)/B5(4)).
+    const run = await originRun(rp, "origin-activation-scope");
     const before = h.store.activeActivation()!.seq;
     const refused = await h.activatePolicy({
       revision: 2,
+      workRunRef: run.effect_id,
+      runCapability: run.capability,
       configOverrides: runProfileConfig({
         allocation_schemas: [...V2_ALLOCATION_SCHEMAS, { ...clone(RUN_ORIGIN_MAPPING), purpose_relation: [{ purpose: "work-start", operation_kind: "SCRIPTED_WRITE" }] }],
       }) as never,
@@ -414,6 +237,8 @@ test("A5 o-iv end to end: the immutability refusal happens at recheck #17; activ
     // carrying an unrelated registry change, ACTIVATES.
     const activated = await h.activatePolicy({
       revision: 3,
+      workRunRef: run.effect_id,
+      runCapability: run.capability,
       configOverrides: runProfileConfig({ identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
         principal: "cadp-workflow-c",
         producer_ref: "workflow:cadp-work-c",
@@ -428,14 +253,19 @@ test("A5 o-iv end to end: the immutability refusal happens at recheck #17; activ
 });
 
 test("A5 o-ii: one origin_key derives ONE effect_id across an unrelated POLICY_ACTIVATE", async () => {
-  const { h } = await runProfileHarness();
+  const rp = await runProfileHarness();
+  const { h } = rp;
   try {
     const tuple = { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key: "origin-stable", purpose: "work-start" };
     const first = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
     assert.equal(h.ingress.allocateEffectId({ ...tuple }, PRINCIPALS.workflow), first, "a retry converges");
 
+    // The activating requester is enrolled, so the activation runs inside a real run (B5(3)/B5(4)).
+    const run = await originRun(rp, "origin-activation-scope");
     const activated = await h.activatePolicy({
       revision: 2,
+      workRunRef: run.effect_id,
+      runCapability: run.capability,
       configOverrides: runProfileConfig({ identity_registry: [...REFERENCE_IDENTITIES, IDENTITY_B, {
         principal: "cadp-workflow-c",
         producer_ref: "workflow:cadp-work-c",
@@ -447,9 +277,11 @@ test("A5 o-ii: one origin_key derives ONE effect_id across an unrelated POLICY_A
     // Asserted with NO allocation-contract qualifier: this schema's contract CANNOT have changed,
     // so the key derived under the new bundle is the same key (B1(5), WP control 13).
     assert.equal(h.ingress.allocateEffectId({ ...tuple }, PRINCIPALS.workflow), first, "the same origin, across an activation");
+    // Scoped to THIS origin's identity: the run the activation had to be sealed inside is a second
+    // logical origin with its own row, and the claim under test is one row PER logical origin.
     const rows = (h.store.db.prepare(
-      "SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?",
-    ).get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n;
+      "SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ? AND effect_id = ?",
+    ).get(RUN_ORIGIN_ALLOCATION_SCHEMA, first) as { n: number }).n;
     assert.equal(rows, 1, "one logical origin, one allocation row");
 
     // The distinctness leg: a DIFFERENT origin_key is a different logical origin, hence a different
@@ -514,10 +346,14 @@ test("A4 o2: a WORK_START binding ANOTHER run is REFUSED RUN_CAPABILITY_INVALID,
       (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
     );
     // And an OFF-AUTHORITY self-binding is not a kernel work-run subject at all (B3(4)(a)): leg 2
-    // matches the DECLARED exact pair, so this fails adjudication rather than satisfying it.
+    // matches the DECLARED exact pair, so this fails adjudication rather than satisfying it. It is
+    // leg 2's "none" case, which B5(3) refuses `RUN_BINDING_REQUIRED` BEFORE the adjudication runs
+    // — the exact re-staging PART 1 recorded as owed here (TD line 166: "its 'none' case
+    // `RUN_BINDING_REQUIRED` by (3)"), replacing the less exact code PART 1 had to use while B5(3)
+    // did not yet exist. Still fail-closed, still never a fall-through: the request seals nothing.
     assert.throws(
       () => sealWorkStart(rp, { origin_key: "origin-fourth", authority_ref: "other" }),
-      (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
+      (error: unknown) => (error as IngressRejection).reason === "RUN_BINDING_REQUIRED",
     );
     assert.equal(count(rp.h, "effect_request"), requestsBefore);
     assert.equal(count(rp.h, "run_membership"), membershipBefore);

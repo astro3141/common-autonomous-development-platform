@@ -246,7 +246,14 @@ export interface Harness {
   sealReach(alternate?: boolean): void;
   sealTargetIdentity(): Promise<void>;
   humanApprove(effect_id: string): EvidenceEnvelopeV1;
-  activatePolicy(input: { revision: number; paramOverrides?: Record<string, unknown>; configOverrides?: ReferencePolicyInput["configOverrides"]; rego?: string; expectedSeqOverride?: number }): Promise<{ admitted: unknown; bundle: Uint8Array; effect_id: string }>;
+  /**
+   * `workRunRef`/`runCapability` exist for AP B5's run profile: once a bundle enrols the sealing
+   * `requester_ref`, EVERY run-bound request of that requester — a `POLICY_ACTIVATE` included — must
+   * present a capability for the run it names (B5(4)), so a test running under an enrolled bundle
+   * activates INSIDE a real run rather than against the placeholder work run. Both are optional and
+   * every existing caller is unchanged.
+   */
+  activatePolicy(input: { revision: number; paramOverrides?: Record<string, unknown>; configOverrides?: ReferencePolicyInput["configOverrides"]; rego?: string; expectedSeqOverride?: number; workRunRef?: string; runCapability?: string }): Promise<{ admitted: unknown; bundle: Uint8Array; effect_id: string }>;
   close(): void;
 }
 
@@ -395,7 +402,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
       const material_ref = ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
       const allocation_tuple = {
         schema: "cadp.allocation-key.v1",
-        work_run_ref: DEFAULT_WORK_RUN_REF,
+        work_run_ref: input.workRunRef ?? DEFAULT_WORK_RUN_REF,
         step_ordinal: (allocationCounter += 1),
         purpose: "policy-activate",
       };
@@ -408,7 +415,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
         {
           effect_id,
           requester_ref: "workflow:cadp-work",
-          work_bindings: v2 ? [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: DEFAULT_WORK_RUN_REF }] : [],
+          work_bindings: v2 ? [{ authority_ref: "cadp-store:k04", namespace: "work-run", object_id: allocation_tuple.work_run_ref }] : [],
           target_ref: { authority_ref: "cadp-store:k04", target_type: "POLICY_ACTIVATION", target_id: "k04" },
           operation_kind: "POLICY_ACTIVATE",
           material_schema: "cadp.policy-activate.v1",
@@ -417,6 +424,9 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
           ...(v2 ? { allocation_tuple } : {}),
         },
         PRINCIPALS.workflow,
+        // AP B6(3): transport, never a body member — the harness hands it in exactly as `api.ts`
+        // hands in the `x-cadp-run-capability` header.
+        input.runCapability === undefined ? {} : { run_capability: input.runCapability },
       );
       const human = harness.humanApprove(effect_id);
       const inputRec = ingress.assembleAdmissionInput(effect_id, [human.evidence_id]);

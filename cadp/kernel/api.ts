@@ -11,7 +11,7 @@ import * as http from "node:http";
 import { Cas } from "./cas.ts";
 import { evaluateAndSeal } from "./evaluator.ts";
 import type { EvaluatorPort } from "./evaluator.ts";
-import { Ingress, IngressRejection } from "./ingress.ts";
+import { Ingress, IngressRejection, RUN_CAPABILITY_HEADER } from "./ingress.ts";
 import type { AllocationTuple, EvidenceDraft, SealRequestBody } from "./ingress.ts";
 import { Pep } from "./pep.ts";
 import { Reconciler } from "./reconciler.ts";
@@ -119,8 +119,21 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
       case "seal_effect_request": {
         // AP B6(1): `allocation_tuple` rides as one optional top-level sibling of the draft keys;
         // the Ingress strips it, so it never reaches `EffectRequestV1` or `request_digest`.
+        //
+        // AP B6(3): the run capability rides as the `x-cadp-run-capability` HEADER — never a body
+        // field, never a draft field, never a record field, never a subject binding. It is read
+        // here and handed to the Ingress as transport METADATA, a separate argument from the body,
+        // so no parse path can turn it into a draft key. A repeated header arrives as an array and
+        // is not one exact presented value: it is dropped, and the Ingress refuses the seal
+        // `RUN_CAPABILITY_REQUIRED` rather than picking one of them. Nothing on this path writes
+        // the value anywhere — not to a log, not into the 422 body below, whose `detail` is the
+        // refusal's own message and never the presented secret.
         const body = JSON.parse(raw.toString("utf8")) as SealRequestBody;
-        return send(200, deps.ingress.sealEffectRequest(body, { principal }));
+        const presented = req.headers[RUN_CAPABILITY_HEADER];
+        return send(
+          200,
+          deps.ingress.sealEffectRequest(body, { principal }, typeof presented === "string" ? { run_capability: presented } : {}),
+        );
       }
       case "submit_evidence": {
         const draft = JSON.parse(raw.toString("utf8")) as EvidenceDraft;
