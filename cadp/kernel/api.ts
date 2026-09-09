@@ -11,8 +11,8 @@ import * as http from "node:http";
 import { Cas } from "./cas.ts";
 import { evaluateAndSeal } from "./evaluator.ts";
 import type { EvaluatorPort } from "./evaluator.ts";
-import { Ingress, IngressRejection } from "./ingress.ts";
-import type { AllocationTuple, EvidenceDraft, SealRequestBody } from "./ingress.ts";
+import { Ingress, IngressRejection, RUN_CAPABILITY_HEADER } from "./ingress.ts";
+import type { AllocationTuple, EvidenceDraft, RequestMetadata, SealRequestBody } from "./ingress.ts";
 import { Pep } from "./pep.ts";
 import { Reconciler } from "./reconciler.ts";
 import { executeRootOperation, RootRejection } from "./rootListener.ts";
@@ -56,6 +56,31 @@ const METHOD_REACH: Record<string, readonly ProcessClass[]> = {
   get_evidence: ["workflow", "evidence-adapter", "deployment-control", "human-surface", "observer"],
   list_evidence: ["workflow", "deployment-control", "observer"],
 };
+
+/**
+ * AP B6(3) — the run capability's ONLY entry point into the Platform, and the whole of what this
+ * layer does with it: lift the header off the request and hand it across as request METADATA.
+ *
+ * It is read from `req.headers`, NEVER merged into the parsed body, so it cannot become a
+ * `RequestDraft` key, an `EffectRequestV1` field, a `SubjectBinding`, or a member of any digest
+ * preimage — the same structural guarantee B6(1) gives `allocation_tuple`, one step stronger,
+ * because this value never touches the body object at all. It is likewise never logged, never put
+ * in a response, and never echoed in an error: the catch arm below sends `error.reason` and
+ * `error.message` from an `IngressRejection`, and no refusal on this path ever names the value
+ * (B6(3)'s logging prohibition; the Ingress parser is written to that rule).
+ *
+ * DUPLICATE HEADERS. `node:http` returns `string | string[] | undefined` here. A repeated header is
+ * a PRESENTATION — the caller sent one — so it is normalised into a single string and handed on
+ * rather than dropped or silently first-wins'd: the joined value fails the Ingress parser's exact
+ * 43-character test and is refused `RUN_CAPABILITY_INVALID`, which is the fail-closed reading. The
+ * alternative, picking one element, would let a caller smuggle a valid value past a proxy that
+ * appended another.
+ */
+function requestMetadata(req: http.IncomingMessage): RequestMetadata {
+  const header = req.headers[RUN_CAPABILITY_HEADER];
+  const presented = Array.isArray(header) ? header.join(",") : header;
+  return presented === undefined ? {} : { run_capability: presented };
+}
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -119,8 +144,12 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
       case "seal_effect_request": {
         // AP B6(1): `allocation_tuple` rides as one optional top-level sibling of the draft keys;
         // the Ingress strips it, so it never reaches `EffectRequestV1` or `request_digest`.
+        // AP B6(3): the run capability rides on `x-cadp-run-capability` and is passed as request
+        // metadata — a third parameter, outside the body entirely, so it is not even a key the
+        // Ingress must strip. The result sent below is the sealed `EffectRequestV1`, which carries
+        // no field derived from it.
         const body = JSON.parse(raw.toString("utf8")) as SealRequestBody;
-        return send(200, deps.ingress.sealEffectRequest(body, { principal }));
+        return send(200, deps.ingress.sealEffectRequest(body, { principal }, requestMetadata(req)));
       }
       case "submit_evidence": {
         const draft = JSON.parse(raw.toString("utf8")) as EvidenceDraft;

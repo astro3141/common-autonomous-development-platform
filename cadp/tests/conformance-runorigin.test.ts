@@ -1,22 +1,30 @@
 /**
- * AP B1(5)/B2(2)(ii)/B5 part 1 — the ALLOCATION, CONFIG, STORAGE and MINTING half of the
- * run-capability mechanism: the `cadp.allocation-key.run-origin.v1` contract and its lifetime
- * immutability, the seal-time `is_run_origin` adjudication (ORIGIN-OR-REFUSED) and its durable
- * `run_membership(E, E)` witness, and the WITNESSED mint delivered exactly once at the verified
- * initial `admit_and_dispatch`.
+ * AP B1(5)/B2(2)(ii)/B5 — the run-capability mechanism.
+ *
+ * PART 1, the ALLOCATION, CONFIG, STORAGE and MINTING half: the
+ * `cadp.allocation-key.run-origin.v1` contract and its lifetime immutability, the seal-time
+ * `is_run_origin` adjudication (ORIGIN-OR-REFUSED) and its durable `run_membership(E, E)` witness,
+ * and the WITNESSED mint delivered exactly once at the verified initial `admit_and_dispatch`.
+ *
+ * PART 2, B5(3)-(4)/B6(3), the last section of this file: the request-metadata PLUMBING of the
+ * `x-cadp-run-capability` header from `api.ts` to the seal, and the STRICT PARSER every
+ * presentation is read through before its digest is compared. The reason code governed there is
+ * `RUN_CAPABILITY_INVALID` alone. B5(4)'s other presentation codes —
+ * `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`,
+ * `RUN_CAPABILITY_REQUIRED` — with B5(3)'s `RUN_BINDING_REQUIRED` and recheck #19's
+ * `RUN_MEMBERSHIP_UNPROVEN`, are later lanes and are asserted nowhere here; each of them NARROWS
+ * what seals, so nothing asserted below starts sealing when they land.
  *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
- * legs o1/o2 and the dispatch-requester equality) and A5 (one `origin_key` → one `effect_id` for
- * the store's lifetime, and the o-iv/o-vi immutability legs). The capability-PRESENTATION half of
- * A4 — `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`,
- * `RUN_CAPABILITY_REQUIRED`, the `x-cadp-run-capability` header and recheck #19 — is a later lane
- * and is asserted nowhere here.
+ * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
+ * `origin_key` → one `effect_id` for the store's lifetime, and the o-iv/o-vi immutability legs).
  *
- * Every rule below is gated on the active config's schema string and, for the seal adjudication,
- * on `run_profile_enrolled_requester_refs` membership. The last two tests are the complementary
- * claims: a NON-ENROLLED requester's ordinary `WORK_START` (B5(1)(α), control A4 leg w1) and a
- * whole `cadp.kernel-config.v1` deployment are untouched — they seal, dispatch, acquire no
- * witness, and mint nothing.
+ * Every rule below is gated on the active config's schema string and, for the seal adjudication
+ * and the presentation legs, on `run_profile_enrolled_requester_refs` membership plus the declared
+ * `kernel_subject_namespaces` work-run pair. The complementary claims are asserted throughout: a
+ * NON-ENROLLED requester's ordinary `WORK_START` (B5(1)(α), control A4 leg w1) and a whole
+ * `cadp.kernel-config.v1` deployment are untouched — they seal, dispatch, acquire no witness, mint
+ * nothing, and treat the header as the inert transport it is under v0.4.
  */
 
 import assert from "node:assert/strict";
@@ -24,8 +32,10 @@ import { createHash } from "node:crypto";
 import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
-import { IngressRejection } from "../kernel/ingress.ts";
+import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
+import { recordDigest } from "../kernel/canonical.ts";
+import type { EffectRequestV1 } from "../kernel/records.ts";
 import { RUN_ORIGIN_ALLOCATION_SCHEMA, KernelConfigInvalid, validateKernelConfig } from "../kernel/policyBundle.ts";
 import type { ActivatedAllocationContracts } from "../kernel/policyBundle.ts";
 import type { AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim } from "../kernel/adapters/types.ts";
@@ -66,6 +76,44 @@ const RUN_ORIGIN_MAPPING = {
 };
 
 const WORK_RUN_AUTHORITY = "cadp-store:k04";
+
+/**
+ * B6(3)'s base64url alphabet, in index order — the one place this file spells it out, so the
+ * non-canonical variant below is derived from the encoding's own definition rather than hand-typed.
+ */
+const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/**
+ * A DETERMINISTIC 32-byte capability, as `Buffer.from(hex)` — no raw control-byte literals and no
+ * dependence on what a CSPRNG happened to produce. Chosen so its canonical text carries BOTH `-`
+ * and `_`, which is what makes the standard-alphabet variant a real variant: a secret whose
+ * base64url text used neither would encode identically under both alphabets and would prove
+ * nothing. The minted-secret path is exercised on its own alongside it.
+ */
+const CAPABILITY_FIXTURE_HEX = "1ecb6d0bbfa9dce864bd8fd43a63c22c26a75b47b360d854e83f8ad1d20c87d4";
+
+/**
+ * The four NON-CANONICAL presentations of one secret that B6(3) must refuse, each built from the
+ * canonical text so the claim "same secret, different string" is structural. `decodes` records what
+ * a PERMISSIVE `Buffer.from(value, "base64url")` yields, and every one of them recovers the
+ * original 32 bytes — which is the whole point: the parser must refuse them anyway, because
+ * `capability_digest` has ONE preimage (B5(1)) and therefore its presentation must have ONE string.
+ */
+function nonCanonicalPresentations(canonical: string): ReadonlyArray<{ note: string; value: string; decodes: "EXACT" | "PREFIX" }> {
+  const last = BASE64URL_ALPHABET.indexOf(canonical[42]!);
+  return [
+    // `=` padding: what a padded base64url encoder emits for 32 bytes. 44 characters.
+    { note: "padded", value: `${canonical}=`, decodes: "EXACT" },
+    // The STANDARD alphabet: the same 6-bit values spelled `+`/`/` instead of `-`/`_`.
+    { note: "standard-alphabet", value: canonical.replace(/-/gu, "+").replace(/_/gu, "/"), decodes: "EXACT" },
+    // 44 characters over the exact alphabet: 33 bytes, whose first 32 are the secret.
+    { note: "44-character", value: `${canonical}A`, decodes: "PREFIX" },
+    // NON-CANONICAL TRAILING BITS: 43 × 6 = 258 bits carry 256 of secret, so the final character
+    // has 2 unused low bits. The canonical encoder zeroes them; the next three alphabet indices
+    // decode to the identical 32 bytes. This is the leg a length-and-alphabet test cannot catch.
+    { note: "non-canonical-trailing-bits", value: `${canonical.slice(0, 42)}${BASE64URL_ALPHABET[last + 1]!}`, decodes: "EXACT" },
+  ];
+}
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -211,6 +259,46 @@ function sealWorkStart(
     principal,
   );
   return { effect_id, tuple };
+}
+
+let memberCounter = 0;
+
+/**
+ * An ordinary run-bound MEMBER request: a non-`WORK_START` operation bound to an existing run, so
+ * it is exactly B5(4)'s scope ("every run-bound request EXCEPT a run origin") rather than B5(9)'s.
+ * `capability` is presented as REQUEST METADATA, the third parameter — never inside the body.
+ */
+function sealMember(
+  rp: RunProfileHarness,
+  options: { work_run_ref: string; capability?: string },
+): { effect_id: string; request: EffectRequestV1 } {
+  const { h } = rp;
+  const tuple = {
+    schema: "cadp.allocation-key.v1",
+    work_run_ref: options.work_run_ref,
+    step_ordinal: (memberCounter += 1),
+    purpose: "record-write",
+  };
+  const effect_id = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
+  // Deliberately free of any effect-specific member, so two members of the same run seal over
+  // BYTE-IDENTICAL material and therefore over one CAS key and one `material_digest`.
+  const material = { tenant: "scripted-1", resource_id: "r-1" };
+  const request = h.ingress.sealEffectRequest(
+    {
+      effect_id,
+      requester_ref: REQUESTER_A,
+      work_bindings: [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: options.work_run_ref }],
+      target_ref: h.target.targetRef(),
+      operation_kind: "SCRIPTED_WRITE",
+      material_schema: "test.scripted-write.v1",
+      material_ref: h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8")),
+      prior_effect_refs: [],
+      allocation_tuple: tuple,
+    },
+    PRINCIPALS.workflow,
+    options.capability === undefined ? {} : { run_capability: options.capability },
+  );
+  return { effect_id, request };
 }
 
 /** assemble → evaluate → admit, with the caller the dispatch equality of B5(1) is checked against. */
@@ -828,6 +916,275 @@ test("v1 config: the seal and dispatch paths are byte-identical — no adjudicat
     const admitted = await h.pep.admitAndDispatch(effect_id, (evaluated as { decision: { decision_id: string } }).decision.decision_id);
     assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
     assert.equal((admitted as { run_capability?: string }).run_capability, undefined);
+    assert.equal(count(h, "run_capability"), 0);
+    assert.equal(count(h, "run_membership"), 0);
+  } finally {
+    h.close();
+  }
+});
+
+// ================================================ B5(3)-(4)/B6(3) — plumbing and the strict parser
+
+test("B6(3): every non-canonical presentation of a VALID secret is refused RUN_CAPABILITY_INVALID", async () => {
+  const rp = await runProfileHarness();
+  try {
+    // R1: a genuine origin whose capability is genuinely MINTED at its own verified initial
+    // dispatch. Its canonical text is what B5(1) actually delivers, so accepting it is the control
+    // that the parser below is calibrated to the mint and not to a fixture's private convention.
+    const { effect_id: r1 } = sealWorkStart(rp, { origin_key: "origin-parser-minted" });
+    const admitted = await dispatch(rp.h, r1, PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    const minted = (admitted as { run_capability: string }).run_capability;
+    assert.match(minted, /^[A-Za-z0-9_-]{43}$/u);
+    const mintedMember = sealMember(rp, { work_run_ref: r1, capability: minted });
+    assert.equal(
+      rp.h.store.effectRequest(mintedMember.effect_id)?.effect_id, mintedMember.effect_id,
+      "the canonical text of a genuinely minted capability SEALS a member request",
+    );
+
+    // R2: a second genuine origin, whose mint is stood in for by a DETERMINISTIC fixture written
+    // through the store's own `insertRunCapability` — the exact row shape and the exact digest rule
+    // the PEP writes (SHA-256 over the RAW bytes) — so the four encodings below are decidable
+    // rather than dependent on which bytes a CSPRNG produced.
+    const { effect_id: r2 } = sealWorkStart(rp, { origin_key: "origin-parser-fixture" });
+    const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+    assert.equal(raw.length, 32, "256 bits");
+    const canonical = raw.toString("base64url");
+    rp.h.store.insertRunCapability({
+      work_run_ref: r2,
+      holder_ref: REQUESTER_A,
+      capability_digest: createHash("sha256").update(raw).digest("hex"),
+      minted_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    const requestsBefore = count(rp.h, "effect_request");
+    for (const { note, value, decodes } of nonCanonicalPresentations(canonical)) {
+      // The premise, asserted rather than assumed: a PERMISSIVE decode of this string recovers the
+      // very bytes the stored `capability_digest` was taken over. So the refusal below cannot be
+      // attributed to a byte mismatch — it is the encoding, and only the encoding, being refused.
+      const permissive = Buffer.from(value, "base64url");
+      const recovered = decodes === "EXACT" ? permissive : permissive.subarray(0, 32);
+      assert.ok(recovered.equals(raw), `${note}: the premise — permissive decoding yields the secret's bytes`);
+      assert.notEqual(value, canonical, `${note}: a genuinely different string`);
+
+      assert.throws(
+        () => sealMember(rp, { work_run_ref: r2, capability: value }),
+        (error: unknown) => {
+          assert.ok(error instanceof IngressRejection, `${note}: ${String(error)}`);
+          assert.equal(error.reason, "RUN_CAPABILITY_INVALID", note);
+          // B6(3)'s logging prohibition, on the noisiest surface a refusal has: neither the
+          // presented string, nor the canonical one, nor any prefix of either, reaches the message
+          // or the stack — a refusal names the reason code and nothing derived from the secret.
+          for (const secret of [value, canonical, raw.toString("hex"), raw.toString("base64")]) {
+            assert.equal(error.message.includes(secret), false, `${note}: the message names the secret`);
+            assert.equal(error.stack?.includes(secret) ?? false, false, `${note}: the stack names the secret`);
+            assert.equal(error.message.includes(secret.slice(0, 8)), false, `${note}: the message leaks a prefix`);
+          }
+          return true;
+        },
+        `${note}: expected RUN_CAPABILITY_INVALID`,
+      );
+      // Pre-K3, like every other seal-time refusal: no `effect_request` row and no membership proof.
+      assert.equal(count(rp.h, "effect_request"), requestsBefore, `${note}: zero effect_request rows`);
+      assert.equal(rp.h.store.runMembership(r2)?.work_run_ref, r2, `${note}: R2's own witness is unmoved`);
+    }
+
+    // The positive control that attributes all four refusals to the ENCODING and to nothing else:
+    // the canonical spelling of the identical bytes, against the identical row, SEALS.
+    const member = sealMember(rp, { work_run_ref: r2, capability: canonical });
+    assert.equal(rp.h.store.effectRequest(member.effect_id)?.effect_id, member.effect_id);
+    assert.equal(count(rp.h, "effect_request"), requestsBefore + 1, "exactly one of the five presentations sealed");
+
+    // And a well-formed capability that is simply not this run's is the OTHER RUN_CAPABILITY_INVALID
+    // leg — including the no-row case, R1's capability being bound to R1 alone (B5(4)).
+    assert.throws(
+      () => sealMember(rp, { work_run_ref: r2, capability: minted }),
+      (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
+      "R1's valid capability does not satisfy an R2-bound request",
+    );
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B6(3): two seals differing ONLY in the header have identical request and material digests", async () => {
+  const rp = await runProfileHarness();
+  try {
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-digest-invariance" });
+    const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+    const canonical = raw.toString("base64url");
+    rp.h.store.insertRunCapability({
+      work_run_ref: run,
+      holder_ref: REQUESTER_A,
+      capability_digest: createHash("sha256").update(raw).digest("hex"),
+      minted_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    // Two member requests of the same run over byte-identical material and byte-identical work
+    // bindings. One presents the capability; the other presents NOTHING. Nothing else differs but
+    // the two values no two sealed records can ever share: the effect identity and the seal instant.
+    const withHeader = sealMember(rp, { work_run_ref: run, capability: canonical }).request;
+    const withoutHeader = sealMember(rp, { work_run_ref: run }).request;
+
+    // MATERIAL DIGEST: identical outright. The header is not in the material, and the seal did not
+    // fold it in — which is the claim B6(3) makes about effect material specifically.
+    assert.equal(withHeader.material_ref, withoutHeader.material_ref, "one CAS object");
+    assert.deepEqual(withHeader.material_digest, withoutHeader.material_digest);
+
+    // REQUEST DIGEST: substitute the two unavoidably-differing fields and the digests must become
+    // IDENTICAL. This is the exact statement of "otherwise identical seals" — anything the header
+    // contributed to the preimage, whether as a record field or as a hidden member, survives the
+    // substitution and breaks the equality.
+    const normalised = { ...withoutHeader, effect_id: withHeader.effect_id, requested_at: withHeader.requested_at };
+    assert.deepEqual(
+      recordDigest(normalised as unknown as Record<string, unknown>, "request_digest"),
+      withHeader.request_digest,
+      "the presented header contributes nothing to request_digest",
+    );
+    // ...and each record's published digest is a function of its own published fields, so the
+    // preimage holds no member the record does not show.
+    assert.deepEqual(recordDigest(withHeader as unknown as Record<string, unknown>, "request_digest"), withHeader.request_digest);
+
+    // The record's KEY SET is unchanged: the header is not a `RequestDraft` key, an
+    // `EffectRequestV1` field, or a `SubjectBinding` (B6(3)).
+    assert.deepEqual(Object.keys(withHeader).sort(), Object.keys(withoutHeader).sort());
+    assert.equal(Object.keys(withHeader).some((key) => key.toLowerCase().includes("capability")), false);
+    assert.deepEqual(withHeader.work_bindings, withoutHeader.work_bindings);
+
+    // And it is durable NOWHERE: swept over every table, in every encoding, exactly as the minted
+    // secret is swept for by the delivery test above.
+    const tables = (rp.h.store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name);
+    for (const table of tables) {
+      const dump = JSON.stringify(rp.h.store.db.prepare(`SELECT * FROM ${table}`).all());
+      for (const needle of [canonical, raw.toString("hex"), raw.toString("base64")]) {
+        assert.equal(dump.includes(needle), false, `${table} holds the presented secret`);
+      }
+    }
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B6(3) over the wire: the header reaches the seal, and its refusal returns a reason code only", async () => {
+  const rp = await runProfileHarness();
+  try {
+    const tokens = new Map<string, string>([["tok-a", "cadp-workflow"]]);
+    const api = await startKernelApi(
+      { store: rp.h.store, cas: rp.h.cas, ingress: rp.h.ingress, pep: rp.h.pep, reconciler: rp.h.reconciler, evaluator: rp.h.evaluator, tokens },
+      0,
+    );
+    try {
+      const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-wire" });
+      const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+      const canonical = raw.toString("base64url");
+      rp.h.store.insertRunCapability({
+        work_run_ref: run,
+        holder_ref: REQUESTER_A,
+        capability_digest: createHash("sha256").update(raw).digest("hex"),
+        minted_at: "2026-01-01T00:00:00.000Z",
+      });
+
+      const seal = async (capability?: string) => {
+        const tuple = { schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: (memberCounter += 1), purpose: "record-write" };
+        const effect_id = rp.h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
+        const material_ref = rp.h.ingress.putBlob(Buffer.from(JSON.stringify({ tenant: "scripted-1", resource_id: "r-1" }), "utf8"));
+        const res = await fetch(`http://127.0.0.1:${api.port}/seal_effect_request`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer tok-a",
+            "content-type": "application/json",
+            // The capability is a HEADER. The body below is the unchanged B6(1) shape.
+            ...(capability === undefined ? {} : { [RUN_CAPABILITY_HEADER]: capability }),
+          },
+          body: JSON.stringify({
+            effect_id,
+            requester_ref: REQUESTER_A,
+            work_bindings: [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: run }],
+            target_ref: rp.h.target.targetRef(),
+            operation_kind: "SCRIPTED_WRITE",
+            material_schema: "test.scripted-write.v1",
+            material_ref,
+            prior_effect_refs: [],
+            allocation_tuple: tuple,
+          }),
+        });
+        return { status: res.status, body: (await res.json()) as Record<string, unknown>, effect_id };
+      };
+
+      // The header is genuinely PLUMBED: the same body seals or is refused according to it alone.
+      const good = await seal(canonical);
+      assert.equal(good.status, 200, JSON.stringify(good.body));
+      assert.equal(good.body["effect_id"], good.effect_id);
+      const bad = await seal(`${canonical}=`);
+      assert.equal(bad.status, 422, JSON.stringify(bad.body));
+      assert.equal(bad.body["error"], "RUN_CAPABILITY_INVALID");
+      assert.equal(rp.h.store.effectRequest(bad.effect_id), undefined, "the refused seal wrote no K3 row");
+
+      // The 200 body is the sealed record and carries no field derived from the header; the 422
+      // body names the reason code and never the presented value or any prefix of it (B6(3)).
+      for (const { body } of [good, bad]) {
+        const rendered = JSON.stringify(body);
+        for (const secret of [canonical, `${canonical}=`, raw.toString("hex"), raw.toString("base64"), canonical.slice(0, 8)]) {
+          assert.equal(rendered.includes(secret), false, `the response echoes the secret: ${rendered}`);
+        }
+      }
+    } finally {
+      api.close();
+    }
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(3)-(4) gating: outside v2-plus-enrollment the header is inert, presented or malformed", async () => {
+  const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+  const canonical = raw.toString("base64url");
+  const junk = `${canonical}=`;
+
+  // (a) v2, but the requester is NOT enrolled: the run profile is off for it, so a run-bound seal
+  // presenting a malformed capability behaves exactly as it does with no header at all.
+  const notEnrolled = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
+  try {
+    const { effect_id: run } = sealWorkStart(notEnrolled, { origin_key: "origin-unenrolled" });
+    const member = sealMember(notEnrolled, { work_run_ref: run, capability: junk });
+    assert.equal(
+      notEnrolled.h.store.effectRequest(member.effect_id)?.effect_id, member.effect_id,
+      "a non-enrolled requester's seal is not graded on the header",
+    );
+  } finally {
+    notEnrolled.h.close();
+  }
+
+  // (b) A whole `cadp.kernel-config.v1` deployment: enrollment is not even expressible, so the
+  // header is transport the seal path never reads — the v0.4 behaviour, byte for byte.
+  const h = await makeHarness({ identityRegistry: [...REFERENCE_IDENTITIES, IDENTITY_B] });
+  try {
+    const material_ref = h.ingress.putBlob(Buffer.from(JSON.stringify({ tenant: "scripted-1", resource_id: "r-1" }), "utf8"));
+    const draft = (effect_id: string) => ({
+      effect_id,
+      requester_ref: REQUESTER_A,
+      work_bindings: [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: DEFAULT_WORK_RUN_REF }],
+      target_ref: h.target.targetRef(),
+      operation_kind: "SCRIPTED_WRITE",
+      material_schema: "test.scripted-write.v1",
+      material_ref,
+      prior_effect_refs: [],
+    });
+    const bare = h.ingress.allocateEffectId(
+      { schema: "cadp.allocation-key.v1", work_run_ref: DEFAULT_WORK_RUN_REF, step_ordinal: 91, purpose: "record-write" },
+      PRINCIPALS.workflow,
+    );
+    const presented = h.ingress.allocateEffectId(
+      { schema: "cadp.allocation-key.v1", work_run_ref: DEFAULT_WORK_RUN_REF, step_ordinal: 92, purpose: "record-write" },
+      PRINCIPALS.workflow,
+    );
+    const a = h.ingress.sealEffectRequest(draft(bare), PRINCIPALS.workflow);
+    const b = h.ingress.sealEffectRequest(draft(presented), PRINCIPALS.workflow, { run_capability: junk });
+    assert.equal(h.store.effectRequest(presented)?.effect_id, presented, "v1 seals a malformed presentation exactly as before");
+    // Byte-identical: normalise the two fields no two records can share and the digests coincide.
+    const normalised = { ...b, effect_id: a.effect_id, requested_at: a.requested_at };
+    assert.deepEqual(recordDigest(normalised as unknown as Record<string, unknown>, "request_digest"), a.request_digest);
     assert.equal(count(h, "run_capability"), 0);
     assert.equal(count(h, "run_membership"), 0);
   } finally {
