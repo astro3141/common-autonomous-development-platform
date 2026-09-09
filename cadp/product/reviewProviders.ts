@@ -124,6 +124,8 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
     // Measured primary path: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. Stdout is a
     // same-shape fallback only.
     model_scan: { session_regex: '"model"\\s*:\\s*"([^"]+)"', stdout_regex: '"model"\\s*:\\s*"([^"]+)"' },
+    requested_effort: "high",
+    effort_argv: { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] },
     identity_class_product: "codex-cli",
     verdict_format: "first-line",
   },
