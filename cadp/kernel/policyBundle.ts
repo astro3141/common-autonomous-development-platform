@@ -12,7 +12,7 @@
 import { gzipSync, gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 
-import { sha256Hex } from "./canonical.ts";
+import { jcs, sha256Hex } from "./canonical.ts";
 import type { Digest } from "./canonical.ts";
 
 // ------------------------------------------------------------------ tar (ustar, minimal)
@@ -314,6 +314,32 @@ const KERNEL_WORK_RUN_NAMESPACE = "work-run";
  */
 const DEFAULT_ALLOCATION_SCHEMA = "cadp.allocation-key.v1";
 
+/**
+ * AP B1(5)/B2(2)(ii) as extended: the ONE allocation schema whose `allocation_schemas` MAPPING
+ * entry is immutable for the store's lifetime alongside its descriptor, and the only schema id
+ * this extension is claimed for. Its wire shape is the Workflow Plane's (WP §3.6) and is NOT
+ * validated here — the Kernel holds no canonical descriptor text for any schema and inventing one
+ * would re-import the field names B2(2)(iii) keeps out of kernel code. What the Kernel holds is
+ * exactly this id string, and only to decide WHICH registry entries may never change: the entry's
+ * `binding_projection` is `[]` (no projection target to repoint) and its `purpose_relation` is one
+ * fixed pair (nothing to re-pair), so it has no content whose drift a composition could legitimately
+ * want — while leaving it mutable would give its `allocation_contract_digest` a second value, which
+ * B1(2)'s key derivation would turn into a SECOND `effect_id` for one logical run origin.
+ */
+export const RUN_ORIGIN_ALLOCATION_SCHEMA = "cadp.allocation-key.run-origin.v1";
+
+/**
+ * AP B2(2)(ii): the allocation-contract entries a PRIOR activation in the sealed store carried,
+ * keyed by schema id. Supplied by the caller that has the store (`policyPublication.ts`), so this
+ * module stays free of store/CAS dependencies; absent at genesis, where by definition no prior
+ * activation exists. Values are the registry entries VERBATIM as they were sealed, compared by
+ * `cadp-jcs-1` byte identity.
+ */
+export interface ActivatedAllocationContracts {
+  readonly descriptors: ReadonlyMap<string, unknown>;
+  readonly allocation_schemas: ReadonlyMap<string, unknown>;
+}
+
 export class KernelConfigInvalid extends Error {
   /**
    * The AP refusal code for the rules that name one (`REGISTRY_DUPLICATE_KEY`,
@@ -346,10 +372,18 @@ const GOVERNED_PRODUCER_CONSTANT = "governed:reclassification";
  * Two schema strings are accepted. `cadp.kernel-config.v1` is validated by exactly the rules
  * below and by nothing else. `cadp.kernel-config.v2` (AP B3(5)) is every v1 rule PLUS the
  * v2-only key set and `validateV2Extensions` — registry uniqueness (B3(1)), closed entry keys
- * (B3(2)–(3)), descriptor/projection validation (B2(2), B2(5)) and the cross-field namespace
- * invariant (B3(4)(c)).
+ * (B3(2)–(3)), descriptor/projection validation (B2(2), B2(5)), the cross-activation allocation-
+ * contract immutability of B2(2)(ii) when the caller supplies the sealed store's prior entries,
+ * and the cross-field namespace invariant (B3(4)(c)).
+ *
+ * `prior` is the sealed store's already-activated allocation contract (B2(2)(ii)). It is optional
+ * because two of the three call sites have nothing to compare against: genesis runs against an
+ * empty `policy_activation` table, and `resolveActivePolicy` re-validates a bundle that is ALREADY
+ * active — comparing it against itself would be a no-op at best and could only ever refuse a
+ * config the store has already accepted. `POLICY_ACTIVATE` recheck #17 and the root listener's
+ * `BREAK_GLASS(ACTIVATE_POLICY)` both pass it, through `verifyProposedBundle`.
  */
-export function validateKernelConfig(dataCadp: unknown): KernelConfig {
+export function validateKernelConfig(dataCadp: unknown, prior?: ActivatedAllocationContracts): KernelConfig {
   if (typeof dataCadp !== "object" || dataCadp === null) throw new KernelConfigInvalid("data.cadp missing or not an object");
   const cfg = dataCadp as Record<string, unknown>;
   const schema = cfg["schema"];
@@ -458,7 +492,7 @@ export function validateKernelConfig(dataCadp: unknown): KernelConfig {
     }
   }
 
-  if (schema === SCHEMA_V2) validateV2Extensions(cfg);
+  if (schema === SCHEMA_V2) validateV2Extensions(cfg, prior);
 
   return cfg as unknown as KernelConfig;
 }
@@ -643,12 +677,78 @@ function assertProjectionCoverage(descriptors: readonly ParsedDescriptor[], sche
 }
 
 /**
+ * AP B2(2)(ii): CROSS-ACTIVATION IMMUTABILITY — a versioned schema id is a fixed contract for the
+ * store's lifetime. The comparison is against the SEALED STORE, not against the currently active
+ * bundle, so a contract cannot be laundered by withdrawing it in one activation and re-adding a
+ * different one in the next.
+ *
+ * Two scopes, and the difference between them is the whole of B2(2)(ii)'s extension:
+ *
+ *  - EVERY schema id any prior activation carried a DESCRIPTOR for: a descriptor carried again
+ *    under that id MUST be byte-identical (`cadp-jcs-1`) to the sealed one. A different wire shape
+ *    therefore requires a different schema id — a version bump, visible in every tuple, every
+ *    allocation row and every conformance report. Withdrawal is NOT refused here: B2(8) lists the
+ *    code as covering "a descriptor for a `schema` id any prior activation already carried, not
+ *    byte-identical to it", and a withdrawn descriptor simply makes that schema unallocatable
+ *    (`ALLOCATION_SCHEMA_UNREGISTERED` at `allocate_effect_id`), which is a lifecycle the mutable
+ *    schemas are entitled to.
+ *  - `cadp.allocation-key.run-origin.v1` ONLY: immutability binds BOTH registry entries and covers
+ *    REMOVAL of either as well as change to either, because that schema's identity consequence is
+ *    the point of the design — one `origin_key` must derive exactly ONE `effect_id` for the store's
+ *    lifetime under ANY activation sequence (B1(5); control A5 leg o-v). No other schema gets this:
+ *    `cadp.allocation-key.external.v1`'s mapping stays MUTABLE and contract-scoped exactly as it is,
+ *    its drift being recoverable by re-allocation (B2(3.3), B2(9), B1(2)).
+ *
+ * PRECEDENCE (B2(8)), stated as an ordering rather than left to implementation: this runs BEFORE
+ * `assertProjectionCoverage`, so for an already-activated run-origin id a bundle that DELETES the
+ * descriptor while keeping the mapping is refused `SCHEMA_DESCRIPTOR_CHANGED` — the prohibited
+ * mutation of an activated contract, which is what it is — and never `ALLOCATION_SCHEMA_UNREGISTERED`,
+ * which names a schema that was never registered and would misreport a deletion as an absence.
+ */
+function assertContractImmutability(
+  cfg: Record<string, unknown>,
+  prior: ActivatedAllocationContracts,
+): void {
+  const carried = (key: string, schema: string): unknown =>
+    (cfg[key] as Array<Record<string, unknown>>).find((entry) => entry["schema"] === schema);
+  const refuse = (detail: string): never => {
+    throw new KernelConfigInvalid(detail, "SCHEMA_DESCRIPTOR_CHANGED");
+  };
+  const identical = (a: unknown, b: unknown): boolean => jcs(a) === jcs(b);
+
+  for (const [schema, sealed] of prior.descriptors) {
+    const present = carried("allocation_schema_descriptors", schema);
+    if (present === undefined) {
+      if (schema === RUN_ORIGIN_ALLOCATION_SCHEMA) {
+        refuse(`allocation_schema_descriptors entry ${schema} is removed; its contract is immutable for the store's lifetime`);
+      }
+      continue;
+    }
+    if (!identical(present, sealed)) {
+      refuse(`allocation_schema_descriptors entry ${schema} differs from the one a prior activation sealed`);
+    }
+  }
+
+  const sealedMapping = prior.allocation_schemas.get(RUN_ORIGIN_ALLOCATION_SCHEMA);
+  if (sealedMapping !== undefined) {
+    const present = carried("allocation_schemas", RUN_ORIGIN_ALLOCATION_SCHEMA);
+    if (present === undefined) {
+      refuse(`allocation_schemas entry ${RUN_ORIGIN_ALLOCATION_SCHEMA} is removed; its contract is immutable for the store's lifetime`);
+    }
+    if (!identical(present, sealedMapping)) {
+      refuse(`allocation_schemas entry ${RUN_ORIGIN_ALLOCATION_SCHEMA} differs from the one a prior activation sealed`);
+    }
+  }
+}
+
+/**
  * The v2-only rules (AP B3(5)): registry uniqueness (B3(1)), closed entry keys (B3(2)–(3)), the
  * two new allocation registries with their descriptor-vs-projection validation (B2(2), B2(5)),
- * the assembly and run-profile keys (B4(1), B5(3)) and the cross-field invariant of B3(4)(c).
- * None of it runs for `cadp.kernel-config.v1`.
+ * the cross-activation contract immutability of B2(2)(ii), the assembly and run-profile keys
+ * (B4(1), B5(3)) and the cross-field invariant of B3(4)(c). None of it runs for
+ * `cadp.kernel-config.v1`.
  */
-function validateV2Extensions(cfg: Record<string, unknown>): void {
+function validateV2Extensions(cfg: Record<string, unknown>, prior?: ActivatedAllocationContracts): void {
   // (2) Closed entry keys over the registries v1 already shape-checks (B3(3)).
   for (const entry of entriesOf(cfg, "approved_digest_schemes")) {
     assertEntryKeys(entry, ENTRY_KEYS.approved_digest_schemes, "approved_digest_schemes entry");
@@ -679,6 +779,11 @@ function validateV2Extensions(cfg: Record<string, unknown>): void {
   // (4)/(5) The two new allocation registries and their cross-validation.
   const descriptors = parseDescriptors(cfg);
   const schemas = parseAllocationSchemas(cfg);
+  // B2(2)(ii)/B2(8): lifetime immutability runs BEFORE the coverage checks, so an activated
+  // run-origin contract's deletion is refused as the prohibited mutation it is rather than as a
+  // never-registered schema. The shape/uniqueness parsing above still precedes it: a malformed
+  // entry has no byte-identity to compare, and both orders refuse the same bundle.
+  if (prior !== undefined) assertContractImmutability(cfg, prior);
   assertProjectionCoverage(descriptors, schemas);
 
   // B2(5): v1's allocatable purpose set is statically all of `allocation_purposes`, so its
