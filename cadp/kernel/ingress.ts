@@ -177,12 +177,9 @@ const REQUESTER_TUPLE_FIELDS: readonly string[] = ["requester_ref", "requester",
 const EFFECT_ID_PREFIX = "cadp-v04:effect:";
 
 /**
- * AP B5(1): the RUN-CAPABILITY-MINTING predicate, defined once and read by both consumers — the
- * PEP's minting-and-delivery rule (B5(1), the sealed `operation_kind` is the run profile's
- * `WORK_START`) and B5(9)'s leg 1, which reuses it VERBATIM rather than defining a second
- * predicate. It is the run profile's operation kind, which the kernel already consumes at this
- * checkout (recheck #5's decision scope, `pep.ts`); it is not tuple vocabulary, and B2(5) leaves
- * no schema's FIELD name in kernel code.
+ * The run profile's operation kind, which the kernel already consumes at this checkout (recheck
+ * #5's decision scope, `pep.ts`). It is not tuple vocabulary, and B2(5) leaves no schema's FIELD
+ * name in kernel code.
  */
 export const RUN_PROFILE_WORK_START = "WORK_START";
 
@@ -194,6 +191,63 @@ export const RUN_PROFILE_WORK_START = "WORK_START";
 export function runProfileEnrolled(config: KernelConfig, requester_ref: string): boolean {
   if (config.schema !== "cadp.kernel-config.v2") return false;
   return (config.run_profile_enrolled_requester_refs ?? []).includes(requester_ref);
+}
+
+/**
+ * AP B5(1) — THE run-capability-minting predicate. **ONE function, exported, and the ONLY thing
+ * either consumer may test**: the PEP's minting-and-delivery rule (B5(1)) and B5(9)'s leg 1, which
+ * "(1)'s predicate reused VERBATIM. No second predicate is defined". Two copies of it in two files
+ * is exactly the defect this shape forecloses: the seal-time adjudication and the dispatch-time
+ * mint would then range over different request sets, and a `WORK_START` no rule adjudicated could
+ * still be minted for.
+ *
+ * The predicate is the run profile's `WORK_START` **from a requester in the run profile** — B5(3)'s
+ * enrollment, read in the same stamped `requester_ref` domain the PEP's admission-time identity is
+ * in ("read off the sealed record rather than re-derived"). Enrollment belongs in it because B5 is
+ * the run-profile mechanism throughout and the TD scopes the adjudication in those exact words:
+ * *"A minting `WORK_START` from an ENROLLED requester is adjudicated ONLY as origin-or-refused"*
+ * (B5(9)), while presentation (B5(4)) and `RUN_BINDING_REQUIRED`/`NOT_RUN_ENROLLED` (B5(3)) are
+ * enrolled-scoped too. Minting for a non-enrolled requester would be a secret with no consumer —
+ * B5(4) admits a presentation only from an enrolled requester — and adjudicating one origin-or-
+ * refused would refuse every non-enrolled `WORK_START` outright, since B5(3) says a non-enrolled
+ * requester's request carries no `work_run_ref` at all (leg 2 would fail on all of them). The
+ * enrollment-blind reading therefore breaks at whichever end it is applied; this one is inert
+ * exactly when the run profile is off, and `runProfileEnrolled` gates it on `cadp.kernel-config.v2`
+ * so a v0.4 deployment reaches no B5 path at all.
+ */
+export function isRunCapabilityMinting(config: KernelConfig, request: { readonly operation_kind: string; readonly requester_ref: string }): boolean {
+  return request.operation_kind === RUN_PROFILE_WORK_START && runProfileEnrolled(config, request.requester_ref);
+}
+
+/**
+ * AP B5(9)'s `is_run_origin`, all three legs, likewise ONE exported function read by both the
+ * seal-time adjudication (`Ingress`) and the dispatch-time mint (`Pep`) — the same sharing rule as
+ * the predicate above, for the same reason.
+ *
+ * Leg 1 is `isRunCapabilityMinting`. Leg 2 matches on the EXACT `(authority_ref, namespace)` pair
+ * declared by `kernel_subject_namespaces` (B3(4)(a)), so an off-authority `{other, work-run, …}`
+ * binding is not a kernel work-run subject at all and cannot stand in for the self-binding; its
+ * "more than one" case is already refused `KERNEL_NAMESPACE_AMBIGUOUS` pre-K3 by B3(4)(b). Leg 3 —
+ * the only new one — is the self-origin equality. An undeclared work-run namespace cannot occur
+ * alongside a non-empty enrollment (B3(4)(c) refuses that bundle at activation) and is fail-closed
+ * here regardless.
+ */
+export function isRunOrigin(
+  config: KernelConfig,
+  request: {
+    readonly effect_id: string;
+    readonly operation_kind: string;
+    readonly requester_ref: string;
+    readonly work_bindings: readonly SubjectBinding[];
+  },
+): boolean {
+  if (!isRunCapabilityMinting(config, request)) return false;
+  const declared = (config.kernel_subject_namespaces ?? []).find((entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE);
+  if (declared === undefined) return false;
+  const bound = request.work_bindings.filter(
+    (b) => b.authority_ref === declared.authority_ref && b.namespace === declared.namespace,
+  );
+  return bound.length === 1 && bound[0]!.object_id === request.effect_id;
 }
 
 /**
@@ -727,35 +781,16 @@ export class Ingress {
    * one is the fail-closed direction.
    */
   #adjudicateRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
-    // Leg 1 — the minting predicate of B5(1), reused verbatim. Everything here is gated on the v2
-    // config: under `cadp.kernel-config.v1` there is no run profile and no enrollment to be in,
-    // so a v0.4 deployment's seal path is unchanged.
-    if (sealed.operation_kind !== RUN_PROFILE_WORK_START) return false;
-    if (!runProfileEnrolled(active.config, sealed.requester_ref)) return false;
+    // Leg 1 — B5(1)'s minting predicate, reused verbatim as the SHARED function the PEP mints on,
+    // so the set this rule adjudicates and the set the PEP mints for are the same set by
+    // construction. It is v2-gated, so a v0.4 deployment's seal path is unchanged.
+    if (!isRunCapabilityMinting(active.config, sealed)) return false;
     if (!this.#ruleEnabled("run_origin_adjudication")) return false;
-    if (this.#isRunOrigin(sealed, active)) return true;
+    if (isRunOrigin(active.config, sealed)) return true;
     throw new IngressRejection(
       "RUN_CAPABILITY_INVALID",
       `${sealed.effect_id} is a run-capability-minting WORK_START whose work-run binding is not its own effect_id`,
     );
-  }
-
-  /**
-   * AP B5(9) legs 2 and 3. Leg 2 matches on the EXACT `(authority_ref, namespace)` pair declared
-   * by `kernel_subject_namespaces` (B3(4)(a)), so an off-authority `{other, work-run, …}` binding
-   * is not a kernel work-run subject at all and cannot stand in for the self-binding; its "more
-   * than one" case is already refused `KERNEL_NAMESPACE_AMBIGUOUS` pre-K3 by B3(4)(b). Leg 3 —
-   * the only new one — is the self-origin equality. An undeclared work-run namespace cannot occur
-   * alongside a non-empty enrollment (B3(4)(c) refuses that bundle at activation) and is
-   * fail-closed here regardless.
-   */
-  #isRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
-    const declared = (active.config.kernel_subject_namespaces ?? []).find((entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE);
-    if (declared === undefined) return false;
-    const bound = sealed.work_bindings.filter(
-      (b) => b.authority_ref === declared.authority_ref && b.namespace === declared.namespace,
-    );
-    return bound.length === 1 && bound[0]!.object_id === sealed.effect_id;
   }
 
   // ---------------------------------------------------------------- submit_evidence

@@ -20,7 +20,7 @@ import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import { Ingress, assemblySubjectKeys, declaredAssemblyEntries, isRunCapabilityMinting, isRunOrigin, subjectKey as subjectKeyOf } from "./ingress.ts";
 import type { Principal } from "./ingress.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
@@ -189,15 +189,6 @@ export class Pep {
   }
 
   /**
-   * AP B5(1)'s minting predicate: the sealed request's `operation_kind` is the run profile's
-   * `WORK_START`, read off the SEALED record. Gated on `cadp.kernel-config.v2`, so under a v0.4
-   * deployment nothing here runs and `admit_and_dispatch` is byte-identical to what it is today.
-   */
-  #isRunCapabilityMinting(request: EffectRequestV1, active: ActivePolicy): boolean {
-    return active.config.schema === "cadp.kernel-config.v2" && request.operation_kind === RUN_PROFILE_WORK_START;
-  }
-
-  /**
    * AP B5(1): a run-capability-minting `WORK_START` is dispatchable ONLY by the caller stamped as
    * its sealed requester — a generic stamped-vs-sealed `requester_ref` equality carrying no domain
    * knowledge, and what makes the one-shot secret deliverable only to its exact holder-to-be.
@@ -207,10 +198,15 @@ export class Pep {
    * permanent stranding, reachable by any authorized caller who simply races the dispatch.
    *
    * A caller that presents no principal at all cannot satisfy the equality, so the in-process
-   * v0.4 callers of `admitAndDispatch` are fail-closed rather than exempt.
+   * callers of `admitAndDispatch` are fail-closed rather than exempt.
+   *
+   * Its scope is `isRunCapabilityMinting` — B5(1)'s predicate, the SHARED function B5(9)'s leg 1
+   * reads, so the equality guards exactly the dispatches that can mint and nothing else. Every
+   * other dispatch, including every dispatch under `cadp.kernel-config.v1` and every `WORK_START`
+   * of a requester the run profile does not enroll, is untouched by it.
    */
   #refuseUnlessSealedRequester(request: EffectRequestV1, active: ActivePolicy, caller: Principal | undefined): Refusal | undefined {
-    if (!this.#isRunCapabilityMinting(request, active) || !this.#enabled("work_start_dispatch_requester")) return undefined;
+    if (!isRunCapabilityMinting(active.config, request) || !this.#enabled("work_start_dispatch_requester")) return undefined;
     const stamped = caller === undefined ? undefined : identityEntry(active.config, caller.principal)?.producer_ref;
     if (stamped !== undefined && stamped === request.requester_ref) return undefined;
     return {
@@ -232,7 +228,17 @@ export class Pep {
     // an activation landing between the pre-lock check and here can never widen what mints.
     const refused = this.#refuseUnlessSealedRequester(request, active, caller);
     if (refused !== undefined) return refused;
-    const minting = this.#isRunCapabilityMinting(request, active);
+    // What may mint: `isRunOrigin` — B5(9)'s function, the SAME one the Ingress adjudicates with
+    // (leg 1 of it IS B5(1)'s minting predicate), re-evaluated here on the SEALED record inside
+    // lock D. Under every stable configuration this is exactly B5(1)'s "the sealed request is
+    // run-capability-minting", because a minting `WORK_START` that is not an origin never becomes
+    // a sealed record at all — B5(9) refuses it `RUN_CAPABILITY_INVALID` before any K3 row exists.
+    // It is re-evaluated rather than assumed so that no ACTIVATION SEQUENCE can fork the two: a
+    // bundle enrolling a requester between the seal and this dispatch cannot make a `WORK_START`
+    // sealed outside the run profile — hence never adjudicated, and possibly bound to ANOTHER
+    // run — mint a capability here. Minting is therefore reachable only for a request that
+    // satisfies the origin relation, and only by the caller the equality above verified.
+    const origin = isRunOrigin(active.config, request);
     const operation = adapter.describe().operations.find((o) => o.operation_kind === request.operation_kind);
     if (operation === undefined) return { kind: "REFUSAL", reason: "OPERATION_UNKNOWN" };
 
@@ -288,7 +294,7 @@ export class Pep {
     let admitted: { admission: EffectAdmissionV1; run_capability?: string };
     try {
       admitted = this.store.withImmediate(() =>
-        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults, minting),
+        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults, origin),
       );
     } catch (error) {
       if (error instanceof Refuse) {
@@ -336,7 +342,7 @@ export class Pep {
     decision_id: string,
     active: ActivePolicy,
     probes: ReadonlyMap<string, { revision_or_version?: string; content_digest?: string; availability: string }>,
-    minting: boolean,
+    origin: boolean,
   ): { admission: EffectAdmissionV1; run_capability?: string } {
     const now = this.clock();
     const store = this.store;
@@ -676,12 +682,14 @@ export class Pep {
     const admission = { ...base, admission_digest: recordDigest(base, "admission_digest") } as unknown as EffectAdmissionV1;
     validateEffectAdmission(admission);
     this.store.insertAdmission(admission);
-    return { admission, run_capability: this.#mintRunCapability(request, minting, prev === undefined) };
+    return { admission, run_capability: this.#mintRunCapability(request, origin, prev === undefined) };
   }
 
   /**
    * AP B5(1): mint at the INITIAL `admit_and_dispatch` of a minting `WORK_START`, in the SAME
-   * transaction as the admission (this method is called only from inside it).
+   * transaction as the admission (this method is called only from inside it). `origin` is
+   * B5(9)'s shared `isRunOrigin` — whose leg 1 IS B5(1)'s minting predicate — so what mints and
+   * what the Ingress adjudicated origin-or-refused are one set, evaluated by one function.
    *
    * `run_capability`'s PRIMARY KEY is that `WORK_START`'s own `effect_id` (TD v0.4 §7.4), so
    * "exactly once" is enforced by the STORE and not by caller discipline: a repeat
@@ -697,8 +705,8 @@ export class Pep {
    * the caller and then dropped: it is never stored, never in any K-record or digest, never in the
    * `ResolvedAdmissionBundle`, and never in workflow args or effect material.
    */
-  #mintRunCapability(request: EffectRequestV1, minting: boolean, initialDispatch: boolean): string | undefined {
-    if (!minting || !initialDispatch) return undefined;
+  #mintRunCapability(request: EffectRequestV1, origin: boolean, initialDispatch: boolean): string | undefined {
+    if (!origin || !initialDispatch) return undefined;
     if (this.store.runCapability(request.effect_id) !== undefined) return undefined;
     const secret = randomBytes(32);
     this.store.insertRunCapability({

@@ -56,6 +56,9 @@ const IDENTITY_B = {
 /** The exact `(authority_ref, namespace)` pair the harness bundle declares for the work run. */
 const WORK_RUN_AUTHORITY = "cadp-store:k04";
 
+/** A well-formed `effect_id` that is NOT the sealing request's own — leg 3's negative value. */
+const OTHER_RUN_REF = "cadp-v04:effect:00000000-0000-7000-8000-0000000000aa";
+
 /**
  * A scripted target that accepts `WORK_START`, so a run origin can be sealed, admitted and
  * dispatched through the PRODUCTION kernel path. Fault injection is at the transport seam only.
@@ -604,17 +607,75 @@ test("B5(9): a NON-self-bound minting WORK_START is RUN_CAPABILITY_INVALID — v
   }
 });
 
-test("B5(9): the adjudication is scoped to the run profile — a v2 bundle enrolling nobody is unchanged", async () => {
-  // B5(9) adjudicates a minting WORK_START FROM AN ENROLLED REQUESTER. A v2 deployment that has
-  // not enabled the run profile keeps its seal behaviour, which is what makes enrollment the
-  // switch B5(3)/B3(4)(c) say it is.
+test("B5(9)/B5(1): ONE predicate — a v2 bundle enrolling nobody neither adjudicates NOR mints", async () => {
+  // B5(9) adjudicates a minting WORK_START FROM AN ENROLLED REQUESTER, and B5(1)'s minting
+  // predicate is the SAME function (B5(9) leg 1: "(1)'s predicate reused verbatim"). This test
+  // asserts BOTH halves over the same request, because the failure mode is the two ranging over
+  // different request sets: if the seal-time adjudication were enrollment-scoped while the
+  // dispatch-time mint were not, this exact request — a non-self-bound minting-shaped WORK_START
+  // from a requester OUTSIDE the run profile — would seal unadjudicated and then be minted for,
+  // yielding a capability for a `work_run_ref` no rule ever authenticated.
   const h = await runHarness({ enrolled: [] });
   try {
+    h.sealReach();
+    await h.pep.refreshTargetIdentity(h.run);
     const tuple = originTuple("origin-unenrolled");
     const effect_id = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
-    sealOrigin(h, { effect_id, tuple, work_run_ref: "cadp-v04:effect:00000000-0000-7000-8000-0000000000aa" });
+    sealOrigin(h, { effect_id, tuple, work_run_ref: OTHER_RUN_REF });
+    // Seal half: the v2 deployment that has not enabled the run profile keeps its seal behaviour,
+    // which is what makes enrollment the switch B5(3)/B3(4)(c) say it is.
     assert.equal(h.store.effectRequest(effect_id)?.effect_id, effect_id);
     assert.equal(h.store.runMembership(effect_id), undefined, "and no membership proof is manufactured either");
+
+    // Dispatch half, by the caller that would otherwise have become the holder: the run profile is
+    // off for it, so the dispatch is the ordinary v0.4 one — no requester gate, and NOTHING minted.
+    const admitted = await h.pep.admitAndDispatch(effect_id, await decisionFor(h, effect_id), PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    assert.equal((admitted as { run_capability?: string }).run_capability, undefined, "no secret delivered");
+    assert.equal(h.store.runCapability(effect_id), undefined, "and none minted for an unadjudicated WORK_START");
+    assert.equal(countRows(h, "run_capability"), 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("B5(1)/B5(9): enrolling a requester AFTER a seal mints nothing for a WORK_START never adjudicated", async () => {
+  // The lifecycle question the shared predicate has to answer: enrollment is read from the ACTIVE
+  // config, so a bundle can turn the run profile on BETWEEN a seal and its dispatch. What may mint
+  // is `isRunOrigin` — the same function the Ingress adjudicates with — re-evaluated on the sealed
+  // record inside lock D, so a WORK_START that sealed outside the run profile bound to ANOTHER run
+  // cannot acquire a capability by a later activation. Under a stable bundle the extra evaluation
+  // is a no-op: B5(9) refuses such a request pre-K3, so it never becomes a sealed record at all.
+  const h = await runHarness({ enrolled: [] });
+  try {
+    h.sealReach();
+    await h.sealTargetIdentity();
+    await h.pep.refreshTargetIdentity(h.run);
+    const tuple = originTuple("origin-late-enrollment");
+    const effect_id = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
+    sealOrigin(h, { effect_id, tuple, work_run_ref: OTHER_RUN_REF });
+
+    const activated = await h.activatePolicy({
+      revision: 2,
+      configOverrides: { run_profile_enrolled_requester_refs: [REQUESTER_A] } as never,
+    });
+    assert.equal((activated.admitted as { kind: string }).kind, "ADMITTED", JSON.stringify(activated.admitted));
+
+    // The requester is now enrolled and IS the sealed requester, so B5(1)'s dispatch equality
+    // passes — and still nothing mints, because the sealed request is not an origin.
+    const admitted = await h.pep.admitAndDispatch(effect_id, await decisionFor(h, effect_id), PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    assert.equal((admitted as { run_capability?: string }).run_capability, undefined, "no secret delivered");
+    assert.equal(h.store.runCapability(effect_id), undefined, "no capability for an unadjudicated work_run_ref");
+    assert.equal(h.store.runMembership(effect_id), undefined, "and no membership proof appeared either");
+
+    // Positive control on the same store under the same activated bundle: a real origin sealed now
+    // IS adjudicated, mints and delivers — so the absence above is the rule's and not a dead path.
+    const origin = await originRun(h, "origin-after-enrollment");
+    assert.equal((origin.admitted as { kind: string }).kind, "ADMITTED", JSON.stringify(origin.admitted));
+    assert.equal(typeof (origin.admitted as { run_capability?: string }).run_capability, "string");
+    assert.equal(h.store.runCapability(origin.effect_id)?.holder_ref, REQUESTER_A);
+    assert.equal(countRows(h, "run_capability"), 1, "exactly the one adjudicated origin has a capability");
   } finally {
     h.close();
   }
