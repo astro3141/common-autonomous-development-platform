@@ -4,17 +4,25 @@
  * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18, run against rows read inside the
  * transaction; K7 truth stays target-authoritative (§6.3).
  *
+ * Under `cadp.kernel-config.v2` it also implements AP B5(1)/B6(4): the run capability of a minting
+ * `WORK_START` is minted in the admission transaction and delivered exactly once, to the caller
+ * verified as that request's sealed requester. Both are gated on the active config's schema, so a
+ * v0.4 (`cadp.kernel-config.v1`) deployment's dispatch path is unchanged.
+ *
  * `disabledChecks` is a TEST-ONLY guard-bite harness knob (TD §13.1): the production
  * composition never passes it, and the conformance suite proves each listed check is
  * load-bearing by disabling it and observing the prohibited effect.
  */
 
+import { randomBytes } from "node:crypto";
+
 import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
-import { adapterEntry, resolveActivePolicy } from "./policyState.ts";
+import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import type { Principal } from "./ingress.ts";
+import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
 import { resolvePointer } from "./policyBundle.ts";
 import { PublicationRefusal, verifyProposedBundle } from "./policyPublication.ts";
@@ -34,9 +42,38 @@ export interface Admitted {
   readonly kind: "ADMITTED";
   readonly admission: EffectAdmissionV1;
   readonly outcome: EffectOutcomeV1;
+  /**
+   * AP B6(4): base64url (unpadded) of the freshly minted 256-bit run capability. Present EXACTLY
+   * when the dispatch is the INITIAL dispatch of that `effect_id`, the sealed request is
+   * run-capability-minting (B5(1)), and the caller passed B5(1)'s stamped-vs-sealed
+   * `requester_ref` equality; absent in every other case without exception.
+   *
+   * The property is defined NON-ENUMERABLE (`deliverRunCapability`), so it is invisible to
+   * `JSON.stringify`, to a spread, and to `util.inspect` — a log or trace of an `AdmitResult`
+   * CANNOT carry the secret, and only a reader that names the field (the `admit_and_dispatch`
+   * response assembly in `api.ts`, which is the one delivery channel B5(7) defines) can see it.
+   * That is B6(3)'s logging prohibition made structural rather than left to discipline.
+   */
+  readonly run_capability?: string;
 }
 
 export type AdmitResult = Refusal | Admitted;
+
+/**
+ * AP B5(7)/B6(3): attach the one-shot secret to the result it is delivered in, non-enumerably.
+ * Nothing else in the process ever holds it: it is not stored (only `capability_digest` is), not
+ * in any K1–K7 record or digest, not in the `ResolvedAdmissionBundle`, and it is never a member of
+ * any error, refusal detail or incident claim.
+ */
+function deliverRunCapability(result: Admitted, run_capability: string | undefined): Admitted {
+  if (run_capability === undefined) return result;
+  return Object.defineProperty(result, "run_capability", {
+    value: run_capability,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+}
 
 const SUPPORTED_CONSTRAINTS = new Set([
   "MAX_DISPATCH_ORDINAL", "NOT_AFTER", "REQUIRE_TARGET_IDEMPOTENCY_PROOF", "REQUIRE_NO_PRIOR_UNKNOWN_IN_SCOPE",
@@ -111,9 +148,24 @@ export class Pep {
 
   // ================================================================ admit_and_dispatch
 
-  async admitAndDispatch(effect_id: string, decision_id: string): Promise<AdmitResult> {
+  /**
+   * AP B5(1): `admit_and_dispatch` now takes the authenticated principal, the same pattern the API
+   * layer already uses for `seal_effect_request` and `submit_evidence`. It is OPTIONAL in the
+   * signature and FAIL-CLOSED in effect: a caller that presents none cannot pass the stamped-vs-
+   * sealed equality below, so it can never mint. Every non-minting dispatch is unchanged by it,
+   * which is what keeps the v0.4 in-process callers of this method exactly as they are.
+   */
+  async admitAndDispatch(effect_id: string, decision_id: string, caller?: Principal): Promise<AdmitResult> {
     const request = this.store.effectRequest(effect_id);
     if (request === undefined) return { kind: "REFUSAL", reason: "EFFECT_NOT_FOUND" };
+
+    // B5(1): refused HERE, before the adapter is resolved and before any pre-K6 target work — and
+    // re-checked inside lock D against the policy read there, so the authoritative evaluation is
+    // never the stale pre-lock one. Either way nothing is minted, no admission is reserved and no
+    // outcome is written.
+    const preLock = this.#refuseUnlessSealedRequester(request, resolveActivePolicy(this.store, this.cas), caller);
+    if (preLock !== undefined) return preLock;
+
     const adapter = this.adapters.byTarget(request.target_ref);
     if (adapter === undefined) return { kind: "REFUSAL", reason: "NO_ADAPTER_FOR_TARGET" };
 
@@ -130,10 +182,42 @@ export class Pep {
     const domain = adapter.serialization_domain(material);
     const release = await this.locks.acquire(domain);
     try {
-      return await this.#admitAndDispatchLocked(request, adapter, material, decision_id);
+      return await this.#admitAndDispatchLocked(request, adapter, material, decision_id, caller);
     } finally {
       release();
     }
+  }
+
+  /**
+   * AP B5(1)'s minting predicate: the sealed request's `operation_kind` is the run profile's
+   * `WORK_START`, read off the SEALED record. Gated on `cadp.kernel-config.v2`, so under a v0.4
+   * deployment nothing here runs and `admit_and_dispatch` is byte-identical to what it is today.
+   */
+  #isRunCapabilityMinting(request: EffectRequestV1, active: ActivePolicy): boolean {
+    return active.config.schema === "cadp.kernel-config.v2" && request.operation_kind === RUN_PROFILE_WORK_START;
+  }
+
+  /**
+   * AP B5(1): a run-capability-minting `WORK_START` is dispatchable ONLY by the caller stamped as
+   * its sealed requester — a generic stamped-vs-sealed `requester_ref` equality carrying no domain
+   * knowledge, and what makes the one-shot secret deliverable only to its exact holder-to-be.
+   * Without it any `workflow`-class principal could dispatch another's `WORK_START`, receive the
+   * capability, and — there being no recovery (B5(7)) — strand that run permanently. The rejected
+   * alternative (dispatch, but withhold the secret from the wrong caller) leaves exactly the same
+   * permanent stranding, reachable by any authorized caller who simply races the dispatch.
+   *
+   * A caller that presents no principal at all cannot satisfy the equality, so the in-process
+   * v0.4 callers of `admitAndDispatch` are fail-closed rather than exempt.
+   */
+  #refuseUnlessSealedRequester(request: EffectRequestV1, active: ActivePolicy, caller: Principal | undefined): Refusal | undefined {
+    if (!this.#isRunCapabilityMinting(request, active) || !this.#enabled("work_start_dispatch_requester")) return undefined;
+    const stamped = caller === undefined ? undefined : identityEntry(active.config, caller.principal)?.producer_ref;
+    if (stamped !== undefined && stamped === request.requester_ref) return undefined;
+    return {
+      kind: "REFUSAL",
+      reason: "WORK_START_DISPATCH_REQUESTER_MISMATCH",
+      detail: "the dispatching caller is not the sealed requester of this WORK_START",
+    };
   }
 
   async #admitAndDispatchLocked(
@@ -141,8 +225,14 @@ export class Pep {
     adapter: TargetAdapterV1,
     material: Record<string, unknown>,
     decision_id: string,
+    caller: Principal | undefined,
   ): Promise<AdmitResult> {
     const active = resolveActivePolicy(this.store, this.cas);
+    // The authoritative evaluation of B5(1)'s equality: against the policy read INSIDE lock D, so
+    // an activation landing between the pre-lock check and here can never widen what mints.
+    const refused = this.#refuseUnlessSealedRequester(request, active, caller);
+    if (refused !== undefined) return refused;
+    const minting = this.#isRunCapabilityMinting(request, active);
     const operation = adapter.describe().operations.find((o) => o.operation_kind === request.operation_kind);
     if (operation === undefined) return { kind: "REFUSAL", reason: "OPERATION_UNKNOWN" };
 
@@ -195,10 +285,10 @@ export class Pep {
 
     // ---- the admission transaction (TD §3.4) ----
 
-    let admission: EffectAdmissionV1;
+    let admitted: { admission: EffectAdmissionV1; run_capability?: string };
     try {
-      admission = this.store.withImmediate(() =>
-        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults),
+      admitted = this.store.withImmediate(() =>
+        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults, minting),
       );
     } catch (error) {
       if (error instanceof Refuse) {
@@ -222,8 +312,15 @@ export class Pep {
 
     // ---- dispatch (after COMMIT, still inside lock D; §3.4) ----
 
+    const { admission, run_capability } = admitted;
     const outcome = await this.#dispatchAndObserve(request, adapter, material, admission, active);
-    return { kind: "ADMITTED", admission, outcome };
+    // B5(2): the capability is DELIVERED here and GRADED later. What the WORK_START's K7 state
+    // becomes changes only the usability of the capability already in the holder's hands, never
+    // its delivery — so the field rides this result whatever the outcome of this dispatch is.
+    // B5(7)'s accepted residual: this delivery and the row's commit are NOT atomic, so a response
+    // lost after the commit strands that run — fail-closed, liveness-only, and documented rather
+    // than papered over, because the raw secret exists nowhere durable.
+    return deliverRunCapability({ kind: "ADMITTED", admission, outcome }, run_capability);
   }
 
   #isProbeable(adapter: TargetAdapterV1, binding: SubjectBinding): boolean {
@@ -239,7 +336,8 @@ export class Pep {
     decision_id: string,
     active: ActivePolicy,
     probes: ReadonlyMap<string, { revision_or_version?: string; content_digest?: string; availability: string }>,
-  ): EffectAdmissionV1 {
+    minting: boolean,
+  ): { admission: EffectAdmissionV1; run_capability?: string } {
     const now = this.clock();
     const store = this.store;
 
@@ -578,7 +676,40 @@ export class Pep {
     const admission = { ...base, admission_digest: recordDigest(base, "admission_digest") } as unknown as EffectAdmissionV1;
     validateEffectAdmission(admission);
     this.store.insertAdmission(admission);
-    return admission;
+    return { admission, run_capability: this.#mintRunCapability(request, minting, prev === undefined) };
+  }
+
+  /**
+   * AP B5(1): mint at the INITIAL `admit_and_dispatch` of a minting `WORK_START`, in the SAME
+   * transaction as the admission (this method is called only from inside it).
+   *
+   * `run_capability`'s PRIMARY KEY is that `WORK_START`'s own `effect_id` (TD v0.4 §7.4), so
+   * "exactly once" is enforced by the STORE and not by caller discipline: a repeat
+   * `admit_and_dispatch` — the further ordinal a post-`NO_EFFECT_CONFIRMED` retry admits (B5(2)) —
+   * finds the row present, mints nothing, delivers nothing, and returns no secret (B6(4)).
+   * The initial-dispatch test is keyed on `prev === undefined`, i.e. on the DISPATCH being the
+   * initial one and not on any call's outcome, so it stays exact if a replayed-result return is
+   * ever added: such a result returns the stored result WITHOUT this field.
+   *
+   * `capability_digest` is pinned to SHA-256 over the RAW 32 SECRET BYTES and never over the
+   * base64url text of B6(3) — one canonical preimage, so no encoding variant (padding, alternate
+   * alphabet, case) can be a second string digesting to the same row. The secret is returned to
+   * the caller and then dropped: it is never stored, never in any K-record or digest, never in the
+   * `ResolvedAdmissionBundle`, and never in workflow args or effect material.
+   */
+  #mintRunCapability(request: EffectRequestV1, minting: boolean, initialDispatch: boolean): string | undefined {
+    if (!minting || !initialDispatch) return undefined;
+    if (this.store.runCapability(request.effect_id) !== undefined) return undefined;
+    const secret = randomBytes(32);
+    this.store.insertRunCapability({
+      work_run_ref: request.effect_id,
+      // B5(1): the stamped `requester_ref` of this WORK_START — which, by the dispatch-time
+      // equality above, is also the caller the secret is being returned to.
+      holder_ref: request.requester_ref,
+      capability_digest: sha256Hex(secret),
+      minted_at: nowIso(this.clock),
+    });
+    return secret.toString("base64url");
   }
 
   #enforceConstraint(

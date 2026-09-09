@@ -62,6 +62,27 @@ export const V2_ALLOCATION_SCHEMA_DESCRIPTORS = [
 ] as const;
 
 /**
+ * WP §3.6's canonical run-origin descriptor, carried as composition data exactly as the other two
+ * are: `origin_key` is the schema's single non-reserved field, `{ENTROPY, NONEMPTY_STRING}`. The
+ * Authority core never parses it (AP B1(5)).
+ */
+export const RUN_ORIGIN_DESCRIPTOR = {
+  schema: "cadp.allocation-key.run-origin.v1",
+  fields: [{ field: "origin_key", role: "ENTROPY", value_contract: "NONEMPTY_STRING" }],
+} as const;
+
+/**
+ * The run-origin mapping entry: `binding_projection` is `[]` (no field is PROJECTED, so the tuple
+ * projects nothing onto any subject binding — the origin's self-binding is verified at seal by AP
+ * B5(9), not by a projection) and one fixed `purpose_relation` pair.
+ */
+export const RUN_ORIGIN_ALLOCATION_SCHEMA_ENTRY = {
+  schema: "cadp.allocation-key.run-origin.v1",
+  binding_projection: [],
+  purpose_relation: [{ purpose: "work-start", operation_kind: "WORK_START" }],
+} as const;
+
+/**
  * AP B2(2)(iii)/B2(6) composition data: projection targets and purpose relations, every string
  * supplied by the bundle and none of it kernel vocabulary. v1's `purpose_relation` is TOTAL over
  * the reference `allocation_purposes`, which B2(5) requires of a bundle carrying a v1 entry.

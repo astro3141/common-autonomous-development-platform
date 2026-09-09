@@ -136,8 +136,17 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         return send(200, outcome);
       }
       case "admit_and_dispatch": {
+        // AP B5(1)/B6(4): the request body is UNCHANGED at `{ effect_id, decision_id }`; the
+        // principal is the one this layer already resolved from `authorization`, never a body
+        // field. `run_capability` is the one new optional RESPONSE field and this is its ONE
+        // delivery channel (B5(7)) — it is non-enumerable on the result, so it reaches the wire
+        // only by being named here and can never leak through an incidental serialization of an
+        // `AdmitResult` (B6(3)'s logging prohibition, made structural).
         const body = JSON.parse(raw.toString("utf8")) as { effect_id: string; decision_id: string };
-        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id);
+        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id, { principal });
+        if (result.kind === "ADMITTED" && result.run_capability !== undefined) {
+          return send(200, { ...result, run_capability: result.run_capability });
+        }
         return send(200, result);
       }
       case "get_effect_state": {

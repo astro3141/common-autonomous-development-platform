@@ -142,6 +142,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS governed_edge_unique
 `;
 
 /**
+ * AP B5(1)/B5(5): the run-membership mechanism's two tables. Both are NON-CONSTITUTIONAL
+ * implementation state in the same store, exactly as `effect_allocation` already is (TD v0.4
+ * §3.2) — in no K-record, no digest and no `ResolvedAdmissionBundle` — and both are APPEND-ONLY
+ * like every other table here: this module contains no UPDATE and no DELETE.
+ *
+ * `run_capability` stores only `capability_digest` = SHA-256 over the RAW 32 secret bytes (B5(1));
+ * the secret itself is never written to this store or anywhere else durable (B5(7)). There is
+ * deliberately NO `revoked_at` column (B5(4)): the store contract forbids runtime UPDATE, so a
+ * mutable flag would be a field no append-only path could ever set. Revocation, if it is ever
+ * wanted, is a future append-only `run_capability_revocation` row.
+ *
+ * `work_run_ref` is the minting `WORK_START`'s own `effect_id` (TD v0.4 §7.4), so its PRIMARY KEY
+ * is what makes minting once-and-only-once BY CONSTRUCTION rather than by caller discipline: a
+ * repeat dispatch finds the row present, mints nothing and delivers nothing.
+ */
+const RUN_PROFILE_DDL = `
+CREATE TABLE IF NOT EXISTS run_capability (
+  work_run_ref TEXT PRIMARY KEY,
+  holder_ref TEXT NOT NULL,
+  capability_digest TEXT NOT NULL,
+  minted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_membership (
+  effect_id TEXT PRIMARY KEY,
+  work_run_ref TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_membership_run_idx ON run_membership (work_run_ref);
+`;
+
+/**
  * AP B2(1): the allocation binding every `cadp.kernel-config.v2` allocation row carries — one
  * GENERIC shape for every tuple schema, so a new schema changes no DDL and no column is ever
  * domain-named. All five are NOT NULL for a v2 row (enforced at write below); they are null for
@@ -167,6 +198,21 @@ export interface AllocationRow {
 const ALLOCATION_BINDING_COLUMNS: readonly (keyof AllocationBinding)[] = [
   "requester_ref", "allocation_schema", "allocation_binding_digest", "allocation_contract_digest", "purpose",
 ];
+
+/** AP B5(1): one row per run, keyed by the minting `WORK_START`'s own `effect_id`. */
+export interface RunCapabilityRow {
+  readonly work_run_ref: string;
+  readonly holder_ref: string;
+  /** SHA-256 over the RAW 32 secret bytes — never over the base64url transport text (B5(1)). */
+  readonly capability_digest: string;
+  readonly minted_at: string;
+}
+
+/** AP B5(5): the durable membership proof recheck #19 reads; for a run origin it is `(E, E)`. */
+export interface RunMembershipRow {
+  readonly effect_id: string;
+  readonly work_run_ref: string;
+}
 
 export interface ActivationRow {
   readonly seq: number;
@@ -240,6 +286,7 @@ export class ConstitutionalStore {
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS effect_allocation_effect_idx ON effect_allocation (effect_id);");
     this.db.exec(GOVERNED_DDL);
+    this.db.exec(RUN_PROFILE_DDL);
   }
 
   close(): void {
@@ -291,6 +338,16 @@ export class ConstitutionalStore {
 
   activeActivation(): ActivationRow | undefined {
     return this.db.prepare("SELECT * FROM policy_activation ORDER BY seq DESC LIMIT 1").get() as ActivationRow | undefined;
+  }
+
+  /**
+   * Every activation the store has ever sealed, oldest first. AP B2(2)(ii)'s cross-activation
+   * immutability compares against the SEALED STORE and not against the currently active bundle,
+   * so a descriptor cannot be laundered by withdrawing it in one activation and re-adding a
+   * different one in the next — which needs the whole history, not just the tip.
+   */
+  allActivations(): ActivationRow[] {
+    return this.db.prepare("SELECT * FROM policy_activation ORDER BY seq").all() as ActivationRow[];
   }
 
   activationBySeq(seq: number): ActivationRow | undefined {
@@ -490,6 +547,36 @@ export class ConstitutionalStore {
       effect_id: string;
     }>;
     return rows.map((r) => r.effect_id);
+  }
+
+  // -------------------------------------------------------------- run capability / membership
+
+  /**
+   * AP B5(1): written in the SAME transaction as the admission that mints it. The PRIMARY KEY on
+   * `work_run_ref` is the once-and-only-once constraint, so a concurrent second minting attempt
+   * loses on the unique constraint rather than on a read-then-write race.
+   */
+  insertRunCapability(row: RunCapabilityRow): void {
+    mapSqliteError(() =>
+      this.db
+        .prepare("INSERT INTO run_capability (work_run_ref, holder_ref, capability_digest, minted_at) VALUES (?, ?, ?, ?)")
+        .run(row.work_run_ref, row.holder_ref, row.capability_digest, row.minted_at),
+    );
+  }
+
+  runCapability(work_run_ref: string): RunCapabilityRow | undefined {
+    return this.db.prepare("SELECT * FROM run_capability WHERE work_run_ref = ?").get(work_run_ref) as RunCapabilityRow | undefined;
+  }
+
+  /** AP B5(5): written in the SAME transaction as the `effect_request` row it proves membership for. */
+  insertRunMembership(effect_id: string, work_run_ref: string): void {
+    mapSqliteError(() =>
+      this.db.prepare("INSERT INTO run_membership (effect_id, work_run_ref) VALUES (?, ?)").run(effect_id, work_run_ref),
+    );
+  }
+
+  runMembership(effect_id: string): RunMembershipRow | undefined {
+    return this.db.prepare("SELECT * FROM run_membership WHERE effect_id = ?").get(effect_id) as RunMembershipRow | undefined;
   }
 
   // -------------------------------------------------------------- input / decision

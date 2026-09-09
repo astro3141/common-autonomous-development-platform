@@ -30,6 +30,36 @@ export interface VerifiedBundle {
   readonly manifest_revision: string;
 }
 
+/**
+ * The `data.cadp` of every activation the store has already sealed, oldest first — the history AP
+ * B2(2)(ii)'s cross-activation immutability compares a proposed bundle against. The comparison is
+ * against the SEALED STORE and not against the currently active bundle, so a contract cannot be
+ * laundered by withdrawing it in one activation and re-adding a different one in the next.
+ *
+ * FAIL-CLOSED on an unreadable prior, deliberately: silently skipping one would make the
+ * immutability rule bypassable by whatever made it unreadable. `cas.get` is verify-on-read, the
+ * store is append-only and nothing prunes CAS, so this is a corruption path and not an ordinary
+ * one; it is a refusal of the ACTIVATION, with no row written either way.
+ */
+function sealedAllocationHistory(cas: Cas, store: ConstitutionalStore): unknown[] {
+  const configs: unknown[] = [];
+  for (const activation of store.allActivations()) {
+    const refRow = store.policyRef(activation.policy_id, activation.revision);
+    if (refRow === undefined) {
+      throw new PublicationRefusal("KERNEL_CONFIG_INVALID", `activation seq ${activation.seq} references a missing policy_ref row`);
+    }
+    let bundleBytes: Uint8Array;
+    try {
+      bundleBytes = cas.get(refRow.bundle_cas_key);
+    } catch {
+      throw new PublicationRefusal("KERNEL_CONFIG_INVALID", `the bundle of activation seq ${activation.seq} is missing or corrupt`);
+    }
+    const prior = (dataJsonOf(bundleBytes) as { cadp?: unknown } | undefined)?.cadp;
+    if (prior !== undefined) configs.push(prior);
+  }
+  return configs;
+}
+
 /** All #17 bundle checks except the activation-base check (#13, caller-owned). */
 export function verifyProposedBundle(cas: Cas, store: ConstitutionalStore, proposed: ProposedPolicyRef, bundle_cas_ref: string): VerifiedBundle {
   let bundleBytes: Uint8Array;
@@ -54,8 +84,11 @@ export function verifyProposedBundle(cas: Cas, store: ConstitutionalStore, propo
     throw new PublicationRefusal("MANIFEST_REVISION_MISMATCH", `manifest ${manifest.revision} != ${manifestRevisionString(proposed.policy_id, proposed.revision, payload.value)}`);
   }
   const data = dataJsonOf(bundleBytes) as { cadp?: unknown } | undefined;
+  // Read outside the `try`: an unreadable sealed history is its own refusal (already a
+  // `PublicationRefusal`), not a `KERNEL_CONFIG_INVALID` re-wrapping of one.
+  const priorConfigs = sealedAllocationHistory(cas, store);
   try {
-    validateKernelConfig(data?.cadp);
+    validateKernelConfig(data?.cadp, priorConfigs);
   } catch (error) {
     throw new PublicationRefusal("KERNEL_CONFIG_INVALID", error instanceof Error ? error.message : String(error));
   }
