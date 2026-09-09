@@ -10,10 +10,16 @@
  * AP B4(2)-(4): assembly completeness, which makes the K4 evidence set the Platform's complete
  * query result unioned with the caller's list rather than the caller's list alone, and AP B5(9):
  * the seal-time run-origin adjudication (ORIGIN-OR-REFUSED) whose `run_membership(E, E)` row is
- * the durable witness that authorizes minting at that effect's own initial dispatch.
+ * the durable witness that authorizes minting at that effect's own initial dispatch. AP B5(3)-(4)
+ * adds the presentation side of that mechanism: the `x-cadp-run-capability` header arrives here as
+ * per-request TRANSPORT METADATA — a parameter of its own, never a body, draft, record or digest
+ * member — and is read through ONE strict base64url parser before its digest is compared, in
+ * constant time, against the `run_capability` row for this request's own `work_run_ref`.
  * Every one of those rules is gated on the ACTIVE CONFIG's schema string, so a running v0.4
  * (`cadp.kernel-config.v1`) deployment keeps its allocation, seal and assembly behaviour unchanged.
  */
+
+import { timingSafeEqual } from "node:crypto";
 
 import { Cas } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, schemeApproved, sha256Hex } from "./canonical.ts";
@@ -39,6 +45,37 @@ export class IngressRejection extends Error {
 export interface Principal {
   /** Exact authenticated identity string (SPIFFE id / IdP subject). */
   readonly principal: string;
+}
+
+/**
+ * AP B6(3): the ONE header the run capability travels on, lower-cased exactly as `node:http`
+ * delivers it in `IncomingMessage.headers`. It is named HERE, next to the only code that consumes
+ * it, so the transport name and its parser are one definition rather than two that can drift.
+ */
+export const RUN_CAPABILITY_HEADER = "x-cadp-run-capability";
+
+/**
+ * AP B6(3)/B5(4) — PER-REQUEST TRANSPORT METADATA for `seal_effect_request`, and the whole of the
+ * plumbing contract in one type: a parameter of its own, alongside the body and the principal and
+ * part of NEITHER.
+ *
+ * The header is "transport, never a draft field" in the same structural sense B6(1) makes
+ * `allocation_tuple` transport — but one step stronger, because `allocation_tuple` at least
+ * ARRIVES inside the body and must be stripped, whereas this value never enters the body object at
+ * all. `api.ts` reads it off `req.headers` and hands it across in this parameter; `sealEffectRequest`
+ * never merges it into `draft`, so it cannot become a `RequestDraft` key, cannot reach
+ * `EffectRequestV1`, cannot enter `request_digest` or `material_digest`, and cannot become a
+ * `SubjectBinding`. That is a property of the parse, not an assertion laid over it: there is no
+ * assignment anywhere on this path from `metadata` into a record.
+ *
+ * LOGGING PROHIBITION (B6(3), normative): this value is never written to a log, a trace, a metric
+ * label, an incident detail, an error message or a `KERNEL_INCIDENT` claim. Every refusal below
+ * names its reason code and, at most, the `work_run_ref` the caller itself sealed — never the
+ * presented secret and never any prefix of it.
+ */
+export interface RequestMetadata {
+  /** The raw `x-cadp-run-capability` header value verbatim, or absent when none was presented. */
+  readonly run_capability?: string;
 }
 
 /**
@@ -252,24 +289,93 @@ export function runProfileEnrolled(config: KernelConfig, requester_ref: string):
 }
 
 /**
- * AP B5(9) legs 2 and 3, evaluated over the SEALED record inside the sealing transaction: the
- * request carries exactly one binding on the EXACT `(authority_ref, namespace)` pair that
- * `kernel_subject_namespaces` declares for the work-run namespace, and that binding's `object_id`
- * is the request's own `effect_id`.
+ * The run scope this SEALED request names, read on the EXACT `(authority_ref, namespace)` pair
+ * `kernel_subject_namespaces` declares for the work-run namespace — the one lookup both B5(9)'s
+ * legs 2 and 3 and B5(4)'s presentation scope are defined over, so they can never disagree about
+ * which run a request is bound to.
  *
  * Matching the declared exact pair — never the namespace alone — is what stops an off-authority
- * `{other, work-run, …}` binding from standing in for the self-binding (B3(4)(a)). An undeclared
- * namespace yields zero matches and therefore a refusal, which is the fail-closed reading:
+ * `{other, work-run, …}` binding from standing in for a self-binding (B3(4)(a)). `undefined` means
+ * "this request names no declared run scope", which covers three cases the callers grade
+ * differently and this function deliberately does not: the namespace is undeclared (fail-closed —
  * B3(4)(c) already refuses at activation any bundle that enables the run profile without declaring
- * it, so this branch is unreachable through a conforming bundle and is not a second policy.
+ * it, so it is unreachable through a conforming bundle and is not a second policy), no binding on
+ * the pair, or more than one (which B3(4)(b)'s ambiguity lock has already refused upstream).
  */
-function bindsItsOwnEffectId(request: EffectRequestV1, config: KernelConfig): boolean {
+function declaredWorkRunRef(request: EffectRequestV1, config: KernelConfig): string | undefined {
   const declared = (config.kernel_subject_namespaces ?? []).find((entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE);
-  if (declared === undefined) return false;
+  if (declared === undefined) return undefined;
   const bound = request.work_bindings.filter(
     (b) => b.authority_ref === declared.authority_ref && b.namespace === declared.namespace,
   );
-  return bound.length === 1 && bound[0]!.object_id === request.effect_id;
+  return bound.length === 1 ? bound[0]!.object_id : undefined;
+}
+
+/** B6(3): the raw secret is 256 bits, so its unpadded base64url text is exactly 43 characters. */
+const RUN_CAPABILITY_BYTES = 32;
+const RUN_CAPABILITY_TEXT = /^[A-Za-z0-9_-]{43}$/u;
+
+/**
+ * AP B6(3) — THE STRICT RUN-CAPABILITY PARSER, and the ONLY path by which a presented capability
+ * ever becomes bytes. Returns the raw 32 secret bytes; refuses `RUN_CAPABILITY_INVALID` otherwise.
+ *
+ * B6(3) pins ONE encoding — "base64url (unpadded) of the raw 256-bit (32-byte) secret" — and B5(1)
+ * pins ONE digest preimage, the raw bytes, precisely "so no encoding variant (padding, alternate
+ * alphabet, case) can be a second string digesting to the same row". That guarantee is a property
+ * of the DECODER, not of the digest: `Buffer.from(value, "base64url")` is deliberately PERMISSIVE
+ * — it accepts `=` padding, the standard `+`/`/` alphabet, non-canonical trailing bits and trailing
+ * garbage, and happily returns the very same 32 bytes for all of them. Accepting whatever it
+ * returns would therefore reinstate exactly the many-strings-one-row situation B5(1) forbids: one
+ * `run_capability` row would have an unbounded family of presentations that satisfy it. So the
+ * decode is never the validation. Three legs, all required, in order:
+ *
+ *   1. the text is EXACTLY 43 characters over EXACTLY `[A-Za-z0-9_-]` — this alone refuses padding,
+ *      the standard alphabet, and any other length;
+ *   2. it decodes to EXACTLY 32 bytes — the length is re-established on the bytes rather than
+ *      inferred from the character count; and
+ *   3. it ROUND-TRIPS: re-encoding those bytes as unpadded base64url reproduces the INPUT
+ *      byte-for-byte. This is the leg the first two cannot supply. A 43-character string over the
+ *      exact alphabet whose final character carries non-zero trailing bits (43 × 6 = 258 bits for
+ *      256 bits of secret, so the last character has 2 unused bits) is accepted by legs 1 and 2 and
+ *      decodes to the SAME 32 bytes as the canonical text — four distinct strings per secret. Only
+ *      re-encoding distinguishes them, and it does so with no bit arithmetic of our own.
+ *
+ * The parameter is `unknown` because that is what a header value honestly is: caller-controlled
+ * transport data of unverified shape. The compiler therefore refuses any read of it that skips
+ * leg 1. NO refusal here names the presented value, echoes it, or reports which leg a prefix of it
+ * satisfied (B6(3)'s logging prohibition).
+ */
+export function decodeRunCapability(presented: unknown): Buffer {
+  if (typeof presented !== "string" || !RUN_CAPABILITY_TEXT.test(presented)) {
+    throw new IngressRejection("RUN_CAPABILITY_INVALID", "presented capability is not 43 unpadded base64url characters");
+  }
+  const raw = Buffer.from(presented, "base64url");
+  if (raw.length !== RUN_CAPABILITY_BYTES) {
+    throw new IngressRejection("RUN_CAPABILITY_INVALID", `presented capability does not decode to ${RUN_CAPABILITY_BYTES} bytes`);
+  }
+  if (raw.toString("base64url") !== presented) {
+    throw new IngressRejection("RUN_CAPABILITY_INVALID", "presented capability is not the canonical encoding of its own bytes");
+  }
+  return raw;
+}
+
+/**
+ * AP B5(4): "every seal-time digest comparison MUST be CONSTANT-TIME, so a refusal leaks no prefix
+ * information about the stored digest". `===` on two hex strings is not: it short-circuits at the
+ * first differing character, so response time is a per-character oracle over `capability_digest`.
+ *
+ * `timingSafeEqual` THROWS on unequal lengths — which would turn a length difference into a 500 and
+ * into its own side channel — so the lengths are established FIRST and a mismatch returns `false`
+ * without ever reaching the comparison. That ordering is the contract: no capability digest is
+ * compared anywhere in this file except through this function. The comparison is over the hex TEXT
+ * of both digests, which is the form `run_capability.capability_digest` is stored in, so a
+ * malformed stored value can never be silently truncated into a match by a hex re-decode.
+ */
+function capabilityDigestsEqual(computed: string, stored: string): boolean {
+  const a = Buffer.from(computed, "utf8");
+  const b = Buffer.from(stored, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 /**
@@ -504,7 +610,13 @@ export class Ingress {
 
   // ---------------------------------------------------------------- seal_effect_request
 
-  sealEffectRequest(body: unknown, principal: Principal): EffectRequestV1 {
+  /**
+   * B6(3): `metadata` is the third parameter for the reason B6(1) made `allocation_tuple` a
+   * stripped body member — transport must be structurally incapable of becoming record content.
+   * It DEFAULTS to `{}`, so every existing caller (the v0.4 clients, the product activities, the
+   * live drivers) is unchanged and presents nothing, which under B5(4) is the same as today.
+   */
+  sealEffectRequest(body: unknown, principal: Principal, metadata: RequestMetadata = {}): EffectRequestV1 {
     const active = this.active();
     // B6(1): the tuple is stripped HERE, before anything reads the draft, so "transport, never a
     // draft field" is true of the implemented parse rather than merely asserted against it.
@@ -595,6 +707,10 @@ export class Ingress {
       // B5(9): ORIGIN-OR-REFUSED. Runs AFTER B2(3)'s legs, which B5(9) leaves unchanged, and
       // refuses before any K3 record exists like every other pre-K3 leg.
       const origin = this.#adjudicateRunOrigin(sealed, active);
+      // B5(4): the presentation legs, whose scope is "every run-bound request EXCEPT a run origin"
+      // — the origin adjudication above is what decides which this is, so it runs first and an
+      // adjudicated origin never reaches here. Also pre-K3: it refuses before the insert below.
+      if (!origin) this.#assertPresentedRunCapability(sealed, active, metadata);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
       // B5(5): the membership proof is inserted in the SAME transaction as the `effect_request`
       // row. For an origin the two columns are equal, and THAT row is B5(1)(b)'s durable minting
@@ -667,11 +783,61 @@ export class Ingress {
   #adjudicateRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
     if (sealed.operation_kind !== RUN_PROFILE_WORK_START) return false; // leg 1
     if (!runProfileEnrolled(active.config, sealed.requester_ref)) return false;
-    if (bindsItsOwnEffectId(sealed, active.config)) return true; // legs 2 and 3
+    // Legs 2 and 3 in one lookup: exactly one binding on the DECLARED exact pair, naming this
+    // request's own `effect_id`. `undefined` (undeclared, none, or more than one) fails leg 2.
+    if (declaredWorkRunRef(sealed, active.config) === sealed.effect_id) return true;
     throw new IngressRejection(
       "RUN_CAPABILITY_INVALID",
       `${sealed.effect_id} is a WORK_START that does not originate its own run scope`,
     );
+  }
+
+  /**
+   * AP B5(4) — the PRESENTATION legs, evaluated over rows read inside the sealing transaction.
+   * This lane implements the `RUN_CAPABILITY_INVALID` leg and it alone: a presented capability that
+   * does not decode canonically (B6(3)), or whose digest matches no `run_capability` row for THIS
+   * request's own `work_run_ref` — including the case where no row exists for it at all, which is
+   * B5(4)'s standing, permanent refusal for any request naming a never-witnessed `WORK_START`.
+   *
+   * GATE, and it is the whole of the gate: the rule engages only for a `requester_ref` enrolled in
+   * `run_profile_enrolled_requester_refs` — which `runProfileEnrolled` makes expressible ONLY under
+   * `cadp.kernel-config.v2` — and only when `kernel_subject_namespaces` declares the work-run
+   * namespace this request is bound on. Under `cadp.kernel-config.v1` the first condition is
+   * unsatisfiable, so the header is inert and a v0.4 deployment's seal path is byte-identical to
+   * what it is today, presented or not. That is why the header is not parsed before the gate: a
+   * malformed value outside the gate must be exactly as inert as a well-formed one, or the header
+   * would be observable where the contract says it is not.
+   *
+   * THE THREE LEGS THIS LANE DOES NOT RAISE, named so their absence is a stated scope and not an
+   * oversight — each is a DISTINCT reason code of B5(4) and each is a later lane:
+   *  - a run-bound request presenting NOTHING is `RUN_CAPABILITY_REQUIRED`, so `presented ===
+   *    undefined` returns here rather than refusing under this lane's less exact code;
+   *  - a row whose `holder_ref` is not this request's stamped `requester_ref` is
+   *    `RUN_CAPABILITY_HOLDER_MISMATCH`; and
+   *  - the `WORK_START`'s latest conclusive K7 grading is `RUN_SCOPE_UNRESOLVED`/`RUN_SCOPE_REFUSED`.
+   * Likewise B5(3)'s `RUN_BINDING_REQUIRED` (an enrolled requester's request carrying no work-run
+   * binding at all) is the `work_run_ref === undefined` case, which returns here for the same
+   * reason. Every one of those legs NARROWS what seals; none widens it, so nothing that refuses
+   * today starts sealing when they land.
+   *
+   * The refusal names the reason code and the caller's own sealed `work_run_ref`. It never names,
+   * echoes or prefixes the presented secret, and the two refusal legs are deliberately ONE message:
+   * "no row" and "row with a different digest" are not distinguished, because distinguishing them
+   * would tell a prober whether a given `work_run_ref` has ever been minted against (B6(3)).
+   */
+  #assertPresentedRunCapability(sealed: EffectRequestV1, active: ActivePolicy, metadata: RequestMetadata): void {
+    if (!runProfileEnrolled(active.config, sealed.requester_ref)) return;
+    const work_run_ref = declaredWorkRunRef(sealed, active.config);
+    if (work_run_ref === undefined) return; // B5(3)'s RUN_BINDING_REQUIRED, a later lane
+    const presented = metadata.run_capability;
+    if (presented === undefined) return; // B5(4)'s RUN_CAPABILITY_REQUIRED, a later lane
+    // B6(3) then B5(1): the ONE strict parser, then SHA-256 over the RAW bytes it returned — never
+    // over the transport text — compared constant-time against the row for this exact run.
+    const secret = decodeRunCapability(presented);
+    const row = this.store.runCapability(work_run_ref);
+    if (row === undefined || !capabilityDigestsEqual(sha256Hex(secret), row.capability_digest)) {
+      throw new IngressRejection("RUN_CAPABILITY_INVALID", `no run capability matches ${work_run_ref}`);
+    }
   }
 
   /**
