@@ -7,7 +7,11 @@
 import { Cas } from "./cas.ts";
 import { sha256Hex } from "./canonical.ts";
 import type { Digest } from "./canonical.ts";
-import { dataJsonOf, manifestOf, manifestRevisionString, parseManifestRevision, payloadDigestOf, validateKernelConfig } from "./policyBundle.ts";
+import {
+  allocationContractEntriesOf, dataJsonOf, manifestOf, manifestRevisionString, parseManifestRevision, payloadDigestOf,
+  RUN_ORIGIN_ALLOCATION_SCHEMA, validateKernelConfig,
+} from "./policyBundle.ts";
+import type { SealedAllocationContract } from "./policyBundle.ts";
 import { ConstitutionalStore } from "./store.ts";
 
 export interface ProposedPolicyRef {
@@ -28,6 +32,33 @@ export interface VerifiedBundle {
   readonly bundleBytes: Uint8Array;
   readonly payload_digest: string;
   readonly manifest_revision: string;
+}
+
+/**
+ * AP B2(2)(ii) as extended for `cadp.allocation-key.run-origin.v1`: the run-origin allocation
+ * contract as the SEALED STORE carries it — the entries of the EARLIEST activation that carried
+ * that schema id at all, scanned in activation order.
+ *
+ * The comparison is against the sealed store and never against the currently active bundle, which
+ * is what stops a contract being laundered by withdrawing it in one activation and re-adding a
+ * different one in the next: an earlier activation still carries the original, and every
+ * activation between them had to equal it, so the earliest is the fixed point.
+ */
+export function sealedRunOriginContract(store: ConstitutionalStore, cas: Cas): SealedAllocationContract | undefined {
+  const active = store.activeActivation();
+  if (active === undefined) return undefined;
+  for (let seq = 1; seq <= active.seq; seq += 1) {
+    const activation = store.activationBySeq(seq);
+    if (activation === undefined) continue; // no row for a seq that was never activated
+    const refRow = store.policyRef(activation.policy_id, activation.revision);
+    if (refRow === undefined) continue;
+    // A read failure here is store corruption, not a policy question: it propagates rather than
+    // being swallowed into a silent "no prior contract", which would be fail-OPEN on immutability.
+    const data = dataJsonOf(cas.get(refRow.bundle_cas_key)) as { cadp?: unknown } | undefined;
+    const contract = allocationContractEntriesOf(data?.cadp, RUN_ORIGIN_ALLOCATION_SCHEMA);
+    if (contract.descriptor !== undefined || contract.allocation_schema !== undefined) return contract;
+  }
+  return undefined;
 }
 
 /** All #17 bundle checks except the activation-base check (#13, caller-owned). */
@@ -55,7 +86,10 @@ export function verifyProposedBundle(cas: Cas, store: ConstitutionalStore, propo
   }
   const data = dataJsonOf(bundleBytes) as { cadp?: unknown } | undefined;
   try {
-    validateKernelConfig(data?.cadp);
+    // The sealed run-origin contract is resolved here, at the one seam every activation decision
+    // passes through (recheck #17 and the root listener's `BREAK_GLASS(ACTIVATE_POLICY)` alike),
+    // so B2(2)(ii)'s cross-activation comparison cannot be reached around by either path.
+    validateKernelConfig(data?.cadp, sealedRunOriginContract(store, cas));
   } catch (error) {
     throw new PublicationRefusal("KERNEL_CONFIG_INVALID", error instanceof Error ? error.message : String(error));
   }

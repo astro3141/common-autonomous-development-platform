@@ -9,12 +9,15 @@
  * load-bearing by disabling it and observing the prohibited effect.
  */
 
+import { randomBytes } from "node:crypto";
+
 import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
-import { adapterEntry, resolveActivePolicy } from "./policyState.ts";
+import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import type { Principal } from "./ingress.ts";
+import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
 import { resolvePointer } from "./policyBundle.ts";
 import { PublicationRefusal, verifyProposedBundle } from "./policyPublication.ts";
@@ -34,6 +37,18 @@ export interface Admitted {
   readonly kind: "ADMITTED";
   readonly admission: EffectAdmissionV1;
   readonly outcome: EffectOutcomeV1;
+  /**
+   * AP B6(4): base64url (unpadded) of the freshly minted 256-bit run capability. Present EXACTLY
+   * when the dispatch is the INITIAL dispatch of that `effect_id`, the sealed request is
+   * run-capability-minting (B5(1) — the WITNESSED predicate, BOTH legs) and the caller passed the
+   * stamped-vs-sealed `requester_ref` equality; ABSENT in every other case without exception.
+   *
+   * NORMATIVE (B6(3)): this value MUST NOT be written to any log, trace, metric label, incident
+   * detail, error message or `KERNEL_INCIDENT` claim. It is returned once, to the verified holder,
+   * and exists nowhere durable — only `capability_digest` is stored, and a digest cannot be
+   * inverted (B5(7)), so a lost secret is not recoverable by any path.
+   */
+  readonly run_capability?: string;
 }
 
 export type AdmitResult = Refusal | Admitted;
@@ -111,9 +126,37 @@ export class Pep {
 
   // ================================================================ admit_and_dispatch
 
-  async admitAndDispatch(effect_id: string, decision_id: string): Promise<AdmitResult> {
+  /**
+   * AP B5(1): `admit_and_dispatch` takes the authenticated principal — the same pattern the API
+   * layer already uses for `seal_effect_request` and `submit_evidence`. It is OPTIONAL in the
+   * signature only because every non-minting dispatch is unaffected by it (the in-process
+   * compositions and the reconciler call this method without one); for a MINTING `WORK_START` an
+   * absent, unregistered or non-matching principal is refused below, so the one-shot secret is
+   * never deliverable to a caller the Platform has not verified as the sealed requester.
+   */
+  async admitAndDispatch(
+    effect_id: string,
+    decision_id: string,
+    options: { readonly principal?: Principal } = {},
+  ): Promise<AdmitResult> {
     const request = this.store.effectRequest(effect_id);
     if (request === undefined) return { kind: "REFUSAL", reason: "EFFECT_NOT_FOUND" };
+    // B5(1): the minting predicate is WITNESSED, and its refusal leg runs BEFORE the adapter is
+    // resolved, before the material is read and before lock D — so a dispatch by anyone other than
+    // the sealed requester mints nothing, writes no outcome and never reaches the target. The cheap
+    // SHAPE leg is tested first, so no non-`WORK_START` dispatch pays for any of this.
+    let verifiedRequester = false;
+    if (request.operation_kind === RUN_PROFILE_WORK_START) {
+      const preflight = resolveActivePolicy(this.store, this.cas);
+      verifiedRequester = this.#isSealedRequester(request, preflight, options.principal);
+      if (this.#isRunCapabilityMinting(request, preflight) && !verifiedRequester) {
+        return {
+          kind: "REFUSAL",
+          reason: "WORK_START_DISPATCH_REQUESTER_MISMATCH",
+          detail: `dispatch of ${effect_id} is reserved to its sealed requester`,
+        };
+      }
+    }
     const adapter = this.adapters.byTarget(request.target_ref);
     if (adapter === undefined) return { kind: "REFUSAL", reason: "NO_ADAPTER_FOR_TARGET" };
 
@@ -130,10 +173,47 @@ export class Pep {
     const domain = adapter.serialization_domain(material);
     const release = await this.locks.acquire(domain);
     try {
-      return await this.#admitAndDispatchLocked(request, adapter, material, decision_id);
+      return await this.#admitAndDispatchLocked(request, adapter, material, decision_id, verifiedRequester);
     } finally {
       release();
     }
+  }
+
+  /**
+   * AP B5(1): `run-capability-minting(E)` — WITNESSED, not shape-only. BOTH legs, each read from
+   * rows in the dispatch path: (a) `E`'s sealed `operation_kind` is the run profile's `WORK_START`,
+   * and (b) `E` was ADJUDICATED A RUN ORIGIN AT SEAL, witnessed by the durable
+   * `run_membership(E, E)` row that B5(9)'s origin path wrote inside `E`'s own sealing transaction.
+   *
+   * Consequence (α), which is why the shape leg alone would be wrong: an ORDINARY `WORK_START` —
+   * `operation_kind == WORK_START` with NO self-witness — is NEVER minting, not at its initial
+   * dispatch and not at any later one, and NO later `POLICY_ACTIVATE` can retroactively make it
+   * one; the witness is fixed in `E`'s sealing transaction and the store has no runtime UPDATE and
+   * no back-dating insert. So no `run_capability` row is ever written for it, and a later request
+   * naming it as its run is refused permanently by B5(4)'s no-row case. Consequence (β): a genuine
+   * self-origin's witness is durable, so it is present at that effect's initial dispatch and at
+   * every later one, with once-and-only-once enforced by the `run_capability` primary key.
+   *
+   * Gated on the v2 config: a `cadp.kernel-config.v1` deployment has no `is_run_origin` path, hence
+   * no witness row, hence no minting — its dispatch behaviour is byte-identical to v0.4's.
+   */
+  #isRunCapabilityMinting(request: EffectRequestV1, active: ActivePolicy): boolean {
+    if (request.operation_kind !== RUN_PROFILE_WORK_START) return false;
+    if (active.config.schema !== "cadp.kernel-config.v2") return false;
+    return this.store.runMembership(request.effect_id)?.work_run_ref === request.effect_id;
+  }
+
+  /**
+   * AP B5(1): a generic stamped-vs-sealed `requester_ref` equality carrying no domain knowledge —
+   * the caller's authenticated principal resolved through the ACTIVE `identity_registry`, compared
+   * against the `requester_ref` the sealed request carries. It is what makes the one-shot secret
+   * deliverable ONLY to its exact holder-to-be; without it any `workflow`-class principal could
+   * dispatch another's `WORK_START`, receive the capability and — there being no recovery (B5(7))
+   * — strand that run permanently.
+   */
+  #isSealedRequester(request: EffectRequestV1, active: ActivePolicy, principal: Principal | undefined): boolean {
+    if (principal === undefined) return false;
+    return identityEntry(active.config, principal.principal)?.producer_ref === request.requester_ref;
   }
 
   async #admitAndDispatchLocked(
@@ -141,6 +221,7 @@ export class Pep {
     adapter: TargetAdapterV1,
     material: Record<string, unknown>,
     decision_id: string,
+    verifiedRequester: boolean,
   ): Promise<AdmitResult> {
     const active = resolveActivePolicy(this.store, this.cas);
     const operation = adapter.describe().operations.find((o) => o.operation_kind === request.operation_kind);
@@ -195,10 +276,10 @@ export class Pep {
 
     // ---- the admission transaction (TD §3.4) ----
 
-    let admission: EffectAdmissionV1;
+    let admitted: { admission: EffectAdmissionV1; run_capability?: string };
     try {
-      admission = this.store.withImmediate(() =>
-        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults),
+      admitted = this.store.withImmediate(() =>
+        this.#admissionTransaction(request, adapter, material, decision_id, active, probeResults, verifiedRequester),
       );
     } catch (error) {
       if (error instanceof Refuse) {
@@ -222,8 +303,14 @@ export class Pep {
 
     // ---- dispatch (after COMMIT, still inside lock D; §3.4) ----
 
+    const { admission, run_capability } = admitted;
     const outcome = await this.#dispatchAndObserve(request, adapter, material, admission, active);
-    return { kind: "ADMITTED", admission, outcome };
+    // B5(7)'s accepted residual, stated where it happens: the `run_capability` row commit and this
+    // delivery are NOT atomic. A crash or a dropped connection after the commit strands the run —
+    // the retry is not the INITIAL dispatch, so nothing mints and nothing is re-delivered, and the
+    // raw secret exists nowhere durable. Fail-closed and liveness-only: no effect authority is
+    // gained by anyone, and the run's already-sealed effects admit, reconcile and grade normally.
+    return { kind: "ADMITTED", admission, outcome, ...(run_capability === undefined ? {} : { run_capability }) };
   }
 
   #isProbeable(adapter: TargetAdapterV1, binding: SubjectBinding): boolean {
@@ -239,7 +326,8 @@ export class Pep {
     decision_id: string,
     active: ActivePolicy,
     probes: ReadonlyMap<string, { revision_or_version?: string; content_digest?: string; availability: string }>,
-  ): EffectAdmissionV1 {
+    verifiedRequester: boolean,
+  ): { admission: EffectAdmissionV1; run_capability?: string } {
     const now = this.clock();
     const store = this.store;
 
@@ -578,7 +666,49 @@ export class Pep {
     const admission = { ...base, admission_digest: recordDigest(base, "admission_digest") } as unknown as EffectAdmissionV1;
     validateEffectAdmission(admission);
     this.store.insertAdmission(admission);
-    return admission;
+    return { admission, ...this.#mintRunCapability(request, active, ordinal, verifiedRequester) };
+  }
+
+  /**
+   * AP B5(1): at the INITIAL `admit_and_dispatch` of a WITNESSED minting `WORK_START`, and before
+   * any outcome exists, mint a run capability of 256 bits from a CSPRNG and store `H(C)` IN THIS
+   * SAME TRANSACTION as the admission. Both legs of the witnessed predicate are re-read from rows
+   * HERE, inside the transaction, not carried in from the pre-flight check.
+   *
+   * The digest is pinned exactly: `capability_digest` = SHA-256 over the RAW 32 SECRET BYTES, never
+   * over B6(3)'s base64url text — one canonical preimage, so no encoding variant (padding, an
+   * alternate alphabet, case) can be a second string digesting to the same row. The secret itself
+   * is never stored, never in any K1–K7 record or digest, never in the `ResolvedAdmissionBundle`,
+   * and never in workflow args or effect material; it is returned to the verified caller and
+   * nowhere else. `holder_ref` is the SEALED `requester_ref`, which by the check above is also the
+   * caller the secret goes to.
+   *
+   * Once-and-only-once is the STORE's, not caller discipline: the `work_run_ref` primary key is
+   * that `WORK_START`'s own `effect_id`, so a repeat `admit_and_dispatch` finds the row present,
+   * mints nothing and returns nothing (B6(4)) — and the `ordinal === 1` leg is the same rule keyed
+   * on "initial dispatch" rather than on call outcome, so a later ordinal after a
+   * `NO_EFFECT_CONFIRMED` (B5(2)) delivers nothing either. K7 grading moves USABILITY, never
+   * minting-ness.
+   */
+  #mintRunCapability(
+    request: EffectRequestV1,
+    active: ActivePolicy,
+    ordinal: number,
+    verifiedRequester: boolean,
+  ): { run_capability?: string } {
+    if (!this.#isRunCapabilityMinting(request, active)) return {};
+    // Belt-and-braces against a future caller path that skips the pre-flight refusal: an unverified
+    // caller never reaches a mint, so no secret is ever generated for one.
+    if (!verifiedRequester) throw new Refuse("WORK_START_DISPATCH_REQUESTER_MISMATCH", request.effect_id);
+    if (ordinal !== 1 || this.store.runCapability(request.effect_id) !== undefined) return {};
+    const secret = randomBytes(32);
+    this.store.insertRunCapability({
+      work_run_ref: request.effect_id,
+      holder_ref: request.requester_ref,
+      capability_digest: sha256Hex(secret),
+      minted_at: nowIso(this.clock),
+    });
+    return { run_capability: secret.toString("base64url") };
   }
 
   #enforceConstraint(

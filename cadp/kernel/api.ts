@@ -136,8 +136,14 @@ async function handle(deps: ApiDeps, req: http.IncomingMessage, res: http.Server
         return send(200, outcome);
       }
       case "admit_and_dispatch": {
+        // AP B5(1)/B6(4): the request body is UNCHANGED at `{ effect_id, decision_id }` — the
+        // principal is the one this layer already resolved from `authorization`, never a body
+        // field. The result may carry the one-shot `run_capability`, which is exactly what a
+        // verified initial dispatch of a witnessed minting `WORK_START` returns and what every
+        // other case must not; B6(3) forbids writing it to any log, trace or error, so it is
+        // serialized to the caller's authenticated response and read nowhere else here.
         const body = JSON.parse(raw.toString("utf8")) as { effect_id: string; decision_id: string };
-        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id);
+        const result = await deps.pep.admitAndDispatch(body.effect_id, body.decision_id, { principal: { principal } });
         return send(200, result);
       }
       case "get_effect_state": {

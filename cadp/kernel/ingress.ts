@@ -19,7 +19,7 @@ import type { Digest } from "./canonical.ts";
 import { newId } from "./ids.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
-import { resolvePointer } from "./policyBundle.ts";
+import { KERNEL_WORK_RUN_NAMESPACE, resolvePointer } from "./policyBundle.ts";
 import type { KernelConfig, SubjectCompleteAssemblyEntry } from "./policyBundle.ts";
 import { validateAdmissionInput, validateEffectRequest, validateEvidenceEnvelope } from "./records.ts";
 import type { AdmissionInputV1, EffectRequestV1, EvidenceEnvelopeV1, EvidenceKind, Provenance, SubjectBinding, TargetRef } from "./records.ts";
@@ -174,6 +174,17 @@ const REQUESTER_TUPLE_FIELDS: readonly string[] = ["requester_ref", "requester",
 
 /** The platform effect-id shape the kernel already validates on this path (AP B2(2)(i)). */
 const EFFECT_ID_PREFIX = "cadp-v04:effect:";
+
+/**
+ * AP B5(1)(a) / B5(9) leg 1: the run profile's `WORK_START`. It is the ONE sealed value both the
+ * seal-time origin adjudication and the dispatch-time minting predicate read, and it is a shape
+ * property of the sealed record that cannot drift — which is exactly why the ADJUDICATION (what
+ * enrollment and self-binding were AT SEAL) is pinned durably by a `run_membership(E, E)` row
+ * instead of being recomputed at dispatch. The kernel already names this operation kind on the
+ * work-run counting path (`pep.ts`); it is kernel run-profile vocabulary, not domain vocabulary,
+ * and it is not an allocation tuple field name (B2(5) leaves no schema's field set in kernel code).
+ */
+export const RUN_PROFILE_WORK_START = "WORK_START";
 
 /**
  * AP B2(2)(i): the closed, GENERIC `value_contract` vocabulary — the v0.4 typed-tuple rules
@@ -549,7 +560,14 @@ export class Ingress {
       // FIRST seal (no `effect_request` row): B2(3)'s legs, all of them generic equalities over
       // bundle data and the caller's own tuple, every one refusing BEFORE any K3 record exists.
       if (allocation !== undefined) this.#assertFirstSealBinding(sealed, allocation, allocation_tuple, active);
+      // AP B5(9): the run-origin adjudication, AFTER B2(3)'s complete first-seal legs and B2(10)'s
+      // allocation-principal gate — "everything else runs unchanged" — and inside this same
+      // transaction, so the witness row and the K3 row commit together or not at all.
+      const origin = allocationBound && this.#isRunOrigin(sealed, active);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
+      // B5(5): the durable membership proof. For an origin it is the SELF-REFERENTIAL row, which
+      // IS B5(1)(b)'s minting witness — written here and on no other path.
+      if (origin) this.store.insertRunMembership(sealed.effect_id, sealed.effect_id);
       return { kind: "row", row: sealed };
     });
     if (outcome.kind === "conflict") {
@@ -592,6 +610,54 @@ export class Ingress {
       throw new IngressRejection("ALLOCATION_BINDING_MISMATCH", "re-presented tuple is not the allocated one");
     }
     return tuple as Record<string, unknown>;
+  }
+
+  /**
+   * AP B5(9) — `is_run_origin(request)`, ORIGIN-OR-REFUSED, evaluated in the sealing transaction.
+   * All three legs, exactly:
+   *   1. the request is `WORK_START`-SHAPED — leg (a) of B5(1)'s minting predicate and DELIBERATELY
+   *      exactly that leg: leg (b) is the `run_membership(E, E)` row this very rule decides whether
+   *      to write, so reusing the witnessed predicate here would require this rule's own output as
+   *      its input and no origin could ever be adjudicated;
+   *   2. EXACTLY ONE binding on the EXACT `(authority_ref, namespace)` pair `kernel_subject_
+   *      namespaces` declares for the work-run namespace (B3(4)(a)) — an off-authority
+   *      `{other, work-run, …}` binding is not a kernel work-run subject at all and cannot stand in
+   *      for the self-binding; and
+   *   3. that binding's `object_id` EQUALS the request's own `effect_id`. Checkable because
+   *      allocation precedes sealing: the Platform-issued `effect_id` is already in the caller's
+   *      hands when it seals, which is also why B1(5)'s tuple cannot carry a `work_run_ref`.
+   *
+   * Leg 3 failing is REFUSED `RUN_CAPABILITY_INVALID` — B5(4)'s existing code, no new code — and
+   * NEVER falls through to the ordinary member path, EVEN IF the request presents a genuinely
+   * valid, holder-matching capability for the run it names: possession is exactly what would
+   * otherwise let one requester originate a second run's identity inside another run's scope. On
+   * that refusal the transaction rolls back, so no `effect_request` row, no `run_membership` row
+   * and no membership proof is created (Spec v0.5 §9.2).
+   *
+   * SCOPE OF THIS LANE, stated so the carve-out is not read as a weakening. A `WORK_START` carrying
+   * ZERO declared work-run bindings is NOT adjudicated here and seals as it does today, acquiring
+   * no witness and therefore never minting (B5(1)(α) describes exactly that request — a
+   * non-enrolled requester's ordinary `WORK_START` — as sealing normally). For an ENROLLED
+   * requester that same request is `RUN_BINDING_REQUIRED` under B5(3), and enrollment,
+   * `RUN_BINDING_REQUIRED` and `NOT_RUN_ENROLLED` are a later lane; until it lands
+   * `run_profile_enrolled_requester_refs` is empty in every composition, so no request that B5(3)
+   * would refuse is silently admitted by this rule instead.
+   */
+  #isRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
+    if (sealed.operation_kind !== RUN_PROFILE_WORK_START) return false;
+    const declared = (active.config.kernel_subject_namespaces ?? []).find((entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE);
+    if (declared === undefined) return false;
+    const bound = sealed.work_bindings.filter(
+      (binding) => binding.authority_ref === declared.authority_ref && binding.namespace === declared.namespace,
+    );
+    if (bound.length === 0) return false;
+    if (bound.length !== 1 || bound[0]!.object_id !== sealed.effect_id) {
+      throw new IngressRejection(
+        "RUN_CAPABILITY_INVALID",
+        `a ${RUN_PROFILE_WORK_START} whose work-run binding is not its own effect_id is not a run origin`,
+      );
+    }
+    return true;
   }
 
   /**

@@ -76,8 +76,19 @@ export class KernelClient {
     return this.#call("evaluate", { input_digest });
   }
 
+  /**
+   * The request body is unchanged at `{ effect_id, decision_id }` (AP B6(4)); the principal is the
+   * caller's own bearer credential, resolved by the kernel from `authorization`.
+   *
+   * `run_capability` is the ONE-SHOT run-capability secret (base64url, unpadded), present exactly
+   * on a verified INITIAL dispatch of a witnessed minting `WORK_START` and absent in every other
+   * result. AP B6(3) is NORMATIVE about it: a holder MUST NOT write this value — nor pass a result
+   * object containing it — to any log, trace, metric label, incident or error message. There is no
+   * re-delivery (B5(7)): only its digest is stored, so a leaked or lost value cannot be rotated or
+   * recovered in this generation.
+   */
   admitAndDispatch(effect_id: string, decision_id: string): Promise<
-    | { kind: "ADMITTED"; admission: EffectAdmissionV1; outcome: EffectOutcomeV1 }
+    | { kind: "ADMITTED"; admission: EffectAdmissionV1; outcome: EffectOutcomeV1; run_capability?: string }
     | { kind: "REFUSAL"; reason: string; detail?: string }
   > {
     return this.#call("admit_and_dispatch", { effect_id, decision_id });
