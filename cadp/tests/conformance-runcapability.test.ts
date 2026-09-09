@@ -829,13 +829,25 @@ function opsDependencies(h: Harness, api: { port: number }, token: string) {
     base_sha: "0".repeat(40), tokens: { "cadp-workflow": token }, root_key_id: "root-1",
     kernel_config_path: "", policy_content_digest: "",
   } as LiveEnvManifest;
+  // The origin path's two LIVE reads, made observable: `resolveBase` stands for the seal-time
+  // `ls-remote` (whose answer MOVES when the base branch moves) and `imageIdentity` for the
+  // `docker inspect` of the built image. A test can move either between attempts and count how
+  // many times each seam was consulted at all.
+  const live = { base_sha: "a".repeat(40), image_digest: "sha256:test", base_reads: 0, image_reads: 0 };
   return {
+    live,
     manifest,
     client: new KernelClient(manifest.api_url, token),
     namespaceId: () => "cadp-v04",
-    resolveBase: () => "a".repeat(40),
+    resolveBase: () => {
+      live.base_reads += 1;
+      return live.base_sha;
+    },
     workerImage: "cadp-worker:test",
-    imageIdentity: (image: string) => ({ image, image_digest: "sha256:test", tool_versions: { "codex-cli": "1.0.0" } }),
+    imageIdentity: (image: string) => {
+      live.image_reads += 1;
+      return { image, image_digest: live.image_digest, tool_versions: { "codex-cli": "1.0.0" } };
+    },
   };
 }
 
@@ -865,10 +877,13 @@ test("A5/WP §3.6: one origin_key gives ONE effect_id and a BYTE-IDENTICAL re-se
       // WP §3.6 / A5 control 14: RETRY the same logical origin. The identity converges AND the
       // material is byte-reproducible, so the re-seal is IDEMPOTENT — one request row, an unchanged
       // request_digest, zero incidents and zero scope holds, not a REQUEST_DIGEST_CONFLICT.
-      // SCOPE NOTE, so this leg is not over-read: the injected `resolveBase` stands for a PINNED
-      // base, which is the case this lane's change covers. The development path still resolves
-      // `base_sha` live at seal time, so a retry after the base branch MOVES still drifts — the
-      // outstanding half of WP §3.6's obligation, named in `cadp/live/ops.ts` and not asserted here.
+      // The retry runs against a MOVED WORLD, which is the case §3.6 names on the development
+      // branch: the base branch has advanced and the worker image has been rebuilt since the first
+      // creation. A path that re-read either at seal time would seal a different `base_sha` (or a
+      // different `image_digest`) under the SAME converged effect_id — the drift the first-creation
+      // pin exists to make unconstructible.
+      dependencies.live.base_sha = "b".repeat(40);
+      dependencies.live.image_digest = "sha256:rebuilt";
       const retried = await startWork(h.dir, "development", ["do the thing", "8", "6"], { originKey, dependencies });
       // The retry's dispatch is refused (the first one COMMITTED), which is recheck #12's business
       // and not this control's; what this control asserts is the SEAL.
@@ -882,6 +897,37 @@ test("A5/WP §3.6: one origin_key gives ONE effect_id and a BYTE-IDENTICAL re-se
       );
       assert.equal(h.store.openIncidents().length, 0, "zero KERNEL_INCIDENT rows, hence zero scope holds");
       assert.equal(count(h, "run_membership"), 1, "and no second membership row");
+
+      // The stored material still carries the FIRST-CREATION values, not the moved world's: what
+      // makes the digests match is a genuine pin, not two live reads that happened to agree.
+      const sealedMaterial = JSON.parse(Buffer.from(h.cas.get(reSealed.material_ref)).toString("utf8")) as {
+        args_cas_key: string; surface_image: { image_digest: string };
+      };
+      const sealedArgs = JSON.parse(Buffer.from(h.cas.get(sealedMaterial.args_cas_key)).toString("utf8")) as {
+        development: { base_sha: string; worker_product: string }; bounds: { max_steps: number; max_effects: number };
+      };
+      assert.equal(sealedArgs.development.base_sha, "a".repeat(40), "the first-creation base, not the moved tip");
+      assert.equal(sealedMaterial.surface_image.image_digest, "sha256:test", "the first-creation image, not the rebuild");
+      // And the live seams were not merely ignored on the retry — they were never consulted, so no
+      // moved value could reach the seal by any route.
+      assert.deepEqual(
+        { base_reads: dependencies.live.base_reads, image_reads: dependencies.live.image_reads },
+        { base_reads: 1, image_reads: 1 },
+        "one live read per origin, at first creation only",
+      );
+
+      // §3.6 fixes the args at first creation, `bounds` and provider selections included: a retry
+      // presenting DIFFERENT ones re-presents the pinned material rather than drifting the origin.
+      const withOtherArgs = await startWork(h.dir, "development", ["do the thing", "4", "3", "", "grok"], { originKey, dependencies });
+      assert.equal(withOtherArgs, undefined, "still no second dispatch");
+      const afterOtherArgs = h.store.effectRequest(run)!;
+      assert.equal(afterOtherArgs.request_digest.value, request.request_digest.value);
+      const pinnedArgs = JSON.parse(
+        Buffer.from(h.cas.get((JSON.parse(Buffer.from(h.cas.get(afterOtherArgs.material_ref)).toString("utf8")) as { args_cas_key: string }).args_cas_key)).toString("utf8"),
+      ) as { development: { worker_product: string }; bounds: { max_steps: number; max_effects: number } };
+      assert.deepEqual(pinnedArgs.bounds, { max_steps: 8, max_effects: 6 }, "the first-creation bounds stand");
+      assert.equal(pinnedArgs.development.worker_product, "codex", "as does the first-creation provider");
+      assert.equal(h.store.openIncidents().length, 0, "and the origin stays retryable — no conflict, no hold");
 
       // A5 o-i: a DIFFERENT origin_key over byte-identical work content is a DIFFERENT origin.
       const other = await startWork(h.dir, "development", ["do the thing", "8", "6"], {
