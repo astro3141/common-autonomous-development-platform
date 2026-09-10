@@ -94,6 +94,63 @@ function summaryCount(output: string, key: "tests" | "pass" | "fail"): number | 
   return line === null ? undefined : Number(line[1]);
 }
 
+/** The built surface image the broker runs verifier containers as (cadp/live/image/Dockerfile). */
+const SURFACE_IMAGE = "cadp-surface:0.151.0-2.1.221";
+
+/**
+ * The surface runtime's Node, read from the image definition itself (`FROM node:<major>-...`) so a
+ * rebase of the image moves this control with it instead of leaving a stale literal here.
+ */
+function surfaceNode(): { major: number; base: string } {
+  const from = /^FROM (node:(\d+)\S*)$/mu.exec(readFileSync(join(REPO_ROOT, "cadp/live/image/Dockerfile"), "utf8"));
+  assert.ok(from !== null, "the surface image must pin a node:<major> base — the verifier's runtime is defined there");
+  return { major: Number(from[2]), base: from[1] as string };
+}
+
+/**
+ * WHERE the pinned invocation gets measured — the surface container's Node, never whatever `node`
+ * happens to sit on the ambient PATH. Discovery semantics differ BY MAJOR: on the surface image's
+ * Node 22 a bare directory argument to `node --test` is resolved as a module specifier and runs no
+ * suite at all, while Node 24 recurses into it. So a run on a host Node measures the host, and a
+ * green result there says nothing about what the verifier actually executes. This resolves a runner
+ * that IS the surface Node:
+ *   • the ambient node, ONLY when its major already IS the image's pin — which is the case inside
+ *     the verifier container itself (where this suite really runs: `--network none`, no docker
+ *     daemon reachable) and on a matching developer host;
+ *   • otherwise a real container on the surface image — the built tag when present, else the base
+ *     tag the Dockerfile pins, which is the same Node layer.
+ * Neither reachable ⇒ the control FAILS. A control that can only skip when it cannot reach the
+ * right runtime reports a pass while proving nothing (the stance conformance-osisolation.test.ts
+ * takes for the surface-lifetime probe).
+ */
+function surfaceRunner(fixture: string): { where: string; run: (argv: readonly string[]) => { status: number | null; output: string } } {
+  const surface = surfaceNode();
+  if (Number(process.versions.node.split(".")[0]) === surface.major) {
+    return {
+      where: `ambient node v${process.versions.node} — IS the surface pin (${surface.base})`,
+      run: (argv) => {
+        const r = spawnSync(argv[0] as string, [...argv.slice(1)], { cwd: fixture, encoding: "utf8", env: cleanEnv(), timeout: 180_000 });
+        return { status: r.status, output: `${r.stdout}${r.stderr}` };
+      },
+    };
+  }
+  const hasDocker = spawnSync("docker", ["info"], { stdio: "ignore", timeout: 60_000 }).status === 0;
+  const image = !hasDocker ? undefined : [SURFACE_IMAGE, surface.base].find((candidate) =>
+    spawnSync("docker", ["image", "inspect", candidate], { stdio: "ignore", timeout: 60_000 }).status === 0
+    || spawnSync("docker", ["pull", "--quiet", candidate], { stdio: "ignore", timeout: 300_000 }).status === 0);
+  assert.ok(
+    image !== undefined,
+    `cannot measure the SURFACE runtime: ambient node is v${process.versions.node}, the surface image pins ${surface.base}, and no container runtime is available to stand in. Refusing to measure the host's discovery semantics and report them as the verifier's.`,
+  );
+  return {
+    where: `container ${image} — the surface runtime (${surface.base})`,
+    run: (argv) => {
+      const r = spawnSync("docker", ["run", "--rm", "--network", "none", "-v", `${fixture}:/ws`, "-w", "/ws", image, ...argv], { encoding: "utf8", timeout: 300_000 });
+      return { status: r.status, output: `${r.stdout}${r.stderr}` };
+    },
+  };
+}
+
 test("GF8: BOTH verifiers pin the same explicit invocation, and running it actually EXECUTES tests in EVERY named suite", () => {
   // The seam this closes is selection-BYPASS: a test must not be evadable by exclusion without
   // modification. Snapshotting the argv is not enough — an argv that discovers NOTHING passes a
@@ -134,12 +191,17 @@ test("GF8: BOTH verifiers pin the same explicit invocation, and running it actua
     assert.ok(readdirSync(dir).some((f) => f.endsWith(".test.ts")), `${pattern} expands to nothing — that suite would silently not run`);
   }
 
-  // (4) EXECUTE the pinned invocation. Running the repo's own suites here would recurse, so the
-  // run is against a minimal fixture that MIRRORS the real layout, driven by the verifier's exact
-  // argv strings. Each pattern is run alone so the summary counts are attributable per suite: a
-  // pattern that discovers nothing is a deterministic failure, not a silently green run.
+  // (4) EXECUTE the pinned invocation ON THE SURFACE RUNTIME. Running the repo's own suites here
+  // would recurse, so the run is against a minimal fixture that MIRRORS the real layout, driven by
+  // the verifier's exact argv strings. Each pattern is run alone so the summary counts are
+  // attributable per suite: a pattern that discovers nothing is a deterministic failure, not a
+  // silently green run. The runtime is the surface image's Node (see `surfaceRunner`) — measuring
+  // `node --test` discovery on an ambient host Node would prove nothing about the verifier, whose
+  // container Node is a different major with different discovery semantics.
   const base = mkdtempSync(join(tmpdir(), "cadp-gf8-"));
   try {
+    const runner = surfaceRunner(base);
+    console.log(`  GF8 invocation measured on: ${runner.where}`);
     writeFileSync(join(base, "package.json"), JSON.stringify({ type: "module" }));
     for (const [i, pattern] of patterns.entries()) {
       const dir = join(base, pattern.slice(0, pattern.lastIndexOf("/")));
@@ -150,18 +212,16 @@ test("GF8: BOTH verifiers pin the same explicit invocation, and running it actua
       writeFileSync(join(dir, "nested", "decoy.test.ts"), `import test from "node:test";\ntest("gf8 decoy ${i}", () => {});\n`);
     }
     for (const pattern of patterns) {
-      const run = spawnSync(VERIFIER_TEST_ARGV[0] as string, [...VERIFIER_TEST_ARGV.slice(1, 2), pattern], { cwd: base, encoding: "utf8", env: cleanEnv() });
-      const out = `${run.stdout}${run.stderr}`;
-      assert.equal(summaryCount(out, "fail"), 0, `${pattern} did not run clean:\n${out}`);
-      const ran = summaryCount(out, "pass");
-      assert.ok(ran !== undefined && ran > 0, `${pattern} executed ZERO tests — an invocation that discovers nothing verifies nothing:\n${out}`);
-      assert.equal(ran, 1, `${pattern} must discover exactly the file directly in its named directory, never the nested decoy:\n${out}`);
+      const { output } = runner.run([...VERIFIER_TEST_ARGV.slice(0, 2), pattern]);
+      assert.equal(summaryCount(output, "fail"), 0, `${pattern} did not run clean on ${runner.where}:\n${output}`);
+      const ran = summaryCount(output, "pass");
+      assert.ok(ran !== undefined && ran > 0, `${pattern} executed ZERO tests on ${runner.where} — an invocation that discovers nothing verifies nothing:\n${output}`);
+      assert.equal(ran, 1, `${pattern} must discover exactly the file directly in its named directory, never the nested decoy:\n${output}`);
     }
     // The whole argv together runs every named suite in one process, as the verifiers run it.
-    const both = spawnSync(VERIFIER_TEST_ARGV[0] as string, [...VERIFIER_TEST_ARGV.slice(1)], { cwd: base, encoding: "utf8", env: cleanEnv() });
-    const out = `${both.stdout}${both.stderr}`;
-    assert.equal(both.status, 0, `the pinned invocation must succeed on a clean tree:\n${out}`);
-    assert.equal(summaryCount(out, "pass"), patterns.length, `the pinned invocation must execute every named suite:\n${out}`);
+    const both = runner.run(VERIFIER_TEST_ARGV);
+    assert.equal(both.status, 0, `the pinned invocation must succeed on a clean tree on ${runner.where}:\n${both.output}`);
+    assert.equal(summaryCount(both.output, "pass"), patterns.length, `the pinned invocation must execute every named suite on ${runner.where}:\n${both.output}`);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
