@@ -46,6 +46,16 @@
  * `recheck19_run_membership` guard-bite knob; and it activates for no v1 deployment, no ungoverned
  * v2 bundle and no non-enrolled requester.
  *
+ * PART 6, the last section: the LIVE COMPOSITION's own origin path — `cadp/live/ops.ts`'s
+ * `startWork` driven unmodified against a real store, for the three claims only a real Kernel can
+ * answer. Its v0.5 branch originates its own run (one `origin_key` → one `effect_id`, exactly one
+ * self-referential work-run binding, `run_membership(E, E)`, and a mint at its own initial
+ * dispatch); a retry of ONE logical origin re-seals IDEMPOTENTLY and byte-identically even after
+ * every environment input the material is built from has moved; and its DEFAULT branch — what the
+ * live v0.4 pilot runs — is unchanged on a `cadp.kernel-config.v1` store, binding no run, proving
+ * no membership and minting nothing. The branch-shape and origin-record legs are asserted at the
+ * ops layer instead, in `conformance-basesha.test.ts`.
+ *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
  * `origin_key` → one `effect_id` for the store's lifetime, and the o-iv/o-vi immutability legs).
@@ -60,8 +70,13 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
+import { startWork } from "../live/ops.ts";
+import type { OpsKernelClient, StartWorkDependencies } from "../live/ops.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
@@ -2335,5 +2350,232 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ============ PART 6 — the LIVE COMPOSITION's origin path, driven against a real store
+
+/**
+ * The cross-kernel half of `cadp/live/ops.ts`'s run-origin migration (asserted at the ops layer in
+ * `conformance-basesha.test.ts`, which owns the branch-shape and origin-record claims). Only the
+ * legs that need a REAL Kernel are here, because only a real store can answer them: that one
+ * `origin_key` derives one `effect_id` for the store's lifetime, that the self-referential
+ * work-run binding is adjudicated an ORIGIN and writes `run_membership(E, E)`, that the initial
+ * dispatch mints against that witness, and that a retry of one logical origin is TD §3.3's
+ * idempotent re-seal rather than a `REQUEST_DIGEST_CONFLICT`.
+ *
+ * `startWork` is driven UNMODIFIED through its own dependency seam: the client forwards to this
+ * harness's Ingress/PEP, and the environment seams (`git ls-remote`, `docker`, the temporal CLI,
+ * the manifest) are the fixtures the ops layer already pins. What is under test is the composition
+ * ops.ts seals, not the fakes.
+ */
+
+const OPS_SHA = "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1";
+
+/** A `KernelClient`-shaped façade over the harness, recording the blob bytes each start puts. */
+function opsClient(rp: RunProfileHarness, puts: Buffer[]): OpsKernelClient {
+  const { h } = rp;
+  return {
+    async putBlob(bytes: Uint8Array) {
+      puts.push(Buffer.from(bytes));
+      return { cas_key: h.ingress.putBlob(Buffer.from(bytes)) };
+    },
+    async allocateEffectId(tuple: unknown) {
+      return { effect_id: h.ingress.allocateEffectId(tuple as never, PRINCIPALS.workflow) };
+    },
+    async sealEffectRequest(body: unknown) {
+      return h.ingress.sealEffectRequest(body as never, PRINCIPALS.workflow);
+    },
+    async assembleAdmissionInput(effect_id: string, refs: string[]) {
+      return h.ingress.assembleAdmissionInput(effect_id, refs);
+    },
+    async evaluate(input_digest: string) {
+      return await h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id: string, decision_id: string) {
+      return await h.pep.admitAndDispatch(effect_id, decision_id, PRINCIPALS.workflow);
+    },
+  } as unknown as OpsKernelClient;
+}
+
+interface OpsSeams {
+  base_sha: string;
+  image_tag: string;
+  image_digest: string;
+  namespace_id: string;
+  repo_id: string;
+}
+
+function opsSeams(): OpsSeams {
+  return { base_sha: OPS_SHA, image_tag: "cadp-surface:0.151.0-2.1.221", image_digest: "sha256:aaaa", namespace_id: "cadp-v04", repo_id: "1234567" };
+}
+
+function opsDependencies(dir: string, rp: RunProfileHarness, seams: OpsSeams, puts: Buffer[]): StartWorkDependencies {
+  return {
+    manifest: {
+      dir, api_url: "http://127.0.0.1:42000", root_url: "http://127.0.0.1:42001",
+      api_port: 42000, root_port: 42001, record_port: 42002, temporal_port: 42003,
+      temporal_ui_port: 42004, broker_port: 42005,
+      repo_full_name: "owner/repo", repo_id: seams.repo_id, base_sha: "0".repeat(40),
+      tokens: {}, root_key_id: "root-1", kernel_config_path: join(dir, "kernel-config.json"),
+      policy_content_digest: "0".repeat(64),
+    } as never,
+    client: opsClient(rp, puts),
+    resolveBase: () => seams.base_sha,
+    workerImageTag: () => seams.image_tag,
+    imageIdentity: (image: string) => ({ image, image_digest: seams.image_digest, tool_versions: { "codex-cli": "1.0.0" } }),
+    // The harness's WORK_START target is `temporal:cadp-v04` / `cadp-v04`, so this is the namespace
+    // the request's `target_ref` must name for the ordinary adapter path to resolve it.
+    namespaceId: () => seams.namespace_id,
+    now: () => "2026-09-10T00:00:00.000Z",
+  };
+}
+
+const OPS_DIRS: string[] = [];
+after(() => {
+  for (const dir of OPS_DIRS) rmSync(dir, { recursive: true, force: true });
+});
+
+function opsDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "cadp-liveops-"));
+  OPS_DIRS.push(dir);
+  return dir;
+}
+
+test("the live composition's v0.5 start ORIGINATES its own run: one effect_id, one self-binding, one witness", async () => {
+  const rp = await runProfileHarness();
+  const dir = opsDir();
+  const seams = opsSeams();
+  try {
+    const puts: Buffer[] = [];
+    const lines: Array<Record<string, unknown>> = [];
+    const started = await startWork(dir, "development", ["implement median", "8", "6"], {
+      originProfile: "v05",
+      originKey: "origin-live-1",
+      log: (line) => lines.push(line),
+      dependencies: opsDependencies(dir, rp, seams, puts),
+    });
+    // No refusal reached the valid origin path — RUN_BINDING_REQUIRED, NOT_RUN_ENROLLED,
+    // RUN_CAPABILITY_REQUIRED/_INVALID/_HOLDER_MISMATCH, RUN_SCOPE_UNRESOLVED/_REFUSED and
+    // RUN_MEMBERSHIP_UNPROVEN all grade OTHER shapes; any of them here would mean the composition
+    // seals something other than an origin.
+    assert.ok(started !== undefined, `the origin was not admitted: ${JSON.stringify(lines)}`);
+    const effect_id = started.effect_id;
+    assert.equal(started.origin_key, "origin-live-1");
+
+    // The allocation: ONE row, under the run-origin contract (control A5 leg o-ii).
+    const rows = (rp.h.store.db.prepare("SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?")
+      .get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n;
+    assert.equal(rows, 1, "one logical origin, one allocation row");
+
+    // The seal: EXACTLY ONE work-run binding, and it names this request's own effect_id.
+    const request = rp.h.store.effectRequest(effect_id)!;
+    const bindings = request.work_bindings.filter((b) => b.namespace === "work-run");
+    assert.equal(bindings.length, 1, "exactly one work-run binding");
+    assert.deepEqual(bindings[0], { authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: effect_id });
+    assert.equal(request.operation_kind, "WORK_START");
+
+    // The witness B5(9) writes for an adjudicated origin, and nothing else.
+    const witness = rp.h.store.runMembership(effect_id);
+    assert.equal(witness?.effect_id, effect_id);
+    assert.equal(witness?.work_run_ref, effect_id, "both columns are the origin's own effect_id");
+    assert.equal(count(rp.h, "run_membership"), 1);
+
+    // And its OWN verified initial dispatch minted against that witness (A4/B6(4)).
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(rp.h.store.runCapability(effect_id)?.holder_ref, REQUESTER_A);
+
+    // A DIFFERENT origin_key is a different logical origin: its own effect_id, its own run.
+    const other = await startWork(dir, "development", ["implement median", "8", "6"], {
+      originProfile: "v05", originKey: "origin-live-2", dependencies: opsDependencies(dir, rp, seams, []),
+    });
+    assert.notEqual(other!.effect_id, effect_id);
+    assert.equal(rp.h.store.runMembership(other!.effect_id)?.work_run_ref, other!.effect_id);
+    assert.equal(count(rp.h, "run_membership"), 2);
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("the live composition's retry of ONE origin re-seals IDEMPOTENTLY, byte-identically, over a moved environment", async () => {
+  const rp = await runProfileHarness();
+  const dir = opsDir();
+  const seams = opsSeams();
+  try {
+    const firstPuts: Buffer[] = [];
+    const started = await startWork(dir, "development", ["implement median", "8", "6"], {
+      originProfile: "v05", originKey: "origin-live-retry", dependencies: opsDependencies(dir, rp, seams, firstPuts),
+    });
+    assert.ok(started !== undefined);
+    const request = rp.h.store.effectRequest(started.effect_id)!;
+    const requests = count(rp.h, "effect_request");
+
+    // EVERY environment seam the material audit named now moves under the retry's feet — the ref
+    // advanced, the worker image was rebuilt, the manifest changed. Before the origin record, this
+    // is exactly the shape that re-sealed DIFFERENT bytes under the SAME effect_id and collided.
+    seams.base_sha = "1".repeat(40);
+    seams.image_tag = "cadp-surface:9.9.9";
+    seams.image_digest = "sha256:bbbb";
+    seams.repo_id = "7654321";
+
+    const retryPuts: Buffer[] = [];
+    const lines: Array<Record<string, unknown>> = [];
+    const retry = await startWork(dir, "development", ["implement median", "8", "6"], {
+      originProfile: "v05",
+      originKey: "origin-live-retry",
+      log: (line) => lines.push(line),
+      dependencies: opsDependencies(dir, rp, seams, retryPuts),
+    });
+    // The retry finds its own COMMITTED effect at dispatch, which is the honest answer for a run
+    // that already started — the point is that it got there through an IDEMPOTENT re-seal.
+    assert.equal(retry, undefined);
+    const admitted = lines.at(-1)!;
+    assert.equal(admitted["effect_id"], started.effect_id, "the same origin_key derives the same effect_id");
+    assert.equal(admitted["origin_key"], "origin-live-retry");
+    assert.equal((admitted["admitted"] as { reason?: string }).reason, "EFFECT_ALREADY_COMMITTED");
+    assert.equal(admitted["request_digest"], request.request_digest.value, "TD §3.3's idempotent no-op returned the STORED row");
+
+    // Byte identity, at the two places it has to hold: the blobs ops.ts put, and the K3 row.
+    assert.equal(retryPuts[0]!.equals(firstPuts[0]!), true, "the args blob is byte-identical");
+    assert.equal(retryPuts[1]!.equals(firstPuts[1]!), true, "the sealed material is byte-identical");
+    assert.match(retryPuts[0]!.toString("utf8"), new RegExp(OPS_SHA, "u"), "the RECORDED base_sha, not the moved tip");
+    const after = rp.h.store.effectRequest(started.effect_id)!;
+    assert.equal(after.material_ref, request.material_ref);
+    assert.equal(after.material_digest.value, request.material_digest.value);
+    assert.equal(after.request_digest.value, request.request_digest.value);
+
+    // Zero durable delta: no second request row, no second membership proof, no re-mint.
+    assert.equal(count(rp.h, "effect_request"), requests, "no second K3 row");
+    assert.equal(count(rp.h, "run_membership"), 1, "exactly one self-referential witness, still");
+    assert.equal(count(rp.h, "run_capability"), 1, "and nothing re-minted");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("the live v0.4 deployment exercises the DEFAULT branch unchanged: a v1 store, no run binding, no witness", async () => {
+  // A whole `cadp.kernel-config.v1` deployment — what the live pilot actually runs. `startWork` is
+  // called exactly as `ctl.ts` calls it, with no origin option at all.
+  const rp = await runProfileHarness({});
+  const dir = opsDir();
+  try {
+    const puts: Buffer[] = [];
+    const started = await startWork(dir, "development", ["implement median", "8", "6"], {
+      dependencies: opsDependencies(dir, rp, opsSeams(), puts),
+    });
+    assert.ok(started !== undefined, "the v0.4 start is admitted and dispatched exactly as today");
+    const request = rp.h.store.effectRequest(started.effect_id)!;
+    assert.deepEqual(request.work_bindings.filter((b) => b.namespace === "work-run"), [], "no run binding under v0.4");
+    assert.equal(rp.h.store.runMembership(started.effect_id), undefined, "no membership proof");
+    assert.equal(count(rp.h, "run_membership"), 0);
+    assert.equal(count(rp.h, "run_capability"), 0, "and nothing is minted");
+    assert.equal(started.origin_key, undefined);
+    assert.equal(existsSync(join(dir, "origin-keys")), false, "the v0.4 branch never touches the origin store");
+    // The tuple is still `cadp.allocation-key.v1`, so no run-origin allocation row exists at all.
+    const rows = (rp.h.store.db.prepare("SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?")
+      .get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n;
+    assert.equal(rows, 0);
+  } finally {
+    rp.h.close();
   }
 });
