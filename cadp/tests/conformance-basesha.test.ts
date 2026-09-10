@@ -25,7 +25,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -442,6 +442,93 @@ test("A4: a crashed direct start leaves its minted origin_key recoverable, and t
     assert.equal(f.minted.length, 1, "the retry minted nothing — one logical origin, one UUID");
     assert.equal(f.kernel.allocations.size, 1);
     assert.equal(readOriginKeyRecords(f.dir).length, 1, "and recorded no second origin");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("A4: a failure of the ORIGIN PHASE ITSELF still carries the minted key out", async () => {
+  // The three ways fixing an origin's material can fail before any kernel call — an unreadable
+  // record file, an unreachable base ref, a record that cannot be written. Each happens with the
+  // key already minted, so each must report it: a durability record the operator cannot read is
+  // the same fork as no record at all.
+  const legs: Array<{ note: string; arrange: (f: Fixture) => StartWorkDependencies; expect: RegExp }> = [
+    {
+      note: "the record read",
+      arrange: (f) => {
+        writeFileSync(originKeysPath(f.dir), `${JSON.stringify({ not: "an array" })}\n`);
+        return f.deps;
+      },
+      expect: /is not a JSON array/u,
+    },
+    {
+      note: "the base resolution",
+      arrange: (f) => ({ ...f.deps, resolveBase: () => { throw new Error("ls-remote unreachable"); } }),
+      expect: /ls-remote unreachable/u,
+    },
+    {
+      note: "the record write",
+      arrange: (f) => {
+        // The append writes `<path>.tmp` then renames; a DIRECTORY in its place fails the write.
+        mkdirSync(`${originKeysPath(f.dir)}.tmp`);
+        return f.deps;
+      },
+      expect: /EISDIR|illegal operation on a directory/u,
+    },
+  ];
+
+  for (const leg of legs) {
+    const f = fixture();
+    try {
+      const deps = leg.arrange(f);
+      let thrown: unknown;
+      try {
+        await startWork(f.dir, "development", ["do the thing", "8", "6"], { originProfile: "v05", log: (l) => f.lines.push(l) }, deps);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown instanceof StartWorkOriginError, `${leg.note}: expected a StartWorkOriginError, got ${String(thrown)}`);
+      assert.equal(thrown.origin_key, "minted-uuid-1", `${leg.note}: the thrown error names the key that was minted`);
+      assert.match(thrown.message, leg.expect, `${leg.note}: the cause survives`);
+      assert.match(thrown.message, /retry with THIS origin_key/u);
+      assert.equal(thrown.origin_keys_path, originKeysPath(f.dir));
+      assert.deepEqual(
+        f.lines.filter((l) => l["origin_start"] === "ORIGIN_KEY_MINTED").map((l) => l["origin_key"]),
+        ["minted-uuid-1"],
+        `${leg.note}: and so does the log, from the moment of the mint`,
+      );
+      assert.equal(f.lines.filter((l) => l["origin_start"] === "FAILED").at(0)?.["origin_key"], "minted-uuid-1", `${leg.note}: the failure line too`);
+      assert.equal(f.kernel.tuples.length, 0, `${leg.note}: it died before any kernel call — no effect identity exists yet`);
+      assert.equal(f.minted.length, 1, `${leg.note}: exactly one key was minted`);
+    } finally {
+      f.cleanup();
+    }
+  }
+
+  // And the recovered key is the whole point: re-invoking with it converges on ONE origin identity,
+  // even though the failed attempt (an unreachable base ref) left no record behind to replay.
+  const f = fixture();
+  try {
+    let thrown: unknown;
+    try {
+      await startWork(
+        f.dir, "development", ["do the thing", "8", "6"], { originProfile: "v05" },
+        { ...f.deps, resolveBase: () => { throw new Error("ls-remote unreachable"); } },
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    const key = (thrown as StartWorkOriginError).origin_key;
+    assert.equal(readOriginKeyRecords(f.dir).length, 0, "nothing was recorded — the key survived only in the error and the log");
+
+    const retried = await startWork(f.dir, "development", ["do the thing", "8", "6"], { originProfile: "v05", originKey: key }, f.deps);
+    assert.equal(retried?.origin_key, key, "the retry re-presented the recovered key");
+    assert.deepEqual(f.kernel.tuples[0], { schema: "cadp.allocation-key.run-origin.v1", origin_key: key, purpose: "work-start" });
+    assert.equal(f.minted.length, 1, "and minted no second identity for the same logical origin");
+    assert.deepEqual(findOriginKeyRecord(f.dir, key), {
+      origin_key: key, work_item_digest: sha256Hex("dev:do the thing"),
+      created_at: "2026-09-10T00:00:00.000Z", base_sha: SHA,
+    }, "the recovering attempt is the one that pins the material");
   } finally {
     f.cleanup();
   }

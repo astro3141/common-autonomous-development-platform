@@ -302,7 +302,9 @@ export class StartWorkOriginError extends Error {
 
   constructor(origin_key: string, origin_keys_path: string, cause: unknown) {
     super(
-      `${cause instanceof Error ? cause.message : String(cause)} — run origin ${origin_key} (recorded in ${origin_keys_path}); ` +
+      // "recovery record", not "recorded": the failure being reported MAY be the record write
+      // itself, and the message must not assert a file state it did not verify.
+      `${cause instanceof Error ? cause.message : String(cause)} — run origin ${origin_key} (recovery record: ${origin_keys_path}); ` +
         "retry with THIS origin_key, never a fresh one, to converge on the same effect_id",
       { cause },
     );
@@ -353,29 +355,41 @@ export interface StartedWork {
 
 interface FixedOrigin {
   readonly origin_key: string;
-  readonly minted: boolean;
   readonly record: OriginKeyRecordV1;
 }
 
 /**
- * Decide the origin and FIX its material, before any kernel call and before any commodity lookup:
- * mint or accept the `origin_key`, emit it, then either replay the recorded material inputs or
- * resolve them once and record them. Everything after this point can fail without forking the run.
+ * DECIDE the origin's key: accept the caller's, or mint this direct start's one key and EMIT it.
+ *
+ * Deliberately the only step of the origin phase that runs before `startWork`'s `try`, and
+ * deliberately incapable of failing WITH a key in hand: it either returns one or throws having
+ * produced none, so there is never a decided key outside the block that reports it. Everything that
+ * CAN fail holding the key — the record read, the base resolution, the persistence — is inside
+ * (`fixRunOrigin`), so those failures throw a `StartWorkOriginError` carrying it.
+ */
+function decideOriginKey(dir: string, options: StartWorkOptions, dependencies: StartWorkDependencies, log: Log): string {
+  if (options.originKey !== undefined) return options.originKey;
+  const origin_key = (dependencies.mintOriginKey ?? ((): string => randomUUID()))();
+  // EMITTED first: the log line is the one record that exists even if the filesystem write fails.
+  log({ origin_start: "ORIGIN_KEY_MINTED", origin_key, origin_keys_path: originKeysPath(dir) });
+  return origin_key;
+}
+
+/**
+ * FIX the decided origin's material, before any kernel call and before any commodity lookup: either
+ * replay the recorded material inputs or resolve them once and record them. Everything from here on
+ * — this function included — can fail without forking the run, because the key is already decided
+ * and every throw out of `startWork`'s `try` re-presents it.
  */
 function fixRunOrigin(
   dir: string,
+  origin_key: string,
   vertical: "development" | "record",
   work_item_ref: string,
   m: LiveEnvManifest,
-  options: StartWorkOptions,
   dependencies: StartWorkDependencies,
   log: Log,
 ): FixedOrigin {
-  const mint = dependencies.mintOriginKey ?? ((): string => randomUUID());
-  const minted = options.originKey === undefined;
-  const origin_key = options.originKey ?? mint();
-  // EMITTED first: the log line is the one record that exists even if the filesystem write fails.
-  if (minted) log({ origin_start: "ORIGIN_KEY_MINTED", origin_key, origin_keys_path: originKeysPath(dir) });
   const recorded = findOriginKeyRecord(dir, origin_key);
   if (recorded !== undefined) {
     // A retry of a KNOWN origin: the recorded inputs are replayed VERBATIM and `resolveBaseSha` is
@@ -384,7 +398,7 @@ function fixRunOrigin(
       throw new Error(`origin ${origin_key} was recorded without a base_sha — refusing to re-resolve one for a development origin`);
     }
     log({ origin_start: "ORIGIN_RECORD_REPLAYED", origin_key, ...(recorded.base_sha !== undefined ? { base_sha: recorded.base_sha } : {}) });
-    return { origin_key, minted, record: recorded };
+    return { origin_key, record: recorded };
   }
   const base_sha = vertical === "development" ? (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main") : undefined;
   const record: OriginKeyRecordV1 = {
@@ -395,7 +409,7 @@ function fixRunOrigin(
   };
   appendOriginKeyRecord(dir, record);
   log({ origin_start: "ORIGIN_RECORD_WRITTEN", origin_key, ...(base_sha !== undefined ? { base_sha } : {}) });
-  return { origin_key, minted, record };
+  return { origin_key, record };
 }
 
 /** The work-run subject pair every kernel reader resolves a run scope on (AP B3(4)(a)). */
@@ -445,10 +459,19 @@ export async function startWork(
 
   // The v0.5 origin phase. Under `"v04"` NOTHING here runs: no key is minted, `origin-keys.json` is
   // neither read nor written, and the branch below is the checked-out one unchanged.
-  const origin = originProfile === "v05" ? fixRunOrigin(dir, vertical, work_item_ref, m, options, dependencies, log) : undefined;
-  const originLog: { origin_key?: string } = origin !== undefined ? { origin_key: origin.origin_key } : {};
+  //
+  // The key is DECIDED outside the try and its material FIXED inside, because the catch reports on
+  // exactly one thing — a key that exists. Fixing the material can fail (an unreadable or damaged
+  // `origin-keys.json`, an `ls-remote` that cannot reach the base ref, a directory that will not
+  // take the record), and each of those failures happens with the key already minted and already
+  // logged; running it outside the try would drop that key from the thrown error and send an
+  // operator back to minting a fresh one, forking the origin the record exists to keep whole.
+  const origin_key = originProfile === "v05" ? decideOriginKey(dir, options, dependencies, log) : undefined;
+  const originLog: { origin_key?: string } = origin_key !== undefined ? { origin_key } : {};
+  let origin: FixedOrigin | undefined;
 
   try {
+    origin = origin_key !== undefined ? fixRunOrigin(dir, origin_key, vertical, work_item_ref, m, dependencies, log) : undefined;
     const c = dependencies.client ?? liveClient(dir, "cadp-workflow");
     const namespaceId = (dependencies.namespaceId ?? temporalNamespaceId)(m);
     const args =
@@ -558,11 +581,13 @@ export async function startWork(
     if (admitted.kind !== "ADMITTED" || admitted.outcome.result !== "COMMITTED") return undefined;
     return { effect_id, workflow_id: material.workflow_id, ...originLog };
   } catch (error) {
-    if (origin === undefined) throw error;
+    if (origin_key === undefined) throw error;
     // Every failure path of a v0.5 origin carries the key out — through the log AND the error — so
     // a retry can re-present it instead of minting a second identity for the same logical origin.
-    log({ origin_start: "FAILED", origin_key: origin.origin_key, origin_keys_path: originKeysPath(dir), detail: error instanceof Error ? error.message : String(error) });
-    throw new StartWorkOriginError(origin.origin_key, originKeysPath(dir), error);
+    // `origin_key`, not `origin`: a failure of the material fixing itself has no `FixedOrigin` yet
+    // and is precisely the case that must not lose the key.
+    log({ origin_start: "FAILED", origin_key, origin_keys_path: originKeysPath(dir), detail: error instanceof Error ? error.message : String(error) });
+    throw new StartWorkOriginError(origin_key, originKeysPath(dir), error);
   }
 }
 
