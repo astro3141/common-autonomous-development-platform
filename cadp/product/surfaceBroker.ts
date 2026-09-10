@@ -299,6 +299,49 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The THREE leaf test directories the verifiers execute, in order. Test files live DIRECTLY in one
+ * of these three — nothing nested deeper, asserted by `conformance-manifest.test.ts` so the
+ * contract cannot rot silently.
+ *
+ *   cadp/tests/conformance/  gate-protected: the executable assurance projection of TD authority
+ *   cadp/tests/ops/          operational contracts, not gate-protected
+ *   devharness/tests/        standalone bootstrap tooling (Authority order.md), not gate-protected
+ *
+ * Protection differs per directory; EXECUTION does not — all three run in both verifiers, exactly
+ * as the previous bare `node --test` discovery ran them.
+ */
+export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/", "cadp/tests/ops/", "devharness/tests/"];
+
+/**
+ * The PINNED verifier invocation — the selection-bypass seam closed.
+ *
+ * A test must not be evadable by EXCLUSION-WITHOUT-MODIFICATION: while the verifier ran
+ * `npm test`, the executed set was whatever `package.json` (an ordinary, delegable file) said it
+ * was, so a candidate could drop a conformance suite from the run without editing one protected
+ * byte. The set is therefore pinned HERE, in a `GATE_PATH_RULES` file, and the external verifier
+ * (`.github/workflows/cadp-verify.yml`, also gate-protected) runs this same argv. `npm test`
+ * survives as a DEVELOPER CONVENIENCE ONLY — it is no longer any verifier's seam.
+ *
+ * One-level `<dir>/*.test.ts` selectors, NOT bare directories: MEASURED on the verifier's own
+ * image (`cadp/live/image/Dockerfile`, node:22-bookworm-slim — Node 22.23.2), `node --test <dir>`
+ * does not search the directory at all, it tries to LOAD it as a module and dies
+ * `ERR_MODULE_NOT_FOUND`; directory arguments only became a search on Node 24. The glob form
+ * enumerates the same three leaf directories, needs no recursion, and behaves identically on both
+ * Node 22 (verifier image) and Node 24 (Actions runner). It is expanded by Node itself, so the
+ * argv is byte-identical at both invocation sites whether or not a shell is in the path.
+ * `conformance-gatefiles.test.ts` GF8 EXECUTES this argv and asserts all three suites report a
+ * nonzero test count — an invocation that silently discovered nothing would fail conformance.
+ *
+ * KNOWN CONSEQUENCE, stated rather than hidden: this argv names CADP's own directories, so
+ * `/verify` is now a SELF-HOST verifier. A governed target that is not this repository (the
+ * disposable pilot seed of `cadp/live/env.ts`, say, whose tests live in `test/`) has no such
+ * paths, and its verification would report `failure` for want of the named files rather than for
+ * anything about the candidate. Pinning the executed set is what closes the bypass seam; a
+ * target-declared test selection is the open question that pin leaves behind.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", ...VERIFIER_TEST_DIRS.map((d) => `${d}*.test.ts`)];
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,7 +382,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",

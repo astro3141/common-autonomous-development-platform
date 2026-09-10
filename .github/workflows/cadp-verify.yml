@@ -29,4 +29,17 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # The PINNED test selection — byte-identical to `VERIFIER_TEST_ARGV` in
+      # cadp/product/surfaceBroker.ts, which the LOCAL verifier runs. Both verifiers name the same
+      # THREE leaf directories, and the invocation contract is that every test file lives DIRECTLY
+      # in one of them (asserted by cadp/tests/conformance/conformance-manifest.test.ts):
+      # cadp/tests/conformance/ (gate-protected), cadp/tests/ops/ and devharness/tests/ (not
+      # protected — but all three EXECUTE here, exactly as the previous bare `npm test` ran them).
+      #
+      # NOT `npm test`: package.json is an ordinary delegable file, so while it was the verifier's
+      # seam a candidate could drop a conformance suite from the executed set without editing one
+      # protected byte. `npm test` remains a developer convenience and is no longer any verifier's
+      # seam. The selectors are QUOTED so Node — not the runner's shell — expands them, keeping the
+      # argv identical to the local verifier's; and one-level globs rather than bare directories
+      # because `node --test <dir>` is not a directory search on the verifier image's Node 22.
+      - run: node --test 'cadp/tests/conformance/*.test.ts' 'cadp/tests/ops/*.test.ts' 'devharness/tests/*.test.ts'
