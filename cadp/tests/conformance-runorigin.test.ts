@@ -19,7 +19,7 @@
  * leaves. Each of these NARROWS what seals, which is why Parts 1 and 2 need no re-statement: what
  * they assert seals still seals, and the two places where a request they exercised is now refused
  * one leg earlier under an exacter code are noted at those assertions. Recheck #19's
- * `RUN_MEMBERSHIP_UNPROVEN` is the PEP-time code and remains a later lane, asserted nowhere here.
+ * `RUN_MEMBERSHIP_UNPROVEN` is the PEP-time code and is asserted in PART 5, never here.
  *
  * PART 4, the last section of this file: the K7 CONFORMANCE MATRIX — B5(2)'s grading stated once
  * per reachable history of the run's own `WORK_START`, each case presenting ONE capability (the one
@@ -36,6 +36,12 @@
  * section closes on the gating regression: under `cadp.kernel-config.v1` and under a v2 bundle
  * whose governing registry content is absent, the very request the first case is refused for seals
  * byte-identically to the same request presenting nothing at all.
+ *
+ * PART 5, B5(5): the PEP-time half — §4.4 recheck item **#19**, the DURABLE membership proof read
+ * inside the admission transaction. One test per grading (the row matches the sealed binding, the
+ * row is absent, the row names another run), the guard-bite that proves the check load-bearing
+ * through the ordinary `disabledChecks` knob, and the gating regression under `cadp.kernel-config.v1`
+ * and under a v2 bundle whose enrollment registry is empty.
  *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
@@ -57,6 +63,7 @@ import { startKernelApi } from "../kernel/api.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
 import { recordDigest } from "../kernel/canonical.ts";
+import type { AdmitResult } from "../kernel/pep.ts";
 import type { EffectRequestV1 } from "../kernel/records.ts";
 import { RUN_ORIGIN_ALLOCATION_SCHEMA, KernelConfigInvalid, validateKernelConfig } from "../kernel/policyBundle.ts";
 import type { ActivatedAllocationContracts } from "../kernel/policyBundle.ts";
@@ -65,7 +72,7 @@ import type { SubjectBinding, TargetRef } from "../kernel/records.ts";
 import { REFERENCE_IDENTITIES, buildReferenceKernelConfig } from "../deployment/referencePolicy.ts";
 import {
   DEFAULT_WORK_RUN_REF, PRINCIPALS, V2_ALLOCATION_SCHEMAS, V2_ALLOCATION_SCHEMA_DESCRIPTORS,
-  makeHarness, stopSharedOpa, v2ConfigOverrides,
+  makeHarness, runChain, sealScriptedRequest, stopSharedOpa, v2ConfigOverrides,
 } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 
@@ -2088,4 +2095,215 @@ test("K7 under v1 and under a v2 schema alone: the grading is unreachable and le
   }
   assert.ok(thrown instanceof KernelConfigInvalid, String(thrown));
   assert.match((thrown as Error).message, /unknown key data\.cadp\.run_profile_enrolled_requester_refs \(closed schema\)/u);
+});
+
+// ================================================ PART 5 — recheck #19, the PEP-time proof
+
+/**
+ * The construction the gradings below share, and the ONLY reachable way to put a run-bound request
+ * in front of the admission transaction WITHOUT the membership proof its own seal would have
+ * written: seal it while the run profile is REGISTERED but not GOVERNING (an empty enrollment — the
+ * reference posture, `deployment/referencePolicy.ts`), then ENROLL the requester by
+ * `POLICY_ACTIVATE`. Recheck #19 is stated over the config ACTIVE AT ADMISSION, so the very same K3
+ * rows arrive at the PEP enrolled and run-bound while proving nothing — and the store, having no
+ * runtime `UPDATE` and no back-dating insert, offers no way to acquire a proof afterwards (B5(5)).
+ *
+ * The three requests are IDENTICAL in shape — same requester, same target, same operation, same
+ * run binding — and differ ONLY in the `run_membership` row that accompanies them: none, one naming
+ * ANOTHER run, and one naming the run they bind. The two rows go in through the store's own
+ * append-only insert, the same call the sealing transaction makes, so what the cases isolate is the
+ * ROW's second column and nothing about how it came to exist.
+ *
+ * The run all three bind is a GENUINE one: allocated up front (allocation is not gated on
+ * enrollment, B1(2), and one `origin_key` derives one `effect_id` across an activation, A5 o-ii),
+ * then originated and dispatched as a proper self-origin once the profile governs — so by the time
+ * the three are admitted it is witnessed, `COMMITTED`, and has a real minted capability. That is
+ * deliberate: it makes every refusal below a statement about THIS REQUEST's own durable proof of
+ * membership, never about the run being unusable, unwitnessed or never minted against.
+ */
+async function membershipProofHarness(disabledChecks?: ReadonlySet<string>): Promise<{
+  rp: RunProfileHarness; run: string; capability: string; absent: string; wrongRun: string; matching: string;
+}> {
+  const rp = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }), disabledChecks);
+  const origin_key = `origin-recheck19-${(originCounter += 1)}`;
+  const run = rp.h.ingress.allocateEffectId(
+    { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key, purpose: "work-start" },
+    PRINCIPALS.workflow,
+  );
+
+  // T1 — three ordinary run-bound seals under the ungoverned bundle. B5(3)'s legs are inert (the
+  // enrollment is empty, so `NOT_RUN_ENROLLED` cannot fire), B5(4) never reads a header, and B5(5)
+  // writes nothing: these are exactly today's requests.
+  const absent = sealScriptedRequest(rp.h, { work_run_ref: run }).request.effect_id;
+  const wrongRun = sealScriptedRequest(rp.h, { work_run_ref: run }).request.effect_id;
+  const matching = sealScriptedRequest(rp.h, { work_run_ref: run }).request.effect_id;
+  for (const effect_id of [absent, wrongRun, matching]) {
+    assert.equal(rp.h.store.runMembership(effect_id), undefined, "an ungoverned seal writes no membership proof");
+  }
+  rp.h.store.insertRunMembership(wrongRun, DEFAULT_WORK_RUN_REF);
+  rp.h.store.insertRunMembership(matching, run);
+
+  // T2 — the ENROLLING activation. Its own `POLICY_ACTIVATE` is itself a run-bound request of this
+  // requester, sealed and admitted under the OLD config: #19 reads the config active in ITS
+  // transaction, which is the one that does not name this requester, so the activation is inert to
+  // the recheck it switches on. (A dispatch of that same effect AFTER the activation would not be:
+  // that is the absent case below, in its purest form.)
+  const activated = await rp.h.activatePolicy({ revision: 2, configOverrides: runProfileConfig() as never });
+  assert.equal((activated.admitted as { kind: string }).kind, "ADMITTED", JSON.stringify(activated.admitted));
+
+  // T3 — the run, originated properly now that the profile governs: the self-bound `WORK_START`
+  // converges on the SAME `effect_id` the three requests bound, is adjudicated an origin, carries
+  // B5(5)'s self-referential witness, and mints at its verified initial dispatch.
+  const origin = sealWorkStart(rp, { origin_key });
+  assert.equal(origin.effect_id, run, "the origin seals against the id the three requests bound");
+  assert.equal(rp.h.store.runMembership(run)?.work_run_ref, run, "the origin's own proof is the self-referential witness");
+  const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+  assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+  const capability = (admitted as { run_capability?: string }).run_capability;
+  assert.match(String(capability), /^[A-Za-z0-9_-]{43}$/u, "the run is genuinely minted against");
+  assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["COMMITTED"], "and genuinely usable");
+  return { rp, run, capability: capability!, absent, wrongRun, matching };
+}
+
+/**
+ * A refusal at recheck #19, with its DURABLE DELTA asserted: the recheck runs inside the admission
+ * transaction and BEFORE the K6 write, so a refused effect has no admission row (no reservation),
+ * no outcome row, nothing that reached the target, and no capability row of its own. The refusal is
+ * swept for every rendering of the run's real capability too (B6(3)): #19 reads no secret, so no
+ * refusal of it can carry one — not the value, not another encoding of the same bytes, not a prefix.
+ */
+function refusedUnproven(
+  rp: RunProfileHarness,
+  result: AdmitResult,
+  effect_id: string,
+  capability: string,
+  note: string,
+): void {
+  assert.equal(result.kind, "REFUSAL", `${note}: ${JSON.stringify(result)}`);
+  assert.equal((result as { reason: string }).reason, "RUN_MEMBERSHIP_UNPROVEN", `${note}: ${JSON.stringify(result)}`);
+  assert.equal(rp.h.store.admissionsByEffect(effect_id).length, 0, `${note}: no admission row — nothing was reserved`);
+  assert.equal(rp.h.store.outcomesByEffect(effect_id).length, 0, `${note}: no outcome row`);
+  assert.equal(rp.h.target.effects.includes(effect_id), false, `${note}: nothing reached the target`);
+  assert.equal(rp.h.store.runCapability(effect_id), undefined, `${note}: no capability row`);
+  assertNoCapabilityText(JSON.stringify(result), capability, `${note}: the refusal`);
+}
+
+test("B5(5)/#19: a member whose seal PROVED membership is admitted on its durable row", async () => {
+  const rp = await runProfileHarness();
+  const logs = captureObservableText();
+  let capability: string | undefined;
+  try {
+    // The ordinary lane end to end, with nothing constructed: origin → witnessed mint → a member
+    // that presents the delivered capability and whose seal therefore writes
+    // `run_membership(member, run)`. Both effects are then admitted THROUGH recheck #19 — the
+    // origin on its self-referential witness, the member on its membership proof.
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-recheck19-happy" });
+    const admittedOrigin = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(admittedOrigin.kind, "ADMITTED", JSON.stringify(admittedOrigin));
+    assert.equal(rp.h.store.admissionsByEffect(run).length, 1, "the origin is admitted on run_membership(E, E)");
+    capability = (admittedOrigin as { run_capability: string }).run_capability;
+
+    const member = sealsFollowUp(rp, run, capability, "#19's ordinary lane");
+    const admittedMember = await dispatch(rp.h, member, PRINCIPALS.workflow);
+    assert.equal(admittedMember.kind, "ADMITTED", JSON.stringify(admittedMember));
+    assert.equal(rp.h.store.admissionsByEffect(member).length, 1, "one admission, at ordinal 1");
+    assert.equal((admittedMember as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 1);
+    assert.deepEqual(rp.h.store.outcomesByEffect(member).map((o) => o.result), ["COMMITTED"], "and it dispatches");
+    // The recheck consumed the ROW, not the secret: no capability is presented at admission, none
+    // is delivered by it, and the run's one row is untouched by the member's dispatch (A4/A5).
+    assert.equal((admittedMember as { run_capability?: string }).run_capability, undefined, "a member's dispatch mints nothing");
+    assertDeliveryInvariants(rp, run, capability, "#19's ordinary lane");
+  } finally {
+    logs.restore();
+    if (capability !== undefined) assertNoCapabilityText(logs.text(), capability, "the observable log");
+    rp.h.close();
+  }
+});
+
+test("B5(5)/#19: an ABSENT membership row and one naming ANOTHER run are both refused RUN_MEMBERSHIP_UNPROVEN", async () => {
+  const { rp, run, capability, absent, wrongRun, matching } = await membershipProofHarness();
+  const logs = captureObservableText();
+  try {
+    // (1) NO ROW AT ALL. The request is run-bound and its stamped requester is now enrolled, so #19
+    // applies; the proof its seal never had to write is the only thing missing. That the run itself
+    // is `COMMITTED`, witnessed and minted against changes nothing — membership is proven per
+    // REQUEST, and this one proves none.
+    refusedUnproven(rp, await dispatch(rp.h, absent, PRINCIPALS.workflow), absent, capability, "no membership row");
+
+    // (2) A ROW NAMING ANOTHER RUN. The row exists, so "the PEP requires that row" is not a
+    // presence test: its `work_run_ref` must EXACTLY equal the run this request's own sealed
+    // bindings name. A proof of membership of some other run proves nothing about this one — which
+    // is the same keying B5(4) refuses borrowing on at seal, re-asserted here on the durable row.
+    refusedUnproven(rp, await dispatch(rp.h, wrongRun, PRINCIPALS.workflow), wrongRun, capability, "a row naming another run");
+    assert.equal(rp.h.store.runMembership(wrongRun)?.work_run_ref, DEFAULT_WORK_RUN_REF, "the row is still what it was");
+
+    // (3) THE MATCHING ROW, the positive control that attributes both refusals to the second column
+    // alone: the identical request, differing only in the run its row names, is ADMITTED and
+    // dispatched.
+    const ok = await dispatch(rp.h, matching, PRINCIPALS.workflow);
+    assert.equal(ok.kind, "ADMITTED", JSON.stringify(ok));
+    assert.equal(rp.h.store.admissionsByEffect(matching).length, 1, "the proven request is reserved");
+    assert.deepEqual(rp.h.store.outcomesByEffect(matching).map((o) => o.result), ["COMMITTED"]);
+    assert.deepEqual(rp.h.target.effects, [matching], "exactly ONE external effect across the three");
+
+    // Nothing about the run moved: no refusal minted, re-delivered or exposed a secret, and the one
+    // row still digests the one capability its origin's initial dispatch delivered.
+    assertDeliveryInvariants(rp, run, capability, "the #19 refusals");
+  } finally {
+    logs.restore();
+    assertNoCapabilityText(logs.text(), capability, "the observable log");
+    rp.h.close();
+  }
+});
+
+test("#19 guard-bite: with the recheck disabled, an UNPROVEN run-bound request is admitted and dispatched", async () => {
+  // The same construction, the same rows, the same activation — the ONLY difference is the
+  // TEST-ONLY knob (TD §13.1), which is how every other numbered recheck is proven load-bearing.
+  const { rp, run, capability, absent, wrongRun, matching } = await membershipProofHarness(
+    new Set(["recheck19_run_membership"]),
+  );
+  try {
+    for (const [effect_id, note] of [[absent, "no membership row"], [wrongRun, "a row naming another run"]] as const) {
+      const admitted = await dispatch(rp.h, effect_id, PRINCIPALS.workflow);
+      assert.equal(admitted.kind, "ADMITTED", `${note}: ${JSON.stringify(admitted)}`);
+      // THE PROHIBITED DURABLE DELTA: an effect the Platform cannot show belongs to the run it
+      // claims is reserved against that run's scope, dispatched, and counted against its bounds.
+      assert.equal(rp.h.store.admissionsByEffect(effect_id).length, 1, `${note}: the prohibited reservation`);
+      assert.deepEqual(rp.h.store.outcomesByEffect(effect_id).map((o) => o.result), ["COMMITTED"], `${note}: the prohibited outcome`);
+      assert.ok(rp.h.target.effects.includes(effect_id), `${note}: the prohibited external effect`);
+    }
+    // The bite is exactly one check wide: the proven request still admits (so the knob is not what
+    // makes anything pass), and nothing about minting or delivery moved — #19 grades the ROW, and
+    // removing it neither mints nor re-delivers a secret.
+    assert.equal((await dispatch(rp.h, matching, PRINCIPALS.workflow)).kind, "ADMITTED");
+    assertDeliveryInvariants(rp, run, capability, "the #19 guard-bite");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("#19 gating: under v1 and under a v2 bundle with an EMPTY enrollment, an unproven run-bound request admits", async () => {
+  // The recheck is stated over the same gate as every other rule in this lane: a STAMPED
+  // `requester_ref` the active `run_profile_enrolled_requester_refs` names. Both configurations
+  // below fail it — one because the registry is not expressible at all, one because it is empty —
+  // so a run-bound request carrying no membership proof takes exactly the path it takes today.
+  for (const [note, configOverrides] of [
+    ["cadp.kernel-config.v1", {}],
+    ["cadp.kernel-config.v2 with an empty enrollment", runProfileConfig({ run_profile_enrolled_requester_refs: [] })],
+  ] as const) {
+    const rp = await runProfileHarness(configOverrides as Record<string, unknown>);
+    try {
+      const { request } = sealScriptedRequest(rp.h, { work_run_ref: DEFAULT_WORK_RUN_REF });
+      assert.equal(rp.h.store.runMembership(request.effect_id), undefined, `${note}: the seal writes no proof`);
+      const admitted = (await runChain(rp.h, request.effect_id)).admitted;
+      assert.equal(admitted?.kind, "ADMITTED", `${note}: ${JSON.stringify(admitted)}`);
+      assert.deepEqual(rp.h.store.outcomesByEffect(request.effect_id).map((o) => o.result), ["COMMITTED"], `${note}: it dispatches`);
+      // The claim in full: the recheck requires no row because this deployment writes none, and the
+      // dispatch takes no principal — the v0.4 call shape — exactly as it does today.
+      assert.equal(count(rp.h, "run_membership"), 0, `${note}: no membership row anywhere in the store`);
+      assert.equal(count(rp.h, "run_capability"), 0, `${note}: and nothing minted`);
+    } finally {
+      rp.h.close();
+    }
+  }
 });
