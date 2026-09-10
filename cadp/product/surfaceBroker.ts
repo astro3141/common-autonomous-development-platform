@@ -299,6 +299,65 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The THREE leaf test directories the verifiers execute, in order. Test files live DIRECTLY in one
+ * of these three — nothing nested deeper, asserted by `conformance-manifest.test.ts` so the
+ * contract cannot rot silently.
+ *
+ *   cadp/tests/conformance/  gate-protected: the executable assurance projection of TD authority
+ *   cadp/tests/ops/          operational contracts, not gate-protected
+ *   devharness/tests/        standalone bootstrap tooling (Authority order.md), not gate-protected
+ *
+ * Protection differs per directory; EXECUTION does not — all three run in both verifiers, exactly
+ * as the previous bare `node --test` discovery ran them.
+ */
+export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/", "cadp/tests/ops/", "devharness/tests/"];
+
+/**
+ * The PINNED verifier invocation — the selection-bypass seam closed.
+ *
+ * A test must not be evadable by EXCLUSION-WITHOUT-MODIFICATION: while the verifier ran
+ * `npm test`, the executed set was whatever `package.json` (an ordinary, delegable file) said it
+ * was, so a candidate could drop a conformance suite from the run without editing one protected
+ * byte. The set is therefore pinned HERE, in a `GATE_PATH_RULES` file, and the external verifier
+ * (`.github/workflows/cadp-verify.yml`, also gate-protected) runs this same argv. `npm test`
+ * survives as a DEVELOPER CONVENIENCE ONLY — it is no longer any verifier's seam.
+ *
+ * EXACT SELECTOR FORM, pinned by the owner: the four tokens `--test` + the three leaf DIRECTORY
+ * paths, trailing slashes, no glob character (`* ? [ ]`), no `--test-*` pattern flag, no shell
+ * involvement. The argv array below is therefore byte-identical to the workflow's `run` line
+ * (modulo the yml's own quoting), and the INVOCATION CONTRACT it depends on is that every test
+ * file of this repository lives DIRECTLY in one of the three named directories — no recursion is
+ * required to reach one, and `conformance-manifest.test.ts` MF4 asserts that nothing sits
+ * anywhere else.
+ *
+ * RUNTIME REQUIREMENT, measured rather than assumed: a positional directory is only expanded into
+ * the test files it holds by a Node whose test runner SEARCHES directory arguments. On Node 22
+ * (`cadp/live/image/Dockerfile` pins node:22-bookworm-slim; measured on 22.23.2) it does not —
+ * the runner treats each directory token as a file to load and reports `Cannot find module
+ * <dir>`, discovering no test at all. This pinned form therefore requires a verifier runtime that
+ * searches directory arguments (Node 24+). `conformance-gatefiles.test.ts` GF8 does not take that
+ * on faith: it EXECUTES this exact argv against a fixture with the same three-leaf layout on the
+ * runtime hosting the suite and asserts every named suite really ran, so a verifier that would
+ * discover nothing fails conformance deterministically instead of reporting a hollow verdict.
+ *
+ * OPEN AT THIS CHECKOUT, stated rather than hidden: the surface image still pins node:22, so the
+ * LOCAL verifier's container is a runtime on which this pinned form discovers nothing — GF8 fails
+ * there, by design, rather than letting `/verify` return a verdict about suites it never ran.
+ * Closing that gap means moving the verifier image to a Node major that searches directory
+ * arguments (`cadp/live/image/Dockerfile` is gate machinery, and the image cannot be rebuilt or
+ * measured from inside a candidate surface), which is a human decision this file does not take on
+ * its own.
+ *
+ * KNOWN CONSEQUENCE, stated rather than hidden: this argv names CADP's own directories, so
+ * `/verify` is now a SELF-HOST verifier. A governed target that is not this repository (the
+ * disposable pilot seed of `cadp/live/env.ts`, say, whose tests live in `test/`) has no such
+ * paths, and its verification would report `failure` for want of the named files rather than for
+ * anything about the candidate. Pinning the executed set is what closes the bypass seam; a
+ * target-declared test selection is the open question that pin leaves behind.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", ...VERIFIER_TEST_DIRS];
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,7 +398,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",
