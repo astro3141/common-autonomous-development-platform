@@ -29,4 +29,26 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # The EXTERNAL verifier's executed set, pinned here (the selection-bypass seam, closed).
+      #
+      # A conformance test must not be evadable by EXCLUSION WITHOUT MODIFICATION: leaving a
+      # control's file untouched — so no reviewer sees a diff to it — while quietly arranging that
+      # the verifier never runs it. `npm test` was exactly that seam: `package.json` is an ORDINARY,
+      # delegable file, so a candidate could narrow the script and disarm a control without editing
+      # one protected byte. This step therefore spawns `node --test` with the explicit path, and
+      # this workflow file is listed in `cadp/product/gateFiles.ts` — external-verifier invocation
+      # is verification machinery, so any change to it routes to a HUMAN_DECISION.
+      #
+      # `package.json`'s `test` script survives as a DEVELOPER CONVENIENCE ONLY. It is no longer any
+      # verifier's seam — the local verifier (`cadp/product/surfaceBroker.ts`, `VERIFIER_TEST_ARGV`)
+      # pins the identical invocation.
+      #
+      # The pattern spans the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/`
+      # and `cadp/tests/ops/` both keep running. The split changed PROTECTION, never coverage.
+      #
+      # The pattern is SINGLE-QUOTED so `**` reaches node verbatim instead of being expanded by the
+      # step's shell (bash expands `**` as a plain `*` unless `globstar` is set, which would silently
+      # narrow the executed set to exactly one directory level). `node --test` takes glob patterns,
+      # not directories: the bare `cadp/tests/` form matches nothing on Node 22, which is the version
+      # the local verifier's surface image pins, so both sites use the pattern and stay identical.
+      - run: node --test 'cadp/tests/**/*.test.ts'

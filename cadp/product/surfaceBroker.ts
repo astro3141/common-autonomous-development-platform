@@ -299,6 +299,35 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The LOCAL verifier's executed set, pinned here (the selection-bypass seam, closed).
+ *
+ * A conformance test must not be evadable by EXCLUSION WITHOUT MODIFICATION: leaving a control's
+ * file untouched — so no reviewer sees a diff to it — while quietly arranging that the verifier
+ * never runs it. The npm `test` script was exactly that seam: `package.json` is an ORDINARY,
+ * delegable file, so a candidate could narrow the script and disarm a control without editing one
+ * protected byte. So the verifier does NOT go through that indirection. It spawns `node --test`
+ * with the explicit path below, and this file (`cadp/product/surfaceBroker.ts`) is gate machinery,
+ * which routes any change to it to a HUMAN_DECISION.
+ *
+ * `package.json`'s `test` script survives as a DEVELOPER CONVENIENCE ONLY. It is no longer any
+ * verifier's seam — neither this one nor the external one in `.github/workflows/cadp-verify.yml`,
+ * which pins the identical invocation. Editing it changes what a developer types, nothing a
+ * verifier runs.
+ *
+ * The pattern spans the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/` and
+ * `cadp/tests/ops/` both keep running. The gateFiles split changed PROTECTION, never coverage.
+ *
+ * Why a `**` PATTERN and not the bare directory `cadp/tests/`: `node --test` takes GLOB PATTERNS,
+ * and Node 22 — the version this verifier's own surface image pins (`cadp/live/image/Dockerfile`,
+ * `node:22-bookworm-slim`) — does not expand a bare directory. It matches nothing, falls back to
+ * treating the argument as an entry module, and dies with `Cannot find module '<repo>/cadp/tests'`
+ * BEFORE running a single control — turning every verification into `conclusion: failure`. The
+ * pattern is the same pinning with the same explicit path, executable on both Node 22 (the surface
+ * image) and Node 24 (the external verifier's runner).
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", "cadp/tests/**/*.test.ts"];
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,7 +368,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",
