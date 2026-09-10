@@ -33,7 +33,7 @@ import type {
   AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim,
 } from "../kernel/adapters/types.ts";
 import {
-  DEFAULT_WORK_RUN_REF, PRINCIPALS, makeHarness, sealScriptedRequest, stopSharedOpa, v2ConfigOverrides,
+  DEFAULT_WORK_RUN_REF, PRINCIPALS, makeHarness, reviewBodyPair, sealScriptedRequest, stopSharedOpa, v2ConfigOverrides,
 } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 
@@ -190,7 +190,7 @@ function sealReview(h: Harness, verdict: "APPROVE" | "REJECT", note: string): Ev
       subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: CANDIDATE_SHA }],
       availability: "PRESENT",
       claim_schema: "cadp.review.v1",
-      claim: { verdict, body_digest: "1".repeat(64), note },
+      claim: { verdict, ...reviewBodyPair(h, `assembly review body ${note}`), note },
       producer_ref: "reviewer:claude-code",
       source_ref: "test",
       source_relation: "INDEPENDENT_OBSERVATION",
@@ -413,7 +413,7 @@ test("scope: an operation_kind no entry lists assembles exactly as before — th
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: CANDIDATE_SHA }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "2".repeat(64), note: "third" },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "assembly review body third"), note: "third" },
         producer_ref: "reviewer:claude-code",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",

@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createHash } from "node:crypto";
 
-import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { ScriptedIssues } from "./support/scriptedIssues.ts";
 import { GitHubIssuesAdapter } from "../kernel/adapters/githubIssues.ts";
@@ -469,7 +469,7 @@ function mergeOrdinaryEvidence(h: Harness, sha: string): { verification: Evidenc
       subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: sha }],
       availability: "PRESENT",
       claim_schema: "cadp.review.v1",
-      claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+      claim: { verdict: "APPROVE", ...reviewBodyPair(h, "intake review body") },
       producer_ref: "reviewer:claude-code",
       source_ref: "test",
       source_relation: "INDEPENDENT_OBSERVATION",

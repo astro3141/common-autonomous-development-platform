@@ -3,7 +3,7 @@ import test, { after } from "node:test";
 
 import { EXTERNAL_CHECK_NAME, projectCheckRuns } from "../product/externalVerification.ts";
 import { REFERENCE_ADAPTERS, REFERENCE_IDENTITIES } from "../deployment/referencePolicy.ts";
-import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { nowIso } from "../kernel/canonical.ts";
 
@@ -113,7 +113,7 @@ function sealPrBase(h: Harness): string[] {
       subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: SHA }],
       availability: "PRESENT",
       claim_schema: "cadp.review.v1",
-      claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+      claim: { verdict: "APPROVE", ...reviewBodyPair(h, "external-verify review body") },
       producer_ref: "reviewer:claude-code",
       source_ref: `t-${(step += 1)}`,
       source_relation: "INDEPENDENT_OBSERVATION",

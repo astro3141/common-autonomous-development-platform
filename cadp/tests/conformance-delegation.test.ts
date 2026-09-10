@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { nowIso } from "../kernel/canonical.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
@@ -49,7 +49,7 @@ function sealMergeBase(h: Harness): { verification: string; review: string; work
       subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: SHA }],
       availability: "PRESENT",
       claim_schema: "cadp.review.v1",
-      claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+      claim: { verdict: "APPROVE", ...reviewBodyPair(h, "delegation review body") },
       producer_ref: "reviewer:claude-code",
       source_ref: `test-${step}`,
       source_relation: "INDEPENDENT_OBSERVATION",
@@ -309,7 +309,7 @@ test("AD6 (12th-pilot regression): the implementer set includes the BACKEND mode
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: SHA }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "2".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "delegation grok review body") },
         producer_ref: "reviewer:grok",
         source_ref: `test-grok-${step += 1}`,
         source_relation: "INDEPENDENT_OBSERVATION",

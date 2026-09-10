@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { makeHarness, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { ScriptedGitHubRepo } from "./support/scriptedGitHub.ts";
 import { GitHubAdapter } from "../kernel/adapters/github.ts";
@@ -88,7 +88,7 @@ async function makeGitHubHarness(options: { rego?: string; disabledChecks?: Read
           subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: sha }],
           availability: "PRESENT",
           claim_schema: "cadp.review.v1",
-          claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+          claim: { verdict: "APPROVE", ...reviewBodyPair(h, `github review body ${sha}`) },
           producer_ref: "reviewer:claude-code",
           source_ref: "test",
           source_relation: "INDEPENDENT_OBSERVATION",
@@ -486,7 +486,7 @@ test("C41: review-to-effect provenance — positive chain + falsifications 1/1b/
                 subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: SHA_A }],
                 availability: "PRESENT",
                 claim_schema: "cadp.review.v1",
-                claim: { verdict: "APPROVE", body_digest: "2".repeat(64) },
+                claim: { verdict: "APPROVE", ...reviewBodyPair(gh.h, "github unregistered reviewer body") },
                 producer_ref: "reviewer:unknown",
                 source_ref: "x",
                 source_relation: "INDEPENDENT_OBSERVATION",

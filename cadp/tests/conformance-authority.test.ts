@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { REFERENCE_ADAPTERS, REFERENCE_IDENTITIES, REFERENCE_REGO } from "../deployment/referencePolicy.ts";
 import { nowIso } from "../kernel/canonical.ts";
@@ -106,7 +106,7 @@ test("C12/C28: self-review and same-product review are denied on DERIVED classes
             subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "sha-x" }],
             availability: "PRESENT",
             claim_schema: "cadp.review.v1",
-            claim: { verdict: "APPROVE", body_digest: "0".repeat(64) },
+            claim: { verdict: "APPROVE", ...reviewBodyPair(h, "authority review body") },
             producer_ref: "surface:selfdev",
             source_ref: "test",
             source_relation: "SELF_REPORT",
@@ -141,7 +141,7 @@ test("C12/C28: self-review and same-product review are denied on DERIVED classes
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "sha-x" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "0".repeat(64), identity_class: { product: "definitely-not-codex" } },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "authority self-review body"), identity_class: { product: "definitely-not-codex" } },
         producer_ref: "surface:selfdev",
         source_ref: "test",
         source_relation: "SELF_REPORT",
@@ -211,7 +211,7 @@ test("C12/C28: self-review and same-product review are denied on DERIVED classes
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "sha-x" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "1".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "authority same-product review body") },
         producer_ref: "reviewer:codex-2",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",
@@ -283,7 +283,7 @@ test("C14: a policy-required observed fact that is UNKNOWN denies with required_
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "sha-c14" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "0".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "authority review body") },
         producer_ref: "reviewer:claude-code",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",

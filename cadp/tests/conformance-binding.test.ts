@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 
 after(() => stopSharedOpa());
 
@@ -71,7 +71,7 @@ test("C2: evidence bound to sha_a while the subject moved to sha_b is refused at
           ],
           availability: "PRESENT",
           claim_schema: "cadp.review.v1",
-          claim: { verdict: "APPROVE", body_digest: "d".repeat(64) },
+          claim: { verdict: "APPROVE", ...reviewBodyPair(h, "binding review body d") },
           producer_ref: "reviewer:claude-code",
           source_ref: "test",
           source_relation: "INDEPENDENT_OBSERVATION",
@@ -151,7 +151,7 @@ test("C38: decisions are a function of input_digest + policy content + now only;
         subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "commit", object_id: "sha-1" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "e".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "binding review body e") },
         producer_ref: "reviewer:claude-code",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",
@@ -179,7 +179,7 @@ test("C38: decisions are a function of input_digest + policy content + now only;
         subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "commit", object_id: "sha-1" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "e".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "binding review body e") },
         producer_ref: "reviewer:claude-code",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",
@@ -207,7 +207,7 @@ test("C38 guard-bite: with verify-on-read removed, a corrupted K4-bound claim is
           subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "commit", object_id: "sha-2" }],
           availability: "PRESENT",
           claim_schema: "cadp.review.v1",
-          claim: { verdict: "APPROVE", body_digest: "f".repeat(64) },
+          claim: { verdict: "APPROVE", ...reviewBodyPair(h, "binding review body f") },
           producer_ref: "reviewer:claude-code",
           source_ref: "test",
           source_relation: "INDEPENDENT_OBSERVATION",

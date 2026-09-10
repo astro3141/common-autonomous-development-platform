@@ -143,6 +143,9 @@ export function attribution(run: RunObservation): Record<string, unknown> {
     evidence_id: e.evidence_id,
     subject: e.subject_bindings.map((b) => `${b.namespace}:${b.object_id}`),
     verdict: (e.claim as { verdict?: string } | undefined)?.verdict,
+    // #259 P0b: the retained full text is named, not inlined — a projection stays a summary. The
+    // `evidence_id` beside it is what recovers those bytes (`ctl review-body <dir> <evidence_id>`).
+    body_cas_key: (e.claim as { body_cas_key?: string } | undefined)?.body_cas_key,
   }));
   const verification = run.byKind("VERIFICATION").map((e) => ({
     evidence_id: e.evidence_id,

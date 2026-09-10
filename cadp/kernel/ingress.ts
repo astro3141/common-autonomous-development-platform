@@ -475,7 +475,8 @@ export class Ingress {
    * load-bearing by disabling it and observing the prohibited effect — a second governed edge for
    * the §5.3 rules, and for the AP B2/B3 rules a cross-principal `REQUEST_DIGEST_CONFLICT`
    * (`allocation_principal_gate`) or a sealed request whose kernel-namespace subject is ambiguous
-   * (`kernel_namespace_lock`).
+   * (`kernel_namespace_lock`); `review_body_retained` (#259 P0b) bites into a sealed `REVIEW`
+   * whose `{body_cas_key, body_digest}` pair does not verify.
    */
   readonly disabledRules: ReadonlySet<string>;
 
@@ -1167,6 +1168,9 @@ export class Ingress {
       // A delegated agent decision carries the exact same §9.3 pre-sealed-scope obligations.
       this.assertHumanDecisionScope(draft, produced_at);
     }
+    if (draft.evidence_kind === "REVIEW" && draft.availability === "PRESENT" && this.#ruleEnabled("review_body_retained")) {
+      this.assertReviewBodyRetained(draft.claim);
+    }
 
     const received_at = nowIso(this.clock);
     const envelope = this.sealEnvelope(draft, identity.producer_ref, produced_at, {
@@ -1370,6 +1374,45 @@ export class Ingress {
       if (v?.availability === "PRESENT" && (typeof v.locator !== "string" || v.locator.length === 0)) {
         throw new IngressRejection("OBSERVED_WITHOUT_LOCATOR", `observed.${field} is PRESENT without a locator`);
       }
+    }
+  }
+
+  /**
+   * `cadp.review.v1` body retention (#259 P0b). A PRESENT `REVIEW` claim must carry the reviewer's
+   * FULL text durably, as a SELF-VERIFYING PAIR: `body_cas_key` locates the exact bytes in CAS and
+   * `body_digest` states their sha256. Both legs are checked here, against CAS, BEFORE the envelope
+   * is sealed — fetch by key, re-digest, compare — so a sealed REVIEW row is always one whose
+   * findings can still be quoted byte-for-byte long after the run stopped (the operator path is
+   * `readReviewBody` / `ctl review-body`, which re-runs exactly this comparison before printing).
+   * Before it, the claim held only a digest of bytes nothing retained: unverifiable against
+   * anything, and unquotable.
+   *
+   * NO TRUNCATION, and none of the reviewer's text is a kernel secret to redact: it is the
+   * reviewer surface's own output, stored verbatim as bytes. The broker's 60 000-character cap
+   * bounds the reviewer PROMPT (the diff it is shown), never this evidence; the only bound on the
+   * stored body is CAS's own `cas_upload_max_bytes`.
+   *
+   * Kind-specific, exactly like the BACKEND_EXECUTION and HUMAN_DECISION rules above: no other
+   * evidence kind's claim shape is read or constrained by this ingress.
+   */
+  private assertReviewBodyRetained(claim: unknown): void {
+    const review = claim as { body_digest?: unknown; body_cas_key?: unknown } | undefined;
+    const digest = review?.body_digest;
+    const cas_key = review?.body_cas_key;
+    if (typeof digest !== "string" || !/^[0-9a-f]{64}$/u.test(digest)) {
+      throw new IngressRejection("REVIEW_CLAIM_INVALID", "cadp.review.v1 requires claim.body_digest as sha256 hex");
+    }
+    if (typeof cas_key !== "string" || cas_key.length === 0) {
+      throw new IngressRejection("REVIEW_CLAIM_INVALID", "cadp.review.v1 requires claim.body_cas_key naming the retained reviewer text");
+    }
+    if (!this.cas.has(cas_key)) {
+      throw new IngressRejection("REVIEW_CLAIM_INVALID", "claim.body_cas_key names no CAS object");
+    }
+    // `Cas.get` re-digests the bytes against their KEY (§2.3 verify-on-read); this compares the
+    // CLAIM's own digest to those same bytes, which is what makes the pair self-verifying for a
+    // later reader holding nothing but the claim.
+    if (sha256Hex(this.cas.get(cas_key)) !== digest) {
+      throw new IngressRejection("REVIEW_CLAIM_INVALID", "claim.body_digest is not the sha256 of the bytes at claim.body_cas_key");
     }
   }
 

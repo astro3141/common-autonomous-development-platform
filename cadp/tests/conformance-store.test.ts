@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { join } from "node:path";
 
-import { makeHarness, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS, PEP_REF, ScriptedTarget } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, runChain, sealScriptedRequest, stopSharedOpa, PRINCIPALS, PEP_REF, ScriptedTarget } from "./support/harness.ts";
 import { ConstitutionalStore } from "../kernel/store.ts";
 import { Cas } from "../kernel/cas.ts";
 import { Ingress } from "../kernel/ingress.ts";
@@ -29,7 +29,7 @@ test("C4: a flipped byte in a stored claim refuses admission, seals DIGEST_CORRU
         subject_bindings: [{ authority_ref: "cadp-store:k04", namespace: "commit", object_id: "sha-c4" }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "a".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "store review body") },
         producer_ref: "reviewer:claude-code",
         source_ref: "test",
         source_relation: "INDEPENDENT_OBSERVATION",
