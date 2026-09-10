@@ -315,18 +315,17 @@ export function scanBackendModel(
  * which pins the identical invocation. Editing it changes what a developer types, nothing a
  * verifier runs.
  *
- * The pattern spans the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/` and
+ * The pinned path is the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/` and
  * `cadp/tests/ops/` both keep running. The gateFiles split changed PROTECTION, never coverage.
  *
- * Why a `**` PATTERN and not the bare directory `cadp/tests/`: `node --test` takes GLOB PATTERNS,
- * and Node 22 — the version this verifier's own surface image pins (`cadp/live/image/Dockerfile`,
- * `node:22-bookworm-slim`) — does not expand a bare directory. It matches nothing, falls back to
- * treating the argument as an entry module, and dies with `Cannot find module '<repo>/cadp/tests'`
- * BEFORE running a single control — turning every verification into `conclusion: failure`. The
- * pattern is the same pinning with the same explicit path, executable on both Node 22 (the surface
- * image) and Node 24 (the external verifier's runner).
+ * RUNTIME REQUIREMENT (owner decision, reviewer-confirmed: the pin is the bare directory, not a
+ * glob): the verifier image must run a Node whose `--test` RECURSES a directory argument. Node 22 —
+ * the version the surface image currently pins (`cadp/live/image/Dockerfile`, `node:22-bookworm-slim`)
+ * — does not: it treats every positional as a glob pattern, so the directory matches only itself and
+ * is then loaded as an entry module. Keep the image's runner ahead of that behaviour; the executed
+ * set is what this constant says, and it is not a glob.
  */
-export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", "cadp/tests/**/*.test.ts"];
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", "cadp/tests/"];
 
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }

@@ -43,12 +43,12 @@ jobs:
       # verifier's seam — the local verifier (`cadp/product/surfaceBroker.ts`, `VERIFIER_TEST_ARGV`)
       # pins the identical invocation.
       #
-      # The pattern spans the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/`
+      # The pinned path is the tests ROOT, not the protected subdirectory: `cadp/tests/conformance/`
       # and `cadp/tests/ops/` both keep running. The split changed PROTECTION, never coverage.
       #
-      # The pattern is SINGLE-QUOTED so `**` reaches node verbatim instead of being expanded by the
-      # step's shell (bash expands `**` as a plain `*` unless `globstar` is set, which would silently
-      # narrow the executed set to exactly one directory level). `node --test` takes glob patterns,
-      # not directories: the bare `cadp/tests/` form matches nothing on Node 22, which is the version
-      # the local verifier's surface image pins, so both sites use the pattern and stay identical.
-      - run: node --test 'cadp/tests/**/*.test.ts'
+      # The path is the bare directory — NOT a glob (owner decision, reviewer-confirmed). It carries
+      # no shell metacharacter, so nothing here is quoted and nothing is expanded by the step's shell
+      # before node sees it; the executed set is exactly the directory named in this protected file.
+      # This requires a runner whose `node --test` recurses a directory argument, which is why the
+      # `node-version` pinned above is the one this step is measured against.
+      - run: node --test cadp/tests/

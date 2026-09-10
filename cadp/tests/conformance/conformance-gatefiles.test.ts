@@ -80,11 +80,11 @@ test("GF8: BOTH verifiers pin the explicit test path — a control cannot be eva
   // while arranging that the verifier never runs it. `npm test` was that seam, because package.json
   // is an ordinary delegable file. Both verifiers now spawn `node --test` with the explicit path,
   // and both invocation sites are gate machinery.
-  assert.deepEqual(VERIFIER_TEST_ARGV, ["node", "--test", "cadp/tests/**/*.test.ts"], "the local verifier's executed set is pinned by a gate-protected file");
+  assert.deepEqual(VERIFIER_TEST_ARGV, ["node", "--test", "cadp/tests/"], "the local verifier's executed set is pinned by a gate-protected file");
   assert.ok(!VERIFIER_TEST_ARGV.includes("npm"), "the local verifier must never route through the npm script indirection");
 
   const workflow = readFileSync(join(REPO_ROOT, ".github", "workflows", "cadp-verify.yml"), "utf8");
-  // Strip the shell quoting the YAML step needs (`**` must reach node, not bash) before comparing.
+  // Quotes are stripped before comparing so a quoted spelling can never diverge from the pinned argv.
   const runSteps = workflow
     .split("\n")
     .filter((line) => /^\s*-\s+run:/u.test(line))
@@ -95,12 +95,11 @@ test("GF8: BOTH verifiers pin the explicit test path — a control cannot be eva
   );
   assert.ok(!runSteps.includes("npm test"), "the external verifier must not route through the npm script indirection");
 
-  // ...and the pinned pattern spans the tests ROOT: the split changed protection, never coverage.
-  const pattern = VERIFIER_TEST_ARGV[2] ?? "";
-  assert.ok(pattern.startsWith("cadp/tests/"), "the pinned pattern must be rooted at the tests directory");
-  assert.ok(pattern.includes("**"), "the pinned pattern must recurse — narrowing it to one directory would drop conformance/ or ops/");
+  // ...and the pinned path is the tests ROOT itself: the split changed protection, never coverage.
+  const path = VERIFIER_TEST_ARGV[2] ?? "";
+  assert.equal(path, "cadp/tests/", "the pinned path must be the bare tests directory, not a glob or a subdirectory");
   for (const dir of ["conformance", "ops"]) {
-    assert.ok(!pattern.includes(`cadp/tests/${dir}`), `${dir}/ must not be singled out — both directories stay in the executed set`);
+    assert.ok(!path.includes(dir), `${dir}/ must not be singled out — both directories stay in the executed set`);
   }
 });
 

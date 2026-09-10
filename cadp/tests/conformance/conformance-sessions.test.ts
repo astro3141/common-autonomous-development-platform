@@ -89,9 +89,9 @@ test("runVerifier carries the broker's PINNED test argv, isolation profile other
     "-v", "/checkout:/ws",
     "-w", "/ws",
     "cadp-surface:conformance",
-    "node", "--test", "cadp/tests/**/*.test.ts",
+    "node", "--test", "cadp/tests/",
   ]);
-  // `-w /ws` is the container workdir, so the pinned pattern resolves against the checkout root.
+  // `-w /ws` is the container workdir, so the pinned path resolves against the checkout root.
   assert.equal(args[args.indexOf("-w") + 1], "/ws");
 });
 
