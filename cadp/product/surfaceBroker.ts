@@ -327,11 +327,14 @@ export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/",
  * image (`cadp/live/image/Dockerfile`, node:22-bookworm-slim — Node 22.23.2), `node --test <dir>`
  * does not search the directory at all, it tries to LOAD it as a module and dies
  * `ERR_MODULE_NOT_FOUND`; directory arguments only became a search on Node 24. The glob form
- * enumerates the same three leaf directories, needs no recursion, and behaves identically on both
- * Node 22 (verifier image) and Node 24 (Actions runner). It is expanded by Node itself, so the
- * argv is byte-identical at both invocation sites whether or not a shell is in the path.
- * `conformance-gatefiles.test.ts` GF8 EXECUTES this argv and asserts all three suites report a
- * nonzero test count — an invocation that silently discovered nothing would fail conformance.
+ * enumerates the same three leaf directories and needs no recursion. It is expanded by Node
+ * itself, so the argv is byte-identical at both invocation sites whether or not a shell is in the
+ * path — and because that discovery is MAJOR-DEPENDENT, the external verifier's runner is pinned
+ * to this image's Node major too (`.github/workflows/cadp-verify.yml` `node-version`), so both
+ * verifiers face the same semantics. `conformance-gatefiles.test.ts` GF8 asserts that pin and
+ * EXECUTES this argv ON THAT RUNTIME (this process when its major matches, otherwise inside the
+ * image itself), asserting all three suites report a nonzero test count — an invocation that
+ * silently discovered nothing would fail conformance.
  *
  * KNOWN CONSEQUENCE, stated rather than hidden: this argv names CADP's own directories, so
  * `/verify` is now a SELF-HOST verifier. A governed target that is not this repository (the

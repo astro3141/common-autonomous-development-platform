@@ -20,7 +20,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          # PINNED TO THE VERIFIER IMAGE'S MAJOR (cadp/live/image/Dockerfile, node:22-bookworm-slim).
+          # `node --test <selector>` semantics differ by major — bare directories only became a
+          # search on Node 24 — so an external verifier running a different runtime than the local
+          # verifier's container would be attesting to semantics the pinned argv never faces.
+          # conformance-gatefiles.test.ts GF8 asserts this equals the Dockerfile's `FROM node:<major>`
+          # and EXECUTES the pinned argv on that runtime.
+          node-version: "22"
       # The conformance suite drives a real OPA evaluator; pin the SAME version the deployment's
       # evaluator integrity records (1.20.1). Without it the suite stalls to the job timeout
       # (measured live, 16th pilot: npm test cancelled at 10m, check-run conclusion=cancelled).
@@ -41,5 +47,6 @@ jobs:
       # protected byte. `npm test` remains a developer convenience and is no longer any verifier's
       # seam. The selectors are QUOTED so Node — not the runner's shell — expands them, keeping the
       # argv identical to the local verifier's; and one-level globs rather than bare directories
-      # because `node --test <dir>` is not a directory search on the verifier image's Node 22.
+      # because `node --test <dir>` is not a directory search on the verifier image's Node 22 —
+      # the major this job is pinned to above, so both verifiers exercise the same runtime.
       - run: node --test 'cadp/tests/conformance/*.test.ts' 'cadp/tests/ops/*.test.ts' 'devharness/tests/*.test.ts'

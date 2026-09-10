@@ -149,6 +149,19 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
   assert.ok(workflow.includes(`- run: ${pinned}`), `the external verifier must run the pinned invocation:\n  ${pinned}`);
   assert.equal(/^\s*-\s*run:\s*npm\s+test\s*$/mu.test(workflow), false, "npm test is a developer convenience, never a verifier's seam");
 
+  // SAME RUNTIME, not just the same argv. `node --test <selector>` semantics are major-dependent
+  // (bare directories only became a directory search on Node 24), so an argv proven on one major
+  // proves nothing about the other. The runtime the LOCAL verifier spawns is the pinned surface
+  // image; the external verifier's `setup-node` must name that same major, or the two verifiers
+  // are attesting to different discovery semantics.
+  const dockerfile = readFileSync(join(REPO_ROOT, "cadp/live/image/Dockerfile"), "utf8");
+  const from = /^FROM (node:(\d+)-\S+)$/mu.exec(dockerfile);
+  assert.ok(from !== null, "the verifier image must pin a node:<major>-<variant> base");
+  const [, IMAGE_TAG, IMAGE_MAJOR] = from as unknown as [string, string, string];
+  const setupNode = /^\s*node-version:\s*"(\d+)"\s*$/mu.exec(workflow);
+  assert.ok(setupNode !== null, "the external verifier must pin an explicit node-version");
+  assert.equal(setupNode[1], IMAGE_MAJOR, `the Actions runner must run the verifier image's Node major (${IMAGE_TAG})`);
+
   // The invocation contract in the repository as it stands: each named directory really does hold
   // test files DIRECTLY (conformance-manifest.test.ts MF4 asserts the converse — that none live
   // anywhere else).
@@ -167,8 +180,8 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
       mkdirSync(join(base, dir), { recursive: true });
       writeFileSync(join(base, dir, "probe.test.ts"), `import test from "node:test";\ntest(${JSON.stringify(`probe:${dir}`)}, () => {});\n`);
     }
-    // argv[0] is the node binary the verifier container resolves from PATH; this process's own
-    // executable is that same runtime, and everything after it is the pinned argv verbatim.
+    // argv[0] is the node binary the verifier container resolves from PATH; everything after it is
+    // the pinned argv verbatim.
     assert.equal(VERIFIER_TEST_ARGV[0], "node");
     // The verifier runs this argv in a fresh container, not inside a test run. `NODE_TEST_CONTEXT`
     // is how the runner tells a child process it is already a test worker ("run() is being called
@@ -176,8 +189,23 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
     // own environment; everything else is inherited.
     const env = { ...process.env };
     delete env["NODE_TEST_CONTEXT"];
+    // ON THE VERIFIER IMAGE'S RUNTIME. `process.execPath` is only the right binary when this suite
+    // is ITSELF running the image's major (the verifier container, and a developer host that
+    // matches it); anywhere else — an Actions runner or a dev host on another major — the leg must
+    // execute inside the pinned image, or it measures a runtime the verifier never uses. Neither
+    // reachable => FAIL CLOSED: a control that silently proves nothing is the failure mode this
+    // whole test exists to catch.
+    const onImageRuntime = process.versions.node.split(".")[0] === IMAGE_MAJOR;
+    const dockerOk = !onImageRuntime && spawnSync("docker", ["version"], { stdio: "ignore" }).status === 0;
+    assert.ok(
+      onImageRuntime || dockerOk,
+      `GF8 must execute the pinned argv on the verifier image's runtime (${IMAGE_TAG}): this process is Node ` +
+        `${process.versions.node} and docker is unavailable to run the image. Use Node ${IMAGE_MAJOR} or provide docker.`,
+    );
     const runCounts = (args: readonly string[]): { tests: number; pass: number; fail: number } => {
-      const r = spawnSync(process.execPath, [...args], { cwd: base, encoding: "utf8", env });
+      const r = onImageRuntime
+        ? spawnSync(process.execPath, [...args], { cwd: base, encoding: "utf8", env })
+        : spawnSync("docker", ["run", "--rm", "-v", `${base}:/gf8`, "-w", "/gf8", IMAGE_TAG, "node", ...args], { encoding: "utf8" });
       const count = (label: string): number => {
         // The runner's own summary counts, under either reporter Node picks by default (`# tests
         // N` from the tap reporter when stdout is not a TTY, `ℹ tests N` from the spec reporter),
