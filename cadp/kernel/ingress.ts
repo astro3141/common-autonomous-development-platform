@@ -15,6 +15,13 @@
  * per-request TRANSPORT METADATA — a parameter of its own, never a body, draft, record or digest
  * member — and is read through ONE strict base64url parser before its digest is compared, in
  * constant time, against the `run_capability` row for this request's own `work_run_ref`.
+ * AP B5(3)-(5) completes that side with the rest of the seal-time run binding, in ONE fixed order
+ * inside the sealing transaction: the enrollment/binding legs (`RUN_BINDING_REQUIRED`,
+ * `NOT_RUN_ENROLLED`) ahead of the origin adjudication, then — for an enrolled, run-bound,
+ * NON-origin request — presentation (`RUN_CAPABILITY_REQUIRED`, `RUN_CAPABILITY_INVALID`), holder
+ * (`RUN_CAPABILITY_HOLDER_MISMATCH`) and Spec v0.5 §5.2's K7 grading of the run's own `WORK_START`
+ * (`RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`), and only then B5(5)'s
+ * `run_membership(effect_id, work_run_ref)` insert in the SAME transaction as the request row.
  * Every one of those rules is gated on the ACTIVE CONFIG's schema string, so a running v0.4
  * (`cadp.kernel-config.v1`) deployment keeps its allocation, seal and assembly behaviour unchanged.
  */
@@ -286,6 +293,28 @@ const KERNEL_WORK_RUN_NAMESPACE = "work-run";
 export function runProfileEnrolled(config: KernelConfig, requester_ref: string): boolean {
   if (config.schema !== "cadp.kernel-config.v2") return false;
   return (config.run_profile_enrolled_requester_refs ?? []).includes(requester_ref);
+}
+
+/**
+ * AP B5(3) — whether the run profile GOVERNS this deployment at all, and therefore the exact scope
+ * of `NOT_RUN_ENROLLED`, the one leg of B5(3)-(4) that grades a requester the enrolled set does
+ * NOT name. Every other leg is per-requester and needs no separate gate: `runProfileEnrolled` is
+ * already false for them.
+ *
+ * The gate is the GOVERNING REGISTRY CONTENT, not the schema string alone: `cadp.kernel-config.v2`
+ * plus a NON-EMPTY `run_profile_enrolled_requester_refs`. B3(4)(c)'s cross-field invariant binds
+ * exactly that case — a non-empty enrollment MUST declare the work-run `kernel_subject_namespaces`
+ * pair (`policyBundle.ts`) — so "the registry names at least one enrolled requester" is the same
+ * condition as "this bundle switched the run profile on", and an EMPTY enrollment is a deployment
+ * that carries the v2 registries without running the profile at all. That is the reference posture
+ * (`deployment/referencePolicy.ts`), under which run-bound requests are ordinary requests exactly
+ * as they are today: `NOT_RUN_ENROLLED` cannot fire, because there is no enrollment to be outside
+ * of. Under `cadp.kernel-config.v1` the field is not even expressible, so a live v0.4 deployment
+ * is untouched — the same gate every other rule in this lane is stated over.
+ */
+function runProfileEngaged(config: KernelConfig): boolean {
+  if (config.schema !== "cadp.kernel-config.v2") return false;
+  return (config.run_profile_enrolled_requester_refs ?? []).length > 0;
 }
 
 /**
@@ -704,18 +733,28 @@ export class Ingress {
       // FIRST seal (no `effect_request` row): B2(3)'s legs, all of them generic equalities over
       // bundle data and the caller's own tuple, every one refusing BEFORE any K3 record exists.
       if (allocation !== undefined) this.#assertFirstSealBinding(sealed, allocation, allocation_tuple, active);
+      // B5(3): the enrollment/binding legs, FIRST of the run-profile rules and deliberately ahead
+      // of the adjudication below — an enrolled requester's request carrying no declared work-run
+      // binding is B5(9) leg 2's "none" case, and `RUN_BINDING_REQUIRED` is the exact code for it
+      // where `RUN_CAPABILITY_INVALID` would be the less exact one (TD B5(9), leg-1/2 note).
+      this.#assertRunEnrollment(sealed, active);
       // B5(9): ORIGIN-OR-REFUSED. Runs AFTER B2(3)'s legs, which B5(9) leaves unchanged, and
       // refuses before any K3 record exists like every other pre-K3 leg.
       const origin = this.#adjudicateRunOrigin(sealed, active);
-      // B5(4): the presentation legs, whose scope is "every run-bound request EXCEPT a run origin"
-      // — the origin adjudication above is what decides which this is, so it runs first and an
-      // adjudicated origin never reaches here. Also pre-K3: it refuses before the insert below.
-      if (!origin) this.#assertPresentedRunCapability(sealed, active, metadata);
+      // B5(4): the presentation, holder and K7-usability legs, whose scope is "every run-bound
+      // request EXCEPT a run origin" — the origin adjudication above is what decides which this
+      // is, so it runs first and an adjudicated origin never reaches here. Also pre-K3: every one
+      // of its refusals happens before the insert below. It returns the `work_run_ref` this seal
+      // PROVED membership of, which is what B5(5) writes.
+      const member = origin ? undefined : this.#adjudicateRunMembership(sealed, active, metadata);
       this.store.insertEffectRequest(sealed, sealed.material_ref, work_run_ref);
       // B5(5): the membership proof is inserted in the SAME transaction as the `effect_request`
       // row. For an origin the two columns are equal, and THAT row is B5(1)(b)'s durable minting
       // witness — the only thing that ever makes this effect minting at its own initial dispatch.
-      if (origin) this.store.insertRunMembership(sealed.effect_id, sealed.effect_id);
+      // For a verified member the second column is the run it presented a capability for, which is
+      // the row recheck #19 reads at admission (`RUN_MEMBERSHIP_UNPROVEN`, a PEP-side lane).
+      const proven = origin ? sealed.effect_id : member;
+      if (proven !== undefined) this.store.insertRunMembership(sealed.effect_id, proven);
       return { kind: "row", row: sealed };
     });
     if (outcome.kind === "conflict") {
@@ -767,18 +806,21 @@ export class Ingress {
    * SCOPE, stated exactly because it is what keeps this lane's change inert for everything else:
    *  - `cadp.kernel-config.v1` — the rule cannot apply at all (enrollment is not expressible), so a
    *    v0.4 deployment's seal path is byte-identical to what it is today;
-   *  - a NON-ENROLLED requester's `WORK_START` — not adjudicated, seals exactly as before, and
-   *    acquires NO witness, so it is never minting at any dispatch and no later `POLICY_ACTIVATE`
-   *    can retroactively make it one (B5(1)(α), control A4 leg w1);
+   *  - a NON-ENROLLED requester's `WORK_START` — not adjudicated, and where B5(3) lets it seal at
+   *    all (a deployment with no enrollment, or a request binding no run) it seals exactly as
+   *    before and acquires NO witness, so it is never minting at any dispatch and no later
+   *    `POLICY_ACTIVATE` can retroactively make it one (B5(1)(α), control A4 leg w1);
    *  - a NON-`WORK_START` request binding its own `effect_id` — fails leg 1, so it writes no
-   *    self-referential row and acquires nothing by the self-binding (B5(9), Spec v0.5 §9.2). Its
-   *    capability-presentation refusal is B5(4)'s ordinary path, a later lane.
+   *    self-referential row and acquires nothing by the self-binding (B5(9), Spec v0.5 §9.2): it is
+   *    graded by B5(4)'s ordinary member path below, where no `run_capability` row can exist for
+   *    its own `effect_id` and the presentation is refused `RUN_CAPABILITY_INVALID`.
    *
-   * ONE ORDERING NOTE FOR THE LANE THAT ADDS B5(3): an enrolled requester's `WORK_START` carrying
-   * NO `work-run` binding is leg 2's "none" case, which B5(3) refuses `RUN_BINDING_REQUIRED`
-   * BEFORE this rule runs. Until that rule exists, the same request is refused here instead, under
-   * `RUN_CAPABILITY_INVALID` — fail-closed and never a fall-through, but the less exact of the two
-   * codes, so `RUN_BINDING_REQUIRED` must be inserted AHEAD of this call and not after it.
+   * ONE ORDERING NOTE, now discharged by B5(3): an enrolled requester's `WORK_START` carrying NO
+   * declared `work-run` binding is leg 2's "none" case, and `#assertRunEnrollment` refuses it
+   * `RUN_BINDING_REQUIRED` BEFORE this rule runs. So leg 2 fails here only for a request that DOES
+   * name a declared work-run subject and names one that is not its own `effect_id` — an
+   * off-authority `{other, work-run, …}` binding is not a kernel work-run subject at all (B3(4)(a))
+   * and is therefore the "none" case too, refused one leg earlier under the exacter code.
    */
   #adjudicateRunOrigin(sealed: EffectRequestV1, active: ActivePolicy): boolean {
     if (sealed.operation_kind !== RUN_PROFILE_WORK_START) return false; // leg 1
@@ -793,50 +835,159 @@ export class Ingress {
   }
 
   /**
-   * AP B5(4) — the PRESENTATION legs, evaluated over rows read inside the sealing transaction.
-   * This lane implements the `RUN_CAPABILITY_INVALID` leg and it alone: a presented capability that
-   * does not decode canonically (B6(3)), or whose digest matches no `run_capability` row for THIS
-   * request's own `work_run_ref` — including the case where no row exists for it at all, which is
-   * B5(4)'s standing, permanent refusal for any request naming a never-witnessed `WORK_START`.
+   * AP B5(3) — the ENROLLMENT/BINDING legs, the FIRST two of the run profile's seal-time rules and
+   * the two that decide, before anything else looks at a capability, whether this requester and
+   * this request agree about being in a run at all. Both are equalities over the sealed record and
+   * the active registry; neither reads the header, and neither can be satisfied by presenting one.
    *
-   * GATE, and it is the whole of the gate: the rule engages only for a `requester_ref` enrolled in
-   * `run_profile_enrolled_requester_refs` — which `runProfileEnrolled` makes expressible ONLY under
-   * `cadp.kernel-config.v2` — and only when `kernel_subject_namespaces` declares the work-run
-   * namespace this request is bound on. Under `cadp.kernel-config.v1` the first condition is
+   *   (1) an ENROLLED `requester_ref` whose request names NO declared work-run subject is refused
+   *       `RUN_BINDING_REQUIRED` — refused, not merely uncounted (Spec v0.5 §5.1). Enrollment is
+   *       the statement that this requester's effects are run-scoped, so an unbound request from
+   *       one is a request whose scope the Platform cannot name.
+   *   (2) a NON-ENROLLED `requester_ref` whose request DOES name one is refused `NOT_RUN_ENROLLED`:
+   *       enrollment cannot be acquired by presenting a binding (WP §5.2, WP control 5). Without
+   *       this leg the enrolled set would be opt-in from the wire — any requester could bind
+   *       another's run and be graded by the member path it was never enrolled into.
+   *
+   * The two conditions are mutually exclusive, so their ORDER is not a precedence — it is the
+   * order the TD states them in, and the order the refusals are asserted in.
+   *
+   * SCOPE. Leg (1) is per-requester (`runProfileEnrolled`, v2-only). Leg (2) is the one leg about a
+   * requester the enrolled set does not name, so it is gated on `runProfileEngaged` — the governing
+   * registry content — and is inert under `cadp.kernel-config.v1` and under any v2 bundle whose
+   * enrollment is empty. `declaredWorkRunRef` decides "run-bound" on the DECLARED exact
+   * `(authority_ref, namespace)` pair for both legs, so an off-authority `{other, work-run, …}`
+   * binding is not a run binding here either (B3(4)(a)) and the two legs can never disagree with
+   * B5(9)'s leg 2 about which run — if any — a request names.
+   */
+  #assertRunEnrollment(sealed: EffectRequestV1, active: ActivePolicy): void {
+    if (!runProfileEngaged(active.config)) return;
+    const enrolled = runProfileEnrolled(active.config, sealed.requester_ref);
+    const work_run_ref = declaredWorkRunRef(sealed, active.config);
+    if (enrolled && work_run_ref === undefined) {
+      throw new IngressRejection("RUN_BINDING_REQUIRED", `${sealed.requester_ref} is run-enrolled; ${sealed.effect_id} binds no work run`);
+    }
+    if (!enrolled && work_run_ref !== undefined) {
+      throw new IngressRejection("NOT_RUN_ENROLLED", `${sealed.requester_ref} is not enrolled in the run profile`);
+    }
+  }
+
+  /**
+   * AP B5(4) — the PRESENTATION, HOLDER and USABILITY legs, all evaluated over rows read inside the
+   * sealing transaction, in this exact order, and all pre-K3: every refusal below happens before
+   * the `effect_request` insert, so a refused seal leaves ZERO rows behind. Returns the
+   * `work_run_ref` this request PROVED membership of — B5(5)'s second column — or `undefined` when
+   * the rule does not apply to this request at all.
+   *
+   *   (3) `RUN_CAPABILITY_REQUIRED` — an enrolled requester's run-bound request presenting nothing.
+   *       Distinct from `RUN_BINDING_REQUIRED`, which covers only B5(3)'s missing-binding case.
+   *   (4) `RUN_CAPABILITY_INVALID` — the presented value does not decode canonically (B6(3)), or
+   *       its digest matches no `run_capability` row for THIS request's own `work_run_ref`. The
+   *       no-row case is B5(4)'s standing, permanent refusal for any request naming a
+   *       never-witnessed `WORK_START`, and BORROWING is this same leg: a genuinely valid,
+   *       holder-matching capability for run R1 presented on an R2-bound request matches no R2 row,
+   *       because the row is keyed by the run and the lookup is by the request's own run.
+   *   (5) `RUN_CAPABILITY_HOLDER_MISMATCH` — the matched row's `holder_ref` is not this request's
+   *       STAMPED `requester_ref`. Possession is therefore never sufficient: an exfiltrated
+   *       capability presented by anyone but its holder fails here even though leg (4) passed.
+   *   (6) Spec v0.5 §5.2's K7 grading of the run's own `WORK_START` (`#gradeRunScope`).
+   *
+   * GATE: a `requester_ref` enrolled in `run_profile_enrolled_requester_refs` — which
+   * `runProfileEnrolled` makes expressible ONLY under `cadp.kernel-config.v2` — and a request
+   * naming a declared work-run subject. Under `cadp.kernel-config.v1` the first condition is
    * unsatisfiable, so the header is inert and a v0.4 deployment's seal path is byte-identical to
    * what it is today, presented or not. That is why the header is not parsed before the gate: a
    * malformed value outside the gate must be exactly as inert as a well-formed one, or the header
-   * would be observable where the contract says it is not.
+   * would be observable where the contract says it is not. The `work_run_ref === undefined` return
+   * is now unreachable for an enrolled requester — B5(3) leg (1) refused it one call earlier — and
+   * is kept as the fail-closed reading of "this request names no declared run scope".
    *
-   * THE THREE LEGS THIS LANE DOES NOT RAISE, named so their absence is a stated scope and not an
-   * oversight — each is a DISTINCT reason code of B5(4) and each is a later lane:
-   *  - a run-bound request presenting NOTHING is `RUN_CAPABILITY_REQUIRED`, so `presented ===
-   *    undefined` returns here rather than refusing under this lane's less exact code;
-   *  - a row whose `holder_ref` is not this request's stamped `requester_ref` is
-   *    `RUN_CAPABILITY_HOLDER_MISMATCH`; and
-   *  - the `WORK_START`'s latest conclusive K7 grading is `RUN_SCOPE_UNRESOLVED`/`RUN_SCOPE_REFUSED`.
-   * Likewise B5(3)'s `RUN_BINDING_REQUIRED` (an enrolled requester's request carrying no work-run
-   * binding at all) is the `work_run_ref === undefined` case, which returns here for the same
-   * reason. Every one of those legs NARROWS what seals; none widens it, so nothing that refuses
-   * today starts sealing when they land.
-   *
-   * The refusal names the reason code and the caller's own sealed `work_run_ref`. It never names,
-   * echoes or prefixes the presented secret, and the two refusal legs are deliberately ONE message:
-   * "no row" and "row with a different digest" are not distinguished, because distinguishing them
-   * would tell a prober whether a given `work_run_ref` has ever been minted against (B6(3)).
+   * The refusals name their reason code and, at most, the caller's own sealed `work_run_ref` and
+   * stamped `requester_ref`. None names, echoes or prefixes the presented secret, and leg (4)'s two
+   * cases are deliberately ONE message: "no row" and "row with a different digest" are not
+   * distinguished, because distinguishing them would tell a prober whether a given `work_run_ref`
+   * has ever been minted against (B6(3)).
    */
-  #assertPresentedRunCapability(sealed: EffectRequestV1, active: ActivePolicy, metadata: RequestMetadata): void {
-    if (!runProfileEnrolled(active.config, sealed.requester_ref)) return;
+  #adjudicateRunMembership(sealed: EffectRequestV1, active: ActivePolicy, metadata: RequestMetadata): string | undefined {
+    if (!runProfileEnrolled(active.config, sealed.requester_ref)) return undefined;
     const work_run_ref = declaredWorkRunRef(sealed, active.config);
-    if (work_run_ref === undefined) return; // B5(3)'s RUN_BINDING_REQUIRED, a later lane
+    if (work_run_ref === undefined) return undefined; // refused RUN_BINDING_REQUIRED by B5(3)
     const presented = metadata.run_capability;
-    if (presented === undefined) return; // B5(4)'s RUN_CAPABILITY_REQUIRED, a later lane
+    if (presented === undefined) {
+      throw new IngressRejection("RUN_CAPABILITY_REQUIRED", `${sealed.effect_id} is bound to ${work_run_ref} and presents no capability`);
+    }
     // B6(3) then B5(1): the ONE strict parser, then SHA-256 over the RAW bytes it returned — never
     // over the transport text — compared constant-time against the row for this exact run.
     const secret = decodeRunCapability(presented);
     const row = this.store.runCapability(work_run_ref);
     if (row === undefined || !capabilityDigestsEqual(sha256Hex(secret), row.capability_digest)) {
       throw new IngressRejection("RUN_CAPABILITY_INVALID", `no run capability matches ${work_run_ref}`);
+    }
+    // The holder comparison is an ordinary string equality, not a constant-time one: B5(4)'s
+    // constant-time mandate is over the capability DIGEST, and `holder_ref` is a stamped identity
+    // this caller already knows — it is its own `requester_ref` on every request it can seal.
+    if (row.holder_ref !== sealed.requester_ref) {
+      throw new IngressRejection("RUN_CAPABILITY_HOLDER_MISMATCH", `${work_run_ref} is not held by ${sealed.requester_ref}`);
+    }
+    this.#gradeRunScope(work_run_ref);
+    return work_run_ref;
+  }
+
+  /**
+   * AP B5(2)/B5(4) leg (6) — Spec v0.5 §5.2's K7 grading of the run scope, re-applied at EVERY
+   * presentation and read inside the sealing transaction. The graded effect is the run's own
+   * `WORK_START`: `work_run_ref` IS that effect's `effect_id` (TD v0.4 §7.4), which is what makes
+   * this a K7 read and not a second notion of run state.
+   *
+   * K7, never K6: an admission proves a dispatch was authorized, never that it landed, so the
+   * grading is over `EffectOutcomeV1` rows and the admissions are read only for the ORDER —
+   * `dispatch_ordinal`, the kernel's own retry sequence — which `effect_outcome` does not carry.
+   * `UNKNOWN` is NON-CONCLUSIVE by construction: it is graded by being neither of the two
+   * conclusive results, so no `unknown_reason` and no observer is interpreted here.
+   *
+   *   - NO admission at all, or the LATEST admitted dispatch still unresolved ⇒
+   *     `RUN_SCOPE_UNRESOLVED`. "Unusable until reconciliation resolves it" (Spec v0.5 §5.2) — no
+   *     blind retry and no optimistic use. This leg is also what keeps a re-admitted run honest:
+   *     while ordinal 2 is admitted and unresolved the scope is UNRESOLVED, not the ordinal-1
+   *     `NO_EFFECT_CONFIRMED` it would report if only conclusive rows were consulted.
+   *   - the greatest-ordinal conclusive row is `NO_EFFECT_CONFIRMED` ⇒ `RUN_SCOPE_REFUSED`, a
+   *     refusal of the presentation AT THAT MOMENT and deliberately not forever: recheck #12 admits
+   *     a further ordinal after a `NO_EFFECT_CONFIRMED` (`pep.ts`), and if that dispatch reaches
+   *     `COMMITTED` the SAME already-delivered capability becomes usable, with no re-delivery.
+   *   - the greatest-ordinal conclusive row is `COMMITTED` ⇒ usable, and this method returns. The
+   *     flip is one-way in practice: once a `COMMITTED` exists, recheck #12 refuses every further
+   *     dispatch `EFFECT_ALREADY_COMMITTED`, so no later ordinal can displace it.
+   *
+   * A single admission carrying BOTH conclusive results is a contradiction the PEP raises an
+   * `OUTCOME_CONTRADICTION` incident for on its own path. Here it is graded NON-conclusive, so the
+   * scope reads `RUN_SCOPE_UNRESOLVED`: fail-closed, under a code this rule already owns, and
+   * without the Ingress inventing a seventh reason or sealing an incident from inside a
+   * transaction that is about to be rolled back by its own refusal.
+   */
+  #gradeRunScope(work_run_ref: string): void {
+    const conclusiveOf = (admission_digest: string): "COMMITTED" | "NO_EFFECT_CONFIRMED" | undefined => {
+      const outcomes = this.store.outcomesByAdmissionDigest(admission_digest);
+      const committed = outcomes.some((o) => o.result === "COMMITTED");
+      const noEffect = outcomes.some((o) => o.result === "NO_EFFECT_CONFIRMED");
+      if (committed === noEffect) return undefined; // neither, or a contradiction: non-conclusive
+      return committed ? "COMMITTED" : "NO_EFFECT_CONFIRMED";
+    };
+    // `admissionsByEffect` is ordered by `dispatch_ordinal`, so `.at(-1)` is the LATEST admitted
+    // dispatch. With that dispatch required to be conclusive, it IS the conclusive row of greatest
+    // `dispatch_ordinal` — an earlier ordinal's grading can never be the one that decides, which is
+    // what stops a superseded `NO_EFFECT_CONFIRMED` from refusing a run that has moved on.
+    const latest = this.store.admissionsByEffect(work_run_ref).at(-1);
+    const conclusive = latest === undefined ? undefined : conclusiveOf(latest.admission_digest.value);
+    if (conclusive === undefined) {
+      throw new IngressRejection(
+        "RUN_SCOPE_UNRESOLVED",
+        latest === undefined
+          ? `${work_run_ref} has no admitted WORK_START dispatch`
+          : `${work_run_ref}'s latest WORK_START dispatch has no conclusive outcome`,
+      );
+    }
+    if (conclusive === "NO_EFFECT_CONFIRMED") {
+      throw new IngressRejection("RUN_SCOPE_REFUSED", `${work_run_ref}'s latest conclusive WORK_START outcome is NO_EFFECT_CONFIRMED`);
     }
   }
 

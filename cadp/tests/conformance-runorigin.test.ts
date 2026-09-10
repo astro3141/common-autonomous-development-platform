@@ -6,14 +6,20 @@
  * `is_run_origin` adjudication (ORIGIN-OR-REFUSED) and its durable `run_membership(E, E)` witness,
  * and the WITNESSED mint delivered exactly once at the verified initial `admit_and_dispatch`.
  *
- * PART 2, B5(3)-(4)/B6(3), the last section of this file: the request-metadata PLUMBING of the
- * `x-cadp-run-capability` header from `api.ts` to the seal, and the STRICT PARSER every
- * presentation is read through before its digest is compared. The reason code governed there is
- * `RUN_CAPABILITY_INVALID` alone. B5(4)'s other presentation codes —
- * `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`,
- * `RUN_CAPABILITY_REQUIRED` — with B5(3)'s `RUN_BINDING_REQUIRED` and recheck #19's
- * `RUN_MEMBERSHIP_UNPROVEN`, are later lanes and are asserted nowhere here; each of them NARROWS
- * what seals, so nothing asserted below starts sealing when they land.
+ * PART 2, B5(3)-(4)/B6(3): the request-metadata PLUMBING of the `x-cadp-run-capability` header
+ * from `api.ts` to the seal, and the STRICT PARSER every presentation is read through before its
+ * digest is compared.
+ *
+ * PART 3, B5(3)-(5), the last section of this file: the rest of the seal-time run binding, one
+ * test per reason code and in the order the Ingress grades them — `RUN_BINDING_REQUIRED`,
+ * `NOT_RUN_ENROLLED`, `RUN_CAPABILITY_REQUIRED`, `RUN_CAPABILITY_INVALID` (same-holder wrong-run
+ * borrowing included), `RUN_CAPABILITY_HOLDER_MISMATCH`, and B5(2)'s K7 grading of the run's own
+ * `WORK_START` (`RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`, and both of its one-way flips) — plus
+ * the `run_membership(F, W)` proof a passing member seals and the ZERO durable rows every refusal
+ * leaves. Each of these NARROWS what seals, which is why Parts 1 and 2 need no re-statement: what
+ * they assert seals still seals, and the two places where a request they exercised is now refused
+ * one leg earlier under an exacter code are noted at those assertions. Recheck #19's
+ * `RUN_MEMBERSHIP_UNPROVEN` is the PEP-time code and remains a later lane, asserted nowhere here.
  *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
@@ -224,6 +230,15 @@ function sealWorkStart(
     /** The `work-run` binding's `object_id`; defaults to the request's OWN effect_id (leg 3). */
     work_run_ref?: string;
     authority_ref?: string;
+    /**
+     * The WHOLE `work_bindings` array, for the cases this helper's single binding cannot express —
+     * `[]` above all, which is B5(3)'s missing-binding case. The run-origin schema projects nothing
+     * (`binding_projection: []`), so B2(3.4) demands no binding of its own and such a request
+     * reaches the run-profile legs carrying exactly what the test gave it.
+     */
+    work_bindings?: readonly SubjectBinding[];
+    /** Presented as REQUEST METADATA, for the legs graded BEFORE any header is read. */
+    capability?: string;
   } = {},
 ): { effect_id: string; tuple: Record<string, unknown> } {
   const { h, target } = rp;
@@ -244,7 +259,7 @@ function sealWorkStart(
     {
       effect_id,
       requester_ref: options.requester_ref ?? REQUESTER_A,
-      work_bindings: [{
+      work_bindings: options.work_bindings ?? [{
         authority_ref: options.authority_ref ?? WORK_RUN_AUTHORITY,
         namespace: "work-run",
         object_id: options.work_run_ref ?? effect_id,
@@ -257,6 +272,7 @@ function sealWorkStart(
       allocation_tuple: tuple,
     },
     principal,
+    options.capability === undefined ? {} : { run_capability: options.capability },
   );
   return { effect_id, tuple };
 }
@@ -270,24 +286,33 @@ let memberCounter = 0;
  */
 function sealMember(
   rp: RunProfileHarness,
-  options: { work_run_ref: string; capability?: string },
+  options: {
+    work_run_ref: string;
+    capability?: string;
+    principal?: Principal;
+    requester_ref?: string;
+    /** The WHOLE `work_bindings` array; `[]` is B5(3)'s missing-binding case for a member request. */
+    work_bindings?: readonly SubjectBinding[];
+  },
 ): { effect_id: string; request: EffectRequestV1 } {
   const { h } = rp;
+  const principal = options.principal ?? PRINCIPALS.workflow;
   const tuple = {
     schema: "cadp.allocation-key.v1",
     work_run_ref: options.work_run_ref,
     step_ordinal: (memberCounter += 1),
     purpose: "record-write",
   };
-  const effect_id = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
+  const effect_id = h.ingress.allocateEffectId(tuple, principal);
   // Deliberately free of any effect-specific member, so two members of the same run seal over
   // BYTE-IDENTICAL material and therefore over one CAS key and one `material_digest`.
   const material = { tenant: "scripted-1", resource_id: "r-1" };
   const request = h.ingress.sealEffectRequest(
     {
       effect_id,
-      requester_ref: REQUESTER_A,
-      work_bindings: [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: options.work_run_ref }],
+      requester_ref: options.requester_ref ?? REQUESTER_A,
+      work_bindings: options.work_bindings ??
+        [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: options.work_run_ref }],
       target_ref: h.target.targetRef(),
       operation_kind: "SCRIPTED_WRITE",
       material_schema: "test.scripted-write.v1",
@@ -295,7 +320,7 @@ function sealMember(
       prior_effect_refs: [],
       allocation_tuple: tuple,
     },
-    PRINCIPALS.workflow,
+    principal,
     options.capability === undefined ? {} : { run_capability: options.capability },
   );
   return { effect_id, request };
@@ -313,6 +338,30 @@ async function dispatch(h: Harness, effect_id: string, caller?: Principal) {
 
 function count(h: Harness, table: string): number {
   return (h.store.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+}
+
+/**
+ * Every seal-time refusal of B5(3)-(5) is PRE-K3: it is graded inside the sealing transaction and
+ * BEFORE the `effect_request` insert, so a refused seal's durable delta is ZERO rows — no K3
+ * record and no membership proof (Spec v0.5 §9.2). Asserted here once, for every reason code,
+ * rather than restated at each call site. The reason code is compared EXACTLY: the order of the
+ * legs is the contract, and a refusal under a neighbouring code would satisfy a looser assertion
+ * while meaning something else entirely.
+ */
+function refuses(rp: RunProfileHarness, reason: string, seal: () => unknown, note: string = reason): void {
+  const requests = count(rp.h, "effect_request");
+  const memberships = count(rp.h, "run_membership");
+  assert.throws(
+    seal,
+    (error: unknown) => {
+      assert.ok(error instanceof IngressRejection, `${note}: ${String(error)}`);
+      assert.equal(error.reason, reason, `${note}: ${error.message}`);
+      return true;
+    },
+    `${note}: expected ${reason}`,
+  );
+  assert.equal(count(rp.h, "effect_request"), requests, `${note}: zero effect_request rows`);
+  assert.equal(count(rp.h, "run_membership"), memberships, `${note}: zero run_membership rows`);
 }
 
 function refuseConfig(
@@ -483,7 +532,13 @@ test("A5 o-iv: a change to EITHER run-origin entry, or removal of either, is ref
 });
 
 test("A5 o-iv end to end: the immutability refusal happens at recheck #17; active policy unchanged", async () => {
-  const { h } = await runProfileHarness();
+  // The run profile is deliberately OFF here (empty enrollment). This test is about the allocation
+  // contract's lifetime immutability, and its vehicle is the harness's own `POLICY_ACTIVATE` — a
+  // run-bound request by `workflow:cadp-work` naming a run it holds no capability for, which with
+  // the profile switched on is B5(4)'s `RUN_CAPABILITY_REQUIRED` before recheck #17 is ever
+  // reached. Enrollment is irrelevant to everything asserted below (B2(2)(ii) is generic over
+  // schemas), so switching it off keeps the subject of the test the subject of the test.
+  const { h } = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
   try {
     const before = h.store.activeActivation()!.seq;
     const refused = await h.activatePolicy({
@@ -516,7 +571,10 @@ test("A5 o-iv end to end: the immutability refusal happens at recheck #17; activ
 });
 
 test("A5 o-ii: one origin_key derives ONE effect_id across an unrelated POLICY_ACTIVATE", async () => {
-  const { h } = await runProfileHarness();
+  // Enrollment off for the same reason as the test above: the vehicle is the harness's own
+  // run-bound `POLICY_ACTIVATE`, and nothing asserted here seals a run-profile request. Allocation
+  // is not gated on enrollment at all (B1(2)), so the key derivation under test is unaffected.
+  const { h } = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
   try {
     const tuple = { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key: "origin-stable", purpose: "work-start" };
     const first = h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
@@ -602,10 +660,12 @@ test("A4 o2: a WORK_START binding ANOTHER run is REFUSED RUN_CAPABILITY_INVALID,
       (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
     );
     // And an OFF-AUTHORITY self-binding is not a kernel work-run subject at all (B3(4)(a)): leg 2
-    // matches the DECLARED exact pair, so this fails adjudication rather than satisfying it.
+    // matches the DECLARED exact pair, so this never satisfies the adjudication. With B5(3) landed
+    // it does not even reach it — a request naming no DECLARED work-run subject is leg 2's "none"
+    // case, which `RUN_BINDING_REQUIRED` refuses one leg earlier under the exacter code.
     assert.throws(
       () => sealWorkStart(rp, { origin_key: "origin-fourth", authority_ref: "other" }),
-      (error: unknown) => (error as IngressRejection).reason === "RUN_CAPABILITY_INVALID",
+      (error: unknown) => (error as IngressRejection).reason === "RUN_BINDING_REQUIRED",
     );
     assert.equal(count(rp.h, "effect_request"), requestsBefore);
     assert.equal(count(rp.h, "run_membership"), membershipBefore);
@@ -956,6 +1016,15 @@ test("B6(3): every non-canonical presentation of a VALID secret is refused RUN_C
       capability_digest: createHash("sha256").update(raw).digest("hex"),
       minted_at: "2026-01-01T00:00:00.000Z",
     });
+    // B5(2): a presentation is graded on the run's OWN `WORK_START` K7 state, so R2 is driven to
+    // `COMMITTED` before anything is presented against it — otherwise every leg below would be
+    // refused `RUN_SCOPE_UNRESOLVED` and none of them would be about the encoding. Pre-inserting
+    // the row above is what keeps the fixture in place across that dispatch: the mint is skipped
+    // when a `run_capability` row already exists (B5(1)), so nothing is delivered and the
+    // deterministic secret stays this run's only one.
+    const started = await dispatch(rp.h, r2, PRINCIPALS.workflow);
+    assert.equal(started.kind, "ADMITTED", JSON.stringify(started));
+    assert.equal((started as { run_capability?: string }).run_capability, undefined, "the fixture row suppressed the mint");
 
     const requestsBefore = count(rp.h, "effect_request");
     for (const { note, value, decodes } of nonCanonicalPresentations(canonical)) {
@@ -1007,8 +1076,15 @@ test("B6(3): every non-canonical presentation of a VALID secret is refused RUN_C
   }
 });
 
-test("B6(3): two seals differing ONLY in the header have identical request and material digests", async () => {
+test("B6(3): a CONSUMED header and no header at all seal identical request and material digests", async () => {
   const rp = await runProfileHarness();
+  // The counterpart store: the SAME v2 bundle with the run profile switched OFF, where the header
+  // is transport the seal path never reads. It is a second harness rather than a second seal on
+  // the first one because, with B5(4) landed, an enrolled requester's run-bound request presenting
+  // NOTHING is refused `RUN_CAPABILITY_REQUIRED` — so "the same request without the header" is only
+  // sealable where the header is inert. That makes the comparison the stronger of the two: a
+  // CONSUMED capability leaves a record byte-identical to the one sealed where none was read.
+  const inert = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
   try {
     const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-digest-invariance" });
     const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
@@ -1019,12 +1095,17 @@ test("B6(3): two seals differing ONLY in the header have identical request and m
       capability_digest: createHash("sha256").update(raw).digest("hex"),
       minted_at: "2026-01-01T00:00:00.000Z",
     });
+    // B5(2): the run's `WORK_START` must be `COMMITTED` for either presentation below to be graded
+    // usable; the pre-inserted fixture row suppresses the mint at that dispatch (B5(1)).
+    assert.equal((await dispatch(rp.h, run, PRINCIPALS.workflow)).kind, "ADMITTED");
 
-    // Two member requests of the same run over byte-identical material and byte-identical work
-    // bindings. One presents the capability; the other presents NOTHING. Nothing else differs but
-    // the two values no two sealed records can ever share: the effect identity and the seal instant.
+    // Two member requests naming the same run, over byte-identical material and byte-identical
+    // work bindings, sealed by the same stamped requester against the same target. One presents
+    // the capability and has it CONSUMED by B5(4)'s legs; the other presents NOTHING on the store
+    // where the profile is off. Nothing else differs but the two values no two sealed records can
+    // ever share: the effect identity and the seal instant.
     const withHeader = sealMember(rp, { work_run_ref: run, capability: canonical }).request;
-    const withoutHeader = sealMember(rp, { work_run_ref: run }).request;
+    const withoutHeader = sealMember(inert, { work_run_ref: run }).request;
 
     // MATERIAL DIGEST: identical outright. The header is not in the material, and the seal did not
     // fold it in — which is the claim B6(3) makes about effect material specifically.
@@ -1063,6 +1144,7 @@ test("B6(3): two seals differing ONLY in the header have identical request and m
     }
   } finally {
     rp.h.close();
+    inert.h.close();
   }
 });
 
@@ -1084,6 +1166,9 @@ test("B6(3) over the wire: the header reaches the seal, and its refusal returns 
         capability_digest: createHash("sha256").update(raw).digest("hex"),
         minted_at: "2026-01-01T00:00:00.000Z",
       });
+      // B5(2): the run must be `COMMITTED` for the good presentation below to be graded usable;
+      // the pre-inserted fixture row suppresses the mint at that dispatch (B5(1)).
+      assert.equal((await dispatch(rp.h, run, PRINCIPALS.workflow)).kind, "ADMITTED");
 
       const seal = async (capability?: string) => {
         const tuple = { schema: "cadp.allocation-key.v1", work_run_ref: run, step_ordinal: (memberCounter += 1), purpose: "record-write" };
@@ -1189,5 +1274,322 @@ test("B5(3)-(4) gating: outside v2-plus-enrollment the header is inert, presente
     assert.equal(count(h, "run_membership"), 0);
   } finally {
     h.close();
+  }
+});
+
+// ================================================ B5(3)-(5) — the seal-time run binding, in order
+
+test("B5(3)-(5): an origin seals headerless, mints once at its dispatch, and its capability seals a member", async () => {
+  const rp = await runProfileHarness();
+  try {
+    // (1) THE ORIGIN. An enrolled requester's self-bound `WORK_START`, presenting NO header —
+    // B5(9)'s origin path is exempted from B5(4)'s presentation legs precisely because the run it
+    // would present for is the one this seal is originating (there is no row and no K7 state yet).
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-happy-path" });
+    assert.equal(rp.h.store.effectRequest(run)?.effect_id, run, "the origin seals with no capability presented");
+    assert.equal(rp.h.store.runMembership(run)?.work_run_ref, run, "B5(5) writes the self-referential witness");
+
+    // (2) THE VERIFIED INITIAL DISPATCH mints and delivers exactly once, to the sealed requester.
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    const capability = (admitted as { run_capability?: string }).run_capability;
+    assert.match(String(capability), /^[A-Za-z0-9_-]{43}$/u, "the one delivery of the one-shot secret");
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(rp.h.store.runCapability(run)?.holder_ref, REQUESTER_A, "the holder is the sealed requester");
+
+    // (3) THE WORK_START IS COMMITTED — the K7 state B5(2)'s grading reads, and the only one of the
+    // three that makes the scope usable.
+    assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["COMMITTED"]);
+
+    // (4) THE FOLLOW-UP. An ordinary member of that run presenting the delivered capability passes
+    // every leg — decode, digest, holder, K7 — and B5(5) writes `run_membership(follow_up, E)` in
+    // the SAME transaction as the K3 row: the durable proof recheck #19 reads at admission.
+    const followUp = sealMember(rp, { work_run_ref: run, capability: capability! });
+    assert.equal(rp.h.store.effectRequest(followUp.effect_id)?.effect_id, followUp.effect_id, "the member SEALS");
+    const membership = rp.h.store.runMembership(followUp.effect_id);
+    assert.equal(membership?.effect_id, followUp.effect_id);
+    assert.equal(membership?.work_run_ref, run, "the member's proof names the RUN, never itself");
+    assert.equal(count(rp.h, "run_membership"), 2, "the origin's witness and the member's proof, and nothing else");
+    assert.equal(count(rp.h, "run_capability"), 1, "sealing a member mints nothing and re-delivers nothing");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(3): an enrolled requester's request that binds no work run is refused RUN_BINDING_REQUIRED", async () => {
+  const rp = await runProfileHarness();
+  try {
+    // Enrollment IS the statement that this requester's effects are run-scoped, so an unbound
+    // request from one is refused rather than merely uncounted (Spec v0.5 §5.1). The refusal is
+    // graded AHEAD of B5(9)'s adjudication, whose leg-2 "none" case would report the less exact
+    // `RUN_CAPABILITY_INVALID` for the very same request.
+    refuses(rp, "RUN_BINDING_REQUIRED", () => sealWorkStart(rp, { origin_key: "origin-unbound", work_bindings: [] }));
+
+    // A genuine, `COMMITTED` run of this requester's own, whose capability it genuinely holds...
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-bound-control" });
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    const capability = (admitted as { run_capability: string }).run_capability;
+
+    // ...does not make an UNBOUND request bound: the binding legs are graded on the sealed record
+    // before any header is read, so the same code is raised whatever is presented.
+    refuses(
+      rp, "RUN_BINDING_REQUIRED",
+      () => sealWorkStart(rp, { origin_key: "origin-unbound-2", work_bindings: [], capability }),
+      "unbound while holding a valid capability",
+    );
+    // THE PRECEDENCE, asserted rather than assumed: for an allocation schema that PROJECTS onto the
+    // work-run pair, B2(3.4) demands that binding and runs BEFORE any run-profile leg, so an
+    // unbound member request never reaches B5(3) at all. B5(3)'s missing-binding case is therefore
+    // exactly the non-projecting schemas' — the run-origin one above — and this leg records which
+    // rule owns which request rather than leaving the two codes looking interchangeable.
+    refuses(
+      rp, "ALLOCATION_BINDING_MISMATCH",
+      () => sealMember(rp, { work_run_ref: run, capability, work_bindings: [] }),
+      "an unbound member request under a PROJECTING schema",
+    );
+
+    // Positive control: the identical member request, bound, SEALS — so the three refusals are
+    // attributed to the missing binding and to nothing else about this requester.
+    const member = sealMember(rp, { work_run_ref: run, capability });
+    assert.equal(rp.h.store.effectRequest(member.effect_id)?.effect_id, member.effect_id);
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(3): a NON-enrolled requester carrying a work-run binding is refused NOT_RUN_ENROLLED", async () => {
+  const rp = await runProfileHarness();
+  try {
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-enrollment" });
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    const capability = (admitted as { run_capability: string }).run_capability;
+
+    // REQUESTER_B is a registered identity that the enrolled set does not name. Its request binds
+    // A's run: enrollment cannot be acquired by presenting a binding (WP §5.2, WP control 5).
+    refuses(
+      rp, "NOT_RUN_ENROLLED",
+      () => sealMember(rp, { work_run_ref: run, principal: PRINCIPAL_B, requester_ref: REQUESTER_B }),
+      "a non-enrolled requester binding another's run",
+    );
+    // Nor by presenting a capability for it — even A's genuinely valid one, exfiltrated: the
+    // enrollment leg is graded before anything reads the header, so this is NOT_RUN_ENROLLED and
+    // not the `RUN_CAPABILITY_HOLDER_MISMATCH` the holder leg would raise if it were reached.
+    refuses(
+      rp, "NOT_RUN_ENROLLED",
+      () => sealMember(rp, { work_run_ref: run, capability, principal: PRINCIPAL_B, requester_ref: REQUESTER_B }),
+      "a non-enrolled requester presenting a valid capability",
+    );
+
+    // Positive control, and the exact scope of the leg: the same non-enrolled requester's request
+    // that binds NO work run is untouched — it seals, is never adjudicated, and acquires no
+    // witness and no membership proof (B5(1)(α)).
+    const unbound = sealWorkStart(rp, {
+      origin_key: "origin-b-unbound", principal: PRINCIPAL_B, requester_ref: REQUESTER_B, work_bindings: [],
+    });
+    assert.equal(rp.h.store.effectRequest(unbound.effect_id)?.effect_id, unbound.effect_id, "a non-enrolled unbound request SEALS");
+    assert.equal(rp.h.store.runMembership(unbound.effect_id), undefined, "and acquires no membership proof");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(4): an enrolled, run-bound, NON-origin request presenting nothing is refused RUN_CAPABILITY_REQUIRED", async () => {
+  const rp = await runProfileHarness();
+  try {
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-required" });
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    const capability = (admitted as { run_capability: string }).run_capability;
+
+    // The run is `COMMITTED` and its capability exists and is held by this very requester: the ONLY
+    // thing missing is the presentation, which is what makes this code distinct from
+    // `RUN_BINDING_REQUIRED` (a missing binding) and from `RUN_CAPABILITY_INVALID` (a presentation
+    // that fails). Nothing about the run is unusable — the request simply proves nothing.
+    refuses(rp, "RUN_CAPABILITY_REQUIRED", () => sealMember(rp, { work_run_ref: run }));
+
+    // Positive control: the identical request presenting the delivered capability SEALS, so the
+    // refusal is attributed to the absent header alone.
+    const member = sealMember(rp, { work_run_ref: run, capability });
+    assert.equal(rp.h.store.effectRequest(member.effect_id)?.effect_id, member.effect_id);
+    assert.equal(rp.h.store.runMembership(member.effect_id)?.work_run_ref, run);
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(4): a capability matching no row for THIS run — borrowing included — is refused RUN_CAPABILITY_INVALID", async () => {
+  const rp = await runProfileHarness();
+  try {
+    // TWO genuine runs of the SAME requester, each `COMMITTED`, each with its own minted, genuinely
+    // valid, holder-matching capability. Everything about the two capabilities is legitimate; the
+    // only thing wrong below is WHICH RUN each is presented against.
+    const { effect_id: r1 } = sealWorkStart(rp, { origin_key: "origin-borrow-1" });
+    const { effect_id: r2 } = sealWorkStart(rp, { origin_key: "origin-borrow-2" });
+    const c1 = ((await dispatch(rp.h, r1, PRINCIPALS.workflow)) as { run_capability: string }).run_capability;
+    const c2 = ((await dispatch(rp.h, r2, PRINCIPALS.workflow)) as { run_capability: string }).run_capability;
+    assert.equal(rp.h.store.runCapability(r1)?.holder_ref, REQUESTER_A);
+    assert.equal(rp.h.store.runCapability(r2)?.holder_ref, REQUESTER_A, "SAME holder: the holder leg cannot be what refuses");
+
+    // SAME-HOLDER, WRONG-RUN BORROWING, both directions. The lookup is keyed by the request's OWN
+    // `work_run_ref`, so R1's capability matches no R2 row at all — this is the digest leg, NOT
+    // `RUN_CAPABILITY_HOLDER_MISMATCH`, which would require a matched row.
+    refuses(rp, "RUN_CAPABILITY_INVALID", () => sealMember(rp, { work_run_ref: r2, capability: c1 }), "R1's capability on an R2-bound request");
+    refuses(rp, "RUN_CAPABILITY_INVALID", () => sealMember(rp, { work_run_ref: r1, capability: c2 }), "the converse");
+
+    // The NO-ROW case, which the same message covers deliberately (B6(3)): a fabricated run that
+    // was never witnessed and never minted against has no row, permanently.
+    refuses(
+      rp, "RUN_CAPABILITY_INVALID",
+      () => sealMember(rp, { work_run_ref: DEFAULT_WORK_RUN_REF, capability: c1 }),
+      "a never-witnessed run",
+    );
+    // A well-formed capability that is nobody's, and a non-canonical encoding of a real one: the
+    // decode leg and the digest leg, both under this one code.
+    refuses(
+      rp, "RUN_CAPABILITY_INVALID",
+      () => sealMember(rp, { work_run_ref: r1, capability: Buffer.from(CAPABILITY_FIXTURE_HEX, "hex").toString("base64url") }),
+      "a capability no row holds",
+    );
+    refuses(rp, "RUN_CAPABILITY_INVALID", () => sealMember(rp, { work_run_ref: r1, capability: `${c1}=` }), "a non-canonical encoding");
+
+    // Positive controls: each capability against its OWN run SEALS, so all five refusals are
+    // attributed to the run keying and to nothing about the capabilities themselves.
+    for (const [work_run_ref, capability] of [[r1, c1], [r2, c2]] as const) {
+      const member = sealMember(rp, { work_run_ref, capability });
+      assert.equal(rp.h.store.runMembership(member.effect_id)?.work_run_ref, work_run_ref);
+    }
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(4): a MATCHED row held by another requester is refused RUN_CAPABILITY_HOLDER_MISMATCH", async () => {
+  // Both requesters enrolled, so the enrollment legs are satisfied for each and the only thing
+  // graded below is the holder — this is the exfiltration case of control A4, where possession is
+  // real and authority is not.
+  const rp = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [REQUESTER_A, REQUESTER_B] }));
+  try {
+    // B's own run: originated by B, dispatched by B, so the row's `holder_ref` is B's stamped ref
+    // and the secret went to B and to nobody else.
+    const { effect_id: runB } = sealWorkStart(rp, { origin_key: "origin-holder-b", principal: PRINCIPAL_B, requester_ref: REQUESTER_B });
+    const admitted = await dispatch(rp.h, runB, PRINCIPAL_B);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    const capabilityB = (admitted as { run_capability: string }).run_capability;
+    assert.equal(rp.h.store.runCapability(runB)?.holder_ref, REQUESTER_B);
+    assert.deepEqual(rp.h.store.outcomesByEffect(runB).map((o) => o.result), ["COMMITTED"], "the scope is usable, for its holder");
+
+    // A presents B's exfiltrated capability on a request bound to B's run. The digest leg PASSES —
+    // the row is B's and the secret is B's — and the holder leg is what refuses: possession is
+    // never sufficient, because the row binds one capability to one run AND one holder.
+    refuses(rp, "RUN_CAPABILITY_HOLDER_MISMATCH", () => sealMember(rp, { work_run_ref: runB, capability: capabilityB }));
+
+    // Positive control on the same row, the same secret and the same run: its HOLDER's identical
+    // request SEALS, so the refusal is attributed to the stamped requester and to nothing else.
+    const held = sealMember(rp, { work_run_ref: runB, capability: capabilityB, principal: PRINCIPAL_B, requester_ref: REQUESTER_B });
+    assert.equal(rp.h.store.effectRequest(held.effect_id)?.effect_id, held.effect_id);
+    assert.equal(rp.h.store.runMembership(held.effect_id)?.work_run_ref, runB);
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(2)/B5(4): an unresolved run scope is refused RUN_SCOPE_UNRESOLVED, and reconciliation lifts it", async () => {
+  const rp = await runProfileHarness();
+  try {
+    // (a) NO ADMITTED DISPATCH AT ALL. The capability row is stood in for by the deterministic
+    // fixture — the exact row shape and digest rule the PEP writes — so the run has a valid,
+    // holder-matching capability and no K7 state whatever. K7 grading is the only leg left.
+    const { effect_id: idle } = sealWorkStart(rp, { origin_key: "origin-unresolved-idle" });
+    const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+    const fixture = raw.toString("base64url");
+    rp.h.store.insertRunCapability({
+      work_run_ref: idle,
+      holder_ref: REQUESTER_A,
+      capability_digest: createHash("sha256").update(raw).digest("hex"),
+      minted_at: "2026-01-01T00:00:00.000Z",
+    });
+    assert.equal(rp.h.store.admissionsByEffect(idle).length, 0, "no admitted dispatch");
+    refuses(rp, "RUN_SCOPE_UNRESOLVED", () => sealMember(rp, { work_run_ref: idle, capability: fixture }), "a run with no dispatch");
+
+    // (b) THE LATEST DISPATCH IS `UNKNOWN`. An AMBIGUOUS dispatch writes an UNKNOWN outcome, which
+    // is non-conclusive by construction — the capability WAS delivered (minting is at admission),
+    // and the scope is still unusable: "unusable until reconciliation resolves it" (Spec v0.5 §5.2).
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-unresolved-dispatch" });
+    rp.target.onDispatch = (effect_id) =>
+      effect_id === run ? { kind: "AMBIGUOUS", raw_observation: "target timed out" } : {
+        kind: "ACCEPTED", target_operation_ref: `wf-${effect_id}`, receipt_claim: { workflow_id: `cadp-work-${effect_id}`, started: true },
+      };
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    const capability = (admitted as { run_capability: string }).run_capability;
+    assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["UNKNOWN"]);
+    refuses(rp, "RUN_SCOPE_UNRESOLVED", () => sealMember(rp, { work_run_ref: run, capability }), "an UNKNOWN latest dispatch");
+
+    // THE FLIP, one-way and with no re-delivery: reconciliation returns COMMITTED and the SAME
+    // already-delivered capability — never touched by any reconciler path — now SEALS.
+    const reconciled = await rp.h.reconciler.reconcileEffect(run);
+    assert.equal(reconciled?.result, "COMMITTED", JSON.stringify(reconciled));
+    const member = sealMember(rp, { work_run_ref: run, capability });
+    assert.equal(rp.h.store.runMembership(member.effect_id)?.work_run_ref, run, "the same capability, now usable");
+    assert.equal(count(rp.h, "run_capability"), 2, "no second row was minted for either run");
+
+    // (c) THE NEGATIVE CONTROL for "latest conclusive", which is what stops a superseded grading
+    // from deciding: a run whose ordinal 1 was NO_EFFECT_CONFIRMED and whose ordinal 2 is admitted
+    // but UNKNOWN reads UNRESOLVED — not the earlier ordinal's RUN_SCOPE_REFUSED, and not a seal.
+    const { effect_id: retried } = sealWorkStart(rp, { origin_key: "origin-unresolved-retry" });
+    rp.target.onDispatch = (effect_id, ordinal) =>
+      effect_id !== retried
+        ? { kind: "ACCEPTED", target_operation_ref: `wf-${effect_id}`, receipt_claim: { workflow_id: `cadp-work-${effect_id}`, started: true } }
+        : ordinal === 1
+          ? { kind: "REJECTED_NO_EFFECT", proof_claim: { authoritative_absence: true } }
+          : { kind: "AMBIGUOUS", raw_observation: "target timed out" };
+    const first = await dispatch(rp.h, retried, PRINCIPALS.workflow);
+    const retriedCapability = (first as { run_capability: string }).run_capability;
+    assert.deepEqual(rp.h.store.outcomesByEffect(retried).map((o) => o.result), ["NO_EFFECT_CONFIRMED"]);
+    const second = await dispatch(rp.h, retried, PRINCIPALS.workflow);
+    assert.equal((second as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 2);
+    assert.deepEqual(rp.h.store.outcomesByEffect(retried).map((o) => o.result), ["NO_EFFECT_CONFIRMED", "UNKNOWN"]);
+    refuses(
+      rp, "RUN_SCOPE_UNRESOLVED",
+      () => sealMember(rp, { work_run_ref: retried, capability: retriedCapability }),
+      "ordinal 2 admitted and unresolved",
+    );
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("B5(2)/B5(4): a latest-conclusive NO_EFFECT_CONFIRMED scope is refused RUN_SCOPE_REFUSED, and a later COMMITTED lifts it", async () => {
+  const rp = await runProfileHarness();
+  try {
+    const { effect_id: run } = sealWorkStart(rp, { origin_key: "origin-refused" });
+    // Ordinal 1 confirms NO EFFECT; recheck #12 permits a further ordinal after exactly this.
+    rp.target.onDispatch = (effect_id, ordinal) =>
+      effect_id === run && ordinal === 1
+        ? { kind: "REJECTED_NO_EFFECT", proof_claim: { authoritative_absence: true } }
+        : { kind: "ACCEPTED", target_operation_ref: `wf-${effect_id}`, receipt_claim: { workflow_id: `cadp-work-${effect_id}`, started: true } };
+    const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+    const capability = (admitted as { run_capability: string }).run_capability;
+    assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["NO_EFFECT_CONFIRMED"]);
+
+    // The capability is valid and holder-matching; the SCOPE is what is refused — and only while
+    // that remains the latest conclusive state, which is the whole claim and deliberately not
+    // "forever" (B5(2)).
+    refuses(rp, "RUN_SCOPE_REFUSED", () => sealMember(rp, { work_run_ref: run, capability }));
+
+    // THE SECOND FLIP: the permitted next admission's dispatch reaches COMMITTED at ordinal 2, and
+    // the SAME already-delivered capability — no re-delivery, no second row — now SEALS.
+    const retry = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(retry.kind, "ADMITTED", JSON.stringify(retry));
+    assert.equal((retry as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 2);
+    assert.equal((retry as { run_capability?: string }).run_capability, undefined, "the retry re-delivers nothing");
+    assert.equal(count(rp.h, "run_capability"), 1, "and writes no second row");
+    assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["NO_EFFECT_CONFIRMED", "COMMITTED"]);
+
+    const member = sealMember(rp, { work_run_ref: run, capability });
+    assert.equal(rp.h.store.effectRequest(member.effect_id)?.effect_id, member.effect_id, "the same capability, now usable");
+    assert.equal(rp.h.store.runMembership(member.effect_id)?.work_run_ref, run);
+  } finally {
+    rp.h.close();
   }
 });
