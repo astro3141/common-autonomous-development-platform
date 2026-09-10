@@ -32,7 +32,7 @@ const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
 /**
  * The THREE leaf directories both verifiers enumerate, repo-relative with trailing slashes —
- * byte-identical to the argv tokens pinned in cadp/tests/conformance/conformance-gatefiles.test.ts
+ * byte-identical to the argv tokens pinned in cadp/tests/conformance/conformance-sessions.test.ts
  * and executed by cadp/product/surfaceBroker.ts and .github/workflows/cadp-verify.yml.
  *
  * The invocation contract this encodes: EVERY test file lives DIRECTLY in one of these three

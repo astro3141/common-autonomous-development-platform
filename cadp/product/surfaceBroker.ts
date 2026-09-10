@@ -309,17 +309,33 @@ export function scanBackendModel(
  * change what verification executes. The external verifier
  * (`.github/workflows/cadp-verify.yml`) carries the same note at its own invocation site.
  *
- * MEASURED CONSTRAINT ON NARROWING THIS SELECTION (surface image `node:22-bookworm-slim`,
- * measured on Node v22.23.2): `node --test <dir>/` does NOT expand a directory argument on Node
- * 22. A positional path is resolved as a module entry point, so
- * `node --test cadp/tests/conformance/ cadp/tests/ops/ devharness/tests/` yields three
- * `ERR_MODULE_NOT_FOUND` failures and executes ZERO real tests. Bare `node --test` recursively
- * discovers every `*.test.ts` in the workspace and is, on this runtime, the only non-glob form
- * that runs the suites at all. Narrowing to an explicit directory enumeration therefore waits on
- * a runtime decision that is not this file's to make; the zero-discovery guard below is what
- * makes any future change to this array fail loudly instead of silently verifying nothing.
+ * THE SELECTION IS THE THREE ENUMERATED LEAF DIRECTORIES, exactly: `--test`, then
+ * `cadp/tests/conformance/`, `cadp/tests/ops/`, `devharness/tests/` — directory paths with
+ * trailing slashes, NO glob characters, no `--test-*` pattern flag, no shell. The workflow's run
+ * line is byte-identical (modulo yml quoting), and the split changes protection, never execution
+ * coverage: all three suites keep running at both verifiers. The invocation contract this pins is
+ * "every test file lives DIRECTLY in one of these three directories" — enforced by MM4 in
+ * `cadp/tests/conformance/conformance-manifest.test.ts`, so nothing nests out of the selection.
+ *
+ * MEASURED, UNRESOLVED (surface image `node:22-bookworm-slim`, measured here on Node v22.23.2 —
+ * both against this repo and against a two-file scratch fixture): on Node 22 a positional
+ * directory argument to `--test` is NOT expanded. It is matched as a path and then loaded as an
+ * entry module, so this argv reports `# tests 3` — one synthetic, FAILING "test" per directory,
+ * each an `ERR_MODULE_NOT_FOUND` — and executes ZERO real tests. The same fixture ran its tests
+ * under bare `node --test` and under a glob. That failure is loud (the run exits non-zero and the
+ * broker concludes `failure`), never a false pass, but on this image it is a verdict about the
+ * runtime rather than about the candidate. This file keeps the pinned enumeration because the
+ * invocation form is the routed contract and the image is out of this lane's scope; substituting
+ * a glob or bumping the image would be a silent workaround. Node 24 (the external verifier's
+ * runtime) is UNMEASURED here — no Node 24 was obtainable in this container.
  */
-export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test"];
+export const VERIFIER_TEST_ARGV: readonly string[] = [
+  "node",
+  "--test",
+  "cadp/tests/conformance/",
+  "cadp/tests/ops/",
+  "devharness/tests/",
+];
 
 /**
  * Executed-test count from a `node --test` TAP summary, or `undefined` if no summary is present.

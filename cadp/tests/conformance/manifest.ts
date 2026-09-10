@@ -228,6 +228,6 @@ export const UNMAPPED_AUXILIARY: readonly AuxiliaryProjection[] = [
   },
   {
     test: "conformance-sessions.test.ts",
-    note: "(b) AMBIGUOUS at the split. Failed-session retention is an ops convenience, but the same file pins runVerifier's and runReviewer's constructed docker argv — the --network none verifier, the read-only workspace and the single writable sessions bind. Those are the isolation boundary in argv form. Fail-protected default applied.",
+    note: "(b) AMBIGUOUS at the split. Failed-session retention is an ops convenience, but the same file pins runVerifier's and runReviewer's constructed docker argv — the --network none verifier, the read-only workspace and the single writable sessions bind. Those are the isolation boundary in argv form. It also carries the verbatim snapshot of the PROTECTED test invocation at BOTH verifier sites (V0b) and the zero-discovery guard's parser (V1) — the selection-bypass seam. Fail-protected default applied.",
   },
 ];

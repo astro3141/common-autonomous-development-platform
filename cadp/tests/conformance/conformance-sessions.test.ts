@@ -85,13 +85,33 @@ test("runVerifier constructed args remain unchanged, and the /verify argv is the
     "-v", "/checkout:/ws",
     "-w", "/ws",
     "cadp-surface:conformance",
-    "node", "--test",
+    "node", "--test", "cadp/tests/conformance/", "cadp/tests/ops/", "devharness/tests/",
   ]);
   // The selection is pinned by a gate-protected file (surfaceBroker.ts routes to a HUMAN merge),
   // NOT by package.json's `test` script: the broker spawns the runner directly, so re-pointing
-  // the npm script cannot change what verification executes. Snapshotted verbatim so any future
-  // narrowing of the selection is a visible, reviewed change rather than a silent one.
-  assert.deepEqual([...VERIFIER_TEST_ARGV], ["node", "--test"]);
+  // the npm script cannot change what verification executes. Snapshotted VERBATIM — exactly five
+  // argv tokens after the node binary, directory paths with trailing slashes and no glob
+  // character — so any future re-selection is a visible, reviewed change rather than a silent one.
+  assert.deepEqual([...VERIFIER_TEST_ARGV], ["node", "--test", "cadp/tests/conformance/", "cadp/tests/ops/", "devharness/tests/"]);
+  for (const token of VERIFIER_TEST_ARGV) {
+    assert.ok(!/[*?[\]]/u.test(token), `${token} carries a glob character — the pinned form selects by explicit directory path, never by pattern`);
+  }
+});
+
+test("V0b: the EXTERNAL verifier's invocation is the same pinned enumeration, not the npm-script seam", () => {
+  // The other half of the same snapshot: gateFiles.ts protects .github/workflows/cadp-verify.yml
+  // precisely because that run line IS the external verifier's selection. Asserted here so the two
+  // sites cannot drift apart — and so `npm test` cannot creep back in as the executed set.
+  const workflow = readFileSync(new URL("../../../.github/workflows/cadp-verify.yml", import.meta.url), "utf8");
+  const invocation = `${VERIFIER_TEST_ARGV.join(" ")} 2>&1 | tee cadp-verify-output.txt`;
+  assert.ok(
+    workflow.includes(`\n          ${invocation}\n`),
+    `.github/workflows/cadp-verify.yml must run the pinned enumeration verbatim: ${invocation}`,
+  );
+  const steps = workflow.split("\n").filter((line) => /^\s*(- run: )?(npm|node) /u.test(line.trimEnd()));
+  for (const line of steps) {
+    assert.ok(!/\bnpm (run )?test\b/u.test(line), `the external verifier must not execute the npm script seam: ${line.trim()}`);
+  }
 });
 
 test("V1: the zero-discovery guard reads the runner's own summary — a run that executed nothing is never a pass", () => {
