@@ -60,9 +60,15 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
+import { startWork } from "../live/ops.ts";
+import type { StartWorkDependencies } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
 import { recordDigest } from "../kernel/canonical.ts";
@@ -2335,5 +2341,136 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ================================ PART 6 — the LIVE COMPOSITION's own origin, through this Kernel
+
+/**
+ * The cross-kernel leg of the `cadp/live/ops.ts` migration, and the only claim of that migration
+ * this file makes: what the live composition BUILDS is what this Kernel ADJUDICATES. Everything
+ * ops-internal — the origin record, the material pinning, the adoption guards, the v0.4 regression
+ * pin — is asserted against a kernel stand-in in `conformance-basesha.test.ts`, where it belongs.
+ * What cannot be asserted there is that the real Ingress reads `startWork`'s v0.5 tuple and its
+ * self-binding as an ORIGIN rather than refusing them, that the real PEP mints against the witness
+ * that seal wrote, and that a second invocation of the same `origin_key` converges on the same
+ * durable rows instead of conflicting.
+ *
+ * `origin_key` here is a caller-passed key, which is the RETRY shape: the two invocations below are
+ * one logical origin, exactly as a re-run after a crash would be.
+ */
+const LIVE_MANIFEST: LiveEnvManifest = {
+  dir: "unused", api_url: "http://kernel.invalid", root_url: "http://root.invalid",
+  api_port: 1, root_port: 2, record_port: 3, temporal_port: 4, temporal_ui_port: 5, broker_port: 6,
+  repo_full_name: "owner/repo", repo_id: "123", base_sha: "0".repeat(40), tokens: {},
+  root_key_id: "root", kernel_config_path: "unused", policy_content_digest: "digest",
+};
+
+/**
+ * The Kernel API surface `startWork` uses, bound straight to this harness's Ingress and PEP.
+ * `delivered` collects every capability the dispatch responses carried, so the log sweep below can
+ * be over the ACTUAL secret rather than over a guess at what one looks like.
+ */
+function opsClient(rp: RunProfileHarness, delivered: string[] = []): NonNullable<StartWorkDependencies["client"]> {
+  return {
+    async allocateEffectId(tuple) {
+      return { effect_id: rp.h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow) };
+    },
+    async putBlob(bytes) {
+      return { cas_key: rp.h.ingress.putBlob(Buffer.from(bytes)) };
+    },
+    async sealEffectRequest(body) {
+      return rp.h.ingress.sealEffectRequest(body, PRINCIPALS.workflow);
+    },
+    async assembleAdmissionInput(effect_id, evidence_refs) {
+      return rp.h.ingress.assembleAdmissionInput(effect_id, evidence_refs);
+    },
+    async evaluate(input_digest) {
+      return rp.h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id, decision_id) {
+      const result = await rp.h.pep.admitAndDispatch(effect_id, decision_id, PRINCIPALS.workflow);
+      const capability = (result as { run_capability?: string }).run_capability;
+      if (capability !== undefined) delivered.push(capability);
+      return result as never;
+    },
+  } as NonNullable<StartWorkDependencies["client"]>;
+}
+
+test("B5(9)/A4: the live composition's v0.5 WORK_START is an adjudicated origin, and a retry converges", async () => {
+  const rp = await runProfileHarness();
+  const dir = mkdtempSync(join(tmpdir(), "cadp-live-origin-"));
+  const lines: Array<Record<string, unknown>> = [];
+  const delivered: string[] = [];
+  const dependencies: StartWorkDependencies = {
+    manifest: LIVE_MANIFEST,
+    client: opsClient(rp, delivered),
+    // The harness target's namespace, so the request names a real WORK_START-capable target.
+    namespaceId: () => "cadp-v04",
+    resolveBase: () => "a".repeat(40),
+    workerImage: () => ({ image: "cadp-surface:test", image_digest: "sha256:aaaa", tool_versions: { "codex-cli": "1.0.0" } }),
+  };
+  const options = { originProfile: "v05" as const, originKey: "origin-live-composition", log: (line: Record<string, unknown>) => lines.push(line) };
+  const start = async (): Promise<{ effect_id: string; workflow_id: string; origin_key?: string } | undefined> => {
+    try {
+      return await startWork(dir, "development", ["implement median", "8", "6", "", "codex", "", ""], options, dependencies);
+    } catch (error) {
+      // The valid origin path must introduce NONE of B5's refusal codes. Reported by name when it
+      // does, rather than as an opaque failure.
+      const cause = (error as { cause?: unknown }).cause;
+      return assert.fail(`the valid origin path was refused: ${cause instanceof IngressRejection ? cause.reason : String((error as Error).message)}`);
+    }
+  };
+
+  try {
+    const started = await start();
+    assert.notEqual(started, undefined, "the origin is admitted and dispatched");
+    const run = started!.effect_id;
+    assert.equal(started!.origin_key, "origin-live-composition");
+    assert.equal(started!.workflow_id, `cadp-work-${run}`);
+
+    // The seal the Ingress actually stored: exactly one work-run binding, on the declared kernel
+    // pair, naming this request's own effect_id — B5(9)'s legs 2 and 3, read off the durable row.
+    const request = rp.h.store.effectRequest(run)!;
+    const workRun = request.work_bindings.filter((b) => b.namespace === "work-run");
+    assert.equal(workRun.length, 1);
+    assert.deepEqual(workRun[0], { authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: run });
+    assert.equal(request.operation_kind, "WORK_START");
+    assert.equal(request.requester_ref, REQUESTER_A);
+
+    // The witness (B5(1)(b)) and the mint it authorised (A4), both exactly once.
+    const witness = rp.h.store.runMembership(run);
+    assert.equal(witness?.effect_id, run);
+    assert.equal(witness?.work_run_ref, run, "run_membership(E, E): the origin's own effect_id in both columns");
+    assert.equal(count(rp.h, "run_membership"), 1);
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(rp.h.store.runCapability(run)?.holder_ref, REQUESTER_A);
+
+    // B6(3) over the live composition's OWN log: `startWork` logs the admission response, and under
+    // v0.5 THAT response is where the capability is delivered — the one place the secret could come
+    // to rest outside its holder. Swept for every rendering of the secret actually delivered.
+    assert.equal(delivered.length, 1, "the initial dispatch delivered exactly one capability");
+    const transcript = JSON.stringify(lines);
+    assertNoCapabilityText(transcript, delivered[0]!, "the live composition's own log");
+    assert.match(transcript, /"run_capability":"\[redacted\]"/u, "the delivered secret is redacted, not rendered");
+
+    // THE RETRY: the same origin_key, the same arguments, a second time. It converges on the same
+    // effect_id, the seal is the idempotent no-op (still ONE K3 row, ONE membership row), and the
+    // PEP refuses the second dispatch as already committed rather than minting again.
+    const requestsBefore = count(rp.h, "effect_request");
+    const retried = await start();
+    assert.equal(retried, undefined, "a committed origin does not re-dispatch");
+    assert.equal(count(rp.h, "effect_request"), requestsBefore, "no second K3 row: the re-seal was idempotent");
+    assert.equal(count(rp.h, "run_membership"), 1, "no second witness");
+    assert.equal(count(rp.h, "run_capability"), 1, "A4 mint-once: no second capability");
+    assert.deepEqual(rp.h.store.effectRequest(run)!.request_digest, request.request_digest, "byte-identical material, hence the same request digest");
+    assert.equal(
+      (rp.h.store.db.prepare("SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?").get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n,
+      1,
+      "one logical origin, one allocation row",
+    );
+  } finally {
+    rp.h.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
