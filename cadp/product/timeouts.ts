@@ -100,12 +100,22 @@ export const VERIFY_BUDGET: SurfaceOperationBudget = {
   activity_attempt_ms: 420_000,
 };
 
-/** `/review`: the second-surface reviewer run over the exact committed diff. */
+/**
+ * `/review`: the second-surface reviewer run over the exact committed diff.
+ *
+ * `surface_ms` is a CEILING, not a target. The codex reviewer stays at effort=high; three
+ * consecutive high-effort reviewer runs on a several-hundred-line diff were TERMINATED at the
+ * previous 300_000ms bound while still mid-review — the bound was too low for that workload, the
+ * reviewer is not defective. The ceiling is raised to 600_000ms (10m) so a high-effort review of
+ * a large diff can finish; a reviewer that finishes on its own is unaffected. The four layers
+ * keep their MIN_LAYER_MARGIN_MS spacing (30k/30k/60k) so the #128 termination→cleanup→response
+ * hierarchy holds.
+ */
 export const REVIEW_BUDGET: SurfaceOperationBudget = {
-  surface_ms: 300_000,
-  broker_response_ms: 330_000,
-  rpc_ms: 360_000,
-  activity_attempt_ms: 420_000,
+  surface_ms: 600_000,
+  broker_response_ms: 630_000,
+  rpc_ms: 660_000,
+  activity_attempt_ms: 720_000,
 };
 
 /** `/plan`: the proposal-only planner surface reading the checkout (read-only, no authority). */
