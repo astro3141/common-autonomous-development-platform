@@ -63,6 +63,7 @@ import { createHash } from "node:crypto";
 import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
+import { KernelApiError } from "../clients/kernelClient.ts";
 import { planOriginKey, startWork } from "../live/ops.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
@@ -2376,10 +2377,12 @@ const RUN_PROFILE_REASONS = [
  * caller (correctly: the effect is already at the target) and the converged `effect_id` has to be
  * read from what the path PRESENTED rather than from what it returned.
  */
-function liveOps(rp: RunProfileHarness) {
+function liveOps(rp: RunProfileHarness, bases: readonly string[] = ["b".repeat(40)]) {
   const allocated: string[] = [];
   const sealed: EffectRequestV1[] = [];
   const refusals: Array<Record<string, unknown>> = [];
+  /** Every EXTERNAL fact an attempt reads; `bases` lets the mutable ref MOVE between attempts. */
+  const reads = { resolveBase: 0 };
   const client = {
     async allocateEffectId(tuple: never): Promise<{ effect_id: string }> {
       const effect_id = rp.h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
@@ -2393,6 +2396,12 @@ function liveOps(rp: RunProfileHarness) {
       const row = rp.h.ingress.sealEffectRequest(body, PRINCIPALS.workflow);
       sealed.push(row);
       return row;
+    },
+    /** The real K3 read the origin path pins on; 404 EFFECT_NOT_FOUND for an origin never sealed. */
+    async getEffectState(effect_id: string): Promise<never> {
+      const request = rp.h.store.effectRequest(effect_id);
+      if (request === undefined) throw new KernelApiError(404, "EFFECT_NOT_FOUND");
+      return { request, inputs: [], decisions: [], admissions: [], outcomes: [] } as never;
     },
     async assembleAdmissionInput(effect_id: string, refs: string[]): Promise<never> {
       return rp.h.ingress.assembleAdmissionInput(effect_id, refs) as never;
@@ -2408,12 +2417,16 @@ function liveOps(rp: RunProfileHarness) {
     allocated,
     sealed,
     refusals,
+    reads,
     /** `startWork`'s live dependency seams, all of them pointed at this harness. */
     dependencies: {
       manifest: LIVE_MANIFEST as never,
       client: client as never,
       namespaceId: () => "cadp-v04",
-      resolveBase: () => "b".repeat(40),
+      resolveBase: () => {
+        reads.resolveBase += 1;
+        return bases[Math.min(reads.resolveBase - 1, bases.length - 1)]!;
+      },
       imageIdentity: () => ({ image: "cadp-surface:test", image_digest: "sha256:image", tool_versions: { "codex-cli": "1.0.0" } }),
     },
     log: (line: Record<string, unknown>) => refusals.push(line),
@@ -2543,6 +2556,45 @@ test("live origin: the SAME origin_key twice derives ONE effect_id and RE-SEALS 
     } finally {
       rp.h.close();
     }
+  }
+});
+
+test("live origin: a retry after the base ref MOVES is still the IDEMPOTENT re-seal — no conflict, no incident", async () => {
+  // The claim the ops-side file cannot make: that the REAL Ingress reads the retry's re-presented
+  // request as identical semantic content and returns the stored row. `base_sha` comes from a
+  // MUTABLE ref, so an attempt that re-resolved would present a different `material_digest` under
+  // this origin's immovable `effect_id` — which is REQUEST_DIGEST_CONFLICT, a KERNEL_INCIDENT and a
+  // scope hold on the very path A5 exists to make retryable. Here the ref moves between the two
+  // attempts and the origin does not notice: the first seal pinned the base, and the retry
+  // re-presents that seal rather than the world.
+  const moved = "c".repeat(40);
+  const rp = await runProfileHarness();
+  const ops = liveOps(rp, ["b".repeat(40), moved]);
+  try {
+    const first = await liveOrigin(ops, "live-moving-base");
+    assertNoRunProfileRefusal(first, ops, "the origin at its first base");
+    const effect_id = first.started!.effect_id;
+    const capability = rp.h.store.runCapability(effect_id)!.capability_digest;
+
+    const second = await liveOrigin(ops, "live-moving-base");
+    assertNoRunProfileRefusal(second, ops, "the retry after the ref moved");
+
+    // The mutable ref was read exactly ONCE — at origin creation — so `moved` never reached a seal.
+    assert.equal(ops.reads.resolveBase, 1, "the retry re-resolves nothing");
+    assert.deepEqual(ops.allocated, [effect_id, effect_id], "one origin, one identity");
+    assert.equal(ops.sealed.length, 2, "the retry DID present a second seal");
+    assert.equal(ops.sealed[1]!.material_digest.value, ops.sealed[0]!.material_digest.value, "identical material");
+    assert.equal(ops.sealed[1]!.request_digest.value, ops.sealed[0]!.request_digest.value, "IDEMPOTENT re-seal");
+    assert.equal(ops.sealed[1]!.requested_at, ops.sealed[0]!.requested_at, "the STORED row, not a fresh one");
+
+    // Which is the whole point: one K3 row, no conflict, no incident, and the run unmoved.
+    assert.equal(count(rp.h, "effect_request"), 1, "exactly one K3 row");
+    assert.equal(incidents(rp), 0, "ZERO incidents — no REQUEST_DIGEST_CONFLICT");
+    assert.equal(count(rp.h, "run_membership"), 1, "still exactly one witness");
+    assert.equal(rp.h.store.runCapability(effect_id)?.capability_digest, capability, "nothing re-minted");
+    assert.deepEqual(rp.h.store.outcomesByEffect(effect_id).map((o) => o.result), ["COMMITTED"]);
+  } finally {
+    rp.h.close();
   }
 });
 

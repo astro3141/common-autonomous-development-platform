@@ -12,7 +12,10 @@
  * retained verbatim across a retry), the ONE self-referential `work-run` binding B5(9) adjudicates,
  * and the replay stability that makes a retry of one origin an IDEMPOTENT re-seal instead of a
  * `REQUEST_DIGEST_CONFLICT`: no field of the sealed material — `resource_prefix` and the departed
- * `step_ordinal` above all — is derived from the wall clock.
+ * `step_ordinal` above all — is derived from the wall clock, and no field is RE-DERIVED at all once
+ * the origin has sealed. That second half is what covers `base_sha`, whose source (`refs/heads/main`)
+ * is mutable: it is resolved at origin creation, pinned by the seal, and re-presented from the
+ * origin's own sealed request on every later attempt, whatever the ref has since done.
  *
  * The assertions here are OPS-side: they read what `startWork` presents to the Kernel. The
  * cross-kernel half — one `origin_key` deriving one `effect_id` through the real Ingress, the
@@ -28,6 +31,7 @@ import {
   PLAN_ORIGIN_KEY_SCHEMA, originResourcePrefix, planOriginKey, resolveBaseSha, startWork, workPlan,
 } from "../live/ops.ts";
 import { jcs, sha256Hex } from "../kernel/canonical.ts";
+import { KernelApiError } from "../clients/kernelClient.ts";
 import { RUN_ORIGIN_ALLOCATION_SCHEMA } from "../kernel/policyBundle.ts";
 import type { LiveEnvManifest } from "../live/env.ts";
 
@@ -85,20 +89,36 @@ interface SealedBody {
 }
 
 /**
- * A scripted Kernel with the ONE property the origin path is about: allocation is IDEMPOTENT ON THE
- * CANONICAL TUPLE, so the same tuple yields the same `effect_id` and a different tuple yields a
- * different one. Everything else is a recorder. This is deliberately NOT a re-implementation of the
- * Ingress — the real derivation, the real seal adjudication and the real refusal codes are asserted
- * against the real Kernel in `conformance-runorigin.test.ts`; what this stands in for is the
- * transport, so the ops-side claims (what is presented, and whether two attempts present the same
- * bytes) can be read directly.
+ * A scripted Kernel with the TWO properties the origin path is about.
+ *
+ * (1) Allocation is IDEMPOTENT ON THE CANONICAL TUPLE, so the same tuple yields the same `effect_id`
+ * and a different tuple yields a different one.
+ *
+ * (2) K3 is a STORE, not a recorder: a first seal inserts a row, a re-seal whose semantic payload
+ * (TD §3.3 — everything but `requested_at`, and never the transport tuple) equals the stored row's
+ * returns THAT row, and a re-seal that differs raises `REQUEST_DIGEST_CONFLICT`. Without (2) the
+ * scripted kernel accepted every re-seal and could not falsify the one claim this part exists to
+ * make; with it, an attempt that re-derives a drifting field under an already-sealed identity FAILS
+ * here, which is what the reviewer's mutable-base scenario does.
+ *
+ * This is deliberately NOT a re-implementation of the Ingress — the real derivation, the real seal
+ * adjudication and the real refusal codes are asserted against the real Kernel in
+ * `conformance-runorigin.test.ts`; what this stands in for is the transport plus that one
+ * idempotency semantic, so the ops-side claims (what is presented, and whether two attempts present
+ * the same bytes) can be read directly.
  */
 function scriptedKernel() {
   const allocations = new Map<string, string>();
   const blobs = new Map<string, string>();
   const seals: SealedBody[] = [];
+  const rows = new Map<string, SealedBody & { requested_at: string }>();
   const tuples: Array<Record<string, unknown>> = [];
   let issued = 0;
+  /** TD §3.3's semantic payload: the draft keys, with the stripped transport sibling left out. */
+  const semantic = (body: SealedBody): string => {
+    const { allocation_tuple: _tuple, requested_at: _at, request_digest: _digest, ...draft } = body as Record<string, unknown>;
+    return jcs(draft);
+  };
   const client = {
     async allocateEffectId(tuple: never): Promise<{ effect_id: string }> {
       const canonical = jcs(tuple);
@@ -115,8 +135,30 @@ function scriptedKernel() {
       return { cas_key };
     },
     async sealEffectRequest(body: never): Promise<never> {
-      seals.push(body as SealedBody);
-      return { request_digest: { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: sha256Hex(jcs(body)) } } as never;
+      const presented = body as SealedBody;
+      seals.push(presented);
+      const existing = rows.get(presented.effect_id);
+      if (existing !== undefined) {
+        // Identical semantic content → the STORED row (an idempotent no-op); any difference → the
+        // conflict, which is an incident and a scope hold on the real Kernel, never a retry.
+        if (semantic(existing) !== semantic(presented)) {
+          throw new Error(`REQUEST_DIGEST_CONFLICT: ${presented.effect_id} re-sealed with different semantic content`);
+        }
+        return existing as never;
+      }
+      const row = {
+        ...presented,
+        requested_at: `stored-at-${rows.size + 1}`,
+        request_digest: { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: sha256Hex(semantic(presented)) },
+      } as SealedBody & { requested_at: string };
+      rows.set(presented.effect_id, row);
+      return row as never;
+    },
+    /** K3 read: 404 EFFECT_NOT_FOUND is the kernel's answer for an origin that has never sealed. */
+    async getEffectState(effect_id: string): Promise<never> {
+      const row = rows.get(effect_id);
+      if (row === undefined) throw new KernelApiError(404, "EFFECT_NOT_FOUND");
+      return { request: row, inputs: [], decisions: [], admissions: [], outcomes: [] } as never;
     },
     async assembleAdmissionInput(): Promise<never> {
       return { input_digest: { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: "input" } } as never;
@@ -308,6 +350,125 @@ test("WP §3.6/control 14: TWO invocations of one origin at DIFFERENT wall-clock
   assert.deepEqual(kernel.tuples[1], kernel.tuples[0], "the allocation tuple does not move with the clock");
   assert.equal(kernel.argsOf(kernel.seals[1]!), kernel.argsOf(kernel.seals[0]!), "nor do the args");
   assert.equal(kernel.materialOf(kernel.seals[1]!), kernel.materialOf(kernel.seals[0]!), "nor the material");
+});
+
+// ---------------------------------------------------------------- the MUTABLE inputs, pinned
+
+/** The tip `refs/heads/main` moves to between one origin's first attempt and its retry. */
+const MOVED_SHA = "1f2e3d4c5b6a798877665544332211ffeeddccbb";
+
+/**
+ * `deps` plus a count of every EXTERNAL fact an attempt reads, and a base ref that MOVES between
+ * attempts — the reviewer's scenario stated as a fixture rather than as prose.
+ */
+function externalDeps(kernel: Kernel, bases: readonly string[]) {
+  const reads = { resolveBase: 0, imageIdentity: 0, namespaceId: 0 };
+  return {
+    reads,
+    dependencies: {
+      manifest: MANIFEST,
+      client: kernel.client as never,
+      namespaceId: () => {
+        reads.namespaceId += 1;
+        return "cadp-v04";
+      },
+      resolveBase: () => {
+        reads.resolveBase += 1;
+        return bases[Math.min(reads.resolveBase - 1, bases.length - 1)]!;
+      },
+      imageIdentity: () => {
+        reads.imageIdentity += 1;
+        return IMAGE;
+      },
+    },
+  };
+}
+
+test("WP §3.6/control 14: a retry after the base ref MOVES re-presents the PINNED material, and never conflicts", async () => {
+  // The development vertical's `base_sha` is resolved from a MUTABLE ref, so killing the wall clock
+  // is necessary and not sufficient: an attempt that re-resolved would seal MOVED_SHA under an
+  // identity already sealed at SHA, which is REQUEST_DIGEST_CONFLICT — an incident and a scope hold
+  // rather than a retry. The origin's own sealed request is the pin.
+  const kernel = scriptedKernel();
+  const moving = externalDeps(kernel, [SHA, MOVED_SHA]);
+  const first = await startWork("unused", "development", DEV_EXTRA, { originKey: "origin-moving-base", dependencies: moving.dependencies as never });
+  const second = await startWork("unused", "development", DEV_EXTRA, { originKey: "origin-moving-base", dependencies: moving.dependencies as never });
+
+  assert.notEqual(first, undefined);
+  assert.equal(second!.effect_id, first!.effect_id, "one origin, one identity");
+  assert.equal(second!.workflow_id, first!.workflow_id, "and one workflow, named from that identity alone");
+
+  // The retry reads NOTHING external: not the mutable ref, not the built image, not the namespace.
+  assert.equal(moving.reads.resolveBase, 1, "the mutable ref is resolved ONCE, at origin creation");
+  assert.equal(moving.reads.imageIdentity, 1, "the image is read once");
+  assert.equal(moving.reads.namespaceId, 1, "the namespace is read once");
+
+  // Two seals were presented, and the second is the first's stored material byte for byte.
+  assert.equal(kernel.seals.length, 2, "the retry DID re-present a seal");
+  const [a, b] = kernel.seals as [SealedBody, SealedBody];
+  assert.equal(b.material_ref, a.material_ref, "the retry re-presents the PINNED material_ref");
+  assert.equal(kernel.materialOf(b), kernel.materialOf(a), "hence identical material bytes");
+  assert.equal(kernel.argsOf(b), kernel.argsOf(a), "and identical args bytes");
+  const sealedBase = (JSON.parse(kernel.argsOf(b)) as { development: { base_sha: string } }).development.base_sha;
+  assert.equal(sealedBase, SHA, "the base the ORIGIN was created at, not the tip the retry would have seen");
+  assert.notEqual(MOVED_SHA, SHA, "the fixture really did move the ref");
+
+  // And the scripted kernel would have CAUGHT the departed behaviour: re-presenting this identity
+  // with different material is exactly the refusal the pin makes unreachable.
+  await assert.rejects(
+    async () => kernel.client.sealEffectRequest({ ...b, material_ref: `${b.material_ref}-drifted` } as never),
+    /REQUEST_DIGEST_CONFLICT/u,
+    "the harness falsifies: a drifted re-seal conflicts",
+  );
+});
+
+test("WP §3.6: an origin_key re-presented for DIFFERENT work REFUSES rather than inheriting the first seal", async () => {
+  // The honest consequence of pinning: the sealed material is inherited unread, so the one thing a
+  // retry can still check is the work it DECLARES. An `origin_key` names one run; re-presenting it
+  // for another work item is a caller error, and running the first item under a name that says
+  // otherwise would be the silent failure.
+  const kernel = scriptedKernel();
+  const started = await startWork("unused", "development", DEV_EXTRA, { originKey: "origin-one-run", dependencies: deps(kernel) });
+  await assert.rejects(
+    async () => startWork("unused", "development", ["a different item", "8", "6"], { originKey: "origin-one-run", dependencies: deps(kernel) }),
+    /already sealed .* for different work/u,
+  );
+  assert.equal(kernel.seals.length, 1, "and it refuses BEFORE presenting a second seal");
+  assert.equal(kernel.seals[0]!.effect_id, started!.effect_id);
+});
+
+test("WP §3.6: an origin whose first attempt never SEALED is not yet pinned — it derives and seals fresh", async () => {
+  // The boundary, asserted rather than left to be discovered: the pin is the sealed K3 row, so an
+  // attempt that died before sealing leaves nothing to inherit and the next attempt is a FIRST seal
+  // at whatever the ref then is. That is correct — a first seal cannot conflict with a row that does
+  // not exist — and it is the whole of the remaining window.
+  const kernel = scriptedKernel();
+  const moving = externalDeps(kernel, [SHA, MOVED_SHA]);
+  const flaky = {
+    ...kernel.client,
+    sealEffectRequest: async (): Promise<never> => {
+      throw new Error("transport reset before the seal landed");
+    },
+  };
+  await assert.rejects(
+    async () => startWork("unused", "development", DEV_EXTRA, {
+      originKey: "origin-unsealed",
+      dependencies: { ...moving.dependencies, client: flaky } as never,
+    }),
+    /transport reset/u,
+  );
+  assert.equal(kernel.seals.length, 0, "nothing was stored");
+
+  const started = await startWork("unused", "development", DEV_EXTRA, { originKey: "origin-unsealed", dependencies: moving.dependencies as never });
+  assert.notEqual(started, undefined);
+  assert.equal(moving.reads.resolveBase, 2, "an unpinned origin resolves the ref again");
+  const sealed = (JSON.parse(kernel.argsOf(kernel.seals[0]!)) as { development: { base_sha: string } }).development.base_sha;
+  assert.equal(sealed, MOVED_SHA, "and pins what it then saw");
+
+  // From here the origin IS pinned: the next retry inherits MOVED_SHA and reads nothing.
+  await startWork("unused", "development", DEV_EXTRA, { originKey: "origin-unsealed", dependencies: moving.dependencies as never });
+  assert.equal(moving.reads.resolveBase, 2, "the retry after a landed seal resolves nothing");
+  assert.equal(kernel.seals[1]!.material_ref, kernel.seals[0]!.material_ref);
 });
 
 // ---------------------------------------------------------------- the two ways an origin is decided

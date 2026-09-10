@@ -15,7 +15,7 @@ import { join } from "node:path";
 
 import { loadManifest } from "./env.ts";
 import type { LiveEnvManifest } from "./env.ts";
-import { KernelClient } from "../clients/kernelClient.ts";
+import { KernelApiError, KernelClient } from "../clients/kernelClient.ts";
 import { jcsDigest, sha256Hex } from "../kernel/canonical.ts";
 import { RUN_ORIGIN_ALLOCATION_SCHEMA } from "../kernel/policyBundle.ts";
 import { workerProfileDigest } from "../product/workerProfile.ts";
@@ -32,8 +32,8 @@ import { classifyRun, nextAction } from "../product/driver.ts";
 import type { ItemStatus, RunSnapshot } from "../product/driver.ts";
 import { attribution, collectRun, humanWait } from "../product/observationProjection.ts";
 import { backendScanClient, backendScanPrincipal, submitBackendExecutionEvidence } from "../product/backendExecution.ts";
-import type { EvidenceDraft } from "../kernel/ingress.ts";
-import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
+import type { EvidenceDraft, SealRequestBody } from "../kernel/ingress.ts";
+import type { EffectRequestV1, EvidenceEnvelopeV1 } from "../kernel/records.ts";
 
 export type Log = (line: Record<string, unknown>) => void;
 const SILENT: Log = () => {};
@@ -222,8 +222,48 @@ interface StartWorkDependencies {
 /** The kernel reach one governed WORK_START needs — the subset of `KernelClient` used below. */
 type StartWorkClient = Pick<
   KernelClient,
-  "allocateEffectId" | "putBlob" | "sealEffectRequest" | "assembleAdmissionInput" | "evaluate" | "admitAndDispatch"
+  "allocateEffectId" | "putBlob" | "sealEffectRequest" | "getEffectState" | "assembleAdmissionInput" | "evaluate" | "admitAndDispatch"
 >;
+
+/**
+ * WP §3.6 — THE ORIGIN'S OWN PRIOR SEAL, which is the durable per-origin state this composition has:
+ * the allocation converges the identity, so `effect_id` is already this origin's name, and K3 either
+ * holds that origin's sealed request or it does not.
+ *
+ * `undefined` means ONLY "this origin has never sealed" — the kernel's 404 EFFECT_NOT_FOUND, and
+ * nothing else. Any other failure is a read we did not get an answer to, and is re-thrown rather
+ * than read as absence: treating an unavailable kernel as "no prior seal" would send the caller down
+ * the re-derivation path and re-present drifted material under an already-sealed identity, which is
+ * the exact `REQUEST_DIGEST_CONFLICT` this read exists to make unreachable.
+ */
+async function priorOriginSeal(c: StartWorkClient, effect_id: string): Promise<EffectRequestV1 | undefined> {
+  try {
+    return (await c.getEffectState(effect_id)).request;
+  } catch (error) {
+    if (error instanceof KernelApiError && error.status === 404 && error.reason === "EFFECT_NOT_FOUND") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * The work an origin's request DECLARES, in the sealed record's own vocabulary: derived from the
+ * caller's arguments and the allocated identity, never from anything external or mutable.
+ */
+function workStartBindings(effect_id: string, vertical: "development" | "record", extra: string[]): SealRequestBody["work_bindings"] {
+  return [
+    // Spec v0.5 §5.3 / AP B5(9) legs 2-3: EXACTLY ONE binding on the kernel's declared work-run
+    // pair, carrying this request's OWN `effect_id`. That self-origin relation is what the
+    // Ingress adjudicates, and the `run_membership(E, E)` witness it writes is the only thing
+    // that ever makes this effect minting at its own initial dispatch (AP B5(1)(b)). A second
+    // work-run binding would be `KERNEL_NAMESPACE_AMBIGUOUS`, so there is exactly one.
+    { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: effect_id },
+    { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
+    // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
+    ...(vertical === "development" && extra[3] !== undefined && extra[3] !== ""
+      ? [{ authority_ref: "cadp-store:k04", namespace: "work-proposal", object_id: extra[3] }]
+      : []),
+  ];
+}
 
 /**
  * One governed WORK_START through the ordinary admission chain. `undefined` = refused, honestly
@@ -245,9 +285,17 @@ type StartWorkClient = Pick<
  * `KERNEL_NAMESPACE_AMBIGUOUS` — and the allocated tuple rides as `allocation_tuple`, the stripped
  * transport sibling B6(1) requires at a first seal and never a record field.
  *
- * NOTHING sealed below is derived from the wall clock: the origin's identity is stable, so its
- * material must be too, or a retry re-presents one `effect_id` with a different semantic payload
- * and lands `REQUEST_DIGEST_CONFLICT` instead of being idempotent (WP §3.6, control 14).
+ * NOTHING sealed below is derived from the wall clock, and on a RETRY nothing is DERIVED AT ALL: the
+ * origin's identity is stable, so its material must be too, or a retry re-presents one `effect_id`
+ * with a different semantic payload and lands `REQUEST_DIGEST_CONFLICT` instead of being idempotent
+ * (WP §3.6, control 14). Killing the wall clock is necessary and not sufficient — `base_sha` is
+ * resolved from a MUTABLE ref, so a retry taken after `refs/heads/main` moves would seal a different
+ * base under an identity that cannot move. So the order below is: ALLOCATE first, then ask K3
+ * whether this origin has already sealed. If it has, its sealed request is RE-PRESENTED VERBATIM —
+ * same `material_ref`, same `target_ref`, same bindings, so the Ingress's semantic comparison is an
+ * equality by construction and the re-seal is the idempotent no-op that returns the stored row. The
+ * first seal is where the base is resolved and pinned; every later attempt inherits it, and no
+ * external fact (the ref tip, the built image, the Temporal namespace) is even READ on that path.
  */
 export async function startWork(
   dir: string,
@@ -259,7 +307,6 @@ export async function startWork(
   const dependencies = options.dependencies ?? {};
   const m = dependencies.manifest ?? loadManifest(dir);
   const c = dependencies.client ?? liveClient(dir, "cadp-workflow");
-  const namespaceId = (dependencies.namespaceId ?? temporalNamespaceId)(m);
 
   if (vertical === "development") {
     const floor = devEffectFloorViolation(boundArg(extra[2], 6));
@@ -283,97 +330,137 @@ export async function startWork(
   // key instead, so nothing on that path is ever minted.
   const mintOriginKey = dependencies.mintOriginKey ?? ((): string => randomUUID());
   const origin_key = options.originKey ?? mintOriginKey();
-  const args =
+  // #127 on EVERY path: a malformed bound refuses HERE, before an identity is allocated, whether or
+  // not this attempt goes on to derive material (a retry does not, and must still refuse one).
+  const bounds =
     vertical === "development"
-      ? {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) },
-          development: {
-            repo_id: m.repo_id,
-            repo_full_name: m.repo_full_name,
-            base_ref: "refs/heads/main",
-            // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
-            // resolveBaseSha). Once sealed it is fixed for the run's whole lifetime.
-            //
-            // WP §3.6 names this as the ONE remaining instance of the replay-stability shape on the
-            // origin path, and it is NOT closed here: a retry of one origin after `refs/heads/main`
-            // moves resolves a different tip, seals different `args`, and re-presents this origin's
-            // (stable) `effect_id` with a different semantic payload — REQUEST_DIGEST_CONFLICT.
-            // Closing it means pinning the FIRST-CREATION value, which needs durable per-origin
-            // state this composition does not yet have; the record vertical's wall-clock
-            // `resource_prefix`, which needed none, is closed above. Until then a dev origin is
-            // replay-stable only while its base ref is.
-            base_sha: (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main"),
-            work_item: extra[0]!,
-            worker_product: workerProduct,
-            review_product: reviewProduct,
-            external_verification: externalVerification,
-            require_human_merge: true,
-          },
-        }
-      : {
-          vertical,
-          bounds: { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) },
-          record: {
-            tenant: "cadp-disposable",
-            // WP §3.6: a function of the ORIGIN, never of the wall clock — see originResourcePrefix.
-            resource_prefix: originResourcePrefix(origin_key),
-            payloads: Array.from({ length: boundArg(extra[0], 2) }, (_, i) => `live payload ${i + 1}`),
-          },
-        };
+      ? { max_steps: boundArg(extra[1], 8), max_effects: boundArg(extra[2], 6) }
+      : { max_steps: boundArg(extra[1], 6), max_effects: boundArg(extra[2], 4) };
+  const payloadCount = vertical === "record" ? boundArg(extra[0], 2) : 0;
 
   // AP B1(5): exactly the three keys of `cadp.allocation-key.run-origin.v1`. No `work_run_ref` (a
   // tuple naming this identity would have to contain the value it is derived to produce) and no
   // `step_ordinal` — the wall-clock ordinal this replaces gave one logical origin a fresh identity
   // per second, which is precisely the fork A5 exists to make unconstructible.
+  //
+  // The allocation is FIRST, before any material is derived: it is what converges this attempt onto
+  // the origin's one identity, and only with that identity in hand can the origin be asked whether
+  // it has already sealed.
   const allocation_tuple = { schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key, purpose: "work-start" as const };
   const { effect_id } = await c.allocateEffectId(allocation_tuple);
-  const { cas_key: args_cas_key } = await c.putBlob(Buffer.from(JSON.stringify(args), "utf8"));
-  // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
-  // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
-  const image = (dependencies.imageIdentity ?? (() => imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim())))();
-  const worker_profile_digest = jcsDigest({
-    profile: workerProfileDigest(),
-    surface_image: image.image,
-    image_digest: image.image_digest,
-    tool_versions: image.tool_versions,
-  }).value;
-  const material = {
-    workflow_id: `cadp-work-${effect_id}`,
-    workflow_type: "cadpWork",
-    task_queue: "cadp-worker",
-    args_cas_key,
-    args_digest: jcsDigest(args).value,
-    bounds: args.bounds,
-    worker_profile_digest,
-    surface_image: image,
-    continuation_target: `temporal:cadp-v04:${namespaceId}`,
-  };
-  const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
-  const request = await c.sealEffectRequest({
-    effect_id,
-    requester_ref: "workflow:cadp-work",
-    work_bindings: [
-      // Spec v0.5 §5.3 / AP B5(9) legs 2-3: EXACTLY ONE binding on the kernel's declared work-run
-      // pair, carrying this request's OWN `effect_id`. That self-origin relation is what the
-      // Ingress adjudicates, and the `run_membership(E, E)` witness it writes is the only thing
-      // that ever makes this effect minting at its own initial dispatch (AP B5(1)(b)). A second
-      // work-run binding would be `KERNEL_NAMESPACE_AMBIGUOUS`, so there is exactly one.
-      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: effect_id },
-      { authority_ref: "github.com", namespace: "work-item", object_id: vertical === "development" ? `dev:${extra[0]}` : `record:${extra[0]}` },
-      // Optional exact provenance: the WORK_PROPOSAL this item came from. A binding, never authority.
-      ...(vertical === "development" && extra[3] !== undefined && extra[3] !== ""
-        ? [{ authority_ref: "cadp-store:k04", namespace: "work-proposal", object_id: extra[3] }]
-        : []),
-    ],
-    target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: namespaceId },
-    operation_kind: "WORK_START",
-    material_schema: "cadp.work-start.v1",
-    material_ref,
-    prior_effect_refs: [],
-    // AP B6(1): transport, stripped before anything reads the draft — never a record field.
-    allocation_tuple,
-  });
+  // A pure function of the effect identity, so a retry names the workflow the first seal named
+  // without reading the sealed material back — the Kernel API serves no blob reads (TD §12).
+  const workflow_id = `cadp-work-${effect_id}`;
+  const work_bindings = workStartBindings(effect_id, vertical, extra);
+  const prior = await priorOriginSeal(c, effect_id);
+  let draft: SealRequestBody;
+
+  if (prior !== undefined) {
+    // THE RETRY (WP §3.6, control 14). This origin already sealed, so its sealed request is the
+    // pinned material: `material_ref` (and with it `base_sha`, the bounds, the image and every other
+    // first-creation fact) and `target_ref` are re-presented VERBATIM, never re-derived. The
+    // Ingress's re-seal comparison is over exactly these fields, so equality is by construction and
+    // the seal below is the idempotent no-op that returns the stored row — for any base ref, any
+    // image and any clock, which is the whole of what replay stability means here.
+    //
+    // What IS recomputed is the declared work, and only to CHECK it: an `origin_key` names one run,
+    // so re-presenting one for different work is a caller error. Refusing it is honest where
+    // silently inheriting the first seal's material would run work nobody asked for under a name
+    // that says otherwise. The material itself is unreadable and deliberately uncompared —
+    // inheriting it is the point, and a retry that wants different material wants a new origin.
+    if (jcsDigest({ work_bindings: prior.work_bindings }).value !== jcsDigest({ work_bindings }).value) {
+      throw new Error(
+        `origin_key '${origin_key}' already sealed ${effect_id} for different work — one origin_key names ONE run; use a new origin for different work`,
+      );
+    }
+    log({ effect_id, origin_key, replay: "PINNED", material_ref: prior.material_ref });
+    draft = {
+      effect_id,
+      requester_ref: prior.requester_ref,
+      work_bindings: prior.work_bindings,
+      target_ref: prior.target_ref,
+      operation_kind: prior.operation_kind,
+      material_schema: prior.material_schema,
+      material_ref: prior.material_ref,
+      prior_effect_refs: prior.prior_effect_refs,
+      // AP B6(1)/B6(2): a re-seal may repeat the tuple, and repeating the ALLOCATED one is never
+      // what turns an idempotent re-seal into a conflict.
+      allocation_tuple,
+    };
+  } else {
+    // THE FIRST SEAL: the one attempt that reads the world, and so the one that PINS it.
+    const namespaceId = (dependencies.namespaceId ?? temporalNamespaceId)(m);
+    const args =
+      vertical === "development"
+        ? {
+            vertical,
+            bounds,
+            development: {
+              repo_id: m.repo_id,
+              repo_full_name: m.repo_full_name,
+              base_ref: "refs/heads/main",
+              // Resolved fresh AT ORIGIN CREATION — the manifest's setup-time snapshot goes stale
+              // (see resolveBaseSha) — and pinned by the seal for the run's whole lifetime. The ref
+              // is mutable, so this value is stable only because no later attempt on this origin
+              // resolves it again: a retry takes the branch above and re-presents this seal's
+              // `material_ref`. Resolving it per attempt is what made one origin able to seal two
+              // different bases under one immovable `effect_id` — REQUEST_DIGEST_CONFLICT, an
+              // incident and a scope hold rather than a retry.
+              base_sha: (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main"),
+              work_item: extra[0]!,
+              worker_product: workerProduct,
+              review_product: reviewProduct,
+              external_verification: externalVerification,
+              require_human_merge: true,
+            },
+          }
+        : {
+            vertical,
+            bounds,
+            record: {
+              tenant: "cadp-disposable",
+              // WP §3.6: a function of the ORIGIN, never of the wall clock — see originResourcePrefix.
+              resource_prefix: originResourcePrefix(origin_key),
+              payloads: Array.from({ length: payloadCount }, (_, i) => `live payload ${i + 1}`),
+            },
+          };
+    const { cas_key: args_cas_key } = await c.putBlob(Buffer.from(JSON.stringify(args), "utf8"));
+    // TD §11 version exactness: bind the immutable built-image digest + observed tool versions
+    // into the WORK_START worker profile, so the reviewed/live composition names the exact image.
+    const image = (dependencies.imageIdentity ?? (() => imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim())))();
+    const worker_profile_digest = jcsDigest({
+      profile: workerProfileDigest(),
+      surface_image: image.image,
+      image_digest: image.image_digest,
+      tool_versions: image.tool_versions,
+    }).value;
+    const material = {
+      workflow_id,
+      workflow_type: "cadpWork",
+      task_queue: "cadp-worker",
+      args_cas_key,
+      args_digest: jcsDigest(args).value,
+      bounds: args.bounds,
+      worker_profile_digest,
+      surface_image: image,
+      continuation_target: `temporal:cadp-v04:${namespaceId}`,
+    };
+    const { cas_key: material_ref } = await c.putBlob(Buffer.from(JSON.stringify(material), "utf8"));
+    draft = {
+      effect_id,
+      requester_ref: "workflow:cadp-work",
+      work_bindings,
+      target_ref: { authority_ref: "temporal:cadp-v04", target_type: "WORKFLOW", target_id: namespaceId },
+      operation_kind: "WORK_START",
+      material_schema: "cadp.work-start.v1",
+      material_ref,
+      prior_effect_refs: [],
+      // AP B6(1): transport, stripped before anything reads the draft — never a record field.
+      allocation_tuple,
+    };
+  }
+
+  const request = await c.sealEffectRequest(draft);
   const input = await c.assembleAdmissionInput(effect_id, []);
   const evaluated = await c.evaluate(input.input_digest.value);
   if (evaluated.kind !== "DECISION" || evaluated.decision.outcome !== "ALLOW") {
@@ -381,11 +468,11 @@ export async function startWork(
     return undefined;
   }
   const admitted = await c.admitAndDispatch(effect_id, evaluated.decision.decision_id);
-  log({ effect_id, workflow_id: material.workflow_id, request_digest: request.request_digest.value, admitted });
+  log({ effect_id, workflow_id, request_digest: request.request_digest.value, admitted });
   if (admitted.kind !== "ADMITTED" || admitted.outcome.result !== "COMMITTED") return undefined;
   // `origin_key` is returned so a retry of THIS origin re-presents it verbatim (WP §3.6): the
   // minted case has no other way to know the value, and a second mint would be a second run.
-  return { effect_id, workflow_id: material.workflow_id, origin_key };
+  return { effect_id, workflow_id, origin_key };
 }
 
 const KNOWN_STATUSES = ["RUNNING", "COMPLETED", "FAILED", "TERMINATED", "TIMED_OUT", "CANCELLED"] as const;
