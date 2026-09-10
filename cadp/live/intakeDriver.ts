@@ -249,7 +249,7 @@ async function contractNegative(): Promise<void> {
 
   // (6) v1.1 (Review B18): an intake-sealed HUMAN_JUDGMENT reclassification citing authority text
   // no longer clears anything — only a governed FINDING_SEAL descendant does. The clearing path
-  // and its falsification controls live in cadp/tests/conformance-transition.test.ts.
+  // and its falsification controls live in cadp/tests/conformance/conformance-transition.test.ts.
   const humanReclass = await submitFindingEnv({
     classification: "IMPLEMENTATION_GAP", anomaly_code: "CG_UNDEFINED_BOUNDARY", summary: "intake human judgment: NOT authority under v1.1",
     basis: diag, basisRole: "DIAGNOSTIC", derivationKind: "HUMAN_JUDGMENT", execution_or_run_ref: "human:astro3141",

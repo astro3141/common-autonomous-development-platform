@@ -29,4 +29,29 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # Zero-discovery guard — the external verifier's half of the same protection the local
+      # verifier gets from `parseExecutedTestCount()` in `cadp/product/surfaceBroker.ts`.
+      #
+      # MEASURED (Node v22.23.2, the surface image's runtime): a `node --test` run that discovers
+      # NO test files prints `# tests 0` and EXITS 0. Exit status alone therefore cannot tell "the
+      # suite passed" from "nothing ran". This job pins Node 24, on which that exit-status
+      # behaviour is UNMEASURED here — the assertion below deliberately does not depend on it: it
+      # reads the runner's own summary, which is the same TAP line on both runtimes.
+      #
+      # NOTE ON THE SEAM: `package.json`'s `test` script stays as a developer convenience. Both
+      # verifiers are meant to spawn the runner directly with an explicit, protected test-path
+      # enumeration so the executed set cannot be re-pointed by editing that script. That
+      # narrowing is NOT yet applied at either site: on Node 22 `node --test <dir>/` resolves a
+      # directory argument as a module entry point rather than expanding it, so the routed
+      # `node --test cadp/tests/conformance/ cadp/tests/ops/ devharness/tests/` executes zero
+      # tests on the surface image (see the same note in `surfaceBroker.ts`). Until that is
+      # re-routed, the guard below is what stops a silently-empty run from reading as a pass.
+      - run: |
+          set -o pipefail
+          npm test 2>&1 | tee cadp-verify-output.txt
+          total="$(grep -E '^# tests [0-9]+$' cadp-verify-output.txt | tail -n 1 | awk '{ print $3 }')"
+          if [ -z "$total" ] || [ "$total" -eq 0 ]; then
+            echo "::error::verification executed ${total:-no} tests — a verifier that ran nothing must never report success"
+            exit 1
+          fi
+          echo "verification executed $total tests"

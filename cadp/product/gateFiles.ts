@@ -29,7 +29,23 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/mcp.ts", // the tool surface a supervising session drives
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
-  "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // The conformance suite that decides verification pass/fail — narrowed from the blanket
+  // `cadp/tests/` to the conformance directory alone (manifest.ts and conformance-manifest.test.ts
+  // included, and the shared harness under conformance/support/ with them).
+  //
+  // Conformance tests are NOT authority themselves — they are the EXECUTABLE ASSURANCE PROJECTION
+  // of TD authority; they are protected to PREVENT WEAKENING OF THE TD ASSURANCE BOUNDARY (not
+  // because changing them "amends the TD"). A candidate cannot amend a TD by editing a test; what
+  // it can do is shrink the projection until a prohibited change stops being observable. That is
+  // the hazard this rule routes to a Human.
+  //
+  // `cadp/tests/ops/` is deliberately NOT here: operational contracts (broker prompt shapes,
+  // provider argv snapshots, timeout budgets, effort argv rendering, planner plumbing) carry no
+  // assurance-boundary claim, so an ordinary candidate may evolve them under a delegated merge.
+  // Both directories keep RUNNING in both verifiers — the split changes protection, never
+  // execution coverage. `cadp/tests/conformance/manifest.ts` is the durable map from TD control ID
+  // to the files that project it.
+  "cadp/tests/conformance/",
   // Reviewer-INSTRUCTION files (#259 P0a). A provider CLI discovers these automatically from its
   // working directory and its ancestors and loads them as its own instructions, so a
   // candidate-authored change to one opens a path to address the reviewer that judges it — gate
@@ -44,6 +60,11 @@ export const GATE_PATH_RULES: readonly string[] = [
   // HUMAN_DECISION. A trailing `*` marks a filename prefix, covering past and future revisions
   // (v0.3, v0.4, next generations) without re-editing this list per revision.
   ".github/", // the external verification workflow — what the Actions verifier actually RUNS
+  // The external verifier's INVOCATION, named exactly. Already inside the `.github/` prefix above,
+  // and pinned here anyway: this file is verification machinery in its own right — it decides what
+  // the Actions verifier executes and whether an empty run can read as a pass — so a later
+  // narrowing of the broad `.github/` rule must not be able to drop it by accident.
+  ".github/workflows/cadp-verify.yml",
   "Authority order.md",
   "Common Autonomous Development Platform — Specification*", // every Spec revision
   "TECHNICAL_DESIGN_*", // every TD document

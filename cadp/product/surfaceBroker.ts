@@ -299,6 +299,46 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The verifier's test selection, as one array so the executed set is pinned by a PROTECTED file
+ * (`cadp/product/gateFiles.ts` routes any change here to a HUMAN_DECISION) rather than by
+ * `package.json`'s `test` script.
+ *
+ * `package.json`'s `test` script REMAINS as a developer convenience, but it is no longer this
+ * verifier's seam: the broker spawns the runner directly, so re-pointing the npm script cannot
+ * change what verification executes. The external verifier
+ * (`.github/workflows/cadp-verify.yml`) carries the same note at its own invocation site.
+ *
+ * MEASURED CONSTRAINT ON NARROWING THIS SELECTION (surface image `node:22-bookworm-slim`,
+ * measured on Node v22.23.2): `node --test <dir>/` does NOT expand a directory argument on Node
+ * 22. A positional path is resolved as a module entry point, so
+ * `node --test cadp/tests/conformance/ cadp/tests/ops/ devharness/tests/` yields three
+ * `ERR_MODULE_NOT_FOUND` failures and executes ZERO real tests. Bare `node --test` recursively
+ * discovers every `*.test.ts` in the workspace and is, on this runtime, the only non-glob form
+ * that runs the suites at all. Narrowing to an explicit directory enumeration therefore waits on
+ * a runtime decision that is not this file's to make; the zero-discovery guard below is what
+ * makes any future change to this array fail loudly instead of silently verifying nothing.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test"];
+
+/**
+ * Executed-test count from a `node --test` TAP summary, or `undefined` if no summary is present.
+ *
+ * Why this parser exists at all: on Node 22 a run that discovers NO test files prints
+ * `# tests 0` and EXITS 0 (measured). Exit status alone therefore cannot distinguish "the
+ * candidate's suite passed" from "nothing ran", and a verifier that silently executed nothing
+ * must never report success. The last unindented `# tests <n>` line is the top-level runner's
+ * own summary; indented ones belong to subtests and are ignored.
+ */
+export function parseExecutedTestCount(output: string): number | undefined {
+  let total: number | undefined;
+  for (const line of output.split("\n")) {
+    const m = /^# tests (\d+)\s*$/u.exec(line);
+    if (m !== null && m[1] !== undefined) total = Number(m[1]);
+  }
+  return total;
+}
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,8 +379,26 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
+    // ZERO-DISCOVERY GUARD. A selection that discovers nothing exits 0 with `# tests 0`, so
+    // without this the broker would report `conclusion: "success"` for a run that executed no
+    // test at all — the loudest possible false PASS, and exactly the shape #89 measured.
+    //
+    // UNKNOWN, not "failure", per this file's existing conclusion taxonomy: `failure` is a
+    // verdict ABOUT THE CANDIDATE (its suite ran and something failed), which would be a false
+    // claim here; every "no verdict could be obtained" case above (DIRTY_WORKSPACE,
+    // HEAD_MISMATCH, DEP_PROVISION_FAILED) is UNKNOWN with an honest reason, and UNKNOWN cannot
+    // be read as success anywhere downstream — a required fact that is UNKNOWN is a policy DENY
+    // (TD §13.1 C14), and C11 pins this same shape for the dirty-workspace false PASS.
+    const executed = parseExecutedTestCount(test.stdout + test.stderr);
+    if (executed === undefined || executed === 0) {
+      return {
+        status: "UNKNOWN",
+        clone_head,
+        unknown_reason: executed === undefined ? "TEST_SUMMARY_UNPARSEABLE" : "NO_TESTS_EXECUTED",
+      };
+    }
     return {
       status: "PRESENT",
       clone_head,
