@@ -729,9 +729,46 @@ export function reviewerAuthArgs(auth: ReviewerAuth): string[] {
 }
 
 /**
+ * One EXTRA read-only bind, at a container path that is NOT the surface's working directory (#259
+ * P0a). It exists so a caller can hand a surface material to READ without making that material the
+ * directory the CLI starts in — the distinction matters because several provider CLIs treat their
+ * cwd (and its ancestors) as an automatic INSTRUCTION source (codex discovers `AGENTS.md` there),
+ * so mounting untrusted content as the cwd would let it address the surface rather than be read by
+ * it. Mounting it elsewhere keeps it evidence.
+ *
+ * `readonly` is the literal `true`, not a boolean: the type itself makes a writable extra mount
+ * unexpressible, so no caller — and no later edit to a caller — can request one.
+ */
+export interface SurfaceExtraMount {
+  readonly host_path: string;
+  readonly container_path: string;
+  readonly readonly: true;
+}
+
+/**
+ * Pure arg-builder for the extra read-only binds (unit-testable without docker). Always `:ro`,
+ * since there is no other kind. The container path must be absolute and must not be the workspace
+ * mount or `/` — either would shadow the cwd the surface was given instead of sitting beside it,
+ * which is the whole point of this mount. Fails closed rather than silently overmounting.
+ */
+export function extraMountArgs(mounts: readonly SurfaceExtraMount[]): string[] {
+  return mounts.flatMap((mount) => {
+    if (!mount.container_path.startsWith("/") || mount.container_path === "/" || mount.container_path === "/ws") {
+      throw new Error(`extra mount container path must be an absolute path beside the workspace mount (got "${mount.container_path}") — failing closed`);
+    }
+    return ["-v", `${mount.host_path}:${mount.container_path}:ro`];
+  });
+}
+
+/**
  * Reviewer container: host fs invisible (only a ro checkout); on the internal network with
  * provider-only egress via the proxy → GitHub/record/Kernel are unreachable (http-000). Auth is
  * injected per the provider profile (`ReviewerAuth`), so no keychain/host credential is reachable.
+ *
+ * `workspace` is the surface's WORKING DIRECTORY (`/ws`), i.e. also its automatic-instruction
+ * neighbourhood for CLIs that discover one; `extra_mounts` are additional read-only paths beside
+ * it, for material the surface should READ rather than be instructed by (#259 P0a). Omitting
+ * `extra_mounts` leaves every argv byte as it was.
  */
 export function runReviewer(
   config: IsolationConfig,
@@ -741,6 +778,7 @@ export function runReviewer(
     authSubdir?: string;
     sessionsDir?: string;
     sessionsContainerDir?: string;
+    extra_mounts?: readonly SurfaceExtraMount[];
     argv: readonly string[];
     timeout_ms?: number;
   },
@@ -754,6 +792,7 @@ export function runReviewer(
       "--network", config.egress_network,
       ...PROXY_ENV(config.egress_proxy),
       "-v", `${input.workspace}:/ws:ro`,
+      ...extraMountArgs(input.extra_mounts ?? []),
       "-e", "HOME=/root",
       ...reviewerAuthArgs(input.auth),
       ...sessionsMount,

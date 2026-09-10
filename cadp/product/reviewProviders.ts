@@ -23,6 +23,14 @@ export interface ReviewProviderProfile {
    */
   readonly argv_template: readonly string[];
   readonly auth_method: ReviewAuthMethod;
+  /**
+   * Whether THIS profile's argv actually leaves the surface able to read files from a mount (#259
+   * P0a). It is a property of the measured argv, not of the product: the claude reviewer profile
+   * disallows `Read,Glob,Grep`, so telling it to open a mounted checkout would instruct it to do
+   * something it cannot do — the prompt keeps that instruction only where the capability exists.
+   * Anything that removes a profile's read tools must clear this flag in the same edit.
+   */
+  readonly can_read_workspace: boolean;
   /** Session fields stay absent until this review argv is measured in a live container probe. */
   readonly sessions_subdir?: string;
   readonly sessions_container_dir?: string;
@@ -71,6 +79,9 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
       DIFF_PROMPT_SENTINEL,
     ],
     auth_method: { kind: "oauth_env", env_var: "CLAUDE_CODE_OAUTH_TOKEN" },
+    // `Read,Glob,Grep` are in the disallowed list above, so this profile reviews the SUPPLIED text
+    // only — it cannot open a mounted checkout, and is not told that one exists.
+    can_read_workspace: false,
     sessions_subdir: "claude-sessions",
     sessions_container_dir: "projects",
     // Measured primary path: ~/.claude/projects/<slug>/<uuid>.jsonl. Stdout is a
@@ -105,6 +116,9 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
       '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","REQUEST_CHANGES"]},"reason":{"type":"string"}},"required":["verdict","reason"]}',
     ],
     auth_method: { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] },
+    // The measured `--tools read_file,list_dir,grep` allow-list IS a read capability (and nothing
+    // more): this profile can open a read-only mount, so the prompt may point it at one.
+    can_read_workspace: true,
     sessions_subdir: "grok-sessions",
     // Measured primary path: ~/.grok/sessions/<urlencoded-cwd>/<session-id>/chat_history.jsonl.
     // Stdout is a same-shape fallback only.
@@ -120,6 +134,9 @@ export const REVIEW_PROVIDERS: Record<ReviewProvider, ReviewProviderProfile> = {
     // reviewer checkout is a fresh clone, not the broker's own repo.
     argv_template: ["exec", "--sandbox", "read-only", "--skip-git-repo-check", DIFF_PROMPT_SENTINEL],
     auth_method: { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] },
+    // `--sandbox read-only` is measured as write-DENYING, not read-denying: this profile can open a
+    // read-only mount, so the prompt may point it at one.
+    can_read_workspace: true,
     sessions_subdir: "codex-sessions",
     // Measured primary path: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. Stdout is a
     // same-shape fallback only.
