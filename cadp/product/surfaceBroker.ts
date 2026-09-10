@@ -392,6 +392,15 @@ function surfaceAuthSubdir(
   return auth_method.kind === "auth_files" ? auth_method.auth_subdir : `.${provider}`;
 }
 
+/**
+ * Told to the reviewer verbatim, right after the "you are reviewing this change" paragraph (#259
+ * P0a): the checkout is there, and the governing Spec/TD text is what the verdict must be measured
+ * against — so a reviewer that would otherwise reason from the patch plus the work item's own
+ * claims about itself is directed at the source instead.
+ */
+export const REVIEW_MOUNT_INSTRUCTION =
+  "The full candidate checkout is mounted read-only at your working directory. Read the governing Spec/TD sections and the changed implementation directly from the mounted checkout. Do not rely only on the supplied diff or work-item claims.";
+
 export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
   verdict: string;
   reason: string;
@@ -427,17 +436,38 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // element, failing the whole review. Escape them before the 60 000-char cap so the bound
     // still holds on exactly the text that gets embedded (measured live: one such file killed a
     // run outright). NUL-free diffs — every ordinary one — pass through byte-for-byte.
+    //
+    // The 60 000-char cap is a CONTEXT HINT, not a correctness boundary (#259 P0a): the reviewer
+    // now has the whole candidate checkout mounted below, so a truncated patch costs convenience
+    // (the summary it opens with), never the ability to see the change. Before the mount it was
+    // the reviewer's ONLY view of the change, and a cut patch really did bound the verdict.
     const diff = spawnSafeText((await git(["diff", "--stat", "--patch", forkBase, body.candidate_sha], workspace)).stdout).slice(0, 60_000);
 
     // The caller's work item and sha are spawn-bound too; the outer pass covers them (and is
     // identity over the already-escaped diff).
-    const prompt = spawnSafeText(`You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${diff}`);
-    const reviewWs = join(base, "review-ws");
-    mkdirSync(reviewWs, { recursive: true });
+    const prompt = spawnSafeText(`You are reviewing the exact committed change below (commit ${body.candidate_sha}) implementing: "${body.work_item}". Reply with exactly APPROVE or REQUEST_CHANGES on the first line, then one short reason line.\n\n${REVIEW_MOUNT_INSTRUCTION}\n\n${diff}`);
     const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
     mkdirSync(sessionsDir, { recursive: true });
     const review = await runReviewer(config(), {
-      workspace: reviewWs,
+      // The MOUNTED workspace is the CANDIDATE CHECKOUT this diff was built from — the clone above,
+      // already checked out at candidate_sha (#259 P0a). It used to be a fresh EMPTY dir, so no
+      // reviewer could open the Spec/TD sections it was asked to judge against, or any file outside
+      // the patch: "I need to read X" was a true statement about an impossibility, and codex only
+      // worked around it with its own remote GitHub calls (slow, and an undeclared dependency).
+      //
+      // Read-only by construction and unchanged by this: runReviewer binds it `:ro` (isolation.ts
+      // `-v ${workspace}:/ws:ro`) and each provider's argv keeps its own read-only sandbox flags
+      // (codex `--sandbox read-only`, grok's read-tool allow-list, claude's plan mode). The
+      // reviewer's WRITABLE state stays where it already was — its own sessions dir, mounted
+      // separately below and outside this tree.
+      //
+      // Nothing secret enters the mount: it is a clone of the PUBLIC repo, holding only what the
+      // repo itself commits — no auth dir, no session state, no manifest. The broker cannot leak
+      // the PEP secret path into it either, and that is not a property of this line: the broker
+      // runs under the deny-read Seatbelt profile that excludes that path (denyReadProfile in
+      // cadp/live/env.ts, wired with [<dir>/secret] by startLiveComponent in
+      // cadp/live/componentControl.ts), and the mount args here are fixed, never caller-supplied.
+      workspace,
       auth: surfaceProviderAuth(profile.auth_method, base),
       authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
       sessionsDir,
