@@ -29,7 +29,20 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/mcp.ts", // the tool surface a supervising session drives
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
-  "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // The CONFORMANCE half of the test corpus — the executable assurance projection of TD authority.
+  // These tests are not authority themselves; they are protected because weakening them weakens the
+  // TD ASSURANCE BOUNDARY (a candidate that deletes, guts or exclusion-evades one has narrowed the
+  // gate without touching the constitution). The whole directory is listed — manifest.ts and its
+  // meta-test included, since a manifest whose checker is delegable protects nothing. Its shared
+  // fixtures live in cadp/tests/conformance/support/ and are covered by the same prefix: a harness
+  // that can be neutered is a suite that can be neutered. cadp/tests/ops/ is deliberately NOT here
+  // — operational contracts (prompt shapes, argv snapshots, timeout budgets) are ordinary product.
+  "cadp/tests/conformance/",
+  // The EXTERNAL verifier's invocation. It pins, by explicit path, which tests actually run; it is
+  // verification machinery for exactly the reason surfaceBroker.ts's local argv is (also listed
+  // above, once). The broader ".github/" rule below covers this file too — the explicit entry
+  // states the verification-machinery reason rather than leaving it to a directory prefix.
+  ".github/workflows/cadp-verify.yml",
   // Reviewer-INSTRUCTION files (#259 P0a). A provider CLI discovers these automatically from its
   // working directory and its ancestors and loads them as its own instructions, so a
   // candidate-authored change to one opens a path to address the reviewer that judges it — gate

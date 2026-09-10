@@ -29,4 +29,18 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # Protected invocation — the EXTERNAL half of the pin. The executed set is enumerated here by
+      # explicit path, byte-identically with VERIFIER_TEST_ARGV in cadp/product/surfaceBroker.ts
+      # (the local verifier), so a candidate cannot narrow the suite by exclusion-without-
+      # modification: both invocation sites are gate-protected files (GATE_PATH_RULES lists this
+      # workflow and surfaceBroker.ts), so changing either routes to a HUMAN_DECISION.
+      #
+      # `npm test` is NOT used here any more. package.json's `test` script remains as a developer
+      # convenience, but it is no verifier's seam — it is an ordinary delegable file.
+      #
+      # Three LEAF directories: cadp/tests/conformance/ (gate-protected), cadp/tests/ops/ and
+      # devharness/tests/ (not protected, still run — the split changes protection, never coverage).
+      # Discovery does not descend into subdirectories, so every test file must live DIRECTLY in one
+      # of the three; cadp/tests/conformance/conformance-manifest.test.ts (CM4) asserts exactly that.
+      # No globs, no --test-* pattern flags: the set is enumerated, not matched.
+      - run: node --test cadp/tests/conformance/ cadp/tests/ops/ devharness/tests/

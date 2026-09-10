@@ -299,6 +299,38 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The three leaf directories the verifiers execute, in order. This is the WHOLE executed set:
+ * `cadp/tests/conformance/` (gate-protected), `cadp/tests/ops/` and `devharness/tests/` (not
+ * protected, but still RUN — the conformance/ops split changes protection, never coverage).
+ *
+ * They are LEAF directories on purpose. Discovery does not descend into subdirectories on the
+ * surface image's Node, so the invocation contract is: every test file lives DIRECTLY in one of
+ * these three directories. `cadp/tests/conformance/conformance-manifest.test.ts` (CM4) asserts that
+ * no *.test.ts anywhere in the repository sits outside them.
+ */
+export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/", "cadp/tests/ops/", "devharness/tests/"];
+
+/**
+ * The verifier's pinned test invocation — the LOCAL half of the protected invocation.
+ *
+ * Closing the selection-bypass seam: a conformance test must not be evadable by exclusion WITHOUT
+ * modification. If the verifier ran `npm test`, the executed set would be decided by package.json's
+ * `test` script — an ordinary, delegable file — so a candidate could quietly narrow the suite while
+ * leaving every protected test byte-identical. The executed set is therefore pinned HERE, in a
+ * gate-protected file (`GATE_PATH_RULES` lists cadp/product/surfaceBroker.ts), by explicit path.
+ *
+ * package.json's `test` script REMAINS, as a developer convenience — it is simply no verifier's
+ * seam any more. Neither verifier goes through it.
+ *
+ * These tokens are byte-identical to the external verifier's run line in
+ * .github/workflows/cadp-verify.yml (itself gate-protected). No globs, no --test-* pattern flags,
+ * no shell selection: the set is enumerated, not matched. GF8 in
+ * cadp/tests/conformance/conformance-gatefiles.test.ts asserts both halves — the argv verbatim, and
+ * that executing it actually discovers and runs tests in all three suites.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", ...VERIFIER_TEST_DIRS];
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,7 +371,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",
