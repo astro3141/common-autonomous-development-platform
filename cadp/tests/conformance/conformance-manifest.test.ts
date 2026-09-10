@@ -15,7 +15,11 @@
  *        enumerated test directories. The verifiers discover tests RECURSIVELY from the repository
  *        root (bare `node --test`, see `cadp/product/surfaceBroker.ts`), so this is what pins the
  *        discovered SET: a test file cannot be parked somewhere the manifest does not account for,
- *        and a conformance file cannot be demoted by moving it into an unlisted directory.
+ *        and a conformance file cannot be demoted by moving it into an unlisted directory. The
+ *        sweep is deliberately WIDER than discovery — `node_modules` is the only exclusion, so
+ *        dot-directories are walked too: a conformance file moved into one would escape both the
+ *        verifiers' run and this directory's protection boundary, which is exactly the silent drop
+ *        MT4 exists to catch.
  */
 
 import assert from "node:assert/strict";
@@ -37,16 +41,16 @@ const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const TEST_DIRECTORIES = ["cadp/tests/conformance", "cadp/tests/ops", "devharness/tests"] as const;
 
 /**
- * Every *.test.ts under `dir`, repo-relative, skipping node_modules and dot-directories — the exact
- * two exclusions `node --test`'s own recursive discovery makes (measured), so this walk sees the
- * same file set the verifiers run. A test hidden where discovery cannot reach it does not run, and
- * a MAPPED test hidden there fails MT1 regardless.
+ * Every *.test.ts under `dir`, repo-relative. `node_modules` is the ONLY exclusion — dot-directories
+ * are walked. `node --test`'s own recursive discovery skips them, which is precisely why this sweep
+ * must not: a test file parked under a dot-directory is a file the verifiers never run and no
+ * manifest entry accounts for, and that gap is the one MT4 is here to close.
  */
 function testFilesUnder(dir: string): string[] {
   const found: string[] = [];
   const walk = (absolute: string): void => {
     for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      if (entry.name === "node_modules") continue;
       const child = join(absolute, entry.name);
       if (entry.isDirectory()) walk(child);
       else if (entry.isFile() && entry.name.endsWith(".test.ts")) found.push(relative(REPO_ROOT, child));
