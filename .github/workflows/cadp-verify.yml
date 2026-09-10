@@ -29,4 +29,24 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # EXTERNAL verifier's executed set, pinned by explicit path — byte-identical to the LOCAL
+      # verifier's `VERIFIER_TEST_ARGV` (cadp/product/surfaceBroker.ts), and asserted equal by GF8.
+      #
+      # NOT `npm test`: that resolves through package.json, which is not gate machinery, so a
+      # candidate could narrow what this job runs — drop a whole suite from the executed set —
+      # without modifying a protected file or a test. package.json's `test` script stays as a
+      # developer convenience and is no longer any verifier's seam.
+      #
+      # INVOCATION CONTRACT: all test files live DIRECTLY in a named leaf directory. Nothing
+      # recurses; every directory is named. The meta-test (conformance-manifest.test.ts, MF4)
+      # refuses a *.test.ts nested any deeper under cadp/tests/, since neither verifier would run
+      # it. Both cadp suites run here — the conformance/ops split changes protection
+      # (gateFiles.ts), never execution coverage. devharness/tests/ is named for coverage PARITY:
+      # it is not a platform component and not gate machinery, but the bare `node --test` behind
+      # `npm test` recursed into it, and this pin must not narrow the executed set.
+      #
+      # The globs are QUOTED so node's test runner expands them, not the shell: that keeps this argv
+      # byte-identical to the local verifier's, and it is the form that works on the surface image's
+      # Node 22, where a bare DIRECTORY argument to `node --test` is resolved as a module specifier
+      # and runs no suite at all.
+      - run: node --test 'cadp/tests/conformance/*.test.ts' 'cadp/tests/ops/*.test.ts' 'devharness/tests/*.test.ts'

@@ -299,6 +299,46 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The LOCAL verifier's executed set, pinned here (a gate-protected file) rather than delegated to
+ * an npm script.
+ *
+ * SELECTION-BYPASS SEAM. `npm test` resolves through `package.json`, which is NOT gate machinery: a
+ * candidate could narrow what the verifier runs — dropping a whole suite from the executed set —
+ * without modifying a single protected file or a single test. That is a weakening of the TD
+ * assurance boundary by exclusion rather than by amendment, and it is exactly what a conformance
+ * suite cannot see about itself. So both verifiers invoke node directly with these explicit paths.
+ * `package.json`'s `test` script survives as a developer convenience only; it is no verifier's seam.
+ *
+ * INVOCATION CONTRACT: all test files live DIRECTLY in a named leaf directory. Nothing here
+ * recurses, and nothing needs to: every directory is named. A test file nested any deeper would be
+ * run by neither verifier, so the meta-test (`conformance-manifest.test.ts`, MF4) refuses one
+ * anywhere under `cadp/tests/`.
+ *
+ * `devharness/tests/` is named for COVERAGE PARITY, not for protection. It is not a platform
+ * component (README) and is not gate machinery, but `npm test` — a bare `node --test`, which
+ * recurses from the repo root — did execute it, so omitting it here would have quietly narrowed
+ * what the verifiers run by 37 tests. Narrowing the executed set without touching a test is the
+ * exact seam this whole pin exists to close, so it must not happen in the act of closing it.
+ *
+ * The per-directory `*.test.ts` GLOB is load-bearing, not decoration. The surface image is
+ * `node:22-bookworm-slim` (`cadp/live/image/Dockerfile`): on Node 22 a DIRECTORY argument to
+ * `node --test` is resolved as a module specifier and dies with `ERR_MODULE_NOT_FOUND` — it runs no
+ * suite at all — while a quoted glob is expanded by the test runner itself on both Node 22 and 24.
+ * The set is pinned by this file either way; the glob is what makes the pin executable.
+ *
+ * The SPLIT changes protection, never execution coverage: `conformance/` is gate-protected
+ * (`gateFiles.ts`) and `ops/` is not, and BOTH keep running in BOTH verifiers.
+ * `.github/workflows/cadp-verify.yml` carries the byte-identical argv (asserted by GF8).
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = [
+  "node",
+  "--test",
+  "cadp/tests/conformance/*.test.ts", // gate-protected: the TD assurance projection
+  "cadp/tests/ops/*.test.ts", // not gate-protected: operational contracts only
+  "devharness/tests/*.test.ts", // not a platform component; named for coverage parity with npm test
+];
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,7 +379,7 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
     return {
       status: "PRESENT",
