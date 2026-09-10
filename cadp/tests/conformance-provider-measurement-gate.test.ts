@@ -15,8 +15,8 @@ test("reviewer and planner model scans are measured while effort slots stay abse
       assert.equal(profile.sessions_subdir, `${provider}-sessions`, `${role}:${provider} preserve name`);
       assert.equal(profile.sessions_container_dir, provider === "claude" ? "projects" : undefined, `${role}:${provider} container layout`);
       if (role === "review" && provider === "codex") {
-        assert.equal(profile.requested_effort, "high", `${role}:${provider} requested_effort is pinned`);
-        assert.deepEqual(profile.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] }, `${role}:${provider} effort_argv is the measured -c form`);
+        assert.equal(profile.requested_effort, "medium", `${role}:${provider} requested_effort is pinned`);
+        assert.deepEqual(profile.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["medium"] }, `${role}:${provider} effort_argv is the measured -c form`);
       } else {
         assert.equal(profile.requested_effort, undefined, `${role}:${provider} requested_effort is unmeasured`);
         assert.equal(profile.effort_argv, undefined, `${role}:${provider} effort_argv is unmeasured`);

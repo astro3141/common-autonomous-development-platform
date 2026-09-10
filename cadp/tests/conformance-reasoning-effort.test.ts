@@ -74,6 +74,6 @@ test("only the measured codex reviewer pins requested effort; other profiles lea
   assert.equal(REVIEW_PROVIDERS.claude.effort_argv, undefined);
   assert.equal(REVIEW_PROVIDERS.grok.requested_effort, undefined);
   assert.equal(REVIEW_PROVIDERS.grok.effort_argv, undefined);
-  assert.equal(REVIEW_PROVIDERS.codex.requested_effort, "high");
-  assert.deepEqual(REVIEW_PROVIDERS.codex.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] });
+  assert.equal(REVIEW_PROVIDERS.codex.requested_effort, "medium");
+  assert.deepEqual(REVIEW_PROVIDERS.codex.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["medium"] });
 });

@@ -36,11 +36,11 @@ const HISTORICAL_CLAUDE_ARGV = (prompt: string): string[] => [
 test("§19 reviewer argv is pinned byte-for-byte; only the measured codex effort pair is present", () => {
   assert.equal(REVIEW_PROVIDERS.claude.effort_argv, undefined);
   assert.equal(REVIEW_PROVIDERS.grok.effort_argv, undefined);
-  assert.equal(REVIEW_PROVIDERS.codex.requested_effort, "high");
-  assert.deepEqual(REVIEW_PROVIDERS.codex.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] });
+  assert.equal(REVIEW_PROVIDERS.codex.requested_effort, "medium");
+  assert.deepEqual(REVIEW_PROVIDERS.codex.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["medium"] });
   assert.deepEqual(reviewArgv("claude", "PROMPT"), HISTORICAL_CLAUDE_ARGV("PROMPT"));
   assert.deepEqual(reviewArgv("grok", "PROMPT"), ["grok", "-p", "PROMPT", "--permission-mode", "plan", "--disable-web-search", "--tools", "read_file,list_dir,grep", "--json-schema", '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","REQUEST_CHANGES"]},"reason":{"type":"string"}},"required":["verdict","reason"]}']);
-  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT", "-c", "model_reasoning_effort=high"]);
+  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT", "-c", "model_reasoning_effort=medium"]);
 });
 
 test("measured reviewer session-scan capabilities are pinned byte-exactly; effort stays unprobed", async () => {
@@ -53,8 +53,8 @@ test("measured reviewer session-scan capabilities are pinned byte-exactly; effor
     assert.deepEqual({ sessions_subdir: profile.sessions_subdir, sessions_container_dir: profile.sessions_container_dir, model_scan: profile.model_scan }, expected[provider as keyof typeof expected]);
     assert.equal(profile.effort_scan, undefined);
     if (provider === "codex") {
-      assert.equal(profile.requested_effort, "high");
-      assert.deepEqual(profile.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["high"] });
+      assert.equal(profile.requested_effort, "medium");
+      assert.deepEqual(profile.effort_argv, { flag: "-c", value_placement: "separate", value_prefix: "model_reasoning_effort=", allowed_values: ["medium"] });
     } else {
       assert.equal(profile.requested_effort, undefined);
       assert.equal(profile.effort_argv, undefined);
@@ -237,7 +237,7 @@ test("grok reviewer argv now carries the verdict json-schema constraint", () => 
 // ------------------------------------------------ codex reviewer + claude worker (2026-09-07 probes)
 
 test("codex reviewer carries the MEASURED read-only sandbox argv and first-line contract", () => {
-  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT", "-c", "model_reasoning_effort=high"]);
+  assert.deepEqual(reviewArgv("codex", "PROMPT"), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "PROMPT", "-c", "model_reasoning_effort=medium"]);
   assert.ok(!REVIEW_PROVIDERS.codex.argv_template.includes("danger-full-access"), "the reviewer must NEVER carry the worker's full-access sandbox");
   assert.equal(REVIEW_PROVIDERS.codex.verdict_format, "first-line");
   assert.deepEqual(REVIEW_PROVIDERS.codex.auth_method, { kind: "auth_files", auth_subdir: ".codex", auth_files: ["auth.json"] });
