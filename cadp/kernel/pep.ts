@@ -1,8 +1,8 @@
 /**
  * PEP (TD §3.4, §4): the only component that writes `EffectAdmissionV1` and dispatches.
  * Serialization lock D spans precondition → admission → dispatch → outcome; the admission
- * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18, run against rows read inside the
- * transaction; K7 truth stays target-authoritative (§6.3).
+ * row is the reservation; rechecks #1–#17, plus AP B4(5)'s #18 and AP B5(5)'s #19, run against rows
+ * read inside the transaction; K7 truth stays target-authoritative (§6.3).
  *
  * It is also where AP B5(1) mints: a run capability is minted in the SAME transaction as the
  * admission, at the INITIAL dispatch of a `WORK_START` whose seal-time origin WITNESS exists, and
@@ -19,7 +19,10 @@ import { Cas, CasCorruption, CasMissing } from "./cas.ts";
 import { jcs, jcsDigest, nowIso, recordDigest, sha256Hex } from "./canonical.ts";
 import { newId } from "./ids.ts";
 // `subjectKey` is aliased: recheck #9 already binds that identifier to a local target-key string.
-import { Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, subjectKey as subjectKeyOf } from "./ingress.ts";
+import {
+  Ingress, RUN_PROFILE_WORK_START, assemblySubjectKeys, declaredAssemblyEntries, declaredWorkRunRef,
+  runProfileEnrolled, subjectKey as subjectKeyOf,
+} from "./ingress.ts";
 import type { Principal } from "./ingress.ts";
 import { adapterEntry, identityEntry, resolveActivePolicy } from "./policyState.ts";
 import type { ActivePolicy } from "./policyState.ts";
@@ -329,7 +332,7 @@ export class Pep {
     return binding.authority_ref === adapter.describe().authority_ref;
   }
 
-  // ------------------------------------------------- the 17 rechecks, plus AP B4(5)'s #18
+  // -------------------------------- the 17 rechecks, plus AP B4(5)'s #18 and AP B5(5)'s #19
 
   #admissionTransaction(
     requestPre: EffectRequestV1,
@@ -650,6 +653,49 @@ export class Pep {
               `${entry.evidence_kind} on ${key}: the bound input carries ${carried.size} of ${complete.size}${missing.length > 0 ? ` (missing ${missing.join(", ")})` : ""}`,
             );
           }
+        }
+      }
+    }
+
+    // #19 — the DURABLE MEMBERSHIP PROOF (AP B5(5)). For a request whose sealed `requester_ref` is
+    // enrolled and which names a declared work-run subject, the PEP requires the `run_membership`
+    // row B5(5)'s insert wrote in that request's OWN sealing transaction, with a `work_run_ref`
+    // EXACTLY equal to the run this request is bound to — absent or different refuses
+    // `RUN_MEMBERSHIP_UNPROVEN`. The row is read HERE, inside the admission transaction, because
+    // authority after restart is reconstructed from rows and never from process memory (TD v0.4
+    // §4.5): the secret itself is not needed at admission and is never touched on this path.
+    //
+    // What it is FOR, stated exactly so it is not read as more than it is. B5(4)'s presentation
+    // legs are seal-time, and their proof — the capability — is deliberately one-shot and not
+    // re-presentable at dispatch. #19 is the ADMISSION-time restatement of the same fact in the
+    // only durable form there is: this effect proved, at seal, membership of the run it claims.
+    // A request that reached a K3 row by any path that did NOT write that proof — a run-bound
+    // request sealed while the profile was not yet governing this requester, whose `requester_ref`
+    // a later `POLICY_ACTIVATE` then enrolled — is admitted no further, though its seal was lawful
+    // when it happened. What it is NOT for: it can never catch a fork whose follow-up seal wrote
+    // its own proof, which is exactly the retroactive-promotion case B5(1)'s WITNESSED minting
+    // predicate closes one step earlier, at the mint (`#isRunCapabilityMinting`, control A4 leg w1).
+    //
+    // GATE, and why every other deployment is untouched: `runProfileEnrolled` is expressible ONLY
+    // under `cadp.kernel-config.v2` and only for a `requester_ref` the active registry names, and
+    // `declaredWorkRunRef` is the Ingress's own lookup on the DECLARED exact `(authority_ref,
+    // namespace)` pair — the same one B5(9) and B5(4) are defined over, so the PEP can never
+    // disagree with the seal about which run a request is bound to. A v1 config, a v2 config whose
+    // enrollment does not name this requester, and a request naming no declared work-run subject
+    // all skip it, leaving those admission paths exactly what they were.
+    if (this.#enabled("recheck19_run_membership") && runProfileEnrolled(active.config, request.requester_ref)) {
+      const bound = declaredWorkRunRef(request, active.config);
+      if (bound !== undefined) {
+        const proof = store.runMembership(request.effect_id);
+        if (proof === undefined || proof.work_run_ref !== bound) {
+          // The detail names the caller's own sealed refs and nothing else: no capability, no
+          // digest and no row beyond the two run refs already in the request it sent (B6(3)).
+          throw new Refuse(
+            "RUN_MEMBERSHIP_UNPROVEN",
+            proof === undefined
+              ? `${request.effect_id} is bound to ${bound} and proves membership of no run`
+              : `${request.effect_id} proves membership of ${proof.work_run_ref}, not ${bound}`,
+          );
         }
       }
     }
