@@ -299,6 +299,52 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The PROTECTED verifier invocation — the exact argv the `--network none` verifier container runs.
+ *
+ * DIRECT, never `npm test`. The npm `test` script stays in package.json as a developer convenience,
+ * but it is no longer any verifier's seam: package.json is not gate machinery, so a candidate could
+ * rewrite that one line and change what "verified" means without a Human ever seeing the change.
+ * Both verifiers (this one and the external `.github/workflows/cadp-verify.yml`) therefore invoke
+ * node directly, from files that ARE gate-protected, and the two argv forms are kept identical.
+ *
+ * BARE — no positional selectors, no glob, no `--test-*` pattern flag. Directory positionals were
+ * MEASURED BROKEN for `.ts` discovery on the container's Node 22 (`cadp/live/image/`): `node --test
+ * cadp/tests/conformance/` does not enumerate that directory, it resolves the path as a module entry
+ * point and dies `Cannot find module`, reporting one failing pseudo-test per positional and running
+ * none of the real suites. Bare `node --test` uses recursive default discovery, which finds every
+ * `*.test.ts` in the repository — including the `cadp/tests/conformance/`, `cadp/tests/ops/` and
+ * `devharness/tests/` subdirectories. A future runtime upgrade may make the explicit-path form work;
+ * revisiting this is then a CONSCIOUS decision, measured on the image, not an assumption.
+ *
+ * Selection integrity does not rest on the selector, then. It rests on: (a) the zero-test guard
+ * below — a run that discovered nothing can never be reported as success; (b) the meta-test
+ * `cadp/tests/conformance/conformance-manifest.test.ts`, which refuses any `*.test.ts` living
+ * outside the three enumerated directories and any conformance file the manifest does not account
+ * for, so the discovered SET is pinned by a protected file; (c) `gateFiles.ts`, which routes a
+ * change to `cadp/tests/conformance/`, to this file, or to the workflow yml to a HUMAN_DECISION.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test"];
+
+/**
+ * The number of tests a `node --test` run actually executed, read from its run summary, or
+ * `undefined` when no summary is present at all.
+ *
+ * MEASURED (Node v22.23.2): a run that discovers NO test files prints `# tests 0` and exits 0 —
+ * status alone cannot distinguish "everything passed" from "nothing ran". Both reporter forms are
+ * accepted: `# tests 40` (tap, the non-TTY default the container gets) and `ℹ tests 40` (spec). The
+ * LAST summary line wins; a failing test's captured output is echoed back into the stream prefixed,
+ * so an earlier match may belong to the candidate's own output rather than to this run.
+ */
+export function testsExecuted(output: string): number | undefined {
+  let executed: number | undefined;
+  for (const line of output.split("\n")) {
+    const match = /^(?:#|ℹ)\s+tests\s+(\d+)$/u.exec(line.trim());
+    if (match?.[1] !== undefined) executed = Number(match[1]);
+  }
+  return executed;
+}
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,8 +385,20 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
+    // ZERO-TEST GUARD. A verifier that silently executed nothing must never report success: a
+    // discovery that finds no files exits 0 with `# tests 0` (measured), which is byte-for-byte as
+    // "green" as a full green run. UNKNOWN, not "failure", is the honest conclusion — it is what
+    // this file already returns for every case where the run produced no VERDICT ABOUT THE
+    // CANDIDATE (DIRTY_WORKSPACE, HEAD_MISMATCH, DEP_PROVISION_FAILED), and a zero-test or
+    // summary-less run is exactly that: no evidence, not evidence of a defect. Neither reading can
+    // be mistaken for success — the policy's verification gate requires PRESENT+success — but
+    // "failure" would assert something about the candidate that this run did not observe.
+    const executed = testsExecuted(test.stdout + test.stderr);
+    if (executed === undefined || executed === 0) {
+      return { status: "UNKNOWN", clone_head, unknown_reason: executed === undefined ? "TEST_SUMMARY_UNPARSEABLE" : "ZERO_TESTS_EXECUTED" };
+    }
     return {
       status: "PRESENT",
       clone_head,

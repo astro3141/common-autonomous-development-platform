@@ -29,7 +29,20 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/mcp.ts", // the tool surface a supervising session drives
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
-  "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // The conformance suite that decides verification pass/fail — narrowed from the blanket
+  // `cadp/tests/` to the conformance half only (manifest, meta-test and shared harness included).
+  // These tests are NOT authority themselves: they are the EXECUTABLE ASSURANCE PROJECTION of TD
+  // authority, protected so that the TD's assurance boundary cannot be WEAKENED — not because
+  // editing one "amends the TD" (`cadp/tests/conformance/manifest.ts` states this in full).
+  // `cadp/tests/ops/` — argv snapshots, prompt shapes, timeout budgets, retention conveniences —
+  // is deliberately NOT here: it still RUNS in both verifiers, it just no longer forces a Human
+  // merge for an operational shape change.
+  "cadp/tests/conformance/",
+  // The external verifier's own invocation: what the Actions check-run actually RUNS is
+  // verification machinery, no less than the broker's argv. Listed explicitly even though the
+  // `.github/` rule below already covers it, so that narrowing that broad constitutional rule can
+  // never silently unprotect the verifier invocation.
+  ".github/workflows/cadp-verify.yml",
   // Reviewer-INSTRUCTION files (#259 P0a). A provider CLI discovers these automatically from its
   // working directory and its ancestors and loads them as its own instructions, so a
   // candidate-authored change to one opens a path to address the reviewer that judges it — gate

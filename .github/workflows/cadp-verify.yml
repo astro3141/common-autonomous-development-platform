@@ -29,4 +29,28 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # The PROTECTED verifier invocation, kept identical to the local verifier's argv
+      # (`VERIFIER_TEST_ARGV`, cadp/product/surfaceBroker.ts): node DIRECTLY, never `npm test`.
+      # package.json's `test` script stays as a developer convenience, but it is no longer any
+      # verifier's seam — package.json is not gate machinery, so a candidate could rewrite that one
+      # line and change what "verified" means without a Human seeing it. This workflow file IS gate
+      # machinery (cadp/product/gateFiles.ts), and so is the broker that runs the same argv locally.
+      #
+      # BARE — no positional selectors, no glob, no --test-* pattern flag. Directory positionals were
+      # measured broken for .ts discovery on the surface image's Node 22 (the path resolves as a
+      # module entry point: `Cannot find module`, one failing pseudo-test per positional, no suite
+      # actually run), while recursive default discovery finds every *.test.ts. All three test
+      # directories — cadp/tests/conformance/, cadp/tests/ops/, devharness/tests/ — run here, exactly
+      # as before the split: the split changes protection, never execution coverage. A future runtime
+      # upgrade may make the explicit-path form work; revisiting is then a conscious, measured choice.
+      #
+      # ZERO-DISCOVERY GUARD. Measured (Node 22): a run that discovers NO test files prints
+      # `# tests 0` and EXITS 0, so this job's exit status alone can never catch an invocation that
+      # silently ran nothing — the summary must be read. `pipefail` keeps a genuine suite failure
+      # fatal through the tee.
+      - name: conformance + ops suites (protected invocation)
+        run: |
+          set -o pipefail
+          node --test | tee /tmp/cadp-node-test.out
+          grep -Eq '^(# |ℹ )tests [1-9][0-9]*$' /tmp/cadp-node-test.out \
+            || { echo "::error::zero tests executed — the verifier discovered nothing, so it verified nothing"; exit 1; }

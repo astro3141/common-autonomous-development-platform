@@ -31,7 +31,7 @@
  *                             failure — not a Temporal timeout — is what the workflow observes.
  *
  * The values are implementation configuration, not architecture authority; the ORDERING is the
- * contract (asserted in cadp/tests/conformance-timeout.test.ts). None of them may be infinite.
+ * contract (asserted in cadp/tests/ops/conformance-timeout.test.ts). None of them may be infinite.
  */
 
 /** One long-running broker operation's complete, explicit bound stack. All values are ms. */
