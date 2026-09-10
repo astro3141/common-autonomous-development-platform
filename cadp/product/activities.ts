@@ -547,7 +547,14 @@ export async function reviewCandidate(input: {
   work_item: string;
   review_product?: string;
   prior_step_envelope_digest?: string;
-}): Promise<{ review_evidence_id: string; backend_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
+}): Promise<{
+  review_evidence_id: string;
+  review_body_cas_key: string;
+  backend_evidence_id: string;
+  verdict: string;
+  reason: string;
+  work_step_envelope_digest: string;
+}> {
   // Fail closed on an unknown selection BEFORE any surface or kernel call; omitted keeps claude.
   const reviewProvider = resolveReviewProvider(input.review_product ?? "claude");
   // Honest attribution: the REVIEW evidence is authenticated as the provider that actually
@@ -575,12 +582,25 @@ export async function reviewCandidate(input: {
     rv.backend_effort_locator,
     rv.backend_requested_effort,
   );
+  // #259 P0b: the reviewer's FULL text is put into kernel CAS and the claim carries the resulting
+  // key ALONGSIDE its digest, so the pair is self-verifying — fetch `body_cas_key`, sha256 it,
+  // compare `body_digest` — and the post-STOP repair lane can quote findings byte-for-byte instead
+  // of only the workflow's parsed one-line reason. Both digest and key are taken from the SAME
+  // buffer, so the digest is over exactly the bytes stored, not over a re-encoding of them.
+  //
+  // Stored AS-IS: no truncation and no redaction. This is the reviewer surface's own stdout, and
+  // it holds no kernel secret — its prompt is the NUL-sanitised diff plus the work item, and the
+  // surface runs with no kernel credential at all. The broker's 60 000-character cap bounds that
+  // PROMPT, never this evidence. The put uses the REVIEWER's own principal (the same one that
+  // seals the envelope below), so no other identity's token touches this path.
+  const bodyBytes = Buffer.from(rv.stdout, "utf8");
+  const { cas_key: body_cas_key } = await reviewer.putBlob(bodyBytes);
   const envelope = await reviewer.submitEvidence({
     evidence_kind: "REVIEW",
     subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
     availability: "PRESENT",
     claim_schema: "cadp.review.v1",
-    claim: { verdict: rv.verdict, body_digest: sha256(rv.stdout), reviewer_run_id: `${reviewProvider}-p:${Date.now()}` },
+    claim: { verdict: rv.verdict, body_digest: sha256(bodyBytes), body_cas_key, reviewer_run_id: `${reviewProvider}-p:${Date.now()}` },
     producer_ref: reviewProvider === "claude" ? "reviewer:claude-code" : `reviewer:${reviewProvider}`,
     source_ref: `${reviewProvider}:read-only-profile`,
     source_relation: "INDEPENDENT_OBSERVATION",
@@ -592,6 +612,7 @@ export async function reviewCandidate(input: {
   });
   return {
     review_evidence_id: envelope.evidence_id,
+    review_body_cas_key: body_cas_key,
     backend_evidence_id: backendEvidence,
     verdict: rv.verdict,
     reason: rv.reason,

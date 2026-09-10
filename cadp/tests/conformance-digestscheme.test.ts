@@ -19,7 +19,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { makeHarness, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, sealScriptedRequest, stopSharedOpa, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 
 after(() => stopSharedOpa());
@@ -34,13 +34,13 @@ const commit = (object_id: string, content_digest?: unknown) => ({
 });
 
 /** A minimal REVIEW draft: the kind the reviewer identity may produce, per the reference registry. */
-const reviewDraft = (subject_bindings: unknown[]) =>
+const reviewDraft = (h: Harness, subject_bindings: unknown[]) =>
   ({
     evidence_kind: "REVIEW",
     subject_bindings,
     availability: "PRESENT",
     claim_schema: "cadp.review.v1",
-    claim: { verdict: "APPROVE", body_digest: "a".repeat(64) },
+    claim: { verdict: "APPROVE", ...reviewBodyPair(h, "digest-scheme review body") },
     producer_ref: "reviewer:claude-code",
     source_ref: "digest-scheme-test",
     source_relation: "INDEPENDENT_OBSERVATION",
@@ -61,7 +61,7 @@ test("D1/D2: an evidence subject binding carrying an unapproved digest scheme is
       [commit("sha-d2c", { algorithm: "sha256", canonicalization: "cadp-jcs-2", value: VALUE }), commit("sha-d2d")],
     ]) {
       assert.throws(
-        () => h.ingress.submitEvidence(reviewDraft(subject_bindings), PRINCIPALS.reviewer),
+        () => h.ingress.submitEvidence(reviewDraft(h, subject_bindings), PRINCIPALS.reviewer),
         (error: unknown) => (error as { reason?: string }).reason === "DIGEST_SCHEME_UNAPPROVED",
         JSON.stringify(subject_bindings),
       );
@@ -76,11 +76,11 @@ test("D3/D4: an approved scheme seals verbatim, and a binding with no content_di
   const h = await makeHarness();
   try {
     const approved = { algorithm: "sha256", canonicalization: "cadp-jcs-1", value: VALUE };
-    const sealed = h.ingress.submitEvidence(reviewDraft([commit("sha-d3", approved)]), PRINCIPALS.reviewer);
+    const sealed = h.ingress.submitEvidence(reviewDraft(h, [commit("sha-d3", approved)]), PRINCIPALS.reviewer);
     assert.deepEqual(sealed.subject_bindings[0]?.content_digest, approved, "the approved digest is sealed unchanged");
 
     // D4: no digest is DEMANDED — digests that exist are validated, absence is not this layer's business.
-    const digestless = h.ingress.submitEvidence(reviewDraft([commit("sha-d4")]), PRINCIPALS.reviewer);
+    const digestless = h.ingress.submitEvidence(reviewDraft(h, [commit("sha-d4")]), PRINCIPALS.reviewer);
     assert.equal(digestless.subject_bindings[0]?.content_digest, undefined);
     assert.equal(digestless.subject_bindings[0]?.object_id, "sha-d4");
 
@@ -88,7 +88,7 @@ test("D3/D4: an approved scheme seals verbatim, and a binding with no content_di
     // check reads the policy set, and knows nothing about which namespace carries which scheme.
     for (const canonicalization of ["raw-bytes-1", "cadp-jcs-1", "cadp-bundle-payload-1"]) {
       const envelope = h.ingress.submitEvidence(
-        reviewDraft([commit(`sha-${canonicalization}`, { algorithm: "sha256", canonicalization, value: VALUE })]),
+        reviewDraft(h, [commit(`sha-${canonicalization}`, { algorithm: "sha256", canonicalization, value: VALUE })]),
         PRINCIPALS.reviewer,
       );
       assert.equal(envelope.subject_bindings[0]?.content_digest?.canonicalization, canonicalization);
@@ -114,7 +114,7 @@ test("D5: malformed content_digests remain the schema layer's refusal and never 
       "cadp-jcs-1:" + VALUE,
     ]) {
       assert.throws(
-        () => h.ingress.submitEvidence(reviewDraft([commit("sha-d5", malformed)]), PRINCIPALS.reviewer),
+        () => h.ingress.submitEvidence(reviewDraft(h, [commit("sha-d5", malformed)]), PRINCIPALS.reviewer),
         (error: unknown) =>
           (error as Error).message.includes("binding.content_digest") ||
           (error as { reason?: string }).reason === "DIGEST_SCHEME_UNAPPROVED",
@@ -123,7 +123,7 @@ test("D5: malformed content_digests remain the schema layer's refusal and never 
     }
     // A non-array subject_bindings stays the schema layer's refusal too, not a TypeError.
     assert.throws(
-      () => h.ingress.submitEvidence(reviewDraft("not-an-array" as never), PRINCIPALS.reviewer),
+      () => h.ingress.submitEvidence(reviewDraft(h, "not-an-array" as never), PRINCIPALS.reviewer),
       (error: unknown) => (error as Error).message.includes("bindings must be an array"),
     );
     assert.equal(evidenceRows(h), before, "no malformed draft sealed a row");

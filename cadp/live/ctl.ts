@@ -11,6 +11,7 @@
  *   node cadp/live/ctl.ts <dir> human-approve <effect_id> <workflow_id>
  *   node cadp/live/ctl.ts <dir> state <effect_id>
  *   node cadp/live/ctl.ts <dir> reconcile <effect_id>
+ *   node cadp/live/ctl.ts <dir> review-body <evidence_id>   full reviewer text of one REVIEW row
  */
 
 import { execFileSync, spawn as execFileSpawn, spawnSync } from "node:child_process";
@@ -30,6 +31,7 @@ import { touchesGateMachinery } from "../product/gateFiles.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { killLiveComponent, startLiveComponent } from "./componentControl.ts";
 import { startAttestRefresh } from "./attestRefresh.ts";
+import { readReviewBody } from "./reviewBody.ts";
 import { ConstitutionalStore } from "../kernel/store.ts";
 import { Cas } from "../kernel/cas.ts";
 import { resolveActivePolicy } from "../kernel/policyState.ts";
@@ -580,6 +582,15 @@ async function main(): Promise<void> {
     }
     case "reconcile":
       console.log(JSON.stringify(await client("cadp-workflow").requestReconcile(process.argv[4]!)));
+      break;
+    case "review-body":
+      // #259 P0b team-lead repair lane: the exact reviewer stdout of one REVIEW evidence row,
+      // written to stdout as BYTES (no JSON wrapper, no re-encoding) so a stopped run's findings
+      // can be quoted verbatim. Read-only and offline — `readReviewBody` opens the store file the
+      // same way `attest-schedule` above does, uses no kernel token, and re-verifies the claim's
+      // {body_cas_key, body_digest} pair before returning; on any mismatch it throws and this
+      // command exits non-zero rather than printing unverified bytes.
+      process.stdout.write(readReviewBody(dir, process.argv[4]!));
       break;
     case "root-window": {
       // Root-operator action on the PEP secret path (TD §12: enabled only for the duration

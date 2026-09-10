@@ -225,6 +225,11 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
     priorStepDigest = reviewed.work_step_envelope_digest;
     trace["review_evidence_id"] = reviewed.review_evidence_id;
     trace["review_backend_evidence_id"] = reviewed.backend_evidence_id;
+    // #259 P0b: round-scoped, so a STOPPED run's trace names BOTH rounds' review evidence rather
+    // than only the last. Each id is what the team lead hands to `ctl review-body <dir> <id>` to
+    // recover that round's full reviewer text; the CAS key is carried beside it as provenance.
+    trace[`round_${round}_review_evidence_id`] = reviewed.review_evidence_id;
+    trace[`round_${round}_review_body_cas_key`] = reviewed.review_body_cas_key;
 
     approved = reviewed.verdict === "APPROVE" && verified.conclusion === "success";
     if (!approved) {

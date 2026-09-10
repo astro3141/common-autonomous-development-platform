@@ -504,6 +504,16 @@ function require_sha(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * The self-verifying `cadp.review.v1` body pair (#259 P0b): the reviewer's full text is really in
+ * CAS and `body_digest` is the sha256 of exactly those bytes. Every REVIEW draft in the suite
+ * builds its claim through this, because the ingress refuses a PRESENT REVIEW without it.
+ */
+export function reviewBodyPair(h: Harness, body: string): { body_digest: string; body_cas_key: string } {
+  const bytes = Buffer.from(body, "utf8");
+  return { body_digest: require_sha(bytes), body_cas_key: h.ingress.putBlob(bytes) };
+}
+
 /** Full positive chain: assemble → evaluate → admit; returns each stage for assertions. */
 export async function runChain(h: Harness, effect_id: string, evidence: string[] = []) {
   const input = h.ingress.assembleAdmissionInput(effect_id, evidence);

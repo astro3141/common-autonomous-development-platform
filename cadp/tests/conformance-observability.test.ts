@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
-import { makeHarness, stopSharedOpa, sealScriptedRequest, runChain, PRINCIPALS } from "./support/harness.ts";
+import { makeHarness, reviewBodyPair, stopSharedOpa, sealScriptedRequest, runChain, PRINCIPALS } from "./support/harness.ts";
 import type { Harness } from "./support/harness.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { KernelClient, KernelApiError } from "../clients/kernelClient.ts";
@@ -331,7 +331,7 @@ test("O5: attribution and human-wait derive only from stored rows through observ
         subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: "a".repeat(40) }],
         availability: "PRESENT",
         claim_schema: "cadp.review.v1",
-        claim: { verdict: "APPROVE", body_digest: "d".repeat(64) },
+        claim: { verdict: "APPROVE", ...reviewBodyPair(h, "observability review body") },
         producer_ref: "reviewer:claude-code",
         source_ref: "review:o5",
         source_relation: "INDEPENDENT_OBSERVATION",
