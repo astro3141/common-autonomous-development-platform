@@ -46,6 +46,14 @@
  * `recheck19_run_membership` guard-bite knob; and it activates for no v1 deployment, no ungoverned
  * v2 bundle and no non-enrolled requester.
  *
+ * PART 6, the last section: the CHECKED-OUT live composition (`cadp/live/ops.ts`'s `startWork`) on
+ * this path, driven against the real Ingress and PEP — the request it builds under the v0.5 origin
+ * profile is adjudicated an origin and acquires the `run_membership(E, E)` witness; a retry of one
+ * origin over a MOVED base ref and a REBUILT worker image converges on one `effect_id`, one
+ * allocation, one K3 row and ZERO incidents; and the DEFAULT (v0.4) profile still seals through a
+ * v1 kernel witnessing nothing. The ops-side claims it complements — the tuple's exact shape, the
+ * byte-reproducible material and the origin record's guards — are in `conformance-basesha.test.ts`.
+ *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
  * `origin_key` → one `effect_id` for the store's lifetime, and the o-iv/o-vi immutability legs).
@@ -60,6 +68,9 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
@@ -72,6 +83,9 @@ import type { ActivatedAllocationContracts } from "../kernel/policyBundle.ts";
 import type { AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim } from "../kernel/adapters/types.ts";
 import type { SubjectBinding, TargetRef } from "../kernel/records.ts";
 import { REFERENCE_IDENTITIES, buildReferenceKernelConfig } from "../deployment/referencePolicy.ts";
+import { startWork } from "../live/ops.ts";
+import type { StartWorkDependencies, SurfaceImageIdentity, WorkStartKernelClient } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 import {
   DEFAULT_WORK_RUN_REF, PRINCIPALS, V2_ALLOCATION_SCHEMAS, V2_ALLOCATION_SCHEMA_DESCRIPTORS,
   makeHarness, stopSharedOpa, v2ConfigOverrides,
@@ -2335,5 +2349,144 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ===================================================== PART 6 — the LIVE COMPOSITION on this path
+
+/**
+ * PART 6, the cross-kernel half of the `cadp/live/ops.ts` origin lane: the CHECKED-OUT live
+ * `startWork`, driven against THIS file's real Ingress and PEP rather than a scripted client.
+ *
+ * The ops-side claims — the tuple's exact shape, the byte-reproducible material, the origin record
+ * and its guards — are asserted in `conformance-basesha.test.ts`, where the kernel is scripted and
+ * the bytes are inspectable. What can only be asserted HERE is what the real Authority Plane does
+ * with what ops seals: that the request ops builds IS adjudicated a run origin (B5(9)), that the
+ * durable `run_membership(E, E)` witness it acquires names the effect itself in BOTH columns, and
+ * that a retry of one origin converges on one `effect_id`, one allocation, one K3 row, an unchanged
+ * `request_digest` and ZERO `REQUEST_DIGEST_CONFLICT` incidents — the exact failure the material
+ * pinning exists to make unconstructible. The complementary leg closes the lane: the DEFAULT
+ * (v0.4) profile still seals through a v1 kernel, acquiring no witness and no membership row.
+ */
+
+const OPS_SHA = "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1";
+const OPS_MOVED_SHA = "1111111111111111111111111111111111111111";
+const OPS_IMAGE: SurfaceImageIdentity = {
+  image: "cadp-surface:0.151.0-2.1.221",
+  image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  tool_versions: { "codex-cli": "1.2.3", claude: "4.5.6", grok: "absent" },
+};
+const OPS_REBUILT_IMAGE: SurfaceImageIdentity = { ...OPS_IMAGE, image: "cadp-surface:0.152.0-2.1.222", tool_versions: { "codex-cli": "9.9.9" } };
+const OPS_MANIFEST = { repo_id: "42", repo_full_name: "owner/repo" } as unknown as LiveEnvManifest;
+const OPS_ITEM = ["implement median", "8", "6"];
+
+/** The live `KernelClient` surface, re-homed onto this harness's in-process kernel. */
+function opsClient(rp: RunProfileHarness): WorkStartKernelClient {
+  const { h } = rp;
+  return {
+    async allocateEffectId(tuple: unknown) {
+      return { effect_id: h.ingress.allocateEffectId(tuple as Parameters<typeof h.ingress.allocateEffectId>[0], PRINCIPALS.workflow) };
+    },
+    async putBlob(bytes: Uint8Array) {
+      return { cas_key: h.ingress.putBlob(bytes) };
+    },
+    async sealEffectRequest(body: unknown) {
+      return h.ingress.sealEffectRequest(body, PRINCIPALS.workflow);
+    },
+    async assembleAdmissionInput(effect_id: string, evidence_refs: string[]) {
+      return h.ingress.assembleAdmissionInput(effect_id, evidence_refs);
+    },
+    async evaluate(input_digest: string) {
+      return h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id: string, decision_id: string) {
+      return h.pep.admitAndDispatch(effect_id, decision_id, PRINCIPALS.workflow);
+    },
+  } as unknown as WorkStartKernelClient;
+}
+
+function opsDeps(rp: RunProfileHarness, overrides: Partial<StartWorkDependencies> = {}): StartWorkDependencies {
+  return {
+    manifest: OPS_MANIFEST,
+    client: opsClient(rp),
+    namespaceId: "cadp-v04",
+    resolveBase: () => OPS_SHA,
+    surfaceImage: () => OPS_IMAGE,
+    ...overrides,
+  };
+}
+
+function opsDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "cadp-ops-origin-"));
+  after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** KERNEL_INCIDENT is sealed as evidence, so the count is over the envelope table, by kind. */
+function incidents(h: Harness): number {
+  return (h.store.db.prepare("SELECT COUNT(*) AS n FROM evidence_envelope WHERE evidence_kind = 'KERNEL_INCIDENT'").get() as { n: number }).n;
+}
+
+test("live composition: ops.startWork under \"v05\" seals an ADJUDICATED origin, and its retry converges with zero incidents", async () => {
+  const rp = await runProfileHarness();
+  const dir = opsDir();
+  try {
+    const originKey = "live-origin-1";
+    const first = await startWork(dir, "development", OPS_ITEM, { originProfile: "v05", originKey, dependencies: opsDeps(rp) });
+    assert.ok(first !== undefined, "the live composition's own WORK_START is admitted through the real chain");
+    assert.equal(first.origin_key, originKey);
+
+    // B5(9): what ops sealed IS an origin — the durable `run_membership(E, E)` witness, both
+    // columns the effect itself, which is what makes it minting at its own initial dispatch.
+    const membership = rp.h.store.runMembership(first.effect_id);
+    assert.equal(membership?.effect_id, first.effect_id, "run_membership's first column is the origin");
+    assert.equal(membership?.work_run_ref, first.effect_id, "and its second column is the origin too");
+    assert.equal(count(rp.h, "run_membership"), 1, "exactly one witness");
+
+    // Leg 2/3 as the STORED request records them: exactly one work-run binding, naming itself.
+    const row = rp.h.store.effectRequest(first.effect_id)!;
+    const workRun = row.work_bindings.filter((b) => b.authority_ref === WORK_RUN_AUTHORITY && b.namespace === "work-run");
+    assert.equal(workRun.length, 1, "exactly one binding on the declared work-run pair");
+    assert.equal(workRun[0]?.object_id, first.effect_id, "whose object_id is the allocated effect_id itself");
+    const request_digest = row.request_digest.value;
+
+    // THE RETRY, with the base ref MOVED and the worker image REBUILT under it. One origin_key ⇒
+    // one effect_id (A5), and the material the record pinned ⇒ an idempotent re-seal rather than
+    // the `REQUEST_DIGEST_CONFLICT` that would strand this origin for the store's lifetime.
+    const retry = await startWork(dir, "development", OPS_ITEM, {
+      originProfile: "v05",
+      originKey,
+      dependencies: opsDeps(rp, { resolveBase: () => OPS_MOVED_SHA, surfaceImage: () => OPS_REBUILT_IMAGE }),
+    });
+    const retried = retry?.effect_id ?? first.effect_id;
+    assert.equal(retried, first.effect_id, "one origin_key → one effect_id, across the retry");
+    assert.equal(count(rp.h, "effect_request"), 1, "one K3 row: the re-seal was the idempotent no-op");
+    assert.equal(count(rp.h, "effect_allocation"), 1, "one allocation for the origin");
+    assert.equal(rp.h.store.effectRequest(first.effect_id)!.request_digest.value, request_digest, "the stored request is unchanged");
+    assert.equal(count(rp.h, "run_membership"), 1, "and no second witness");
+    assert.equal(incidents(rp.h), 0, "ZERO KERNEL_INCIDENT rows — no REQUEST_DIGEST_CONFLICT anywhere");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("live composition: the DEFAULT (v0.4) profile still seals through a v1 kernel, witnessing nothing", async () => {
+  // A `cadp.kernel-config.v1` deployment — the live one. The zero-sentinel `cadp.allocation-key.v1`
+  // tuple is the only allocation this kernel accepts, the seal carries no work-run binding, no
+  // adjudication is even expressible, and the request acquires no witness: exactly today.
+  const v1 = await runProfileHarness({});
+  const dir = opsDir();
+  try {
+    const started = await startWork(dir, "development", OPS_ITEM, { ordinalArg: "4242", dependencies: opsDeps(v1) });
+    assert.ok(started !== undefined, "the v0.4 path is untouched end to end");
+    assert.equal(started.origin_key, undefined, "and has no origin key");
+    const row = v1.h.store.effectRequest(started.effect_id)!;
+    assert.equal(row.work_bindings.some((b) => b.namespace === "work-run"), false, "no work-run binding on the v0.4 path");
+    assert.equal(v1.h.store.runMembership(started.effect_id), undefined, "no witness, so it is minting at no dispatch");
+    assert.equal(count(v1.h, "run_membership"), 0);
+    assert.equal(count(v1.h, "run_capability"), 0);
+    assert.equal(incidents(v1.h), 0);
+  } finally {
+    v1.h.close();
   }
 });
