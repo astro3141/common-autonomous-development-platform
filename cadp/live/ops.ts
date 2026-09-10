@@ -237,9 +237,11 @@ export function readOriginKeyRecords(dir: string): OriginKeyRecord[] {
 }
 
 /**
- * Append one minted `origin_key`, BEFORE the first kernel call. Fails closed: a mint we could not
- * record is a mint a crash would lose, and losing it is exactly the fork this record exists to
- * prevent — a retry that cannot recover the key mints a second one and originates a SECOND run.
+ * Append one minted `origin_key`, before anything else in the start can fail. Fails closed: a mint
+ * we could not record is a mint a crash would lose, and losing it is exactly the fork this record
+ * exists to prevent — a retry that cannot recover the key mints a second one and originates a
+ * SECOND run. The caller publishes the key through `log` BEFORE calling this, so a refusal here
+ * still leaves the operator a key to re-present rather than swallowing it.
  */
 function appendOriginKeyRecord(dir: string, record: OriginKeyRecord): void {
   writeFileSync(join(dir, ORIGIN_KEY_RECORD_FILE), `${JSON.stringify([...readOriginKeyRecords(dir), record], null, 2)}\n`);
@@ -329,9 +331,11 @@ export interface StartWorkDependencies {
  * the record `resource_prefix` from the origin key and drops the wall-clock ordinal.
  *
  * RECOVERING A MINTED ORIGIN (WP §3.6 caller obligation 1). A direct `v05` start with no
- * `originKey` mints one with `crypto.randomUUID`, emits it through `log`, and appends it to
- * `<dir>/origin-keys.json` BEFORE the first kernel call — so a process that dies anywhere after
- * that leaves a recoverable record instead of an orphaned run. The recovery flow is: read
+ * `originKey` mints one with `crypto.randomUUID` as its FIRST fallible-path act — before the
+ * manifest read, the client construction, the argument legs and every kernel call — then emits it
+ * through `log` and appends it to `<dir>/origin-keys.json`. So a process that dies anywhere after
+ * entry leaves a recoverable record instead of an orphaned run, and even a failure of the record
+ * write itself surfaces the key (log line first, then `OriginStartFailure`). The recovery flow is: read
  * `<dir>/origin-keys.json` (`readOriginKeyRecords`), match the invocation by `work_item_digest`,
  * and re-invoke this function with `{ originKey: <the recorded key> }`. That converges on the SAME
  * `effect_id` and, on the record vertical, re-seals byte-identical material — an idempotent no-op
@@ -368,55 +372,69 @@ export async function startWork(
 ): Promise<{ effect_id: string; workflow_id: string; origin_key?: string } | undefined> {
   const log = options.log ?? SILENT;
   const profile = options.originProfile ?? "v04";
-  const m = dependencies.manifest ?? loadManifest(dir);
-  const c = dependencies.client ?? liveClient(dir, "cadp-workflow");
-  const namespaceId = dependencies.namespaceId ?? temporalNamespaceId(m);
 
-  if (vertical === "development") {
-    const floor = devEffectFloorViolation(boundArg(extra[2], 6));
-    if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
-  }
-  // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
-  // an unknown provider at entry, before anything is sealed.
-  const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
-  // review_product select (extra[5], optional; omitted keeps the claude default). §8.4 reviewer
-  // independence fails closed HERE, before anything is sealed or any surface spends compute.
-  const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
-  assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
-  // extra[6]: opt-in external verification backend (#57). Only the exact literal enables it —
-  // anything else fails closed rather than silently running without the second verifier.
-  if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
-  const externalVerification = extra[6] === "external";
-
-  // WP §3.6, caller obligation 1 — DECIDE THE ORIGIN KEY ONCE, and make it durable and visible
-  // before anything that could fail. Placed here, after the fail-closed argument legs above (which
-  // are pure and allocate nothing, so a refusal among them leaves no origin to converge on) and
-  // ahead of EVERY kernel call and of `resolveBaseSha`'s network read. `originKey`/`baseSha` are
-  // v0.5-only inputs: accepting them silently under `v04` would let a caller believe it had pinned
-  // an origin the v1 tuple cannot express, so they fail closed instead.
+  // WP §3.6, caller obligation 1 — DECIDE THE ORIGIN KEY FIRST, ahead of EVERY fallible thing this
+  // function does: the manifest read, the kernel client construction, the namespace lookup, the
+  // fail-closed argument legs, `resolveBaseSha`'s network read and all of the kernel calls. A mint
+  // placed after any of those lets that call be the thing that fails while no key exists yet — and
+  // an invocation that fails with no key to re-present is exactly the fork this contract exists to
+  // prevent, since its retry mints a second key and originates a SECOND run. Only the profile check
+  // precedes the mint: it is pure, decides nothing, and runs before any key exists to lose.
+  // `originKey`/`baseSha` are v0.5-only inputs — accepting them silently under `v04` would let a
+  // caller believe it had pinned an origin the v1 tuple cannot express, so they fail closed.
   if (profile === "v04" && (options.originKey !== undefined || options.baseSha !== undefined)) {
     throw new Error("originKey/baseSha are v0.5 origin-path inputs; originProfile 'v04' allocates under cadp.allocation-key.v1");
   }
   let originKey: string | undefined;
+  let mintedHere = false;
   if (profile === "v05") {
     originKey = options.originKey;
     if (originKey === undefined) {
-      // A DIRECT start: mint exactly once, here and nowhere else. Emitted and recorded before the
-      // first kernel call, so a crash at any point below leaves the key recoverable and the retry
-      // converges instead of originating a second run.
+      // A DIRECT start: mint exactly once, here and nowhere else. Nothing stands between this line
+      // and the `log` that publishes it below, so the key is visible from the instant it exists.
       originKey = (dependencies.randomUUID ?? randomUUID)();
-      appendOriginKeyRecord(dir, {
-        origin_key: originKey,
-        work_item_digest: jcsDigest({ scheme: "cadp.origin-intent.v1", vertical, extra }).value,
-        created_at: (dependencies.now ?? (() => new Date().toISOString()))(),
-      });
-      log({ origin_profile: profile, origin_key: originKey, origin_source: "minted", origin_key_record: join(dir, ORIGIN_KEY_RECORD_FILE) });
-    } else {
-      log({ origin_profile: profile, origin_key: originKey, origin_source: "provided" });
+      mintedHere = true;
     }
   }
 
   try {
+    if (originKey !== undefined) {
+      // VISIBILITY BEFORE DURABILITY, and both INSIDE this `try`. The log line carries the key
+      // before the record file is touched, so a write that itself fails — an unwritable deployment
+      // dir, a corrupt existing `origin-keys.json` — cannot be the thing that loses it: it becomes
+      // an `OriginStartFailure` naming the key, exactly like every later failure on this path. The
+      // second line confirms the record actually landed, and is only emitted once it has.
+      log({ origin_profile: profile, origin_key: originKey, origin_source: mintedHere ? "minted" : "provided" });
+      if (mintedHere) {
+        appendOriginKeyRecord(dir, {
+          origin_key: originKey,
+          work_item_digest: jcsDigest({ scheme: "cadp.origin-intent.v1", vertical, extra }).value,
+          created_at: (dependencies.now ?? (() => new Date().toISOString()))(),
+        });
+        log({ origin_key: originKey, origin_key_record: join(dir, ORIGIN_KEY_RECORD_FILE) });
+      }
+    }
+
+    const m = dependencies.manifest ?? loadManifest(dir);
+    const c = dependencies.client ?? liveClient(dir, "cadp-workflow");
+    const namespaceId = dependencies.namespaceId ?? temporalNamespaceId(m);
+
+    if (vertical === "development") {
+      const floor = devEffectFloorViolation(boundArg(extra[2], 6));
+      if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
+    }
+    // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
+    // an unknown provider at entry, before anything is sealed.
+    const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
+    // review_product select (extra[5], optional; omitted keeps the claude default). §8.4 reviewer
+    // independence fails closed HERE, before anything is sealed or any surface spends compute.
+    const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
+    assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
+    // extra[6]: opt-in external verification backend (#57). Only the exact literal enables it —
+    // anything else fails closed rather than silently running without the second verifier.
+    if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
+    const externalVerification = extra[6] === "external";
+
     const args =
       vertical === "development"
         ? {

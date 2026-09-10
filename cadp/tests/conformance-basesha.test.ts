@@ -506,6 +506,9 @@ test("v0.5 direct start: the origin_key is minted ONCE, and a failure leaves it 
     const emitted = r.lines.find((line) => line["origin_source"] === "minted");
     assert.equal(emitted?.["origin_key"], MINTED);
     assert.equal(emitted?.["origin_profile"], "v05");
+    const confirmed = r.lines.find((line) => line["origin_key_record"] !== undefined);
+    assert.equal(confirmed?.["origin_key"], MINTED, "and a second line confirms the record landed, naming the file to recover it from");
+    assert.equal(confirmed?.["origin_key_record"], join(r.dir, ORIGIN_KEY_RECORD_FILE));
 
     // (c) the state file holds it, so a process that DIED here still leaves a recoverable record.
     const records = readOriginKeyRecords(r.dir);
@@ -545,6 +548,65 @@ test("v0.5 direct start: a refused admission still reports the origin_key throug
     const refusal = r.lines.find((line) => line["evaluated"] !== undefined);
     assert.equal(refusal?.["origin_key"], MINTED, "the refusal line names the origin the retry must re-present");
     assert.equal(readOriginKeyRecords(r.dir)[0]?.origin_key, MINTED);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("v0.5 direct start: a SETUP failure before the first kernel call still surfaces the minted origin_key", async () => {
+  const MINTED = "0f0f0f0f-2345-4678-8abc-def012345678";
+  const r = rig({ uuids: [MINTED] });
+  try {
+    // The `manifest` seam withdrawn, so `loadManifest` runs for real against a deployment dir that
+    // has no `manifest.json`: the start dies in the SETUP that precedes the argument legs and every
+    // kernel call. WP §3.6's obligation is that no such call can be the thing that loses the key,
+    // so the mint has to be strictly earlier than all of them — this is the leg that pins that.
+    const failure = await startWork(r.dir, "development", DEV_EXTRA, { log: r.log, originProfile: "v05" }, { ...r.dependencies, manifest: undefined })
+      .then(() => undefined, (error: unknown) => error);
+
+    assert.ok(failure instanceof OriginStartFailure, `expected OriginStartFailure, got ${String(failure)}`);
+    assert.equal(failure.origin_key, MINTED);
+    assert.match(failure.message, new RegExp(MINTED, "u"), "the key rides out in the message a caller reading only `.message` prints");
+    assert.equal(r.lines.find((line) => line["origin_source"] === "minted")?.["origin_key"], MINTED);
+    assert.equal(readOriginKeyRecords(r.dir)[0]?.origin_key, MINTED, "and the crash-recoverable record was already written");
+    assert.deepEqual(r.kernel.allocations, [], "nothing was allocated — the key is durable strictly EARLIER than any allocation");
+
+    // The recovery flow over a setup failure converges exactly as it does over a kernel failure: the
+    // rig holds one UUID, so this can only pass because the recorded key was re-presented verbatim.
+    const started = await startWork(
+      r.dir, "development", DEV_EXTRA,
+      { log: r.log, originProfile: "v05", originKey: readOriginKeyRecords(r.dir)[0]!.origin_key },
+      r.dependencies,
+    );
+    assert.equal(started?.origin_key, MINTED);
+    assert.deepEqual(r.kernel.allocations, [{ schema: RUN_ORIGIN_ALLOCATION_SCHEMA, origin_key: MINTED, purpose: "work-start" }]);
+    assert.deepEqual(r.minted, [MINTED], "one mint across the whole logical origin");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("v0.5 direct start: a failing origin-key RECORD WRITE surfaces the key instead of swallowing it", async () => {
+  const MINTED = "cafecafe-2345-4678-8abc-def012345678";
+  const r = rig({ uuids: [MINTED] });
+  try {
+    // A deployment dir that does not exist: `appendOriginKeyRecord` itself throws. The persistence
+    // step is the one place a naive ordering loses the key entirely — minted, never published,
+    // never recorded. Publishing through `log` first and persisting INSIDE the try makes even this
+    // failure a recoverable origin.
+    const failure = await startWork(join(r.dir, "no-such-deployment-dir"), "development", DEV_EXTRA, { log: r.log, originProfile: "v05" }, r.dependencies)
+      .then(() => undefined, (error: unknown) => error);
+
+    assert.ok(failure instanceof OriginStartFailure, `expected OriginStartFailure, got ${String(failure)}`);
+    assert.equal(failure.origin_key, MINTED);
+    assert.match(failure.message, new RegExp(MINTED, "u"));
+    assert.equal(r.lines.find((line) => line["origin_source"] === "minted")?.["origin_key"], MINTED, "published BEFORE the write that failed");
+    assert.equal(
+      r.lines.some((line) => line["origin_key_record"] !== undefined), false,
+      "and the record-landed confirmation is emitted only once the record actually landed",
+    );
+    assert.deepEqual(r.kernel.allocations, [], "a start that could not record its origin allocates nothing");
+    assert.deepEqual(r.minted, [MINTED]);
   } finally {
     r.cleanup();
   }
