@@ -319,9 +319,11 @@ function runProfileEngaged(config: KernelConfig): boolean {
 
 /**
  * The run scope this SEALED request names, read on the EXACT `(authority_ref, namespace)` pair
- * `kernel_subject_namespaces` declares for the work-run namespace — the one lookup both B5(9)'s
- * legs 2 and 3 and B5(4)'s presentation scope are defined over, so they can never disagree about
- * which run a request is bound to.
+ * `kernel_subject_namespaces` declares for the work-run namespace — the one lookup B5(9)'s legs 2
+ * and 3, B5(4)'s presentation scope and recheck #19's PEP-side scope (B5(5), `pep.ts`) are all
+ * defined over, so they can never disagree about which run a request is bound to. Exported for that
+ * last consumer alone: #19 compares the SEALED membership row's `work_run_ref` against this very
+ * value, and a second reading of "run-bound" in the PEP would be a second policy.
  *
  * Matching the declared exact pair — never the namespace alone — is what stops an off-authority
  * `{other, work-run, …}` binding from standing in for a self-binding (B3(4)(a)). `undefined` means
@@ -331,7 +333,7 @@ function runProfileEngaged(config: KernelConfig): boolean {
  * it, so it is unreachable through a conforming bundle and is not a second policy), no binding on
  * the pair, or more than one (which B3(4)(b)'s ambiguity lock has already refused upstream).
  */
-function declaredWorkRunRef(request: EffectRequestV1, config: KernelConfig): string | undefined {
+export function declaredWorkRunRef(request: EffectRequestV1, config: KernelConfig): string | undefined {
   const declared = (config.kernel_subject_namespaces ?? []).find((entry) => entry.namespace === KERNEL_WORK_RUN_NAMESPACE);
   if (declared === undefined) return undefined;
   const bound = request.work_bindings.filter(
