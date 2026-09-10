@@ -490,16 +490,30 @@ async function startWorkOnce(
 ): Promise<StartWorkResult | undefined> {
   const log = options.log ?? SILENT;
   const deps = options.dependencies ?? {};
-  const m = deps.manifest ?? loadManifest(dir);
   const c: OpsKernelClient = deps.client ?? liveClient(dir, "cadp-workflow");
   const resolveBase = deps.resolveBase ?? resolveBaseSha;
   const readImageIdentity = deps.imageIdentity ?? imageIdentity;
   const readNamespaceId = deps.namespaceId ?? temporalNamespaceId;
   const readWorkerImageTag = deps.workerImageTag ?? ((d: string) => readFileSync(join(d, "worker-image"), "utf8").trim());
+  /**
+   * THE MANIFEST IS ITSELF ONE OF THE AUDITED ENVIRONMENT SEAMS, so it is read ON DEMAND rather than
+   * up front. `repo_id`/`repo_full_name` flow out of it into the sealed args and the namespace read
+   * takes it — which is exactly why they are `OriginMaterialInputs` fields — so a v0.5 retry that
+   * ADOPTS an origin record must reconstruct WITHOUT touching it: reading it there would let a
+   * manifest that CHANGED move the sealed bytes under a fixed `effect_id` (the drift the invariant
+   * forbids), and one that went MISSING break a retry whose material is already fully recorded.
+   * Only two branches read it: v0.4, one line below and at exactly the point it always has, and
+   * v0.5 ORIGIN CREATION. The kernel client above is the exception that proves the rule — its own
+   * manifest read is TRANSPORT (`api_url` plus the principal's token), never material: no start on
+   * any profile can reach the Kernel without one, but not one byte of an ADOPTED material comes
+   * from it.
+   */
+  let loaded = deps.manifest;
+  const manifest = (): LiveEnvManifest => (loaded ??= loadManifest(dir));
   // v0.4 reads the namespace HERE, exactly where it always has, so a deployment whose temporal CLI
   // is unavailable still fails at the step it fails at today. On the v0.5 branch the read is an
   // audited material input and belongs to origin creation instead (`OriginMaterialInputs`).
-  const v04NamespaceId = origin_key === undefined ? readNamespaceId(m) : undefined;
+  const v04NamespaceId = origin_key === undefined ? readNamespaceId(manifest()) : undefined;
 
   if (vertical === "development") {
     const floor = devEffectFloorViolation(boundArg(extra[2], 6));
@@ -549,6 +563,9 @@ async function startWorkOnce(
       record = assertOriginArguments(existing, identity, origin_key);
       log({ origin_key, origin_record: "ADOPTED", base_sha: record.material_inputs.base_sha });
     } else {
+      // Origin CREATION is the one v0.5 moment that may read the environment — including the
+      // manifest — because it is what freezes every seam into the record for good.
+      const m = manifest();
       const resolved: OriginMaterialInputs = {
         repo_id: m.repo_id,
         repo_full_name: m.repo_full_name,
@@ -581,8 +598,10 @@ async function startWorkOnce(
           vertical,
           bounds,
           development: {
-            repo_id: inputs?.repo_id ?? m.repo_id,
-            repo_full_name: inputs?.repo_full_name ?? m.repo_full_name,
+            // `inputs ?? manifest()`: on v0.5 the record always carries these, so the manifest is
+            // never consulted there; on v0.4 the call returns the read taken at entry.
+            repo_id: inputs?.repo_id ?? manifest().repo_id,
+            repo_full_name: inputs?.repo_full_name ?? manifest().repo_full_name,
             base_ref: DEV_BASE_REF,
             // v0.4: resolved fresh at seal time — the manifest's setup-time snapshot goes stale
             // (see resolveBaseSha). v0.5: resolved once at origin creation and adopted from the
@@ -591,7 +610,7 @@ async function startWorkOnce(
             // development origin carries no `base_sha` is a corrupt record, not a licence to
             // re-resolve: re-resolving is exactly the drift the invariant forbids.
             base_sha: origin_key === undefined
-              ? resolveBase(m.repo_full_name, DEV_BASE_REF)
+              ? resolveBase(manifest().repo_full_name, DEV_BASE_REF)
               : requireRecorded(inputs?.base_sha, "base_sha", origin_key),
             work_item: extra[0]!,
             worker_product: workerProduct,

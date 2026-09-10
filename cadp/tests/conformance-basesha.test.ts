@@ -423,6 +423,36 @@ test("v0.5: the same origin_key twice derives the same effect_id and re-seals by
     "every environment seam is resolved exactly once, at origin creation");
 });
 
+test("a v0.5 retry reconstructs from the record ALONE — it does not read the deployment manifest", async () => {
+  const dir = tempDir();
+  const seams = freshSeams();
+  const counts = zeroCounts();
+  const first = new OpsClientSpy();
+  await startWork(dir, "development", [WORK_ITEM, "8", "6"], {
+    originProfile: "v05", originKey: "origin-manifestless", dependencies: seamDeps(dir, seams, first, counts),
+  });
+
+  // The manifest is an environment seam like every other one — `repo_id`/`repo_full_name` reach the
+  // sealed args through it — so an ADOPTING invocation must not touch it. A manifest that MOVED is
+  // covered by the seam-flip above; here it is GONE, which is the sharper case: the retry is handed
+  // no manifest and a deployment dir with no `manifest.json`, so any read at all throws ENOENT.
+  const second = new OpsClientSpy();
+  const deps = seamDeps(dir, seams, second, counts);
+  delete deps.manifest;
+  assert.equal(existsSync(join(dir, "manifest.json")), false, "nothing on disk for a manifest read to succeed against");
+
+  const started = await startWork(dir, "development", [WORK_ITEM, "8", "6"], {
+    originProfile: "v05", originKey: "origin-manifestless", dependencies: deps,
+  });
+
+  assert.equal(started?.origin_key, "origin-manifestless");
+  assert.deepEqual(second.tuples[0], first.tuples[0], "the same allocation tuple, reconstructed from the record alone");
+  assert.equal(second.materialBytes().equals(first.materialBytes()), true, "and byte-identical sealed material");
+  assert.equal(second.argsBytes().equals(first.argsBytes()), true);
+  assert.deepEqual(counts, { resolveBase: 1, imageIdentity: 1, namespaceId: 1, workerImageTag: 1 },
+    "still exactly one resolution of each seam, at origin creation");
+});
+
 test("v0.5 records the origin BEFORE the first kernel call, and the record holds the whole audited input set", async () => {
   const dir = tempDir();
   const seams = freshSeams();
