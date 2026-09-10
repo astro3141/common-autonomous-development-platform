@@ -10,7 +10,7 @@
  * from `api.ts` to the seal, and the STRICT PARSER every presentation is read through before its
  * digest is compared.
  *
- * PART 3, B5(3)-(5), the last section of this file: the rest of the seal-time run binding, one
+ * PART 3, B5(3)-(5): the rest of the seal-time run binding, one
  * test per reason code and in the order the Ingress grades them — `RUN_BINDING_REQUIRED`,
  * `NOT_RUN_ENROLLED`, `RUN_CAPABILITY_REQUIRED`, `RUN_CAPABILITY_INVALID` (same-holder wrong-run
  * borrowing included), `RUN_CAPABILITY_HOLDER_MISMATCH`, and B5(2)'s K7 grading of the run's own
@@ -20,6 +20,22 @@
  * they assert seals still seals, and the two places where a request they exercised is now refused
  * one leg earlier under an exacter code are noted at those assertions. Recheck #19's
  * `RUN_MEMBERSHIP_UNPROVEN` is the PEP-time code and remains a later lane, asserted nowhere here.
+ *
+ * PART 4, the last section of this file: the K7 CONFORMANCE MATRIX — B5(2)'s grading stated once
+ * per reachable history of the run's own `WORK_START`, each case presenting ONE capability (the one
+ * its verified initial dispatch delivered) at EVERY state that history passes through, so a case
+ * that re-minted or needed a second secret fails rather than passes quietly. The four corners are
+ * `UNKNOWN` at ordinal 1 lifted by reconciliation; `NO_EFFECT_CONFIRMED` at ordinal 1 lifted by a
+ * `COMMITTED` ordinal 2; an ADMITTED but unresolved ordinal 2 (`RUN_SCOPE_UNRESOLVED`, never the
+ * superseded ordinal-1 grading); and a `COMMITTED` ordinal 1 behind an unresolved ordinal 2 — the
+ * corner recheck #12 makes unconstructible, asserted both as unreachable and as fail-closed if it
+ * were reached. Each case carries the same cross-cutting claims: a permitted follow-up writes
+ * `run_membership(effect_id, work_run_ref)` and reports no reason code, every refusal leaves ZERO
+ * `effect_request` rows, the mint and its delivery stay once-only under controls A4/A5, and no
+ * rendering of the secret reaches a refusal message, a store row or the process's own log. The
+ * section closes on the gating regression: under `cadp.kernel-config.v1` and under a v2 bundle
+ * whose governing registry content is absent, the very request the first case is refused for seals
+ * byte-identically to the same request presenting nothing at all.
  *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
@@ -341,14 +357,132 @@ function count(h: Harness, table: string): number {
 }
 
 /**
+ * Every rendering of ONE capability a leak could plausibly take: the canonical transport text
+ * itself, the two other encodings of the identical bytes, and an 8-character prefix of the
+ * canonical text — the "surely a fragment is harmless" case B6(3) does not exempt.
+ */
+function capabilityRenderings(capability: string): readonly string[] {
+  const raw = Buffer.from(capability, "base64url");
+  return [capability, raw.toString("hex"), raw.toString("base64"), capability.slice(0, 8)];
+}
+
+function assertNoCapabilityText(haystack: string, capability: string, note: string): void {
+  for (const rendering of capabilityRenderings(capability)) {
+    assert.equal(haystack.includes(rendering), false, `${note}: a capability rendering is present`);
+  }
+}
+
+/**
+ * B6(3) over the OBSERVABLE LOG: the process's own output streams, recorded for the duration of a
+ * case and swept afterwards. `console.log`/`console.error` write through these two `write`
+ * functions, so patching them covers every logging surface the Kernel actually has (`kernelService`
+ * is the only module in the checkout that logs at all, and nothing on the seal, mint, dispatch or
+ * reconcile path does). Each chunk is FORWARDED to the original writer as well as recorded — the
+ * test runner's own reporter writes through the same function, and swallowing its output would
+ * corrupt the run rather than test it.
+ */
+function captureObservableText(): { text: () => string; restore: () => void } {
+  const chunks: string[] = [];
+  // While `probing`, chunks are recorded but NOT forwarded — the self-check below writes through
+  // both streams to prove the recording path is live, and a sweep over a transcript that silently
+  // recorded nothing would be a vacuous assertion rather than a weaker one.
+  let probing = true;
+  const patched = [process.stdout, process.stderr].map((stream) => {
+    const original = stream.write.bind(stream) as (chunk: unknown, ...rest: unknown[]) => boolean;
+    (stream as unknown as { write: unknown }).write = (chunk: unknown, ...rest: unknown[]): boolean => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+      return probing ? true : original(chunk, ...rest);
+    };
+    return { stream, original };
+  });
+  const probe = "cadp-run-capability-log-probe";
+  console.log(probe);
+  console.error(probe);
+  assert.equal(chunks.filter((chunk) => chunk.includes(probe)).length, 2, "the log capture records both streams");
+  probing = false;
+  chunks.length = 0;
+  return {
+    text: () => chunks.join(""),
+    restore: () => {
+      for (const { stream, original } of patched) (stream as unknown as { write: unknown }).write = original;
+    },
+  };
+}
+
+/**
+ * The A4/A5 DELIVERY invariants of a whole K7 case, asserted after every state the run passed
+ * through: control A5's one-capability-per-run (`run_capability`'s primary key is the run, and this
+ * store holds exactly the one row), control A4's mint-once (the row still digests the ONE secret
+ * that was delivered at the verified initial dispatch, so no later ordinal re-minted under the same
+ * key), and B5(7)/B6(3)'s no-recovery (no table holds any rendering of it — a digest is all there
+ * is). Stated as a function of the DELIVERED text, so a re-mint that replaced the row would fail
+ * here even though the row count stayed at one.
+ */
+function assertDeliveryInvariants(rp: RunProfileHarness, run: string, capability: string, note: string): void {
+  assert.equal(count(rp.h, "run_capability"), 1, `${note}: exactly one capability row in the store`);
+  const row = rp.h.store.runCapability(run);
+  assert.equal(row?.work_run_ref, run, `${note}: the row is keyed by the run`);
+  assert.equal(row?.holder_ref, REQUESTER_A, `${note}: the holder is the sealed requester`);
+  assert.equal(
+    row?.capability_digest,
+    createHash("sha256").update(Buffer.from(capability, "base64url")).digest("hex"),
+    `${note}: the row still digests the ONE delivered secret — nothing re-minted`,
+  );
+  const tables = (rp.h.store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+    .map((entry) => entry.name);
+  for (const table of tables) {
+    const dump = JSON.stringify(rp.h.store.db.prepare(`SELECT * FROM ${table}`).all());
+    for (const rendering of capabilityRenderings(capability).slice(0, 3)) {
+      assert.equal(dump.includes(rendering), false, `${note}: ${table} holds the secret`);
+    }
+  }
+}
+
+/**
+ * A follow-up that PASSES every leg of B5(3)-(4) and B5(2)'s K7 grading: it seals, it raises NO
+ * refusal reason (the `IngressRejection` catch is the assertion — a graded-but-permitted path must
+ * not report a code), and B5(5) writes `run_membership(effect_id, work_run_ref)` in the SAME
+ * transaction as the K3 row, naming the RUN in the second column and never the follow-up itself.
+ */
+function sealsFollowUp(rp: RunProfileHarness, run: string, capability: string, note: string): string {
+  const requests = count(rp.h, "effect_request");
+  let effect_id: string;
+  try {
+    effect_id = sealMember(rp, { work_run_ref: run, capability }).effect_id;
+  } catch (error) {
+    return assert.fail(
+      `${note}: expected a seal with no refusal reason, got ${
+        error instanceof IngressRejection ? error.reason : String(error)
+      }`,
+    );
+  }
+  assert.equal(rp.h.store.effectRequest(effect_id)?.effect_id, effect_id, `${note}: the follow-up SEALS`);
+  assert.equal(count(rp.h, "effect_request"), requests + 1, `${note}: exactly one K3 row`);
+  const membership = rp.h.store.runMembership(effect_id);
+  assert.equal(membership?.effect_id, effect_id, `${note}: run_membership's first column is the follow-up`);
+  assert.equal(membership?.work_run_ref, run, `${note}: run_membership's second column is the RUN`);
+  return effect_id;
+}
+
+/**
  * Every seal-time refusal of B5(3)-(5) is PRE-K3: it is graded inside the sealing transaction and
  * BEFORE the `effect_request` insert, so a refused seal's durable delta is ZERO rows — no K3
  * record and no membership proof (Spec v0.5 §9.2). Asserted here once, for every reason code,
  * rather than restated at each call site. The reason code is compared EXACTLY: the order of the
  * legs is the contract, and a refusal under a neighbouring code would satisfy a looser assertion
  * while meaning something else entirely.
+ *
+ * `capability`, when given, is the secret the refused presentation carried: the refusal's own
+ * message and stack are then swept for every rendering of it (B6(3)), which is the surface a
+ * refusal path can leak on that no store sweep would catch.
  */
-function refuses(rp: RunProfileHarness, reason: string, seal: () => unknown, note: string = reason): void {
+function refuses(
+  rp: RunProfileHarness,
+  reason: string,
+  seal: () => unknown,
+  note: string = reason,
+  capability?: string,
+): void {
   const requests = count(rp.h, "effect_request");
   const memberships = count(rp.h, "run_membership");
   assert.throws(
@@ -356,6 +490,10 @@ function refuses(rp: RunProfileHarness, reason: string, seal: () => unknown, not
     (error: unknown) => {
       assert.ok(error instanceof IngressRejection, `${note}: ${String(error)}`);
       assert.equal(error.reason, reason, `${note}: ${error.message}`);
+      if (capability !== undefined) {
+        assertNoCapabilityText(error.message, capability, `${note}: the refusal message`);
+        assertNoCapabilityText(error.stack ?? "", capability, `${note}: the refusal stack`);
+      }
       return true;
     },
     `${note}: expected ${reason}`,
@@ -1592,4 +1730,362 @@ test("B5(2)/B5(4): a latest-conclusive NO_EFFECT_CONFIRMED scope is refused RUN_
   } finally {
     rp.h.close();
   }
+});
+
+// ================================================ PART 4 — the K7 seal-time conformance MATRIX
+
+/** The run's own `WORK_START` outcome history, in `dispatch_ordinal` order: what B5(2) grades. */
+function outcomes(rp: RunProfileHarness, effect_id: string): string[] {
+  return rp.h.store.outcomesByEffect(effect_id).map((outcome) => outcome.result);
+}
+
+/** An `ACCEPTED` dispatch for every effect but the one under script, so only the run is scripted. */
+function acceptOthers(effect_id: string): DispatchResult {
+  return {
+    kind: "ACCEPTED",
+    target_operation_ref: `wf-${effect_id}`,
+    receipt_claim: { workflow_id: `cadp-work-${effect_id}`, started: true },
+  };
+}
+
+/**
+ * A genuine origin, dispatched once under `script`, returning the ONE capability the verified
+ * initial dispatch delivered. Every case below presents THIS value and no other — at every state
+ * of the run — which is what makes "the flip is about the SCOPE, not about the secret" a claim the
+ * assertions can actually distinguish: a case that re-minted, or that needed a second secret after
+ * reconciliation, fails at the first presentation rather than passing silently.
+ */
+async function originateRun(
+  rp: RunProfileHarness,
+  origin_key: string,
+  script: (effect_id: string, ordinal: number) => DispatchResult,
+): Promise<{ run: string; capability: string }> {
+  const { effect_id: run } = sealWorkStart(rp, { origin_key });
+  assert.equal(rp.h.store.runMembership(run)?.work_run_ref, run, `${origin_key}: B5(5)'s self-referential witness`);
+  rp.target.onDispatch = (effect_id, ordinal) => (effect_id === run ? script(effect_id, ordinal) : acceptOthers(effect_id));
+  const admitted = await dispatch(rp.h, run, PRINCIPALS.workflow);
+  assert.equal(admitted.kind, "ADMITTED", JSON.stringify(admitted));
+  const capability = (admitted as { run_capability?: string }).run_capability;
+  // B6(4): minting is at ADMISSION, so the secret is delivered whatever outcome the dispatch
+  // reached — including the UNKNOWN and NO_EFFECT_CONFIRMED states the cases below start from.
+  assert.match(String(capability), /^[A-Za-z0-9_-]{43}$/u, `${origin_key}: the one delivery`);
+  return { run, capability: capability! };
+}
+
+test("K7 matrix (i): UNKNOWN at ordinal 1, then reconciliation to COMMITTED, permits sealing", async () => {
+  const rp = await runProfileHarness();
+  const logs = captureObservableText();
+  let capability: string | undefined;
+  try {
+    // Ordinal 1 is AMBIGUOUS, so the run's only admitted dispatch has a NON-CONCLUSIVE outcome:
+    // the scope is unusable and the capability is already in the requester's hands.
+    const originated = await originateRun(rp, "origin-k7-unknown", () => ({ kind: "AMBIGUOUS", raw_observation: "target timed out" }));
+    const run = originated.run;
+    capability = originated.capability;
+    assert.deepEqual(outcomes(rp, run), ["UNKNOWN"]);
+    refuses(rp, "RUN_SCOPE_UNRESOLVED", () => sealMember(rp, { work_run_ref: run, capability }), "ordinal 1 UNKNOWN", capability);
+
+    // RECONCILIATION resolves the SAME admission to COMMITTED — the only lawful way out of UNKNOWN
+    // (Spec v0.5 §5.2: "unusable until reconciliation resolves it"), and a path that touches the
+    // capability nowhere: the reconciler mints nothing and returns an outcome, never a secret.
+    const reconciled = await rp.h.reconciler.reconcileEffect(run);
+    assert.equal(reconciled?.result, "COMMITTED", JSON.stringify(reconciled));
+    assert.deepEqual(outcomes(rp, run), ["UNKNOWN", "COMMITTED"]);
+    assert.equal(
+      Object.keys(reconciled!).some((key) => key.toLowerCase().includes("capability")), false,
+      "no outcome record carries a capability field",
+    );
+    assert.equal(rp.h.store.admissionsByEffect(run).length, 1, "reconciliation resolves ordinal 1; it admits nothing");
+
+    // THE FLIP: the SAME capability, never re-delivered, now seals — and writes its membership proof.
+    sealsFollowUp(rp, run, capability, "after reconciliation to COMMITTED");
+    assertDeliveryInvariants(rp, run, capability, "UNKNOWN then reconciled COMMITTED");
+  } finally {
+    logs.restore();
+    if (capability !== undefined) assertNoCapabilityText(logs.text(), capability, "the observable log");
+    rp.h.close();
+  }
+});
+
+test("K7 matrix (ii): NO_EFFECT_CONFIRMED at ordinal 1 then a COMMITTED ordinal 2 permits sealing, and ordinal 2 delivers no new capability", async () => {
+  const rp = await runProfileHarness();
+  const logs = captureObservableText();
+  let capability: string | undefined;
+  try {
+    // Ordinal 1 proves NO EFFECT — the one conclusive state recheck #12 admits a further ordinal
+    // after — and ordinal 2 is ACCEPTED, so the run reaches COMMITTED under a LATER admission than
+    // the one that minted. The capability is the ordinal-1 delivery throughout.
+    const originated = await originateRun(
+      rp, "origin-k7-noeffect-committed",
+      (effect_id, ordinal) => (ordinal === 1
+        ? { kind: "REJECTED_NO_EFFECT", proof_claim: { authoritative_absence: true } }
+        : acceptOthers(effect_id)),
+    );
+    const run = originated.run;
+    capability = originated.capability;
+    assert.deepEqual(outcomes(rp, run), ["NO_EFFECT_CONFIRMED"]);
+    // The intermediate state, stated so the ORDER of this case is part of the record: while that is
+    // the latest conclusive grading the scope is REFUSED, not unresolved and not usable.
+    refuses(rp, "RUN_SCOPE_REFUSED", () => sealMember(rp, { work_run_ref: run, capability }), "ordinal 1 NO_EFFECT_CONFIRMED", capability);
+
+    // ORDINAL 2, admitted and COMMITTED. A4/A5: the mint is a property of the INITIAL dispatch, so
+    // this admission delivers nothing, writes no second row, and leaves the ordinal-1 secret the
+    // only capability this run has ever had.
+    const retry = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(retry.kind, "ADMITTED", JSON.stringify(retry));
+    assert.equal((retry as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 2);
+    assert.equal((retry as { run_capability?: string }).run_capability, undefined, "ordinal 2 delivers NO new capability");
+    assert.deepEqual(outcomes(rp, run), ["NO_EFFECT_CONFIRMED", "COMMITTED"]);
+
+    sealsFollowUp(rp, run, capability, "after a COMMITTED ordinal 2");
+    assertDeliveryInvariants(rp, run, capability, "NO_EFFECT_CONFIRMED then COMMITTED at ordinal 2");
+  } finally {
+    logs.restore();
+    if (capability !== undefined) assertNoCapabilityText(logs.text(), capability, "the observable log");
+    rp.h.close();
+  }
+});
+
+test("K7 matrix (iii): an ADMITTED but unresolved ordinal 2 is refused RUN_SCOPE_UNRESOLVED, never the ordinal-1 grading", async () => {
+  const rp = await runProfileHarness();
+  const logs = captureObservableText();
+  let capability: string | undefined;
+  try {
+    // Ordinal 1 proves NO EFFECT and ordinal 2 is AMBIGUOUS: the run's LATEST admitted dispatch is
+    // unresolved while an earlier CONCLUSIVE row still exists. This is the case that distinguishes
+    // "the latest admitted dispatch decides" from "the greatest-ordinal conclusive row decides" —
+    // the second reading would report the superseded ordinal-1 `RUN_SCOPE_REFUSED` here.
+    const originated = await originateRun(
+      rp, "origin-k7-unresolved-ordinal-2",
+      (_e, ordinal) => (ordinal === 1
+        ? { kind: "REJECTED_NO_EFFECT", proof_claim: { authoritative_absence: true } }
+        : { kind: "AMBIGUOUS", raw_observation: "target timed out" }),
+    );
+    const run = originated.run;
+    capability = originated.capability;
+    assert.deepEqual(outcomes(rp, run), ["NO_EFFECT_CONFIRMED"]);
+
+    const retry = await dispatch(rp.h, run, PRINCIPALS.workflow);
+    assert.equal(retry.kind, "ADMITTED", JSON.stringify(retry));
+    assert.equal((retry as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 2);
+    assert.equal((retry as { run_capability?: string }).run_capability, undefined, "ordinal 2 delivers NO new capability");
+    assert.deepEqual(outcomes(rp, run), ["NO_EFFECT_CONFIRMED", "UNKNOWN"]);
+    assert.equal(rp.h.store.admissionsByEffect(run).length, 2, "two admitted dispatches, the latter unresolved");
+
+    // The EXACT code: `RUN_SCOPE_UNRESOLVED`, and deliberately not the `RUN_SCOPE_REFUSED` this very
+    // capability was refused under one ordinal earlier.
+    refuses(rp, "RUN_SCOPE_UNRESOLVED", () => sealMember(rp, { work_run_ref: run, capability }), "ordinal 2 admitted and unresolved", capability);
+
+    // The positive control, on the SAME capability: reconciling the ordinal-2 admission to COMMITTED
+    // makes the scope usable, so the refusal above is attributed to that admission's unresolved
+    // state and to nothing about the presentation or the earlier ordinal.
+    const reconciled = await rp.h.reconciler.reconcileEffect(run);
+    assert.equal(reconciled?.result, "COMMITTED", JSON.stringify(reconciled));
+    assert.deepEqual(outcomes(rp, run), ["NO_EFFECT_CONFIRMED", "UNKNOWN", "COMMITTED"]);
+    sealsFollowUp(rp, run, capability, "after ordinal 2 reconciled to COMMITTED");
+    assertDeliveryInvariants(rp, run, capability, "an unresolved ordinal 2");
+  } finally {
+    logs.restore();
+    if (capability !== undefined) assertNoCapabilityText(logs.text(), capability, "the observable log");
+    rp.h.close();
+  }
+});
+
+test("K7 matrix (iv): a COMMITTED ordinal 1 with an admitted, unresolved ordinal 2 is refused RUN_SCOPE_UNRESOLVED", async () => {
+  // The fourth corner of the matrix, and the one the production kernel makes UNCONSTRUCTIBLE: once
+  // a `COMMITTED` outcome exists, recheck #12 refuses every further dispatch
+  // `EFFECT_ALREADY_COMMITTED`, so no later ordinal can be admitted to displace it. Both halves are
+  // asserted — that the state cannot be reached (part A) and that the grading is fail-closed if it
+  // somehow were (part B) — because "one-way in practice" is a claim about recheck #12, and the K7
+  // grading must not be relying on it: it reads the LATEST admitted dispatch, not "any COMMITTED
+  // this run ever had".
+  const production = await runProfileHarness();
+  // Part B's store, with recheck #12's ordinal admissibility BITTEN (TD §13.1's test-only knob) —
+  // the one guard whose refusal is what keeps part A's state unreachable.
+  const bitten = await runProfileHarness(runProfileConfig(), new Set(["recheck12_ordinal"]));
+  const logs = captureObservableText();
+  let capability: string | undefined;
+  let bittenCapability: string | undefined;
+  try {
+    // ---- part A: the production store. Ordinal 1 COMMITS, and the scope is usable.
+    const originated = await originateRun(production, "origin-k7-committed", (effect_id) => acceptOthers(effect_id));
+    const run = originated.run;
+    capability = originated.capability;
+    assert.deepEqual(outcomes(production, run), ["COMMITTED"]);
+    sealsFollowUp(production, run, capability, "a COMMITTED ordinal 1");
+
+    // No ordinal 2 is admissible, so the unresolved-ordinal-2 state below cannot arise here: the
+    // refusal is pre-K6 and leaves the run exactly where it was.
+    const refused = await dispatch(production.h, run, PRINCIPALS.workflow);
+    assert.equal(refused.kind, "REFUSAL", JSON.stringify(refused));
+    assert.equal((refused as { reason: string }).reason, "EFFECT_ALREADY_COMMITTED");
+    assert.equal((refused as { run_capability?: string }).run_capability, undefined, "a refused dispatch delivers nothing");
+    assert.equal(production.h.store.admissionsByEffect(run).length, 1, "still ONE admitted dispatch");
+    assert.deepEqual(outcomes(production, run), ["COMMITTED"]);
+    sealsFollowUp(production, run, capability, "after the refused ordinal 2");
+    assertDeliveryInvariants(production, run, capability, "a COMMITTED ordinal 1");
+
+    // ---- part B: the same run shape on the bitten store, where ordinal 2 IS admitted and returns
+    // AMBIGUOUS. The greatest-ordinal CONCLUSIVE row is still ordinal 1's COMMITTED, and the scope
+    // reads UNRESOLVED anyway: the latest admitted dispatch decides, fail-closed.
+    const bittenRun = await originateRun(
+      bitten, "origin-k7-committed-then-unresolved",
+      (effect_id, ordinal) => (ordinal === 1 ? acceptOthers(effect_id) : { kind: "AMBIGUOUS", raw_observation: "target timed out" }),
+    );
+    bittenCapability = bittenRun.capability;
+    assert.deepEqual(outcomes(bitten, bittenRun.run), ["COMMITTED"]);
+    sealsFollowUp(bitten, bittenRun.run, bittenCapability, "the bitten store's COMMITTED ordinal 1");
+
+    const secondary = await dispatch(bitten.h, bittenRun.run, PRINCIPALS.workflow);
+    assert.equal(secondary.kind, "ADMITTED", JSON.stringify(secondary));
+    assert.equal((secondary as { admission: { dispatch_ordinal: number } }).admission.dispatch_ordinal, 2);
+    assert.equal((secondary as { run_capability?: string }).run_capability, undefined, "ordinal 2 delivers NO new capability");
+    assert.deepEqual(outcomes(bitten, bittenRun.run), ["COMMITTED", "UNKNOWN"]);
+    refuses(
+      bitten, "RUN_SCOPE_UNRESOLVED",
+      () => sealMember(bitten, { work_run_ref: bittenRun.run, capability: bittenCapability }),
+      "a COMMITTED ordinal 1 behind an unresolved ordinal 2",
+      bittenCapability,
+    );
+    assertDeliveryInvariants(bitten, bittenRun.run, bittenCapability, "a bitten ordinal 2");
+  } finally {
+    logs.restore();
+    for (const secret of [capability, bittenCapability]) {
+      if (secret !== undefined) assertNoCapabilityText(logs.text(), secret, "the observable log");
+    }
+    production.h.close();
+    bitten.h.close();
+  }
+});
+
+test("K7 under v1 and under a v2 schema alone: the grading is unreachable and legacy sealing is byte-identical", async () => {
+  const raw = Buffer.from(CAPABILITY_FIXTURE_HEX, "hex");
+  const canonical = raw.toString("base64url");
+  const digest = createHash("sha256").update(raw).digest("hex");
+  // A non-canonical presentation of the same secret, which the strict parser refuses wherever the
+  // profile governs. Outside it, it must be exactly as inert as the canonical text.
+  const malformed = `${canonical}=`;
+
+  /**
+   * The EXACT shape B5(2) refuses `RUN_SCOPE_UNRESOLVED` under the governed profile: an enrolled
+   * requester's member request bound to a run whose `WORK_START` has NO admitted dispatch at all,
+   * presenting a valid, holder-matching capability. Sealed here on stores where the profile does
+   * NOT govern — so a seal is the proof that the K7 leg was never reached.
+   */
+  const sealsUngraded = (rp: RunProfileHarness, run: string, note: string): void => {
+    rp.h.store.insertRunCapability({ work_run_ref: run, holder_ref: REQUESTER_A, capability_digest: digest, minted_at: "2026-01-01T00:00:00.000Z" });
+    assert.equal(rp.h.store.admissionsByEffect(run).length, 0, `${note}: the run has no admitted dispatch`);
+    const graded = sealMember(rp, { work_run_ref: run, capability: canonical });
+    assert.equal(rp.h.store.effectRequest(graded.effect_id)?.effect_id, graded.effect_id, `${note}: the unresolved-scope shape SEALS`);
+    // ...and so does the malformed presentation, and so does no presentation at all: none of the
+    // three is read, which is what "the header is inert transport" means (B6(3)).
+    const junk = sealMember(rp, { work_run_ref: run, capability: malformed });
+    const bare = sealMember(rp, { work_run_ref: run });
+    assert.equal(rp.h.store.effectRequest(junk.effect_id)?.effect_id, junk.effect_id, `${note}: a malformed presentation SEALS`);
+    assert.equal(rp.h.store.effectRequest(bare.effect_id)?.effect_id, bare.effect_id, `${note}: and so does no presentation at all`);
+    // BYTE-IDENTICAL: normalise the two values no two sealed records can ever share — the effect
+    // identity and the seal instant — and the three request digests coincide exactly.
+    for (const [seal, sealNote] of [[graded, "canonical"], [junk, "malformed"]] as const) {
+      const sealed = rp.h.store.effectRequest(seal.effect_id)!;
+      const normalised = { ...sealed, effect_id: bare.request.effect_id, requested_at: bare.request.requested_at };
+      assert.deepEqual(
+        recordDigest(normalised as unknown as Record<string, unknown>, "request_digest"),
+        bare.request.request_digest,
+        `${note}: the ${sealNote} presentation contributes nothing to request_digest`,
+      );
+    }
+    assert.equal(count(rp.h, "run_membership"), 0, `${note}: no membership proof is written`);
+    assert.equal(count(rp.h, "run_capability"), 1, `${note}: the fixture row only — nothing minted`);
+    assert.equal(rp.h.store.runCapability(run)?.capability_digest, digest, `${note}: and the fixture row is untouched`);
+  };
+
+  // (a) THE GOVERNED CONTROL, so every seal below is attributed to the GATE and not to the shape
+  // being unobjectionable: on a store where the profile governs, that exact request — same fixture
+  // capability, same holder, same never-dispatched run — is refused `RUN_SCOPE_UNRESOLVED`.
+  const governed = await runProfileHarness();
+  try {
+    const { effect_id: run } = sealWorkStart(governed, { origin_key: "origin-k7-gate-control" });
+    governed.h.store.insertRunCapability({ work_run_ref: run, holder_ref: REQUESTER_A, capability_digest: digest, minted_at: "2026-01-01T00:00:00.000Z" });
+    refuses(
+      governed, "RUN_SCOPE_UNRESOLVED",
+      () => sealMember(governed, { work_run_ref: run, capability: canonical }),
+      "the governed control",
+      canonical,
+    );
+  } finally {
+    governed.h.close();
+  }
+
+  // (b) A whole `cadp.kernel-config.v1` deployment — live v0.4. The run is an ordinary self-bound
+  // `WORK_START` under the v1 allocation schema (the run-origin contract is a v2 registry and is
+  // not even registered here), which is the shape that WOULD be an origin under the governed
+  // profile. It acquires no witness, mints nothing at its own dispatch, and its members seal
+  // ungraded whatever they present.
+  const v1 = await runProfileHarness({});
+  try {
+    const tuple = { schema: "cadp.allocation-key.v1", work_run_ref: DEFAULT_WORK_RUN_REF, step_ordinal: 41, purpose: "work-start" };
+    const run = v1.h.ingress.allocateEffectId(tuple, PRINCIPALS.workflow);
+    const material = { workflow_id: `cadp-work-${run}`, workflow_type: "cadpWork", task_queue: "cadp-worker", bounds: { max_steps: 8, max_effects: 6 } };
+    v1.h.ingress.sealEffectRequest(
+      {
+        effect_id: run,
+        requester_ref: REQUESTER_A,
+        work_bindings: [{ authority_ref: WORK_RUN_AUTHORITY, namespace: "work-run", object_id: run }],
+        target_ref: v1.target.targetRef(),
+        operation_kind: "WORK_START",
+        material_schema: "cadp.work-start.v1",
+        material_ref: v1.h.ingress.putBlob(Buffer.from(JSON.stringify(material), "utf8")),
+        prior_effect_refs: [],
+        allocation_tuple: tuple,
+      },
+      PRINCIPALS.workflow,
+      { run_capability: malformed },
+    );
+    assert.equal(v1.h.store.effectRequest(run)?.effect_id, run, "v1 seals the origin-shaped WORK_START");
+    assert.equal(v1.h.store.runMembership(run), undefined, "v1 writes no witness");
+    sealsUngraded(v1, run, "cadp.kernel-config.v1");
+  } finally {
+    v1.h.close();
+  }
+
+  // (c) NO ACTIVATION FROM THE SCHEMA ALONE. The same v2 bundle as every governed test in this
+  // file — the run-origin contract registered, the work-run namespace declared — with the ONE piece
+  // of governing registry content absent: the enrollment set is empty. The schema string does not
+  // switch the profile on, so the identical unresolved-scope shape seals here too.
+  const schemaOnly = await runProfileHarness(runProfileConfig({ run_profile_enrolled_requester_refs: [] }));
+  try {
+    const { effect_id: run } = sealWorkStart(schemaOnly, { origin_key: "origin-k7-schema-only" });
+    assert.equal(schemaOnly.h.store.runMembership(run), undefined, "an empty enrollment adjudicates nothing");
+    sealsUngraded(schemaOnly, run, "cadp.kernel-config.v2 with an empty enrollment");
+  } finally {
+    schemaOnly.h.close();
+  }
+
+  // (d) ...and the profile cannot be HALF activated either: B3(4)(c) refuses at validation any
+  // bundle that names an enrolled requester while declaring no work-run namespace, so there is no
+  // reachable config in which the K7 grading runs against an undeclared subject pair.
+  refuseConfig(
+    configOf({ kernel_subject_namespaces: [] }),
+    activatedContracts(),
+    "KERNEL_NAMESPACE_UNDECLARED",
+    "an enrollment with no declared work-run namespace",
+  );
+  // And under v1 the registry is not expressible at all: a v1 bundle carrying the enrollment key is
+  // refused by the closed-schema rule, which is why a live v0.4 deployment cannot reach these rules
+  // by configuration at all (AP B3(3)).
+  const v1Bundle = configOf() as Record<string, unknown>;
+  v1Bundle["schema"] = "cadp.kernel-config.v1";
+  // Every other v2-only key REMOVED, so the refusal below is about the enrollment registry alone
+  // and not about whichever v2 key the closed-schema loop happened to reach first.
+  for (const key of ["allocation_schema_descriptors", "allocation_schemas", "subject_complete_assembly", "kernel_subject_namespaces"]) {
+    delete v1Bundle[key];
+  }
+  let thrown: unknown;
+  try {
+    validateKernelConfig(v1Bundle);
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof KernelConfigInvalid, String(thrown));
+  assert.match((thrown as Error).message, /unknown key data\.cadp\.run_profile_enrolled_requester_refs \(closed schema\)/u);
 });
