@@ -60,9 +60,14 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
 import { startKernelApi } from "../kernel/api.ts";
+import { planItemOriginKey, startWork } from "../live/ops.ts";
+import type { StartWorkClient } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
 import { recordDigest } from "../kernel/canonical.ts";
@@ -2335,5 +2340,225 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ================================================ PART 6 — the LIVE COMPOSITION's origin path
+
+/**
+ * The Workflow-side half of A4/A5, exercised through the function the live composition actually
+ * calls: `cadp/live/ops.ts`'s `startWork`. Everything the Kernel adjudicates above is asserted here
+ * against what that function CONSTRUCTS — the `cadp.allocation-key.run-origin.v1` tuple, the one
+ * self-referential work-run binding, and the material an origin pins — with a real store, a real
+ * Ingress and a real PEP behind it, because those are the claims a fake kernel cannot make:
+ * `origin_key` → `effect_id` convergence is the Ingress's allocation row, the idempotent re-seal is
+ * the Ingress's K3 semantics, and `run_membership(E, E)` is written by the seal or by nothing.
+ *
+ * The complementary claim is asserted in the same shape: under the v0.4 default the SAME function
+ * seals the v1 zero-sentinel tuple, binds no run, and originates nothing — that branch's byte-level
+ * pin lives in `conformance-basesha.test.ts`, and here it is the durable delta that is checked.
+ *
+ * None of the refusal codes this file is otherwise about may appear on a valid origin path:
+ * `RUN_BINDING_REQUIRED`, `NOT_RUN_ENROLLED`, `RUN_CAPABILITY_REQUIRED`, `RUN_CAPABILITY_INVALID`,
+ * `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED` at the seal, and
+ * `RUN_MEMBERSHIP_UNPROVEN` at admission. A start that returns a handle raised none of them, and
+ * `startsWork` below fails the test with the reason code if any is raised.
+ */
+
+const OPS_MANIFEST: LiveEnvManifest = {
+  dir: "/deployment",
+  api_url: "http://127.0.0.1:42000",
+  root_url: "http://127.0.0.1:42001",
+  api_port: 42000,
+  root_port: 42001,
+  record_port: 42002,
+  temporal_port: 42003,
+  temporal_ui_port: 42004,
+  broker_port: 42005,
+  repo_full_name: "owner/repo",
+  repo_id: "github.com/owner/repo",
+  base_sha: "0000000000000000000000000000000000000000",
+  tokens: {},
+  root_key_id: "root-1",
+  kernel_config_path: "/deployment/kernel-config.json",
+  policy_content_digest: "deadbeef",
+};
+
+const OPS_BASE_SHA = "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1";
+const OPS_ITEM = ["make the thing", "8", "6", ""];
+
+/**
+ * The Kernel surface `startWork` calls, wired straight to this harness's components with the
+ * principal STAMPED exactly as `api.ts` stamps it (the authenticated caller, never a body field) —
+ * so the seal legs, B5(1)'s dispatch-requester equality and the mint all run for real.
+ */
+function opsKernel(rp: RunProfileHarness): { client: StartWorkClient; delivered: string[] } {
+  const delivered: string[] = [];
+  const client = {
+    async allocateEffectId(tuple: Record<string, unknown>) {
+      return { effect_id: rp.h.ingress.allocateEffectId(tuple as never, PRINCIPALS.workflow) };
+    },
+    async putBlob(bytes: Uint8Array) {
+      return { cas_key: rp.h.ingress.putBlob(bytes) };
+    },
+    async sealEffectRequest(body: unknown) {
+      return rp.h.ingress.sealEffectRequest(body, PRINCIPALS.workflow);
+    },
+    async assembleAdmissionInput(effect_id: string, evidence_refs: string[]) {
+      return rp.h.ingress.assembleAdmissionInput(effect_id, evidence_refs);
+    },
+    async evaluate(input_digest: string) {
+      return rp.h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id: string, decision_id: string) {
+      const result = await rp.h.pep.admitAndDispatch(effect_id, decision_id, PRINCIPALS.workflow);
+      const secret = (result as { run_capability?: string }).run_capability;
+      if (secret !== undefined) delivered.push(secret);
+      return result;
+    },
+  };
+  return { client: client as unknown as StartWorkClient, delivered };
+}
+
+/**
+ * One `startWork` through this harness. A raised `IngressRejection` FAILS the test naming its
+ * reason code: on a valid origin path none of B5's refusals may fire, and a rejection swallowed
+ * into an `undefined` return would be exactly the silence this file exists to prevent.
+ */
+async function startsWork(
+  rp: RunProfileHarness,
+  client: StartWorkClient,
+  options: { originKey?: string; originProfile?: "v04" | "v05"; log?: (line: Record<string, unknown>) => void; image?: string } = {},
+): Promise<{ effect_id: string; workflow_id: string; origin_key?: string }> {
+  let started: { effect_id: string; workflow_id: string; origin_key?: string } | undefined;
+  try {
+    started = await startWork(rp.h.dir, "development", OPS_ITEM, {
+      ...(options.log === undefined ? {} : { log: options.log }),
+      ...(options.originProfile === undefined ? {} : { originProfile: options.originProfile }),
+      ...(options.originKey === undefined ? {} : { originKey: options.originKey }),
+      dependencies: {
+        manifest: OPS_MANIFEST,
+        client,
+        namespaceId: () => "cadp-v04",
+        resolveBase: () => OPS_BASE_SHA,
+        workerImage: () => ({ image: options.image ?? "cadp-worker:v1", image_digest: "sha256:aaaa", tool_versions: { "codex-cli": "1.0.0" } }),
+        now: () => "2026-09-10T00:00:00.000Z",
+      },
+    });
+  } catch (error) {
+    return assert.fail(
+      `no refusal code may fire on a valid origin path, got ${
+        error instanceof IngressRejection ? error.reason : String((error as { cause?: unknown }).cause ?? error)
+      }`,
+    );
+  }
+  assert.notEqual(started, undefined, "the start was admitted");
+  return started!;
+}
+
+test("A4/A5 through cadp/live/ops.ts: one origin_key is one effect_id, one self-witnessed run, and one idempotent re-seal", async () => {
+  const rp = await runProfileHarness();
+  const { client, delivered } = opsKernel(rp);
+  const lines: Array<Record<string, unknown>> = [];
+  try {
+    const started = await startsWork(rp, client, { originProfile: "v05", originKey: "origin-live-1", log: (line) => lines.push(line) });
+    assert.equal(started.origin_key, "origin-live-1");
+
+    // The allocation the run-origin tuple derived, and the SEAL it names.
+    const request = rp.h.store.effectRequest(started.effect_id)!;
+    assert.equal(request.effect_id, started.effect_id, "the composition's WORK_START seals");
+    assert.equal(request.requester_ref, REQUESTER_A);
+    assert.equal(
+      (rp.h.store.db.prepare("SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?").get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n,
+      1,
+      "one logical origin, one allocation row",
+    );
+
+    // B5(9) legs 2-3: EXACTLY ONE binding on the declared work-run pair, naming its own effect_id —
+    // and `declaredWorkRunRef` is the Kernel's own reading of it, not the test's.
+    const workRun = request.work_bindings.filter((b) => b.authority_ref === WORK_RUN_AUTHORITY && b.namespace === "work-run");
+    assert.equal(workRun.length, 1, "exactly one work-run binding");
+    assert.equal(workRun[0]!.object_id, started.effect_id, "self-referential");
+    // The other bindings the development vertical carries are untouched by the migration.
+    assert.deepEqual(
+      request.work_bindings.filter((b) => b.namespace !== "work-run"),
+      [{ authority_ref: "github.com", namespace: "work-item", object_id: "dev:make the thing" }],
+    );
+
+    // B5(5)/B5(1)(b): the durable witness, both columns the origin's own effect_id.
+    const witness = rp.h.store.runMembership(started.effect_id);
+    assert.equal(witness?.effect_id, started.effect_id);
+    assert.equal(witness?.work_run_ref, started.effect_id);
+    assert.equal(count(rp.h, "run_membership"), 1, "exactly one membership row");
+
+    // A4: the capability was minted at THIS dispatch and delivered exactly once — and no rendering
+    // of it reaches the composition's own log, which is the surface B6(3) is easiest to lose on.
+    assert.equal(delivered.length, 1);
+    assertDeliveryInvariants(rp, started.effect_id, delivered[0]!, "the live composition's origin");
+    const admittedLine = lines.find((line) => line["admitted"] !== undefined)!;
+    assert.equal((admittedLine["admitted"] as { run_capability?: string }).run_capability, "[redacted]");
+    assertNoCapabilityText(JSON.stringify(lines), delivered[0]!, "the ops log transcript");
+
+    // THE RETRY. The same key, the same arguments: the same effect_id, an idempotent re-seal (a
+    // differing material would raise REQUEST_DIGEST_CONFLICT here), no second membership row, no
+    // second capability, and the same handle back rather than a NOT_ADMITTED.
+    const material = rp.h.store.effectRequest(started.effect_id)!.material_digest.value;
+    const retry = await startsWork(rp, client, { originProfile: "v05", originKey: "origin-live-1", log: (line) => lines.push(line) });
+    assert.deepEqual(retry, started, "the retry converges on the same run");
+    assert.equal(count(rp.h, "effect_request"), 1, "still exactly one K3 row");
+    assert.equal(rp.h.store.effectRequest(started.effect_id)!.material_digest.value, material, "byte-identical sealed material");
+    assert.equal(count(rp.h, "run_membership"), 1);
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(delivered.length, 1, "and nothing was re-minted or re-delivered");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("A5 o-i through ops.ts: two plan-item origins are two runs, each witnessing only itself", async () => {
+  const rp = await runProfileHarness();
+  const { client } = opsKernel(rp);
+  try {
+    const proposal = "cadp-v04:evidence:proposal-1";
+    const first = await startsWork(rp, client, { originProfile: "v05", originKey: planItemOriginKey(proposal, 0) });
+    const second = await startsWork(rp, client, { originProfile: "v05", originKey: planItemOriginKey(proposal, 1) });
+    assert.notEqual(second.effect_id, first.effect_id, "a different item index is a different effect identity");
+    for (const run of [first, second]) {
+      assert.equal(rp.h.store.runMembership(run.effect_id)?.work_run_ref, run.effect_id, "each run witnesses only itself");
+      assert.equal(rp.h.store.runCapability(run.effect_id)?.holder_ref, REQUESTER_A);
+    }
+    assert.equal(count(rp.h, "run_membership"), 2);
+    assert.equal(count(rp.h, "run_capability"), 2, "one capability per run (control A5)");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("the v0.4 DEFAULT of the same function originates nothing: v1 tuple, no run binding, no witness, no mint", async () => {
+  // A `cadp.kernel-config.v1` deployment — the live v0.4 one. The function under test is the same
+  // `startWork`; the only difference is the profile it defaults to.
+  const rp = await runProfileHarness({});
+  const { client, delivered } = opsKernel(rp);
+  try {
+    const started = await startsWork(rp, client);
+    assert.equal(started.origin_key, undefined, "no origin exists on this branch");
+    const request = rp.h.store.effectRequest(started.effect_id)!;
+    assert.deepEqual(
+      request.work_bindings,
+      [{ authority_ref: "github.com", namespace: "work-item", object_id: "dev:make the thing" }],
+      "today's bindings exactly — nothing binds a run",
+    );
+    assert.equal(rp.h.store.runMembership(started.effect_id), undefined, "no membership row");
+    assert.equal(count(rp.h, "run_membership"), 0);
+    assert.equal(count(rp.h, "run_capability"), 0, "nothing is minting under v1");
+    assert.equal(delivered.length, 0, "and nothing is delivered");
+    assert.equal(
+      (rp.h.store.db.prepare("SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?").get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n,
+      0,
+      "and no run-origin allocation row exists",
+    );
+    assert.equal(existsSync(join(rp.h.dir, "origin-keys")), false, "the v0.4 branch touches no origin record");
+  } finally {
+    rp.h.close();
   }
 });
