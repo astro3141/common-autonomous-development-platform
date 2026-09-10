@@ -363,6 +363,14 @@ export function originResourcePrefix(origin_key: string): string {
  * moment it is minted, persisted in the origin record before the first kernel call, AND carried by
  * every failure after it is decided — message included, so a caller that only prints `e.message`
  * (as `ctl auto-dev` does) still leaves the key recoverable.
+ *
+ * EVERY failure of a v0.5 start is this shape, not only the kernel's: the key is decided before the
+ * manifest read, the client mint and the argument refusals, so a `loadManifest` ENOENT or an unknown
+ * `worker_product` surfaces the key too. Such a failure precedes the origin record, so
+ * `origin_record_path` may name a file that does not exist yet — which is not a lost origin: nothing
+ * was resolved, recorded or sealed, so re-invoking with this key creates the record then and still
+ * yields ONE origin and ONE `effect_id`. The record's absence tells the recovering operator exactly
+ * that: this origin never reached its material.
  */
 export class OriginStartFailure extends Error {
   readonly origin_key: string;
@@ -490,43 +498,23 @@ export async function startWork(
   const log = options.log ?? SILENT;
   const originProfile = options.originProfile ?? "v04";
   const deps = options.dependencies ?? {};
-  const m = deps.manifest ?? loadManifest(dir);
-  const c: StartWorkKernelClient = deps.client ?? liveClient(dir, "cadp-workflow");
-  // v0.4 resolves the Temporal namespace HERE, exactly where it does today and ahead of the
-  // argument refusals below, so the default branch's observable order of external reads is
-  // unchanged. The v0.5 path resolves it inside the origin-material step instead — once per origin,
-  // and never again on a retry.
-  const v04NamespaceId = originProfile === "v04" ? (deps.namespaceId ?? temporalNamespaceId)(m) : undefined;
-
-  if (vertical === "development") {
-    const floor = devEffectFloorViolation(boundArg(extra[2], 6));
-    if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
-  }
-  // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
-  // an unknown provider at entry, before anything is sealed.
-  const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
-  // review_product select (extra[5], optional; omitted keeps the claude default). §8.4 reviewer
-  // independence fails closed HERE, before anything is sealed or any surface spends compute.
-  const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
-  assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
-  // extra[6]: opt-in external verification backend (#57). Only the exact literal enables it —
-  // anything else fails closed rather than silently running without the second verifier.
-  if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
-  const externalVerification = extra[6] === "external";
-  // The run-origin tuple carries no `step_ordinal` at all, so an operator-supplied ordinal has no
-  // place to go on this path: fail closed rather than accept an argument that would be ignored.
-  if (originProfile === "v05" && options.ordinalArg !== undefined) {
-    throw new Error("ordinalArg is a v0.4 allocation input; cadp.allocation-key.run-origin.v1 carries no step_ordinal");
-  }
 
   // ---------------------------------------------------------------- v0.5 origin identity
-  // The key is decided ONCE per logical origin and preserved verbatim across retries (WP §3.6).
-  // A minted one is emitted through the log IMMEDIATELY — before anything below can fail — and is
-  // then carried by every failure via `OriginStartFailure` and persisted in the origin record
-  // before the first kernel call. `workPlan`'s derived keys need no such emission: they are
-  // re-derivable from the proposal id and the item index.
+  // THE KEY IS DECIDED FIRST — before the manifest is read, before a client is built, before a
+  // single argument is validated. Nothing above this point can fail, and everything below it runs
+  // inside `startOrigin`, under the catch that attaches the key to the error. That ordering IS the
+  // durability obligation: a minted key that a failure swallowed would be re-minted by the retry,
+  // and two keys for one logical origin is the run fork WP §3.6's verbatim-preservation obligation
+  // forbids. Loading the manifest, minting the kernel client and resolving the worker/review
+  // providers are all fallible, so none of them may run before the key exists.
+  // A minted key is emitted through the log the moment it is decided, carried by every subsequent
+  // failure via `OriginStartFailure`, and persisted in the origin record before the first kernel
+  // call. `workPlan`'s derived keys need no such emission: they are re-derivable from the proposal
+  // id and the item index.
   // WP §3.6 gives `origin_key` the `NONEMPTY_STRING` value contract, so an empty one is refused here
   // rather than sent to be refused as `ALLOCATION_TUPLE_INVALID` after a record has been written.
+  // This one refusal may precede the mint: it rejects a key the CALLER passed, so on that path there
+  // is no minted key to lose (`originKey === ""` and "mint one" are mutually exclusive).
   if (options.originKey === "") throw new Error("originKey must be a non-empty string (WP §3.6: NONEMPTY_STRING)");
   const minted = originProfile === "v05" && options.originKey === undefined;
   const origin_key = originProfile === "v05" ? options.originKey ?? (deps.mintOriginKey ?? randomUUID)() : undefined;
@@ -546,11 +534,43 @@ export async function startWork(
   }
 
   /**
-   * Everything from the origin's material onward, for both profiles. It is a nested function for
-   * exactly one reason: the `catch` above must cover EVERY failure that can happen once an
-   * `origin_key` exists, so that a minted key is never lost to a thrown error.
+   * EVERY FALLIBLE STEP OF A START, for both profiles: the environment reads, the argument
+   * refusals, the origin's material and the kernel chain. It is a nested function for exactly one
+   * reason — the `catch` above must cover every failure that can happen once an `origin_key`
+   * exists, so a minted key is never lost to a thrown error, whether it was thrown by the kernel or
+   * by `loadManifest`, `liveClient` or a provider select. The step order within it is untouched, so
+   * the v0.4 branch's observable sequence of external reads and refusals is exactly today's.
    */
   async function startOrigin(): Promise<{ effect_id: string; workflow_id: string; origin_key?: string; run_capability?: string } | undefined> {
+    const m = deps.manifest ?? loadManifest(dir);
+    const c: StartWorkKernelClient = deps.client ?? liveClient(dir, "cadp-workflow");
+    // v0.4 resolves the Temporal namespace HERE, exactly where it does today and ahead of the
+    // argument refusals below, so the default branch's observable order of external reads is
+    // unchanged. The v0.5 path resolves it inside the origin-material step instead — once per
+    // origin, and never again on a retry.
+    const v04NamespaceId = originProfile === "v04" ? (deps.namespaceId ?? temporalNamespaceId)(m) : undefined;
+
+    if (vertical === "development") {
+      const floor = devEffectFloorViolation(boundArg(extra[2], 6));
+      if (floor !== undefined) throw new Error(floor); // fail closed before anything is sealed
+    }
+    // worker_product select (extra[4] on the dev path; extra[3] is the proposal id): fail closed on
+    // an unknown provider at entry, before anything is sealed.
+    const workerProduct = resolveWorkerProvider(extra[4] !== undefined && extra[4] !== "" ? extra[4] : "codex");
+    // review_product select (extra[5], optional; omitted keeps the claude default). §8.4 reviewer
+    // independence fails closed HERE, before anything is sealed or any surface spends compute.
+    const reviewProduct = resolveReviewProvider(extra[5] !== undefined && extra[5] !== "" ? extra[5] : "claude");
+    assertReviewIndependence(WORKER_PROVIDERS[workerProduct].identity_class_product, reviewProduct);
+    // extra[6]: opt-in external verification backend (#57). Only the exact literal enables it —
+    // anything else fails closed rather than silently running without the second verifier.
+    if (extra[6] !== undefined && extra[6] !== "" && extra[6] !== "external") throw new Error(`unknown external-verification flag: ${extra[6]} (use "external" or omit)`);
+    const externalVerification = extra[6] === "external";
+    // The run-origin tuple carries no `step_ordinal` at all, so an operator-supplied ordinal has no
+    // place to go on this path: fail closed rather than accept an argument that would be ignored.
+    if (originProfile === "v05" && options.ordinalArg !== undefined) {
+      throw new Error("ordinalArg is a v0.4 allocation input; cadp.allocation-key.run-origin.v1 carries no step_ordinal");
+    }
+
     // -------------------------------------------------------------- v0.5 origin material
     // The environment is read EXACTLY ONCE per origin, at origin creation, and recorded. On every
     // later attempt `inputs` comes from the record and nothing here touches `ls-remote`, the

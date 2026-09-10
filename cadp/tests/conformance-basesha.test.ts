@@ -20,10 +20,11 @@
  * namespace was re-read.
  *
  * PART 4, ORIGIN DURABILITY: a direct start mints its `origin_key` exactly once with
- * `crypto.randomUUID`, and a failure cannot swallow it — it is emitted through the log at mint time,
- * persisted under `origin-keys/` before the first kernel call, and carried by the thrown error. The
- * recovery flow (read the record, re-invoke with the recorded key) converges on the same allocation
- * tuple and re-seals the recorded material.
+ * `crypto.randomUUID`, and NO failure can swallow it — not the kernel's, and not the pre-kernel
+ * manifest/provider work either, because the key is decided before any of it runs. It is emitted
+ * through the log at mint time, persisted under `origin-keys/` before the first kernel call, and
+ * carried by the thrown error. The recovery flow (read the record, re-invoke with the recorded key)
+ * converges on the same allocation tuple and re-seals the recorded material.
  *
  * PART 5, `workPlan`'s DERIVED keys: stable and distinct by `proposal_evidence_id` + item index, and
  * threaded into each `startWork` — the one origin path that needs no durability record for its KEY.
@@ -410,6 +411,50 @@ test("v0.5 direct start: the minted origin_key survives a failed start in the lo
       return true;
     },
   );
+});
+
+test("v0.5 direct start: a failure in the PRE-KERNEL manifest/provider work still exposes the minted origin_key", async () => {
+  // The durability obligation is about the WHOLE start, not about the kernel chain: the key is
+  // decided before the manifest read, the client mint and the argument refusals, so no fallible
+  // step of a v0.5 start can run while the origin has no identity to report.
+  const seams: Array<{ name: string; extra: string[]; deps: StartWorkDependencies; cause: RegExp }> = [
+    // The manifest read: an empty deployment dir has no manifest.json.
+    { name: "manifest", extra: [...DEV_EXTRA], deps: { ...dependencies(fakeKernel()), manifest: undefined }, cause: /manifest\.json/u },
+    // The provider selects, which run on the arguments and fail closed on an unknown product.
+    { name: "worker_product", extra: [...DEV_EXTRA, "proposal-1", "no-such-worker"], deps: dependencies(fakeKernel()), cause: /unknown worker provider: no-such-worker/u },
+  ];
+
+  for (const seam of seams) {
+    const dir = deployment();
+    const log = lines();
+    await assert.rejects(
+      () => startWork(dir, "development", seam.extra, { originProfile: "v05", log: log.log, dependencies: seam.deps }),
+      (error: unknown) => {
+        assert.ok(error instanceof OriginStartFailure, `${seam.name}: ${String(error)}`);
+        assert.match(error.origin_key, UUID_V4, `${seam.name}: the key was minted before this step ran`);
+        assert.ok(error.message.includes(error.origin_key), `${seam.name}: and rides the message`);
+        assert.match((error.cause as Error).message, seam.cause, `${seam.name}: the cause is never swallowed`);
+        assert.equal(log.all.find((line) => line["origin"] === "MINTED")?.["origin_key"], error.origin_key, `${seam.name}: the log carries it too`);
+        // This failure precedes the origin record, which is not a lost origin: nothing was
+        // resolved, recorded or sealed, so a retry with this key is still ONE origin.
+        assert.equal(existsSync(originRecordPath(dir, error.origin_key)), false, `${seam.name}: this origin never reached its material`);
+        return true;
+      },
+    );
+  }
+});
+
+test("v0.4 (default): the same pre-kernel failures propagate RAW — the default branch mints no key and wraps no error", async () => {
+  const dir = deployment();
+  await assert.rejects(
+    () => startWork(dir, "development", [...DEV_EXTRA], { dependencies: { ...dependencies(fakeKernel()), manifest: undefined } }),
+    (error: unknown) => {
+      assert.ok(!(error instanceof OriginStartFailure), "v0.4 errors are exactly today's, unwrapped");
+      assert.match((error as Error).message, /manifest\.json/u);
+      return true;
+    },
+  );
+  assert.equal(existsSync(join(dir, "origin-keys")), false, "and nothing about an origin was written");
 });
 
 test("v0.5 recovery flow: re-invoking with the recorded key derives the same tuple and seals the recorded material", async () => {
