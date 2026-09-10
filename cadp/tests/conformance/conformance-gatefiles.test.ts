@@ -182,19 +182,47 @@ test("GF8: the pinned argv is exactly five glob-free tokens, and EXECUTING it ru
     // behaviour the verifier's discovery behaviour.
     const env = { ...process.env };
     delete env["NODE_TEST_CONTEXT"];
-    const run = spawnSync(process.execPath, [...VERIFIER_TEST_ARGV.slice(1)], { cwd: root, encoding: "utf8", timeout: 120_000, env });
-    const out = `${run.stdout ?? ""}${run.stderr ?? ""}`;
-    const evidence = `node ${process.version}, argv ${JSON.stringify(VERIFIER_TEST_ARGV)}\n--- output ---\n${out.slice(0, 4000)}`;
+    /** Run one selector form against the fixture and report what it actually discovered. */
+    const runForm = (label: string, argv: readonly string[]) => {
+      const run = spawnSync(process.execPath, [...argv], { cwd: root, encoding: "utf8", timeout: 120_000, env });
+      const out = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+      const count = (field: string): number => Number(new RegExp(`^# ${field} (\\d+)$`, "mu").exec(out)?.[1] ?? "-1");
+      const found = legs.filter((name) => out.includes(`ok 1 - ${name}`) || out.includes(`- ${name}`));
+      return { label, argv, out, found, status: run.status, tests: count("tests"), pass: count("pass"), fail: count("fail") };
+    };
 
-    // Parse the summary counts the runner reports, and the per-leg results.
-    const count = (field: string): number => Number(new RegExp(`^# ${field} (\\d+)$`, "mu").exec(out)?.[1] ?? "-1");
-    for (const name of legs) {
-      assert.ok(out.includes(`ok 1 - ${name}`) || out.includes(`- ${name}`), `the invocation discovered NO test in the suite carrying "${name}".\n${evidence}`);
+    const pinned = runForm("PINNED — the contracted five tokens", VERIFIER_TEST_ARGV.slice(1));
+    const healthy = pinned.found.length === legs.length && pinned.tests >= legs.length && pinned.pass === legs.length && pinned.fail === 0 && pinned.status === 0;
+    if (!healthy) {
+      // The pinned form did not run all three suites on this Node. Per the team lead's routing note,
+      // THIS OUTPUT IS THE EVIDENCE: probe the alternatives so the re-route decision is informed
+      // (does this Node lack directory discovery entirely, or only recursion?), report, and STOP.
+      // Nothing here substitutes a different selector — VERIFIER_TEST_ARGV is not touched.
+      const probes = [
+        runForm("probe A — bare `node --test` (cwd-recursive discovery, the pre-pin form)", ["--test"]),
+        runForm("probe B — glob selectors (NOT the contract; probed only to locate the failure)", ["--test", ...VERIFIER_TEST_DIRS.map((d) => `${d}*.test.ts`)]),
+      ];
+      const summarise = (r: typeof pinned): string => `${r.label}\n  argv: ${JSON.stringify(["node", ...r.argv])}\n  exit ${r.status} · tests ${r.tests} · pass ${r.pass} · fail ${r.fail} · legs discovered ${r.found.length}/${legs.length}`;
+      const report = [
+        `local verifier Node: ${process.version} (the surface image — OUT OF SCOPE to change).`,
+        `external verifier Node: node-version in .github/workflows/cadp-verify.yml (a different runtime; this leg measures THIS one).`,
+        `fixture: ${legs.length} leaf directories, one passing *.test.ts sitting DIRECTLY in each — no nesting, so no recursion is required.`,
+        "",
+        [pinned, ...probes].map(summarise).join("\n"),
+        "",
+        `--- pinned invocation output ---\n${pinned.out.slice(0, 4000)}`,
+        "",
+        "ROUTING: if the pinned form discovers nothing while a probe does, the exact five-token contract is not executable on this Node. Do NOT work around it here — the team lead re-routes.",
+      ].join("\n");
+
+      for (const name of legs) {
+        assert.ok(pinned.found.includes(name), `the pinned invocation discovered NO test in the suite carrying "${name}".\n${report}`);
+      }
+      assert.ok(pinned.tests >= legs.length, `expected at least ${legs.length} tests to RUN (one per enumerated directory), got ${pinned.tests}.\n${report}`);
+      assert.equal(pinned.pass, legs.length, `expected exactly ${legs.length} passing fixture tests, one discovered per enumerated directory.\n${report}`);
+      assert.equal(pinned.fail, 0, `the pinned invocation failed on this Node.\n${report}`);
+      assert.equal(pinned.status, 0, `the pinned invocation exited ${pinned.status}.\n${report}`);
     }
-    assert.ok(count("tests") >= legs.length, `expected at least ${legs.length} tests to RUN (one per enumerated directory), got ${count("tests")}.\n${evidence}`);
-    assert.equal(count("pass"), legs.length, `expected exactly ${legs.length} passing fixture tests, one discovered per enumerated directory.\n${evidence}`);
-    assert.equal(count("fail"), 0, `the pinned invocation failed on this Node.\n${evidence}`);
-    assert.equal(run.status, 0, `the pinned invocation exited ${run.status}.\n${evidence}`);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
