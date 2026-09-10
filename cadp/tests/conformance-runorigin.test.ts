@@ -46,6 +46,17 @@
  * `recheck19_run_membership` guard-bite knob; and it activates for no v1 deployment, no ungoverned
  * v2 bundle and no non-enrolled requester.
  *
+ * PART 6, the CROSS-KERNEL legs of the live composition's origin path: `cadp/live/ops.ts`'s
+ * `startWork` driven against this file's real Ingress and PEP under both origin profiles — that
+ * what its `"v05"` branch seals IS an adjudicated origin (the self-referential `work-run` binding,
+ * the `run_membership(E, E)` witness, the once-only mint at its own dispatch), that a retry of one
+ * `origin_key` converges on the same `effect_id` as an idempotent re-seal with no run-profile
+ * refusal code raised, and that its `"v04"` default under a `cadp.kernel-config.v1` deployment
+ * seals, admits and dispatches with zero membership rows and zero capabilities — the live v0.4
+ * deployment, unmoved. Everything about that path that needs no Kernel — the byte pins, the
+ * material-pinning invariant, the origin record and the recovery flow — is in
+ * `conformance-basesha.test.ts`, the live-ops test file.
+ *
  * These are the Authority-side legs of §C controls A4 (witnessed minting, delivery, the origin
  * legs o1/o2, the dispatch-requester equality and the presentation encoding) and A5 (one
  * `origin_key` → one `effect_id` for the store's lifetime, and the o-iv/o-vi immutability legs).
@@ -60,7 +71,14 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
+
+import { originKeysPath, startWork } from "../live/ops.ts";
+import type { StartWorkDependencies } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 
 import { startKernelApi } from "../kernel/api.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
@@ -2335,5 +2353,193 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ================================ PART 6 — the LIVE composition's origin path, against this Kernel
+
+/**
+ * The live deployment directory `cadp/live/ops.ts` reads: only `worker-image` is a real file here,
+ * because every other environment read is injected below. `origin-keys.json` is written by the
+ * origin path itself, and its ABSENCE is the v0.4 branch's assertion.
+ */
+function liveDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "cadp-ops-origin-"));
+  writeFileSync(join(dir, "worker-image"), "cadp-surface:test\n");
+  return dir;
+}
+
+const LIVE_MANIFEST = {
+  dir: "/live", api_url: "http://127.0.0.1:1", repo_id: "9001", repo_full_name: "owner/live-target",
+  base_sha: "0".repeat(40), tokens: {},
+} as unknown as LiveEnvManifest;
+
+const LIVE_BASE_SHA = "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1";
+
+/**
+ * `ops.ts`'s Kernel client, wired to THIS harness's real Ingress and PEP instead of HTTP. The
+ * caller passed to `admitAndDispatch` is the sealed requester, which is B5(1)'s dispatch equality.
+ */
+function liveKernelClient(h: Harness, principal: Principal = PRINCIPALS.workflow): StartWorkDependencies["client"] {
+  return {
+    async allocateEffectId(tuple: unknown) {
+      return { effect_id: h.ingress.allocateEffectId(tuple as never, principal) };
+    },
+    async putBlob(bytes: Uint8Array) {
+      return { cas_key: h.ingress.putBlob(bytes) };
+    },
+    async sealEffectRequest(body: unknown) {
+      return h.ingress.sealEffectRequest(body, principal);
+    },
+    async assembleAdmissionInput(effect_id: string, evidence_refs: string[]) {
+      return h.ingress.assembleAdmissionInput(effect_id, evidence_refs);
+    },
+    async evaluate(input_digest: string) {
+      return h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id: string, decision_id: string) {
+      return h.pep.admitAndDispatch(effect_id, decision_id, principal);
+    },
+  } as unknown as StartWorkDependencies["client"];
+}
+
+/** The live start's environment, injected: no git, no docker daemon, no `temporal` CLI in a test. */
+function liveDeps(h: Harness): StartWorkDependencies {
+  return {
+    manifest: LIVE_MANIFEST,
+    client: liveKernelClient(h),
+    resolveBase: () => LIVE_BASE_SHA,
+    resolveImage: () => ({ image: "cadp-surface:test", image_digest: "sha256:aaaa", tool_versions: { "codex-cli": "1.0.0" } }),
+    // The namespace the WORK_START target this harness registers actually names.
+    resolveNamespace: () => "cadp-v04",
+    now: () => "2026-09-10T00:00:00.000Z",
+  };
+}
+
+/** `liveDeps` with the admit response observed at the transport seam, before `ops.ts` sees it. */
+function observingDeps(h: Harness, observe: (capability: string | undefined) => void): StartWorkDependencies {
+  const base = liveDeps(h);
+  const inner = base.client!;
+  return {
+    ...base,
+    client: {
+      ...inner,
+      admitAndDispatch: async (effect_id: string, decision_id: string) => {
+        const result = await inner.admitAndDispatch(effect_id, decision_id);
+        observe((result as { run_capability?: string }).run_capability);
+        return result;
+      },
+    } as unknown as StartWorkDependencies["client"],
+  };
+}
+
+const LIVE_EXTRA = ["implement median", "8", "6", "cadp-v04:evidence:p-1"];
+
+/** A `REQUEST_DIGEST_CONFLICT` is sealed as a `KERNEL_INCIDENT` envelope, not as its own table. */
+function kernelIncidents(h: Harness): number {
+  return (h.store.db.prepare("SELECT COUNT(*) AS n FROM evidence_envelope WHERE evidence_kind = 'KERNEL_INCIDENT'").get() as { n: number }).n;
+}
+
+test("PART 6 / A4 o1+B5(1): the live v0.5 start path seals an adjudicated ORIGIN, mints once, and its retry is a no-op", async () => {
+  const rp = await runProfileHarness();
+  const dir = liveDir();
+  try {
+    // `workflow:cadp-work` — the requester `ops.ts` seals as — is the enrolled one here, so every
+    // run-profile leg of B5(3)-(5) is live for this request. A refusal under ANY of them would
+    // escape this call as an `IngressRejection`: the start completing IS the assertion that
+    // RUN_BINDING_REQUIRED, NOT_RUN_ENROLLED, RUN_CAPABILITY_REQUIRED, RUN_CAPABILITY_INVALID,
+    // RUN_CAPABILITY_HOLDER_MISMATCH, RUN_SCOPE_UNRESOLVED, RUN_SCOPE_REFUSED and (at admission)
+    // RUN_MEMBERSHIP_UNPROVEN are none of them introduced on the valid origin path.
+    // The admit response is intercepted at the transport seam so the test holds the secret that
+    // was actually DELIVERED — the store keeps only its digest, and `ops.ts` never returns it.
+    const liveLog: Array<Record<string, unknown>> = [];
+    let delivered: string | undefined;
+    const started = await startWork(dir, "development", LIVE_EXTRA, {
+      originProfile: "v05", originKey: "origin-live-1", log: (line) => liveLog.push(line),
+      dependencies: observingDeps(rp.h, (secret) => { delivered = secret; }),
+    });
+    assert.ok(started !== undefined, "the governed start was admitted and COMMITTED");
+    assert.equal(started.origin_key, "origin-live-1");
+
+    // The allocation row is the run-origin contract's, keyed by the origin (A5 leg o-ii).
+    const allocations = (rp.h.store.db.prepare(
+      "SELECT COUNT(*) AS n FROM effect_allocation WHERE allocation_schema = ?",
+    ).get(RUN_ORIGIN_ALLOCATION_SCHEMA) as { n: number }).n;
+    assert.equal(allocations, 1, "one logical origin, one allocation row");
+
+    // B5(9) legs 2 and 3, read off the SEALED row: exactly one binding on the declared work-run
+    // pair, naming the WORK_START's own effect_id — beside the ordinary work-item provenance.
+    const sealed = rp.h.store.effectRequest(started.effect_id)!;
+    const workRun = sealed.work_bindings.filter((b) => b.authority_ref === WORK_RUN_AUTHORITY && b.namespace === "work-run");
+    assert.equal(workRun.length, 1, "exactly one work-run binding");
+    assert.equal(workRun[0]!.object_id, started.effect_id, "self-referential: the origin names its own run");
+    assert.equal(sealed.work_bindings.filter((b) => b.namespace === "work-item").length, 1);
+
+    // A4 o1: the durable witness, both columns the origin's own effect_id.
+    const witness = rp.h.store.runMembership(started.effect_id);
+    assert.equal(witness?.effect_id, started.effect_id);
+    assert.equal(witness?.work_run_ref, started.effect_id);
+    assert.equal(count(rp.h, "run_membership"), 1, "exactly one membership row");
+
+    // B5(1)/B6(4): the origin's OWN verified initial dispatch minted exactly one capability, held
+    // by the sealed requester. `ops.ts` never reads or logs it — the row is where it lives.
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(rp.h.store.runCapability(started.effect_id)?.holder_ref, REQUESTER_A);
+
+    // B6(3) over the live composition's OWN log: the admit response of an origin's initial
+    // dispatch carries the delivered secret, and `ops.ts` must render none of it. The capability
+    // that WAS delivered here is the one this row digests, so the sweep is stated over the actual
+    // secret rather than over a pattern that a redaction bug could still satisfy.
+    assert.equal(typeof delivered, "string", "a capability WAS delivered — the sweep below is not vacuous");
+    assert.equal(
+      rp.h.store.runCapability(started.effect_id)?.capability_digest,
+      createHash("sha256").update(Buffer.from(delivered!, "base64url")).digest("hex"),
+      "the delivered secret is the one this row digests",
+    );
+    assert.equal(liveLog.length > 0, true, "the start did log");
+    for (const line of liveLog) assertNoCapabilityText(JSON.stringify(line), delivered!, "the live start's log");
+
+    // THE RETRY: the same origin_key, and the environment moved under it (a new base sha, a
+    // rebuilt image). It converges on the same effect_id, re-seals identically (no
+    // REQUEST_DIGEST_CONFLICT incident, no new K3 row) and re-mints nothing.
+    const incidents = kernelIncidents(rp.h);
+    const retry = await startWork(dir, "development", LIVE_EXTRA, {
+      originProfile: "v05", originKey: "origin-live-1",
+      dependencies: {
+        ...liveDeps(rp.h),
+        resolveBase: () => "1".repeat(40),
+        resolveImage: () => ({ image: "cadp-surface:rebuilt", image_digest: "sha256:bbbb", tool_versions: { "codex-cli": "2.0.0" } }),
+      },
+    });
+    // The re-seal is the idempotent no-op; the dispatch of an already-COMMITTED effect is refused
+    // EFFECT_ALREADY_COMMITTED, which `ops.ts` reports honestly as "not started again".
+    assert.equal(retry, undefined, "the retry starts nothing new");
+    assert.equal(count(rp.h, "effect_request"), 1, "still exactly one sealed request");
+    assert.equal(count(rp.h, "run_membership"), 1, "still exactly one membership row");
+    assert.equal(count(rp.h, "run_capability"), 1, "and nothing re-minted");
+    assert.equal(kernelIncidents(rp.h), incidents, "no REQUEST_DIGEST_CONFLICT incident");
+    assert.equal(rp.h.store.effectRequest(started.effect_id)?.request_digest.value, sealed.request_digest.value, "byte-identical seal");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("PART 6 / B5(1)(α): the live v0.4 DEFAULT under a v1 deployment seals, dispatches, and originates nothing", async () => {
+  // A whole `cadp.kernel-config.v1` deployment — the live one. The default profile is what every
+  // existing caller (`ctl.ts` work-dev/auto-dev, the MCP surface, `workPlan`) passes.
+  const rp = await runProfileHarness({});
+  const dir = liveDir();
+  try {
+    const started = await startWork(dir, "development", LIVE_EXTRA, { dependencies: liveDeps(rp.h) });
+    assert.ok(started !== undefined, "the v0.4 start is admitted and COMMITTED exactly as today");
+    assert.equal(started.origin_key, undefined, "no origin is minted or derived");
+
+    const sealed = rp.h.store.effectRequest(started.effect_id)!;
+    assert.equal(sealed.work_bindings.filter((b) => b.namespace === "work-run").length, 0, "no work-run binding");
+    assert.equal(count(rp.h, "run_membership"), 0, "no witness: this WORK_START is not a run origin");
+    assert.equal(count(rp.h, "run_capability"), 0, "and its dispatch mints nothing (B5(1)(α))");
+    assert.equal(existsSync(originKeysPath(dir)), false, "the v0.4 branch never touches origin-keys.json");
+  } finally {
+    rp.h.close();
   }
 });
