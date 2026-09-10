@@ -225,12 +225,18 @@ export async function cadpWork(args: WorkArgs): Promise<Record<string, unknown>>
     priorStepDigest = reviewed.work_step_envelope_digest;
     trace["review_evidence_id"] = reviewed.review_evidence_id;
     trace["review_backend_evidence_id"] = reviewed.backend_evidence_id;
+    // #259 P0b: the CAS key of this round's FULL review text. The trace is what a post-STOP
+    // team-lead repair lane reads, and the one-line `reason` below is a PARSE of that text, never a
+    // substitute for it — the key makes the bytes fetchable (kernel CAS get by key).
+    trace["review_body_cas_key"] = reviewed.review_body_cas_key;
 
     approved = reviewed.verdict === "APPROVE" && verified.conclusion === "success";
     if (!approved) {
       baseSha = implemented.candidate_sha;
       workItem = `${dev.work_item}\n\nA reviewer requested changes on the previous candidate with this reason: ${reviewed.reason}. Address the feedback with a minimal follow-up commit.`;
       trace[`round_${round}_verdict`] = `${reviewed.verdict}/${verified.conclusion}`;
+      // Round 2 overwrites `review_body_cas_key`; keep round 1's body reachable under its own key.
+      trace[`round_${round}_review_body_cas_key`] = reviewed.review_body_cas_key;
     }
   }
   if (!approved) return { ...trace, stopped: "REVIEW_NOT_APPROVED", detail: reviewed.reason };

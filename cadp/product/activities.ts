@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { KernelClient } from "../clients/kernelClient.ts";
 import { brokerPostJson } from "./brokerTransport.ts";
 import { resolveReviewProvider } from "./reviewProviders.ts";
+import { submitReviewEvidence } from "./reviewEvidence.ts";
 import { BROKER_CALL_HEARTBEAT_INTERVAL_MS, EXTERNAL_VERIFY, SURFACE_BUDGETS } from "./timeouts.ts";
 import type { SurfaceOperationBudget } from "./timeouts.ts";
 import type { EvidenceEnvelopeV1 } from "../kernel/records.ts";
@@ -547,7 +548,15 @@ export async function reviewCandidate(input: {
   work_item: string;
   review_product?: string;
   prior_step_envelope_digest?: string;
-}): Promise<{ review_evidence_id: string; backend_evidence_id: string; verdict: string; reason: string; work_step_envelope_digest: string }> {
+}): Promise<{
+  review_evidence_id: string;
+  backend_evidence_id: string;
+  verdict: string;
+  reason: string;
+  review_body_cas_key: string;
+  review_body_digest: string;
+  work_step_envelope_digest: string;
+}> {
   // Fail closed on an unknown selection BEFORE any surface or kernel call; omitted keeps claude.
   const reviewProvider = resolveReviewProvider(input.review_product ?? "claude");
   // Honest attribution: the REVIEW evidence is authenticated as the provider that actually
@@ -575,26 +584,31 @@ export async function reviewCandidate(input: {
     rv.backend_effort_locator,
     rv.backend_requested_effort,
   );
-  const envelope = await reviewer.submitEvidence({
-    evidence_kind: "REVIEW",
-    subject_bindings: [{ authority_ref: "github.com", namespace: "commit", object_id: input.candidate_sha, revision_or_version: input.candidate_sha }],
-    availability: "PRESENT",
-    claim_schema: "cadp.review.v1",
-    claim: { verdict: rv.verdict, body_digest: sha256(rv.stdout), reviewer_run_id: `${reviewProvider}-p:${Date.now()}` },
-    producer_ref: reviewProvider === "claude" ? "reviewer:claude-code" : `reviewer:${reviewProvider}`,
-    source_ref: `${reviewProvider}:read-only-profile`,
-    source_relation: "INDEPENDENT_OBSERVATION",
+  // #259 P0b: the FULL reviewer stdout is made durable in the kernel CAS and the claim names those
+  // exact bytes alongside their digest, so {body_digest, body_cas_key} is self-verifying and the
+  // post-STOP repair lane can quote findings byte-for-byte instead of `rv.reason`, the one parsed
+  // line that used to be the only surviving text. No truncation (see ./reviewEvidence.ts) — the
+  // 60 000-char cap bounds the reviewer PROMPT, not stored evidence.
+  const review = await submitReviewEvidence({
+    client: reviewer,
+    review_provider: reviewProvider,
+    candidate_sha: input.candidate_sha,
+    stdout: rv.stdout,
+    verdict: rv.verdict,
+    reviewer_run_id: `${reviewProvider}-p:${Date.now()}`,
   });
   const workStep = await submitWorkStep({
     work_run_ref: input.work_run_ref, step_ordinal: input.step_ordinal,
-    input_digest: input.candidate_sha, output_digest: envelope.envelope_digest.value,
+    input_digest: input.candidate_sha, output_digest: review.envelope.envelope_digest.value,
     summary: `review ${rv.verdict}`, prior_step_envelope_digest: input.prior_step_envelope_digest,
   });
   return {
-    review_evidence_id: envelope.evidence_id,
+    review_evidence_id: review.envelope.evidence_id,
     backend_evidence_id: backendEvidence,
     verdict: rv.verdict,
     reason: rv.reason,
+    review_body_cas_key: review.body_cas_key,
+    review_body_digest: review.body_digest,
     work_step_envelope_digest: workStep.envelope_digest.value,
   };
 }

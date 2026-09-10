@@ -139,11 +139,19 @@ export function attribution(run: RunObservation): Record<string, unknown> {
     // requested and observed are NEVER merged; a PRESENT observed fact carries its locator.
     return { evidence_id: e.evidence_id, requested: claim.requested, observed: claim.observed };
   });
-  const verdicts = run.byKind("REVIEW").map((e) => ({
-    evidence_id: e.evidence_id,
-    subject: e.subject_bindings.map((b) => `${b.namespace}:${b.object_id}`),
-    verdict: (e.claim as { verdict?: string } | undefined)?.verdict,
-  }));
+  // #259 P0b: the review body pair rides along so a reader of this projection can fetch the FULL
+  // reviewer text (kernel CAS get by body_cas_key) and re-digest it against body_digest. The text
+  // itself is not inlined here — a projection reports where the bytes are, it does not restate them.
+  const verdicts = run.byKind("REVIEW").map((e) => {
+    const claim = e.claim as { verdict?: string; body_digest?: string; body_cas_key?: string } | undefined;
+    return {
+      evidence_id: e.evidence_id,
+      subject: e.subject_bindings.map((b) => `${b.namespace}:${b.object_id}`),
+      verdict: claim?.verdict,
+      body_digest: claim?.body_digest,
+      body_cas_key: claim?.body_cas_key,
+    };
+  });
   const verification = run.byKind("VERIFICATION").map((e) => ({
     evidence_id: e.evidence_id,
     availability: e.availability,
