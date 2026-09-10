@@ -22,7 +22,11 @@ jobs:
         with:
           # The pinned invocation below names DIRECTORIES, which only a Node whose test runner
           # searches directory arguments expands into test files (measured: Node 22 does not — it
-          # tries to load each directory as a module). This runner is therefore kept on 24.
+          # glob-matches the directory itself and then tries to load it as a module, discovering no
+          # test at all). This version is therefore the runtime half of the pin: it is
+          # `VERIFIER_NODE_MAJOR` in cadp/product/surfaceBroker.ts, the SAME major the LOCAL
+          # verifier's image declares (`FROM node:24-bookworm-slim` in cadp/live/image/Dockerfile),
+          # so both verifiers run the same argv on the same runtime. GF8 asserts all three agree.
           node-version: "24"
       # The conformance suite drives a real OPA evaluator; pin the SAME version the deployment's
       # evaluator integrity records (1.20.1). Without it the suite stalls to the job timeout

@@ -6,7 +6,23 @@
 #
 # TD §11 measured reference surfaces are PINNED, so rebuilding this exact Git head reproduces
 # the same worker/reviewer products (no mutable `latest`).
-FROM node:22-bookworm-slim
+#
+# NODE MAJOR = THE LOCAL VERIFIER'S RUNTIME. `runVerifier` runs the pinned invocation
+# (`VERIFIER_TEST_ARGV` in cadp/product/surfaceBroker.ts) inside THIS image, so the base tag is
+# what decides whether that invocation selects anything at all. Measured on node:22 (22.23.2, the
+# tag this line used to carry): the test runner glob-matches each positional, and a directory
+# pattern matches the DIRECTORY ITSELF, which is then loaded as a test file — `Cannot find module
+# /ws/cadp/tests/conformance` — so all three suites were discovered EMPTY and `/verify` returned a
+# verdict about tests it never ran. The major is therefore pinned to the one the external verifier
+# already runs (`node-version: "24"` in .github/workflows/cadp-verify.yml): both verifiers execute
+# the same argv on the same Node major, and conformance-gatefiles.test.ts GF8 asserts this tag,
+# that workflow's version and `VERIFIER_NODE_MAJOR` are the same number. The 24 half of that
+# measurement cannot be taken from inside a candidate surface (one runtime, no docker), so GF8
+# takes it ON THE VERIFIER: at or above the pinned major the pinned argv MUST select all three
+# suites, so a 24 that also failed to expand directories turns both verifiers red — never quiet.
+# The major moves for the worker and reviewer surfaces too — they share this image — which is a
+# TD §11 pin change, deliberate and human-merged with the rest of this gate machinery.
+FROM node:24-bookworm-slim
 # `opa` is pinned so the verifier can run CADP's OWN conformance suite (which spawns an OPA
 # sidecar) when the governed target is CADP itself — self-hosting verification needs the same
 # toolchain `npm test` needs on a developer host. TARGETARCH picks the matching static binary.

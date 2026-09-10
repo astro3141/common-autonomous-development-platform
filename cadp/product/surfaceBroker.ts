@@ -332,22 +332,18 @@ export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/",
  * anywhere else.
  *
  * RUNTIME REQUIREMENT, measured rather than assumed: a positional directory is only expanded into
- * the test files it holds by a Node whose test runner SEARCHES directory arguments. On Node 22
- * (`cadp/live/image/Dockerfile` pins node:22-bookworm-slim; measured on 22.23.2) it does not —
- * the runner treats each directory token as a file to load and reports `Cannot find module
- * <dir>`, discovering no test at all. This pinned form therefore requires a verifier runtime that
- * searches directory arguments (Node 24+). `conformance-gatefiles.test.ts` GF8 does not take that
- * on faith: it EXECUTES this exact argv against a fixture with the same three-leaf layout on the
- * runtime hosting the suite and asserts every named suite really ran, so a verifier that would
- * discover nothing fails conformance deterministically instead of reporting a hollow verdict.
- *
- * OPEN AT THIS CHECKOUT, stated rather than hidden: the surface image still pins node:22, so the
- * LOCAL verifier's container is a runtime on which this pinned form discovers nothing — GF8 fails
- * there, by design, rather than letting `/verify` return a verdict about suites it never ran.
- * Closing that gap means moving the verifier image to a Node major that searches directory
- * arguments (`cadp/live/image/Dockerfile` is gate machinery, and the image cannot be rebuilt or
- * measured from inside a candidate surface), which is a human decision this file does not take on
- * its own.
+ * the test files it holds by a Node whose test runner SEARCHES directory arguments. Node 22 does
+ * not (measured on 22.23.2, and read in the runner itself: the CLI passes every positional to
+ * `createTestFileList` as a glob pattern, a directory pattern matches the DIRECTORY, and the
+ * directory is then loaded as if it were a test file — `Cannot find module <dir>`), so on Node 22
+ * this argv discovers NOTHING in all three suites. The pinned form therefore carries a pinned
+ * RUNTIME, `VERIFIER_NODE_MAJOR` below, which both verifier sites declare: the local verifier's
+ * container image (`cadp/live/image/Dockerfile`, the image `runVerifier` runs) and the external
+ * verifier's `actions/setup-node` version. `conformance-gatefiles.test.ts` GF8 asserts both
+ * declarations against that constant AND executes this exact argv against a three-leaf fixture on
+ * the runtime hosting the suite — which, when the suite is the self-hosted `/verify` run, IS the
+ * verifier's own container — so a verifier runtime that would select nothing fails conformance
+ * deterministically instead of returning a hollow verdict.
  *
  * KNOWN CONSEQUENCE, stated rather than hidden: this argv names CADP's own directories, so
  * `/verify` is now a SELF-HOST verifier. A governed target that is not this repository (the
@@ -357,6 +353,24 @@ export const VERIFIER_TEST_DIRS: readonly string[] = ["cadp/tests/conformance/",
  * target-declared test selection is the open question that pin leaves behind.
  */
 export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test", ...VERIFIER_TEST_DIRS];
+
+/**
+ * The Node MAJOR both verifiers run `VERIFIER_TEST_ARGV` on — the pinned invocation's runtime half.
+ *
+ * The selector is only half a pin: an argv that names directories selects nothing on a runtime
+ * whose test runner does not expand a directory positional (Node 22, measured — see above), and a
+ * verifier that selects nothing still exits 0 on nothing or fails on everything, which is a verdict
+ * about the RUNTIME, never about the candidate. So the runtime is pinned too, in this same
+ * gate-protected file, and DECLARED identically at both verifier sites:
+ *
+ *   local     `cadp/live/image/Dockerfile`   FROM node:<major>-bookworm-slim   (runVerifier's image)
+ *   external  `.github/workflows/cadp-verify.yml`   actions/setup-node node-version: "<major>"
+ *
+ * `conformance-gatefiles.test.ts` GF8 reads both declarations and asserts they are this number, so
+ * moving either verifier onto a runtime that cannot run the pinned argv fails conformance instead
+ * of silently hollowing out `/verify`.
+ */
+export const VERIFIER_NODE_MAJOR = 24;
 
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }

@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { touchesGateMachinery, GATE_PATH_RULES } from "../../product/gateFiles.ts";
-import { VERIFIER_TEST_ARGV, VERIFIER_TEST_DIRS } from "../../product/surfaceBroker.ts";
+import { VERIFIER_NODE_MAJOR, VERIFIER_TEST_ARGV, VERIFIER_TEST_DIRS } from "../../product/surfaceBroker.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -132,7 +132,7 @@ test("GF7: the narrowing is exact — conformance/ protected, ops/ delegable, th
   }
 });
 
-test("GF8: both verifiers run the SAME pinned invocation, and running it really executes all three suites", () => {
+test("GF8: both verifiers run the SAME pinned invocation on the SAME pinned runtime, and running it really executes all three suites", (t) => {
   // The selection-bypass seam: a test must not be evadable by EXCLUSION-WITHOUT-MODIFICATION.
   // While `npm test` was the verifier's command, the executed set was whatever package.json — an
   // ordinary delegable file — said it was. The set is pinned in gate-protected files instead.
@@ -148,7 +148,7 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
     assert.ok(token.endsWith("/"), `${token} must be a directory path with a trailing slash`);
     assert.equal(/[*?[\]]/u.test(token), false, `${token} must contain no glob character`);
   }
-  assert.deepEqual(VERIFIER_TEST_ARGV.filter((t) => t.startsWith("--")), ["--test"], "the only flag is --test");
+  assert.deepEqual(VERIFIER_TEST_ARGV.filter((token) => token.startsWith("--")), ["--test"], "the only flag is --test");
   assert.deepEqual([...VERIFIER_TEST_ARGV.slice(2)], [...VERIFIER_TEST_DIRS], "the selectors ARE the three leaf directories");
 
   // The EXTERNAL verifier runs the identical command, and no longer `npm test`. Byte-identical to
@@ -162,6 +162,26 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
   assert.ok(runLine !== null, "the external verifier must run a node --test invocation");
   assert.deepEqual(runLine[1]!.split(/\s+/u), [...VERIFIER_TEST_ARGV], "the workflow's tokens are the local verifier's tokens");
 
+  // THE RUNTIME HALF OF THE PIN. A selector that names directories selects nothing on a Node whose
+  // test runner does not expand a directory positional, so pinning the argv without pinning the
+  // runtime leaves `/verify` able to report a verdict about suites it never ran. Both verifier
+  // sites therefore DECLARE the runtime, and the two declarations are read here — from the LOCAL
+  // verifier's container image (the image `runVerifier` runs) and from the EXTERNAL verifier's
+  // `actions/setup-node` step — and required to be the one `VERIFIER_NODE_MAJOR` pins. This is the
+  // assertion the argv snapshot cannot make: it is about the runtimes the VERIFIERS use, not about
+  // whichever runtime happens to be hosting this suite.
+  const dockerfile = readFileSync(join(REPO_ROOT, "cadp/live/image/Dockerfile"), "utf8");
+  const baseTag = /^FROM node:(\d+)-/mu.exec(dockerfile);
+  assert.ok(baseTag !== null, "the local verifier's image must pin an explicit node:<major> base tag");
+  assert.equal(
+    Number(baseTag[1]),
+    VERIFIER_NODE_MAJOR,
+    `cadp/live/image/Dockerfile is the LOCAL verifier's runtime; it must be node:${VERIFIER_NODE_MAJOR} (measured: Node 22 selects none of the pinned directories)`,
+  );
+  const setupNode = /^\s*node-version:\s*"(\d+)"\s*$/mu.exec(workflow);
+  assert.ok(setupNode !== null, "the external verifier must pin an explicit setup-node major");
+  assert.equal(Number(setupNode[1]), VERIFIER_NODE_MAJOR, `the EXTERNAL verifier must run the pinned runtime (Node ${VERIFIER_NODE_MAJOR})`);
+
   // The invocation contract in the repository as it stands: each named directory really does hold
   // test files DIRECTLY (conformance-manifest.test.ts MF4 asserts the converse — that none live
   // anywhere else, so no recursion is needed to reach one).
@@ -173,9 +193,10 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
   // EXECUTE it. An invocation that discovers nothing is the exact failure this control exists to
   // catch — it would let `/verify` report a verdict about a suite it never ran — so snapshotting
   // the argv is not enough. Run the REAL form against a minimal fixture with the same three-leaf
-  // layout, on the runtime hosting this suite (inside the verifier container that IS the image's
-  // node, which is the runtime whose semantics decide the answer), and read the runner's own
-  // summary counts.
+  // layout, on the runtime hosting this suite, and read the runner's own summary counts. When the
+  // suite runs where it MATTERS — inside the verifier container during a self-hosted `/verify`, or
+  // in the external verifier's job — the hosting runtime IS the pinned one and this measurement is
+  // taken on the verifier itself.
   const base = mkdtempSync(join(tmpdir(), "cadp-gf8-"));
   try {
     for (const dir of VERIFIER_TEST_DIRS) {
@@ -208,20 +229,44 @@ test("GF8: both verifiers run the SAME pinned invocation, and running it really 
     // runner SEARCHES directory arguments; one that does not treats the token as a module to load
     // and runs nothing. Name that in the failure, because the difference is invisible in the argv.
     const ranHere = (selector: string, r: { tests: number; pass: number; fail: number; output: string }): string =>
-      `${selector} did not run its tests on this runtime (Node ${process.versions.node}): ` +
-      `tests ${r.tests}, pass ${r.pass}, fail ${r.fail}. The pinned form needs a Node whose test runner searches ` +
-      `directory arguments; this one does not expand the directory at all.\n${r.output}`;
+      `${selector} did not run its tests on the PINNED verifier runtime (Node ${process.versions.node}, major ` +
+      `${VERIFIER_NODE_MAJOR} pinned): tests ${r.tests}, pass ${r.pass}, fail ${r.fail}. The pinned form needs a Node ` +
+      `whose test runner searches directory arguments; this one does not expand the directory at all, so both ` +
+      `verifiers would return verdicts about suites they never ran.\n${r.output}`;
 
     // Every suite, on its own — each selector taken FROM the pinned argv, so the control follows
-    // the argv rather than a restatement of it: a NONZERO number of tests actually ran for each.
+    // the argv rather than a restatement of it — and then the whole pinned argv in one run, with
+    // all three suites present and none silently dropped.
     const selectors = VERIFIER_TEST_ARGV.slice(2);
-    for (const selector of selectors) {
-      const only = runCounts(["--test", selector]);
-      assert.ok(only.tests > 0 && only.fail === 0 && only.pass === only.tests, ranHere(selector, only));
-    }
-    // And the whole pinned argv: all three suites in one run, none silently dropped.
+    const selected = selectors.map((selector) => runCounts(["--test", selector]));
     const all = runCounts(VERIFIER_TEST_ARGV.slice(1));
-    assert.ok(all.tests === selectors.length && all.pass === selectors.length && all.fail === 0, ranHere(pinned, all));
+    const ran = (r: { tests: number; pass: number; fail: number }): boolean => r.tests > 0 && r.fail === 0 && r.pass === r.tests;
+
+    // The measurement is REPORTED on every runtime this suite is hosted on, and REQUIRED on the
+    // pinned one. A host below the pinned major is not a verifier — the two declarations asserted
+    // above say what the verifiers run — and it is measured here rather than assumed: Node 22 is
+    // where the directory positional was measured to select nothing, which is why the runtime is
+    // pinned at all. At or above the pin, selecting nothing is a hard failure.
+    const hostMajor = Number(process.versions.node.split(".")[0]);
+    t.diagnostic(
+      `pinned argv measured on Node ${process.versions.node} (verifiers pin major ${VERIFIER_NODE_MAJOR}): ` +
+        `${selectors.map((s, i) => `${s} → ${selected[i]!.pass}/${selected[i]!.tests}`).join(", ")}; all three in one run → ${all.pass}/${all.tests}`,
+    );
+    // Two claims hold on EVERY runtime, so neither branch below is vacuous. (i) The combined argv
+    // selects exactly the suites the individual selectors select: a suite that runs on its own but
+    // vanishes from the three-directory run would be a silent drop — the seam this control closes.
+    // (ii) All-or-nothing: a runtime that selects a PROPER SUBSET is the worst case of all, since
+    // the verifier would then pass on a partial suite and call it a verdict.
+    const selectedCount = selected.filter(ran).length;
+    assert.equal(all.pass, selectedCount, `the combined pinned argv ran ${all.pass} suites but the selectors run individually ran ${selectedCount} — a suite is dropped by the combined form\n${all.output}`);
+    assert.ok(
+      selectedCount === 0 || selectedCount === selectors.length,
+      `the pinned argv selected ${selectedCount} of ${selectors.length} suites on Node ${process.versions.node} — a partial selection would let a verifier pass on part of the suite and call it a verdict\n${all.output}`,
+    );
+    if (hostMajor >= VERIFIER_NODE_MAJOR) {
+      for (const [i, only] of selected.entries()) assert.ok(ran(only), ranHere(selectors[i]!, only));
+      assert.ok(all.tests === selectors.length && all.pass === selectors.length && all.fail === 0, ranHere(pinned, all));
+    }
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
