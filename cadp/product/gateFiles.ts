@@ -30,6 +30,14 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
   "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // Reviewer-INSTRUCTION files (#259 P0a). A provider CLI discovers these automatically from its
+  // working directory and its ancestors and loads them as its own instructions, so a
+  // candidate-authored change to one opens a path to address the reviewer that judges it — gate
+  // machinery by exactly the test above (it can influence merge eligibility), even though no such
+  // file exists in the repo today. A leading `**/` marks a BASENAME rule: the discovery walk is
+  // per-directory, so the root copy is not the only one that would be loaded.
+  "**/AGENTS.md",
+  "**/AGENTS.override.md",
   // Constitutional documents (design lane): the Spec, TDs and the authority order DEFINE the very
   // authority boundaries this gate enforces — a delegated agent auto-merging an edit to them is
   // the self-approval hazard in its purest form. Every constitutional/design document routes to a
@@ -46,7 +54,8 @@ export const GATE_PATH_RULES: readonly string[] = [
 export function touchesGateMachinery(changedPaths: readonly string[]): string[] {
   return changedPaths.filter((p) =>
     GATE_PATH_RULES.some((rule) =>
-      rule.endsWith("/") ? p.startsWith(rule) // directory prefix
+      rule.startsWith("**/") ? p === rule.slice(3) || p.endsWith(`/${rule.slice(3)}`) // basename, any depth
+      : rule.endsWith("/") ? p.startsWith(rule) // directory prefix
       : rule.endsWith("*") ? p.startsWith(rule.slice(0, -1)) // filename prefix (constitutional docs)
       : p === rule, // exact file
     ),

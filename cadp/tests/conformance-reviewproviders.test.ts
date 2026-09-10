@@ -172,6 +172,26 @@ test("grok reviewer carries the MEASURED read-only argv (allow-list is the bound
   assert.ok(argv.includes("--tools"), "the enforced read-only boundary is the tool allow-list");
 });
 
+test("§4.1 can_read_workspace tracks the profile's MEASURED read tools, not the product name", () => {
+  // #259 P0a. The broker appends the candidate-mount instruction from this flag alone, so the flag
+  // must agree with what the argv actually permits: a profile that disallows its read tools cannot
+  // be told to open a mount. Anything that edits an argv's read capability fails here until the
+  // flag is edited with it.
+  for (const [provider, profile] of Object.entries(REVIEW_PROVIDERS)) {
+    const disallowed = profile.argv_template.find((a) => a.startsWith("--disallowedTools="))?.split("=")[1] ?? "";
+    const readBlocked = disallowed.split(",").some((tool) => tool === "Read" || tool === "Glob" || tool === "Grep");
+    assert.equal(profile.can_read_workspace, !readBlocked, `${provider}: capability flag must match its argv`);
+  }
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(REVIEW_PROVIDERS).map(([name, p]) => [name, p.can_read_workspace])),
+    { claude: false, grok: true, codex: true },
+  );
+  // The readers' read capability is exactly what the measured argv grants: grok's allow-list, and
+  // codex's write-denying (not read-denying) sandbox.
+  assert.ok(REVIEW_PROVIDERS.grok.argv_template.join(" ").includes("read_file,list_dir,grep"));
+  assert.ok(REVIEW_PROVIDERS.codex.argv_template.includes("read-only"));
+});
+
 test("grok reviewer authenticates via its own auth files, never the claude token", () => {
   assert.deepEqual(REVIEW_PROVIDERS.grok.auth_method, { kind: "auth_files", auth_subdir: ".grok", auth_files: ["auth.json"] });
 });

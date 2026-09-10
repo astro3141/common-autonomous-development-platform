@@ -46,9 +46,23 @@ test("GF4: the rule file guards itself and every rule is a real repo path shape"
   assert.ok(GATE_PATH_RULES.includes("cadp/product/gateFiles.ts"), "the gate rule must protect itself from delegated edits");
   for (const rule of GATE_PATH_RULES) {
     // Machinery rules live under cadp/; constitutional documents live at the repo root and are
-    // named by exact file or a trailing-`*` filename prefix.
+    // named by exact file or a trailing-`*` filename prefix; reviewer-instruction files are named
+    // by a leading-`**/` basename rule, since the discovery walk is per-directory.
     const constitutional = rule === "Authority order.md" || rule.endsWith("*") || rule === ".github/";
-    assert.ok(rule.startsWith("cadp/") || constitutional, `rule ${rule} should be a cadp path or a constitutional-doc rule`);
+    assert.ok(rule.startsWith("cadp/") || rule.startsWith("**/") || constitutional, `rule ${rule} should be a cadp path, a reviewer-instruction basename, or a constitutional-doc rule`);
+  }
+});
+
+test("GF6: reviewer-instruction files are gate machinery at any depth — a candidate cannot instruct its reviewer", () => {
+  // #259 P0a. A provider CLI loads these automatically from its working directory and its
+  // ancestors, so a candidate-authored change to one is a change to the REVIEWER, not to the
+  // product: it opens a path to influence merge eligibility, which is the gate test itself.
+  for (const p of ["AGENTS.md", "AGENTS.override.md", "cadp/AGENTS.md", "cadp/product/AGENTS.override.md"]) {
+    assert.deepEqual(touchesGateMachinery([p]), [p], `${p} must be gate-flagged (HUMAN merge)`);
+  }
+  // The basename rule matches the FILE, not a prefix of some other name.
+  for (const p of ["docs/MYAGENTS.md", "AGENTS.md.bak", "agents.md", "AGENTS.override.md.txt"]) {
+    assert.deepEqual(touchesGateMachinery([p]), [], `${p} must stay delegable`);
   }
 });
 
