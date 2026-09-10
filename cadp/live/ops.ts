@@ -10,9 +10,10 @@
  * `startWork` is also the RUN ORIGIN path of WP §3.6: it allocates the originating `WORK_START`'s
  * identity under `cadp.allocation-key.run-origin.v1` from an `origin_key` decided ONCE per logical
  * origin, binds that `effect_id` as the request's own `work-run` subject (AP B5(9)), and seals
- * material carrying no wall-clock input, so one origin retries onto one identity with byte-
- * identical material instead of forking into a second run. See `workPlanOriginKey` for the two
- * derivations, `recordMintedOrigin` for the durability contract a minted key carries, and
+ * material carrying no wall-clock input and no re-resolved base revision, so one origin retries
+ * onto one identity with byte-identical material instead of forking into a second run. See
+ * `workPlanOriginKey` for the two derivations, `recordMintedOrigin` for the durability contract a
+ * minted key carries, `pinOriginBaseSha` for the origin's once-resolved base revision, and
  * `runOriginUnavailable` for the v0.4 generation seam that keeps the live pilot unchanged.
  */
 
@@ -153,6 +154,10 @@ export async function loadProposal(dir: string, proposalEvidenceId: string): Pro
  * at merge. `base_ref` is what the material DECLARES the run builds on, so the sealed `base_sha`
  * must be that ref's tip when the run is sealed — resolved fresh, never the manifest snapshot.
  * Fail closed on any resolution problem: sealing a knowingly stale base is worse than refusing.
+ *
+ * "Fresh" is per ORIGIN, not per attempt: on the origin path this runs exactly once per logical
+ * origin and the answer is pinned (`pinOriginBaseSha`), because a second resolution is a second
+ * `base_sha` the moment `refs/heads/main` moves under a retry.
  */
 export function resolveBaseSha(
   repo_full_name: string,
@@ -262,34 +267,125 @@ export const ORIGIN_KEY_RECORD_FILE = "origin-keys.json";
  * RECOVERY FLOW for a crashed or refused direct start: read `<dir>/origin-keys.json`, take the
  * record whose `work_item_digest` matches the start being retried (it is the newest such line), and
  * re-invoke `startWork(..., { originKey })` with that `origin_key` verbatim. The allocation
- * re-derives the same key and returns the SAME `effect_id`, so the retry converges on the origin
- * instead of forking it. `workPlan`'s derived keys need no record at all — see `workPlanOriginKey`.
+ * re-derives the same key and returns the SAME `effect_id`, and the base revision that attempt
+ * pinned (`<dir>/origin-base.json`) is replayed with it, so the retry converges on the origin —
+ * identity AND material — instead of forking it or conflicting on it. `workPlan`'s derived keys
+ * need no key record at all (see `workPlanOriginKey`); they are pinned for base like any origin.
  *
- * The file is APPEND-ONLY, one JSON object per line, written with a single `appendFileSync`: a
- * read-modify-write of a JSON array would have to parse whatever is already there, which turns one
- * corrupt byte into a start that either refuses or silently discards prior records. A torn final
- * line costs at most the record being written, never a record already on disk.
+ * The file is APPEND-ONLY, one JSON object per line, each written with a single `appendFileSync`
+ * (`appendRecordLine`): a read-modify-write of a JSON array would have to parse whatever is already
+ * there, which turns one corrupt byte into a start that either refuses or silently discards prior
+ * records. A torn final line costs at most the record being written, never a record already on disk.
  */
 export function recordMintedOrigin(dir: string, record: OriginKeyRecord): void {
-  appendFileSync(join(dir, ORIGIN_KEY_RECORD_FILE), `${JSON.stringify(record)}\n`, "utf8");
+  appendRecordLine(dir, ORIGIN_KEY_RECORD_FILE, record);
+}
+
+/**
+ * The shared append. A torn final line is HEALED with a leading newline rather than appended onto:
+ * gluing this record to that fragment would make the record being written unparseable too, which
+ * for a pin means the next attempt silently re-resolves — the torn line must cost only itself.
+ */
+function appendRecordLine(dir: string, file: string, record: unknown): void {
+  const path = join(dir, file);
+  let heal = "";
+  try {
+    const raw = readFileSync(path, "utf8");
+    if (raw !== "" && !raw.endsWith("\n")) heal = "\n";
+  } catch { /* absent: this append creates it */ }
+  appendFileSync(path, `${heal}${JSON.stringify(record)}\n`, "utf8");
 }
 
 /** The recovery-flow read of the file above. Unparseable lines are skipped, never fatal. */
 export function readOriginKeyRecords(dir: string): OriginKeyRecord[] {
+  return readRecordLines<OriginKeyRecord>(dir, ORIGIN_KEY_RECORD_FILE);
+}
+
+/** The shared read of an append-only record file: absent = empty, a torn line costs only itself. */
+function readRecordLines<T>(dir: string, file: string): T[] {
   let raw: string;
   try {
-    raw = readFileSync(join(dir, ORIGIN_KEY_RECORD_FILE), "utf8");
+    raw = readFileSync(join(dir, file), "utf8");
   } catch {
-    return []; // no direct start has minted here yet
+    return []; // nothing has been recorded here yet
   }
-  const records: OriginKeyRecord[] = [];
+  const records: T[] = [];
   for (const line of raw.split("\n")) {
     if (line.trim() === "") continue;
     try {
-      records.push(JSON.parse(line) as OriginKeyRecord);
+      records.push(JSON.parse(line) as T);
     } catch { /* a torn final line from a crash mid-append: skip it, keep every complete record */ }
   }
   return records;
+}
+
+// ------------------------------------------------- the origin's pinned base revision (WP §3.6)
+
+/** The ref this composition's development runs declare, and therefore resolve and pin, as their base. */
+const ORIGIN_BASE_REF = "refs/heads/main";
+
+/** One origin's base revision, decided at its FIRST creation and replayed by every later attempt. */
+export interface OriginBaseRecord {
+  origin_key: string;
+  base_ref: string;
+  base_sha: string;
+  created_at: string;
+}
+
+export const ORIGIN_BASE_RECORD_FILE = "origin-base.json";
+
+/** A resolved sha is only usable as a pin if it is one — a garbled record must not become material. */
+function usablePin(record: OriginBaseRecord): boolean {
+  return typeof record.base_sha === "string" && /^[0-9a-f]{40}$/u.test(record.base_sha);
+}
+
+/**
+ * The origin's `base_sha`, RESOLVED ONCE and pinned. A stable `origin_key` converges a retry onto
+ * one `effect_id`, but convergence is only half of replay: the retry must also seal the SAME
+ * material under that identity. `base_sha` was the last input on this path that a retry could
+ * observe differently — `refs/heads/main` moves, so an attempt made after a merge resolved a
+ * different sha, sealed a different `args_digest`/`material_ref` under the converged `effect_id`,
+ * and landed `REQUEST_DIGEST_CONFLICT`: a K3 incident and a scope hold, which is precisely the
+ * failure the origin path exists to make unconstructible (WP §3.6; AP control A5 leg o-i). Pinning
+ * makes the whole of a development origin's sealed material a function of its `origin_key` and its
+ * first-creation base, hence byte-reproducible for that origin.
+ *
+ * The pin is written BEFORE the seal that consumes it, for the same reason the minted key is: a
+ * process that dies after resolving leaves the value its retry must reuse, not a fresh one.
+ *
+ * Both derivations need this, so unlike the minted-key record it is written for EVERY origin on
+ * this path — a `workPlan` origin re-derives its KEY from the sealed proposal, but nothing in that
+ * proposal names the ref tip at the moment the item first started. The two files stay separate so
+ * that a derived key still mints and records no key material of its own.
+ *
+ * The FIRST record for the pair wins, so two racing first attempts converge on one base rather than
+ * on whichever appended last. A record that is present but not a sha is skipped and re-resolved: a
+ * corrupt pin should cost a retry the drift risk it had before this pin existed, never strand the
+ * origin permanently unretryable — the one outcome worse than resolving again.
+ *
+ * RESIDUAL, stated rather than hidden: the pin is deployment-local, so an origin retried from a
+ * deployment dir that never held its record (a fresh checkout, a wiped dir) re-resolves and can
+ * still conflict if the ref moved. Recovering that needs the base read back from the sealed
+ * material through a kernel request/blob read — a Kernel API surface this lane does not add.
+ */
+export function pinOriginBaseSha(
+  dir: string,
+  origin_key: string,
+  base_ref: string,
+  resolve: () => string,
+  now: () => string,
+): string {
+  const pinned = readRecordLines<OriginBaseRecord>(dir, ORIGIN_BASE_RECORD_FILE)
+    .find((r) => r.origin_key === origin_key && r.base_ref === base_ref && usablePin(r));
+  if (pinned !== undefined) return pinned.base_sha; // replayed verbatim; no second ls-remote to differ
+  const base_sha = resolve();
+  appendRecordLine(dir, ORIGIN_BASE_RECORD_FILE, { origin_key, base_ref, base_sha, created_at: now() } satisfies OriginBaseRecord);
+  return base_sha;
+}
+
+/** The recovery-flow read of the pin file above. */
+export function readOriginBaseRecords(dir: string): OriginBaseRecord[] {
+  return readRecordLines<OriginBaseRecord>(dir, ORIGIN_BASE_RECORD_FILE);
 }
 
 /**
@@ -448,17 +544,20 @@ export async function startWork(
             development: {
               repo_id: m.repo_id,
               repo_full_name: m.repo_full_name,
-              base_ref: "refs/heads/main",
-              // Resolved fresh at seal time — the manifest's setup-time snapshot goes stale (see
-              // resolveBaseSha). The sealed sha stays deterministic for the run's whole lifetime.
-              //
-              // NOT wall-clock derived, but the one remaining input on this branch that a retry
-              // could observe differently: WP §3.6 names it as the second instance of the
-              // replay-stability shape (a retry after `refs/heads/main` moves seals a different
-              // `base_sha` for the same origin) and requires the origin path to pin its
-              // first-creation value. Pinning it needs a durable per-origin ARGS record, which is a
-              // wider state contract than this lane's minted-key record, and is left to that lane.
-              base_sha: (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, "refs/heads/main"),
+              base_ref: ORIGIN_BASE_REF,
+              // Resolved fresh at the origin's FIRST creation — the manifest's setup-time snapshot
+              // goes stale (see `resolveBaseSha`) — and then PINNED to this origin, so a retry made
+              // after `refs/heads/main` moves seals the same sha rather than a different one under
+              // the converged effect_id (`pinOriginBaseSha`). With this pinned and the ordinal and
+              // resource_prefix keyed on the origin, every input to this origin's sealed material
+              // is a function of the origin itself: byte-reproducible, hence replayable.
+              base_sha: pinOriginBaseSha(
+                dir,
+                origin_key,
+                ORIGIN_BASE_REF,
+                () => (dependencies.resolveBase ?? resolveBaseSha)(m.repo_full_name, ORIGIN_BASE_REF),
+                dependencies.now ?? (() => new Date().toISOString()),
+              ),
               work_item: extra[0]!,
               worker_product: workerProduct,
               review_product: reviewProduct,

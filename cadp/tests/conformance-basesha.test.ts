@@ -18,6 +18,9 @@
  *     it on every failure, and REUSES it verbatim when the caller retries with it;
  *   - `resource_prefix` and the v0.4 fallback's `step_ordinal` are functions of the `origin_key`
  *     alone — proved by moving `Date.now` between two invocations and comparing bytes;
+ *   - `base_sha`, the one input that drifts without the clock, is resolved ONCE per origin and
+ *     PINNED, so a retry after `refs/heads/main` moves seals the same bytes rather than conflicting
+ *     on the identity it just converged onto — proved by moving the REF between two invocations;
  *   - the v0.4 GENERATION SEAM: a `cadp.kernel-config.v1` kernel (and a v2 bundle carrying no
  *     run-origin registry entry) still gets the zero-sentinel `cadp.allocation-key.v1` tuple and NO
  *     work-run binding, so the live v0.4 pilot's sealed request is what it is today.
@@ -29,16 +32,19 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  ORIGIN_BASE_RECORD_FILE,
   ORIGIN_KEY_RECORD_FILE,
   StartWorkOriginError,
   mintOriginKey,
   originResourcePrefix,
   originStepOrdinal,
+  pinOriginBaseSha,
+  readOriginBaseRecords,
   readOriginKeyRecords,
   resolveBaseSha,
   startWork,
@@ -471,9 +477,111 @@ test("the development origin's sealed material carries no wall-clock input", asy
 
   assert.deepEqual(kernel.blobs.slice(0, 2), kernel.blobs.slice(2, 4), "args and material are byte-identical across a two-century clock move");
   assert.equal(kernel.conflicts, 0);
-  // The one input a retry could still observe differently is `base_sha`, resolved live at seal time.
-  // It is NOT wall-clock derived — WP §3.6 names pinning it to the origin's first-creation value as
-  // a separate lane — so it is HELD FIXED here rather than asserted stable, and the claim above is
-  // exactly "no clock on this path", not "nothing about this material can ever drift".
+  // `base_sha` is the other input a retry could observe differently — not from the clock, but from
+  // the ref moving. It is held fixed here and asserted stable under a MOVING ref below.
   assert.equal((JSON.parse(kernel.argsBlobs()[0]!) as { development: { base_sha: string } }).development.base_sha, SHA);
+});
+
+// ---------------------------------------------------------------- the origin's pinned base sha
+
+/** A `refs/heads/main` that MOVES between attempts — a merge landing under a retry. */
+function movingRef(shas: string[]): { resolve: () => string; calls: () => number } {
+  let i = 0;
+  return { resolve: () => shas[Math.min(i++, shas.length - 1)]!, calls: () => i };
+}
+
+const MOVED_SHA = "1f2e3d4c5b6a798807162534435261708091a2b3";
+
+test("the origin's base_sha is resolved ONCE and pinned — a retry under a MOVED ref replays it", async () => {
+  const dir = tempDir();
+  const kernel = new StandInKernel();
+  const ref = movingRef([SHA, MOVED_SHA]);
+  // A derived (workPlan) origin: it re-derives its KEY from the sealed proposal, but nothing there
+  // names the ref tip when the item first started, so it needs the pin exactly as a minted one does.
+  const originKey = workPlanOriginKey("cadp-v04:evidence:01999a70-0000-7000-8000-00000000000c", 0);
+  const dependencies = { ...deps(kernel), resolveBase: ref.resolve };
+
+  const first = await startWork(dir, "development", DEV, { originKey, dependencies });
+  const second = await startWork(dir, "development", DEV, { originKey, dependencies });
+
+  assert.equal(ref.calls(), 1, "the ref is resolved once per ORIGIN, not once per attempt — the retry reads its pin");
+  const args = kernel.argsBlobs().map((a) => JSON.parse(a) as { development: { base_sha: string } });
+  assert.deepEqual(args.map((a) => a.development.base_sha), [SHA, SHA], "the retry seals the origin's FIRST-CREATION base, not the tip it would resolve now");
+  assert.equal(args[0]!.development.base_sha === MOVED_SHA, false, "the moved tip is not what this origin declares");
+  assert.deepEqual(kernel.blobs.slice(0, 2), kernel.blobs.slice(2, 4), "so both attempts put byte-identical args and material");
+  assert.equal(first!.effect_id, second!.effect_id, "one origin, one effect identity");
+  assert.equal(kernel.conflicts, 0, "and the re-seal is IDEMPOTENT — the moved ref cannot make it a REQUEST_DIGEST_CONFLICT");
+
+  const pins = readOriginBaseRecords(dir);
+  assert.deepEqual(pins.map((p) => [p.origin_key, p.base_ref, p.base_sha]), [[originKey, "refs/heads/main", SHA]], `one pin for the origin in ${ORIGIN_BASE_RECORD_FILE}`);
+  assert.equal(pins[0]!.created_at, "2026-09-10T00:00:00.000Z");
+  assert.equal(readOriginKeyRecords(dir).length, 0, "and a derived key still mints and records no key of its own");
+});
+
+test("the pin is per ORIGIN: distinct origins under a moving ref each declare their own base", async () => {
+  const dir = tempDir();
+  const kernel = new StandInKernel();
+  const ref = movingRef([SHA, MOVED_SHA]);
+  const dependencies = { ...deps(kernel), resolveBase: ref.resolve };
+
+  await startWork(dir, "development", DEV, { originKey: "origin-base-a", dependencies });
+  await startWork(dir, "development", DEV, { originKey: "origin-base-b", dependencies });
+  await startWork(dir, "development", DEV, { originKey: "origin-base-a", dependencies });
+
+  const sealed = kernel.argsBlobs().map((a) => (JSON.parse(a) as { development: { base_sha: string } }).development.base_sha);
+  assert.deepEqual(sealed, [SHA, MOVED_SHA, SHA], "a NEW origin builds on the tip it finds; a RETRY of an existing one replays its own pin");
+  assert.equal(ref.calls(), 2, "two origins, two resolutions");
+  assert.deepEqual(readOriginBaseRecords(dir).map((p) => p.origin_key), ["origin-base-a", "origin-base-b"], "one record per origin, appended in creation order");
+  assert.equal(kernel.conflicts, 0);
+});
+
+test("a crashed direct start pins its base before it can fail, and the recorded key replays both", async () => {
+  const dir = tempDir();
+  const kernel = new StandInKernel();
+  kernel.failAt = "sealEffectRequest";
+  const ref = movingRef([SHA, MOVED_SHA]);
+
+  // The reviewer's scenario end to end: the first attempt dies at the seal, `refs/heads/main` moves,
+  // and the operator retries from the recorded key. Identity AND material must both converge.
+  const thrown = await startWork(dir, "development", DEV, { dependencies: { ...deps(kernel), resolveBase: ref.resolve } })
+    .then(() => undefined, (e: unknown) => e as StartWorkOriginError);
+  assert.equal(thrown instanceof StartWorkOriginError, true);
+
+  const recorded = readOriginKeyRecords(dir)[0]!.origin_key;
+  const restarted = new StandInKernel("v0.5", kernel.allocations);
+  const recovered = await startWork(dir, "development", DEV, {
+    originKey: recorded,
+    dependencies: { ...deps(restarted), resolveBase: ref.resolve },
+  });
+
+  assert.equal(recovered!.origin_key, thrown!.origin_key, "the minted key survives the crash");
+  assert.equal(ref.calls(), 1, "and so does the base it pinned — the retry never re-resolves the moved ref");
+  assert.deepEqual(
+    [kernel.argsBlobs()[0], restarted.argsBlobs()[0]],
+    [kernel.argsBlobs()[0], kernel.argsBlobs()[0]],
+    "the recovered attempt seals BYTE-IDENTICAL args to the attempt that crashed",
+  );
+  assert.equal(restarted.conflicts, 0, "which is what keeps the recovery off REQUEST_DIGEST_CONFLICT");
+  assert.deepEqual(readOriginBaseRecords(dir).map((p) => p.base_sha), [SHA], "one pin for the logical origin across the crash");
+});
+
+test("pinning fails SAFE: a corrupt or torn pin re-resolves rather than sealing garbage or stranding the origin", () => {
+  const dir = tempDir();
+  const now = () => "2026-09-10T00:00:00.000Z";
+  const pinFile = join(dir, ORIGIN_BASE_RECORD_FILE);
+
+  assert.equal(pinOriginBaseSha(dir, "origin-pin", "refs/heads/main", () => SHA, now), SHA, "first creation resolves and records");
+  assert.equal(pinOriginBaseSha(dir, "origin-pin", "refs/heads/main", () => MOVED_SHA, now), SHA, "and every later attempt replays it, whatever the ref says now");
+  assert.equal(pinOriginBaseSha(dir, "origin-pin", "refs/heads/other", () => MOVED_SHA, now), MOVED_SHA, "the pin is per (origin, declared ref) — another ref is another base");
+  assert.equal(pinOriginBaseSha(dir, "origin-other", "refs/heads/main", () => MOVED_SHA, now), MOVED_SHA, "and another origin is another base");
+
+  // A crash mid-append and a record whose sha is not one: neither may become sealed material, and
+  // neither may leave the origin permanently unretryable.
+  writeFileSync(pinFile, `${JSON.stringify({ origin_key: "origin-bad", base_ref: "refs/heads/main", base_sha: "not-a-sha", created_at: now() })}\n{"origin_key":"origin-torn"`, "utf8");
+  assert.deepEqual(readOriginBaseRecords(dir).map((p) => p.origin_key), ["origin-bad"], "the torn final line costs only itself");
+  assert.equal(pinOriginBaseSha(dir, "origin-bad", "refs/heads/main", () => SHA, now), SHA, "a garbled pin is re-resolved, never sealed as-is");
+  assert.equal(pinOriginBaseSha(dir, "origin-bad", "refs/heads/main", () => MOVED_SHA, now), SHA, "and the sound record it appends pins the origin from then on");
+
+  rmSync(pinFile);
+  assert.equal(pinOriginBaseSha(dir, "origin-pin", "refs/heads/main", () => MOVED_SHA, now), MOVED_SHA, "with no file at all it resolves — deployment-local state, the stated residual");
 });
