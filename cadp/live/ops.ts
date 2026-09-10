@@ -10,7 +10,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadManifest } from "./env.ts";
@@ -279,6 +279,9 @@ export interface OriginMaterialInputs {
 /**
  * One logical origin's durable record. Append-only and first-write-wins: an entry is never
  * rewritten, so the pinned material of an origin that has reached the Kernel cannot move under it.
+ * The file backing these records is written under an exclusive lock and published by atomic rename
+ * (`withOriginLock` / `writeOriginRecords`), so neither a concurrent start nor a crash mid-write can
+ * lose an already-pinned origin or leave a torn file behind.
  */
 export interface OriginRecordV1 {
   readonly origin_key: string;
@@ -292,6 +295,10 @@ export function originKeysPath(dir: string): string {
   return join(dir, "origin-keys.json");
 }
 
+/**
+ * Read the records. Deliberately UNLOCKED: every publish is an atomic rename (`writeOriginRecords`),
+ * so a reader observes one complete version of the file or the other, never a half-written one.
+ */
 export function readOriginRecords(dir: string): OriginRecordV1[] {
   const path = originKeysPath(dir);
   if (!existsSync(path)) return [];
@@ -307,14 +314,122 @@ export function originRecord(dir: string, originKey: string): OriginRecordV1 | u
   return readOriginRecords(dir).find((entry) => entry.origin_key === originKey);
 }
 
-/** Append unless the key is already recorded; the FIRST record for a key always wins. */
-function appendOriginRecord(dir: string, record: OriginRecordV1): OriginRecordV1 {
-  const records = readOriginRecords(dir);
-  const existing = records.find((entry) => entry.origin_key === record.origin_key);
-  if (existing !== undefined) return existing;
-  records.push(record);
-  writeFileSync(originKeysPath(dir), `${JSON.stringify(records, null, 2)}\n`);
-  return record;
+/**
+ * The lock guarding the origin file's read-modify-write, and how long a caller waits for it.
+ *
+ * An unlocked read-modify-write is a LOST-UPDATE hole in the durability this file exists to give:
+ * two starts that read the same array and write back their own entry publish one of the two pinned
+ * origins and silently drop the other, and the dropped origin then re-resolves its material from the
+ * environment on its retry — the exact drift the material-pinning invariant forbids. Timings here
+ * are operator-side liveness only; nothing in this section reaches sealed material, so the v0.5
+ * path's "no wall clock" property is untouched by the clock reads below.
+ */
+const ORIGIN_LOCK_POLL_MS = 25;
+const ORIGIN_LOCK_WAIT_MS = 10_000;
+/** A holder that died leaves its lock behind; break one only once it is far older than any live
+ *  critical section (which is a couple of file operations — the material resolution happens OUTSIDE
+ *  the lock, so no `git ls-remote` or docker read is ever held across it). */
+const ORIGIN_LOCK_STALE_MS = 30_000;
+
+export interface OriginLockOptions {
+  /** Total time to wait for a held lock before refusing (default `ORIGIN_LOCK_WAIT_MS`). */
+  readonly waitMs?: number;
+  /** Age at which a lock is presumed abandoned by a dead holder (default `ORIGIN_LOCK_STALE_MS`). */
+  readonly staleMs?: number;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run `fn` holding the deployment's exclusive origin-file lock. `open(…, "wx")` is the atomic
+ * create-if-absent primitive here: exactly one process can hold the lock file at a time, so a
+ * concurrent start waits rather than racing the array. Any tool that hand-edits `origin-keys.json`
+ * (a recovery flow, say) must take this same lock.
+ */
+export function withOriginLock<T>(dir: string, fn: () => T, options: OriginLockOptions = {}): T {
+  const lock = `${originKeysPath(dir)}.lock`;
+  const staleMs = options.staleMs ?? ORIGIN_LOCK_STALE_MS;
+  // Bounded by ATTEMPTS, not by a deadline read off the clock, so a pinned/adjusted clock can
+  // never turn "wait ten seconds" into an unbounded spin.
+  const attempts = Math.max(1, Math.ceil((options.waitMs ?? ORIGIN_LOCK_WAIT_MS) / ORIGIN_LOCK_POLL_MS));
+  let holder = "";
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const fd = openSync(lock, "wx");
+      try {
+        writeSync(fd, `${JSON.stringify({ pid: process.pid })}\n`); // diagnostics for a stuck lock
+      } finally {
+        closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        holder = readFileSync(lock, "utf8").trim();
+        if (Date.now() - statSync(lock).mtimeMs > staleMs) {
+          rmSync(lock, { force: true }); // abandoned by a dead holder — reclaim and retry at once
+          continue;
+        }
+      } catch {
+        /* the holder released it between our open and our stat — fall through and retry, still
+           under the attempt bound, so a lock that keeps flickering can never spin here forever */
+      }
+      if (attempt >= attempts) throw new Error(`${lock} is held by another start (${holder}) — refusing to write origin records unlocked`);
+      sleepSync(ORIGIN_LOCK_POLL_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lock, { force: true });
+  }
+}
+
+/**
+ * Publish `records` by write-temp → fsync → rename. The rename is atomic, so a reader (and a crash
+ * at any instant) sees either the whole previous file or the whole new one — never the truncated
+ * half of an in-place rewrite, which `readOriginRecords` would have to fail closed on, stranding
+ * every origin already pinned in it.
+ */
+function writeOriginRecords(dir: string, records: OriginRecordV1[]): void {
+  const path = originKeysPath(dir);
+  const tmp = `${path}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w");
+  try {
+    writeSync(fd, `${JSON.stringify(records, null, 2)}\n`);
+    fsyncSync(fd); // the bytes reach the disk BEFORE the rename publishes them
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, path);
+  let dirFd: number | undefined;
+  try {
+    dirFd = openSync(dir, "r");
+    fsyncSync(dirFd); // and the rename itself survives a power loss, where the platform allows it
+  } catch {
+    /* not every platform permits fsync on a directory; the rename is still atomic */
+  } finally {
+    if (dirFd !== undefined) closeSync(dirFd);
+  }
+}
+
+/**
+ * Append unless the key is already recorded; the FIRST record for a key always wins. Read, check
+ * and publish happen under the lock as ONE critical section — a concurrent start for another origin
+ * can no longer read a stale array and write this record back out of existence. `appended` reports
+ * which side of that check won, so the caller's log tells the truth under contention.
+ */
+function appendOriginRecord(dir: string, record: OriginRecordV1): { record: OriginRecordV1; appended: boolean } {
+  return withOriginLock(dir, () => {
+    const records = readOriginRecords(dir);
+    const existing = records.find((entry) => entry.origin_key === record.origin_key);
+    if (existing !== undefined) return { record: existing, appended: false };
+    records.push(record);
+    writeOriginRecords(dir, records);
+    return { record, appended: true };
+  });
 }
 
 /**
@@ -657,14 +772,20 @@ async function startWorkOrigin(
   const selection = startSelection(vertical, extra);
 
   // The origin record: read first, written (once) BEFORE the first Kernel call, never rewritten.
+  // The environment resolution stays OUTSIDE the file lock — a `git ls-remote` held across it would
+  // serialise unrelated starts — and its result is discarded if the locked check finds this origin
+  // already recorded, since the first record for a key wins whatever a racing start resolved.
   const recorded = originRecord(dir, originKey);
-  const record = recorded ?? appendOriginRecord(dir, {
-    origin_key: originKey,
-    work_item_digest: sha256Hex(extra[0] ?? ""),
-    material_inputs: resolveMaterialInputs(dir, vertical, m, deps),
-    created_at: (deps.now ?? (() => new Date().toISOString()))(),
-  });
-  log({ origin: recorded === undefined ? "recorded" : "reused", origin_key: originKey, work_item_digest: record.work_item_digest });
+  const outcome = recorded !== undefined
+    ? { record: recorded, appended: false }
+    : appendOriginRecord(dir, {
+        origin_key: originKey,
+        work_item_digest: sha256Hex(extra[0] ?? ""),
+        material_inputs: resolveMaterialInputs(dir, vertical, m, deps),
+        created_at: (deps.now ?? (() => new Date().toISOString()))(),
+      });
+  const record = outcome.record;
+  log({ origin: outcome.appended ? "recorded" : "reused", origin_key: originKey, work_item_digest: record.work_item_digest });
   const inputs = record.material_inputs;
   if (vertical === "development" && (inputs.base_sha === undefined || inputs.repo_id === undefined || inputs.repo_full_name === undefined)) {
     // Fail closed rather than re-resolve: a record without the development inputs was written for

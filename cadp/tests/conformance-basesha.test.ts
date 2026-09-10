@@ -25,13 +25,14 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   OriginStartFailure, originKeysPath, originRecord, originResourcePrefix, planOriginKey,
-  resolveBaseSha, runOriginTuple, startWork, workPlan,
+  readOriginRecords, resolveBaseSha, runOriginTuple, startWork, withOriginLock, workPlan,
 } from "../live/ops.ts";
 import type { StartWorkDependencies, SurfaceImage } from "../live/ops.ts";
 import type { LiveEnvManifest } from "../live/env.ts";
@@ -516,4 +517,116 @@ test("workPlan: each item starts under its own derived origin, and a re-run conv
   assert.equal(kernel.reseals, 2, "both items re-sealed as no-ops");
   assert.equal(kernel.requests.size, 2);
   assert.equal(readOriginKeys(dir).length, 2, "one record per logical origin, appended once");
+});
+
+// ---------------------------------------------------------------- the origin file's durability
+//
+// The pinning invariant is only as durable as the file that carries it: a lost or torn record sends
+// the origin it belonged to straight back to the environment on its retry, which is the
+// REQUEST_DIGEST_CONFLICT the whole path exists to prevent. So the file's write discipline —
+// exclusive lock around the read-modify-write, atomic rename to publish — is a conformance property
+// of this path, asserted here against real concurrent processes rather than argued from the code.
+
+/** One child start per key: it pins its origin, then dies at the first Kernel call, as a crash would. */
+const CONCURRENT_CHILD = `
+const { startWork } = await import(process.argv[2]);
+const [dir, label, count] = process.argv.slice(3);
+const failing = { async allocateEffectId() { throw new Error("the child dies at the first Kernel call"); } };
+const dependencies = {
+  manifest: { repo_id: "9001", repo_full_name: "owner/live-target" },
+  client: failing,
+  resolveImage: () => ({ image: "cadp-surface:test", image_digest: "sha256:aaaa", tool_versions: {} }),
+  resolveNamespace: () => "ns-live-0001",
+  now: () => "2026-09-10T00:00:00.000Z",
+};
+for (let i = 0; i < Number(count); i += 1) {
+  await startWork(dir, "record", ["2", "6", "4"], {
+    originProfile: "v05", originKey: label + "-" + i, dependencies,
+  }).catch(() => {});
+}
+`;
+
+function runChild(script: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [script, new URL("../live/ops.ts", import.meta.url).href, ...args], (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+test("origin-keys.json: concurrent starts in separate processes lose no pinned origin", async () => {
+  const dir = deployment();
+  const script = join(dir, "concurrent-start.mjs");
+  writeFileSync(script, CONCURRENT_CHILD);
+  const CHILDREN = 4;
+  const PER_CHILD = 8;
+
+  // Real processes, genuinely interleaved: an unlocked read-modify-write publishes one writer's
+  // array over another's and drops the difference on the floor.
+  await Promise.all(Array.from({ length: CHILDREN }, (_, i) => runChild(script, [dir, `child${i}`, String(PER_CHILD)])));
+
+  const records = readOriginRecords(dir);
+  const keys = new Set(records.map((entry) => entry.origin_key));
+  const expected = Array.from({ length: CHILDREN }, (_, c) => Array.from({ length: PER_CHILD }, (_, i) => `child${c}-${i}`)).flat();
+  assert.equal(records.length, expected.length, "every concurrently pinned origin survived");
+  for (const key of expected) assert.ok(keys.has(key), `origin ${key} was lost by a concurrent writer`);
+  for (const record of records) {
+    assert.equal(record.material_inputs.temporal_namespace_id, "ns-live-0001", "and survived whole, not half-written");
+  }
+
+  // Nothing is left behind for the next start to trip over.
+  const leftovers = readdirSync(dir).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"));
+  assert.deepEqual(leftovers, [], "no lock or temp file outlives the writes");
+});
+
+test("origin-keys.json: the lock is exclusive, released on throw, and reclaimed only when stale", () => {
+  const dir = deployment();
+  const lock = `${originKeysPath(dir)}.lock`;
+
+  // A live holder: the waiter refuses rather than writing the file unlocked.
+  writeFileSync(lock, `${JSON.stringify({ pid: 999_999 })}\n`);
+  let entered = 0;
+  assert.throws(
+    () => withOriginLock(dir, () => { entered += 1; }, { waitMs: 50 }),
+    /is held by another start.*refusing to write origin records unlocked/su,
+  );
+  assert.equal(entered, 0, "the critical section was never entered");
+
+  // The same lock, now provably older than any live critical section: it is a dead holder's, and is
+  // reclaimed — otherwise one crashed start would wedge the deployment's origins forever.
+  const old = new Date(Date.now() - 10 * 60_000);
+  utimesSync(lock, old, old);
+  withOriginLock(dir, () => { entered += 1; }, { waitMs: 50 });
+  assert.equal(entered, 1, "a stale lock is broken and the section runs");
+  assert.equal(existsSync(lock), false, "and the lock is released afterwards");
+
+  // A critical section that throws still releases: the next caller must not inherit a wedged lock.
+  assert.throws(() => withOriginLock(dir, () => { throw new Error("boom"); }), /boom/u);
+  assert.equal(existsSync(lock), false, "released on the failure path too");
+  withOriginLock(dir, () => { entered += 1; }, { waitMs: 50 });
+  assert.equal(entered, 2);
+});
+
+test("origin-keys.json: the publish is atomic — a torn temp file never becomes the record file", async () => {
+  const kernel = new ScriptedKernel();
+  const dir = deployment();
+  const first = await startWork(dir, "record", RECORD_EXTRA, { originProfile: "v05", originKey: "origin-atomic-1", dependencies: scriptedDeps(kernel) });
+  assert.ok(first !== undefined);
+  const pinned = readFileSync(originKeysPath(dir), "utf8");
+
+  // A previous process died between its write and its rename, leaving half a JSON array behind.
+  // It is a temp file, not the record file, so it is invisible to every reader.
+  writeFileSync(`${originKeysPath(dir)}.99999.tmp`, '[{"origin_key":"half-writ');
+  assert.equal(readFileSync(originKeysPath(dir), "utf8"), pinned, "the published file is untouched by the debris");
+  assert.equal(readOriginRecords(dir).length, 1);
+
+  // And the next start publishes over it by rename, leaving a whole file and a whole record set.
+  const second = await startWork(dir, "record", RECORD_EXTRA, { originProfile: "v05", originKey: "origin-atomic-2", dependencies: scriptedDeps(kernel) });
+  assert.ok(second !== undefined);
+  assert.notEqual(second.effect_id, first.effect_id);
+  assert.deepEqual(readOriginRecords(dir).map((entry) => entry.origin_key), ["origin-atomic-1", "origin-atomic-2"]);
+  assert.equal(existsSync(`${originKeysPath(dir)}.${process.pid}.tmp`), false, "this process's temp file is renamed away, never left");
+
+  // The v0.4 branch still touches none of this machinery.
+  const v04dir = deployment();
+  await atClock(1_757_462_400_000, () => startWork(v04dir, "record", RECORD_EXTRA, { dependencies: scriptedDeps(kernel) }));
+  assert.deepEqual(readdirSync(v04dir), ["worker-image"], "no origin file, no lock, no temp file on the v0.4 path");
 });
