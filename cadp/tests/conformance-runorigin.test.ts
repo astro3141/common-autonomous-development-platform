@@ -60,8 +60,14 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { after } from "node:test";
 
+import { planOriginKey, originResourcePrefix, startWork } from "../live/ops.ts";
+import type { StartWorkDependencies } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 import { startKernelApi } from "../kernel/api.ts";
 import { IngressRejection, RUN_CAPABILITY_HEADER } from "../kernel/ingress.ts";
 import type { Principal } from "../kernel/ingress.ts";
@@ -2335,5 +2341,181 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ============================================== PART 6 — the LIVE composition on the origin path
+//
+// The Workflow-Plane caller obligations of WP §3.6 (`cadp/live/ops.ts`) driven through THIS file's
+// real Ingress and PEP, so the three claims that only a cross-kernel test can make are made:
+//
+//  1. the tuple `startWork` forms and the self-binding it seals are what AP B5(9) ADJUDICATES as a
+//     run origin — the `run_membership(E, E)` witness is written by the Kernel, not asserted by the
+//     caller, and the capability is minted at that origin's own verified initial dispatch;
+//  2. NONE of the run-profile refusal codes fires on the valid origin path (`RUN_BINDING_REQUIRED`,
+//     `NOT_RUN_ENROLLED`, `RUN_CAPABILITY_REQUIRED`, `RUN_CAPABILITY_INVALID`,
+//     `RUN_CAPABILITY_HOLDER_MISMATCH`, `RUN_SCOPE_UNRESOLVED`, `RUN_SCOPE_REFUSED`, and #19's
+//     admission-time `RUN_MEMBERSHIP_UNPROVEN`) — the seal and the dispatch both complete;
+//  3. WP control 14: a RETRY of one logical origin converges on the same `effect_id` and re-seals
+//     BYTE-IDENTICAL material, which K3 answers as an idempotent no-op — one `effect_request` row,
+//     an unchanged `request_digest`, ZERO `KERNEL_INCIDENT` envelopes and no second membership row.
+//     Against the checked-out v0.4 shape this is the falsification: a wall-clock `resource_prefix`
+//     or a wall-clock `step_ordinal` makes either the identity or the material drift, and the same
+//     retry lands `REQUEST_DIGEST_CONFLICT` instead.
+//
+// The ops-side unit legs (the v0.4 regression pin, the derivations, the minted-key recovery record)
+// are in `conformance-basesha.test.ts`, which needs no kernel.
+
+const OPS_MANIFEST = { repo_id: "42", repo_full_name: "owner/repo", tokens: {} } as unknown as LiveEnvManifest;
+
+/**
+ * `cadp/live/ops.ts`'s Kernel-API seam, wired to THIS harness's in-process components. Every call
+ * `startWork` makes is the production call; only the transport is short-circuited. The recorded
+ * `allocated`/`sealed` arrays are how the two invocations of one origin are compared, since the
+ * SECOND `startWork` returns `undefined` by design — its re-dispatch is `EFFECT_ALREADY_COMMITTED`.
+ */
+function opsDependencies(rp: RunProfileHarness, dir: string): {
+  dependencies: StartWorkDependencies;
+  allocated: string[];
+  sealed: EffectRequestV1[];
+} {
+  const allocated: string[] = [];
+  const sealed: EffectRequestV1[] = [];
+  const principal = PRINCIPALS.workflow;
+  const client = {
+    async allocateEffectId(tuple: Record<string, unknown>) {
+      const effect_id = rp.h.ingress.allocateEffectId(tuple as never, principal);
+      allocated.push(effect_id);
+      return { effect_id };
+    },
+    async putBlob(bytes: Uint8Array) {
+      return { cas_key: rp.h.ingress.putBlob(Buffer.from(bytes)) };
+    },
+    async sealEffectRequest(body: unknown) {
+      const request = rp.h.ingress.sealEffectRequest(body as never, principal, {});
+      sealed.push(request);
+      return request;
+    },
+    async assembleAdmissionInput(effect_id: string, refs: string[]) {
+      return rp.h.ingress.assembleAdmissionInput(effect_id, refs);
+    },
+    async evaluate(input_digest: string) {
+      return rp.h.evaluate(input_digest);
+    },
+    async admitAndDispatch(effect_id: string, decision_id: string) {
+      return rp.h.pep.admitAndDispatch(effect_id, decision_id, principal);
+    },
+  };
+  return {
+    allocated,
+    sealed,
+    dependencies: {
+      manifest: OPS_MANIFEST,
+      client: client as unknown as StartWorkDependencies["client"],
+      // The harness's `WorkStartTarget` answers on `target_id: "cadp-v04"`, which is exactly what a
+      // live deployment's `temporalNamespaceId` resolves to for this namespace.
+      namespaceId: "cadp-v04",
+      resolveBase: () => "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1",
+      identifyImage: (image: string) => ({ image, image_digest: "sha256:feed", tool_versions: { "codex-cli": "1.2.3" } }),
+    },
+  };
+}
+
+function opsDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "cadp-ops-kernel-"));
+  writeFileSync(join(dir, "worker-image"), "cadp-surface:test\n");
+  return dir;
+}
+
+/** The seal-time and admission-time codes that must NOT appear anywhere on a valid origin path. */
+const ORIGIN_PATH_FORBIDDEN_REASONS = [
+  "RUN_BINDING_REQUIRED", "NOT_RUN_ENROLLED", "RUN_CAPABILITY_REQUIRED", "RUN_CAPABILITY_INVALID",
+  "RUN_CAPABILITY_HOLDER_MISMATCH", "RUN_SCOPE_UNRESOLVED", "RUN_SCOPE_REFUSED", "RUN_MEMBERSHIP_UNPROVEN",
+] as const;
+
+test("WP §3.6: the live ops origin path is ADJUDICATED as a run origin, and its retry is idempotent", async () => {
+  const rp = await runProfileHarness();
+  const dir = opsDir();
+  const { dependencies, allocated, sealed } = opsDependencies(rp, dir);
+  try {
+    // A `workPlan`-derived key: the stable pair a driver already holds at origin creation.
+    const origin_key = planOriginKey("cadp-v04:evidence:proposal-1", 0);
+    const extra = ["implement median", "8", "6", "cadp-v04:evidence:proposal-1"];
+    const lines: Array<Record<string, unknown>> = [];
+    const start = () => startWork(dir, "development", extra, { log: (line) => lines.push(line), originProfile: "v05", originKey: origin_key }, dependencies);
+
+    const first = await start();
+    assert.ok(first !== undefined, `the origin start was not admitted: ${JSON.stringify(lines)}`);
+    const effect_id = first.effect_id;
+    assert.equal(first.origin_key, origin_key);
+    assert.equal(allocated[0], effect_id, "the sealed effect IS the allocated one");
+
+    // (1) ADJUDICATED, by the Kernel: `is_run_origin` held, so B5(5) wrote the self-referential
+    // witness in the same transaction as the K3 row. Nothing in `ops.ts` can write this.
+    const witness = rp.h.store.runMembership(effect_id);
+    assert.equal(witness?.effect_id, effect_id);
+    assert.equal(witness?.work_run_ref, effect_id, "both columns are the origin's own effect_id");
+    assert.equal(count(rp.h, "run_membership"), 1, "exactly one membership row");
+    assert.equal(sealed[0]!.work_bindings.filter((b) => b.namespace === "work-run").length, 1, "exactly one work-run binding reached the seal");
+
+    // The capability was minted at THIS origin's own verified initial dispatch (A4/B5(1)), which is
+    // the observable that the adjudication — and not some other path — is what admitted it.
+    assert.equal(count(rp.h, "run_capability"), 1);
+    assert.equal(rp.h.store.runCapability(effect_id)?.holder_ref, REQUESTER_A);
+
+    // (3) THE RETRY. Same origin_key, therefore the same tuple, therefore the same effect_id; and
+    // the material is re-formed from the origin key rather than the clock, so it is byte-identical.
+    const incidentsBefore = rp.h.store.openIncidents().length;
+    const retry = await start();
+    assert.equal(retry, undefined, "the retry's re-DISPATCH is EFFECT_ALREADY_COMMITTED — the run is not started twice");
+    assert.equal(allocated[1], allocated[0], "one logical origin, one effect identity (WP control 13)");
+    assert.deepEqual(sealed[1], sealed[0], "the re-seal returned the STORED row: identical semantic payload");
+    assert.equal(sealed[1]!.request_digest.value, sealed[0]!.request_digest.value, "an unchanged request_digest");
+    assert.equal(count(rp.h, "effect_request"), 1, "exactly one effect_request row");
+    assert.equal(count(rp.h, "run_membership"), 1, "and no second membership row");
+    assert.equal(rp.h.store.openIncidents().length, incidentsBefore, "ZERO KERNEL_INCIDENT: an idempotent no-op, not a K3 conflict");
+
+    // (2) No run-profile refusal code anywhere in what the path reported.
+    const transcript = JSON.stringify(lines);
+    for (const reason of ORIGIN_PATH_FORBIDDEN_REASONS) {
+      assert.equal(transcript.includes(reason), false, `${reason} must not appear on the valid origin path`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rp.h.close();
+  }
+});
+
+test("WP §3.6: the RECORD vertical originates through the same path, with an origin-derived resource_prefix", async () => {
+  const rp = await runProfileHarness();
+  const dir = opsDir();
+  const { dependencies, allocated, sealed } = opsDependencies(rp, dir);
+  try {
+    // Vertical generality (WP control 15): the record args carry no `repo_id`, `base_sha` or
+    // `work_item` at all, so a content-derived tuple is not even expressible here — and this one
+    // needs none of them. The prefix is the origin's, which is what makes the material replayable.
+    const origin_key = "origin-record-live";
+    const lines: Array<Record<string, unknown>> = [];
+    const start = () => startWork(dir, "record", ["2", "6", "4"], { log: (line) => lines.push(line), originProfile: "v05", originKey: origin_key }, dependencies);
+
+    const first = await start();
+    assert.ok(first !== undefined, `the record origin was not admitted: ${JSON.stringify(lines)}`);
+    const witness = rp.h.store.runMembership(first.effect_id);
+    assert.equal(witness?.work_run_ref, first.effect_id, "the record vertical originates its own scope too");
+
+    const readBlob = (cas_key: string): Record<string, unknown> =>
+      JSON.parse(Buffer.from(rp.h.cas.get(cas_key)).toString("utf8")) as Record<string, unknown>;
+    const material = readBlob(sealed[0]!.material_ref);
+    const args = readBlob(material["args_cas_key"] as string) as unknown as { record: { resource_prefix: string } };
+    assert.equal(args.record.resource_prefix, originResourcePrefix(origin_key), "sealed material carries the origin-derived prefix");
+
+    const incidentsBefore = rp.h.store.openIncidents().length;
+    await start();
+    assert.equal(allocated[1], allocated[0]);
+    assert.deepEqual(sealed[1], sealed[0], "byte-reproducible record material across the retry");
+    assert.equal(rp.h.store.openIncidents().length, incidentsBefore, "zero incidents");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rp.h.close();
   }
 });
