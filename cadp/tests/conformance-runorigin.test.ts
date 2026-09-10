@@ -154,6 +154,16 @@ class WorkStartTarget implements TargetAdapterV1 {
 
   readonly authority_ref = "temporal:cadp-v04";
 
+  /**
+   * Every transport call that REACHED this target and took effect, as `ScriptedTarget` records its
+   * own (`support/harness.ts`). The two adapters are DISJOINT external-effect ledgers: a run's
+   * `WORK_START` dispatches here (`sealWorkStart` seals against `rp.target`), while every member
+   * request dispatches to the harness's scripted target (`rp.h.target`). A test that pins one of
+   * the two lists is stating the delta at THAT target only, which is why both are asserted wherever
+   * a case dispatches at both.
+   */
+  readonly effects: string[] = [];
+
   onDispatch: ((effect_id: string, ordinal: number) => DispatchResult) | undefined;
 
   describe(): { target_type: string; authority_ref: string; operations: readonly AdapterOperation[] } {
@@ -189,11 +199,13 @@ class WorkStartTarget implements TargetAdapterV1 {
   }
 
   async dispatch(effect_id: string, ordinal: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<DispatchResult> {
-    return this.onDispatch?.(effect_id, ordinal) ?? {
-      kind: "ACCEPTED",
+    const result = this.onDispatch?.(effect_id, ordinal) ?? {
+      kind: "ACCEPTED" as const,
       target_operation_ref: `wf-${effect_id}-${ordinal}`,
       receipt_claim: { workflow_id: material["workflow_id"], started: true },
     };
+    if (result.kind === "ACCEPTED") this.effects.push(effect_id);
+    return result;
   }
 
   async reconcile(effect_id: string, _o: number, _t: TargetRef, _op: string, material: Record<string, unknown>): Promise<ReconcileResult> {
@@ -2162,6 +2174,11 @@ async function membershipProofHarness(disabledChecks?: ReadonlySet<string>): Pro
   const capability = (admitted as { run_capability?: string }).run_capability;
   assert.match(String(capability), /^[A-Za-z0-9_-]{43}$/u, "the run is genuinely minted against");
   assert.deepEqual(rp.h.store.outcomesByEffect(run).map((o) => o.result), ["COMMITTED"], "and genuinely usable");
+  // Where that dispatch LANDED, stated so the per-target ledgers below are read against the right
+  // one: the origin is a `WORK_START`, so its external effect is at the WORKFLOW target, and the
+  // SCRIPTED target the three graded requests dispatch to has still seen nothing at all.
+  assert.deepEqual(rp.target.effects, [run], "the run's own external effect is at the WORKFLOW target");
+  assert.deepEqual(rp.h.target.effects, [], "and the SCRIPTED target is untouched by it");
   return { rp, run, capability: capability!, absent, wrongRun, matching };
 }
 
@@ -2244,7 +2261,11 @@ test("B5(5)/#19: an ABSENT membership row and one naming ANOTHER run are both re
     assert.equal(ok.kind, "ADMITTED", JSON.stringify(ok));
     assert.equal(rp.h.store.admissionsByEffect(matching).length, 1, "the proven request is reserved");
     assert.deepEqual(rp.h.store.outcomesByEffect(matching).map((o) => o.result), ["COMMITTED"]);
-    assert.deepEqual(rp.h.target.effects, [matching], "exactly ONE external effect across the three");
+    // Exactly ONE of the three took effect. Scoped to the SCRIPTED target, which is the only one
+    // these three dispatch to; the run's own `WORK_START` effect is on the WORKFLOW target's
+    // ledger, pinned in the fixture and unmoved by any of the three.
+    assert.deepEqual(rp.h.target.effects, [matching], "of the three, only the proven one reached the scripted target");
+    assert.deepEqual(rp.target.effects, [run], "and no refusal added an effect at the workflow target");
 
     // Nothing about the run moved: no refusal minted, re-delivered or exposed a secret, and the one
     // row still digests the one capability its origin's initial dispatch delivered.
