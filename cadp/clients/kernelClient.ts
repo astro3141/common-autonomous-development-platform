@@ -16,10 +16,18 @@ export interface EffectState {
 export class KernelApiError extends Error {
   readonly status: number;
   readonly reason: string;
+  /**
+   * The refusal's `detail`, retained rather than only formatted into the message: a caller that
+   * must distinguish two refusals sharing one reason code — `ALLOCATION_TUPLE_INVALID` on the
+   * `schema` field (a v0.4 kernel that knows no other allocation schema) from the same code on a
+   * genuinely malformed tuple — would otherwise have to pattern-match the message text.
+   */
+  readonly detail: string | undefined;
   constructor(status: number, reason: string, detail?: string) {
     super(`kernel api ${status} ${reason}${detail !== undefined ? `: ${detail}` : ""}`);
     this.status = status;
     this.reason = reason;
+    this.detail = detail;
   }
 }
 

@@ -72,6 +72,10 @@ import type { ActivatedAllocationContracts } from "../kernel/policyBundle.ts";
 import type { AdapterOperation, DispatchResult, ReconcileResult, RevisionRead, TargetAdapterV1, TargetIdentityClaim } from "../kernel/adapters/types.ts";
 import type { SubjectBinding, TargetRef } from "../kernel/records.ts";
 import { REFERENCE_IDENTITIES, buildReferenceKernelConfig } from "../deployment/referencePolicy.ts";
+import { KernelApiError } from "../clients/kernelClient.ts";
+import { startWork } from "../live/ops.ts";
+import type { StartWorkDependencies, StartWorkKernelClient } from "../live/ops.ts";
+import type { LiveEnvManifest } from "../live/env.ts";
 import {
   DEFAULT_WORK_RUN_REF, PRINCIPALS, V2_ALLOCATION_SCHEMAS, V2_ALLOCATION_SCHEMA_DESCRIPTORS,
   makeHarness, stopSharedOpa, v2ConfigOverrides,
@@ -2335,5 +2339,185 @@ test("#19 does not activate under v1, under an ungoverned v2 bundle, or for a NO
     assert.equal(count(governed.h, "run_capability"), 0);
   } finally {
     governed.h.close();
+  }
+});
+
+// ================================================================================================
+// PART 6 — the LIVE COMPOSITION's origin path against this kernel (`cadp/live/ops.ts`).
+//
+// `conformance-basesha.test.ts` states the ops-side legs against a stand-in kernel: one origin_key
+// ⇒ one effect_id, an idempotent re-seal, byte-identical material, one self-referential work-run
+// binding, the minted-key durability record and the v0.4 generation seam. What CANNOT be stated
+// there, and is stated here, is the CROSS-KERNEL half: that the request `startWork` actually seals
+// is ADJUDICATED by this Ingress as a run origin (B5(9)), acquires the `run_membership(E, E)`
+// witness B5(1)(b) makes minting-ness out of, and reaches NONE of B5(3)-(5)'s refusal codes on the
+// valid path. The two files' claims are disjoint by construction: nothing below re-asserts a
+// byte-level ops claim, and nothing there touches a store row.
+// ================================================================================================
+
+/**
+ * The Kernel API slice `startWork` uses, served by this harness's in-process Ingress/PEP.
+ * `IngressRejection` is translated to the `KernelApiError` the HTTP client would raise, detail
+ * included — that detail is what the ops path reads to tell the v0.4 generation seam
+ * (`ALLOCATION_TUPLE_INVALID` on `schema`) from a genuinely malformed tuple.
+ */
+function opsKernelClient(rp: RunProfileHarness, principal: Principal = PRINCIPALS.workflow): {
+  client: StartWorkKernelClient;
+  allocated: string[];
+  blobs: string[];
+} {
+  const allocated: string[] = [];
+  const blobs: string[] = [];
+  const call = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!(error instanceof IngressRejection)) throw error;
+      const prefix = `${error.reason}: `;
+      throw new KernelApiError(422, error.reason, error.message.startsWith(prefix) ? error.message.slice(prefix.length) : undefined);
+    }
+  };
+  const client = {
+    allocateEffectId: (tuple: unknown) =>
+      call(() => {
+        const effect_id = rp.h.ingress.allocateEffectId(tuple as never, principal);
+        allocated.push(effect_id);
+        return { effect_id };
+      }),
+    putBlob: (bytes: Uint8Array) =>
+      call(() => {
+        blobs.push(Buffer.from(bytes).toString("utf8"));
+        return { cas_key: rp.h.ingress.putBlob(bytes) };
+      }),
+    sealEffectRequest: (body: unknown) => call(() => rp.h.ingress.sealEffectRequest(body, principal)),
+    assembleAdmissionInput: (effect_id: string, evidence_refs: string[]) => call(() => rp.h.ingress.assembleAdmissionInput(effect_id, evidence_refs)),
+    evaluate: (input_digest: string) => rp.h.evaluate(input_digest),
+    admitAndDispatch: (effect_id: string, decision_id: string) => rp.h.pep.admitAndDispatch(effect_id, decision_id, principal),
+  };
+  return { client: client as unknown as StartWorkKernelClient, allocated, blobs };
+}
+
+/** `startWork`'s non-kernel reads (the temporal CLI, `git ls-remote`, docker), injected. */
+function opsDependencies(rp: RunProfileHarness, client: StartWorkKernelClient): StartWorkDependencies {
+  return {
+    manifest: { repo_id: "R_kgDOops", repo_full_name: "owner/repo" } as unknown as LiveEnvManifest,
+    client,
+    // The `WorkStartTarget` above answers on `temporal:cadp-v04` / `WORKFLOW` / `cadp-v04`, which is
+    // the target_ref `startWork` composes from this namespace id.
+    namespaceId: () => "cadp-v04",
+    resolveBase: () => "8cbc629d3adf9f29c8e21ecb69a11a7cfbcbe4f1",
+    imageIdentity: () => ({ image: "cadp-worker:test", image_digest: "sha256:feed", tool_versions: { "codex-cli": "1.0.0" } }),
+    now: () => "2026-09-10T00:00:00.000Z",
+  };
+}
+
+/** The refusal codes B5(3)-(5) and #19 grade with. None may appear on the valid origin path. */
+const RUN_PROFILE_REFUSAL_CODES = [
+  "RUN_BINDING_REQUIRED", "NOT_RUN_ENROLLED", "RUN_CAPABILITY_REQUIRED", "RUN_CAPABILITY_INVALID",
+  "RUN_CAPABILITY_HOLDER_MISMATCH", "RUN_SCOPE_UNRESOLVED", "RUN_SCOPE_REFUSED", "RUN_MEMBERSHIP_UNPROVEN",
+] as const;
+
+for (const vertical of ["development", "record"] as const) {
+  test(`ops.startWork's ${vertical} WORK_START is adjudicated a RUN ORIGIN, and its retry converges on it`, async () => {
+    // WP control 15, the record leg: the record vertical's args carry only `tenant`,
+    // `resource_prefix` and `payloads` — no `repo_id`, `base_sha` or `work_item` anywhere on the
+    // path — so a tuple that could not be formed there would fail this test, which is the whole
+    // point of a discriminator that asks for nothing a vertical may not have.
+    const rp = await runProfileHarness();
+    try {
+      const { client, allocated, blobs } = opsKernelClient(rp);
+      const extra = vertical === "development" ? ["improve the thing", "8", "6"] : ["2", "6", "4"];
+      const origin_key = `ops-origin-${vertical}`;
+      const dependencies = opsDependencies(rp, client);
+      const lines: Array<Record<string, unknown>> = [];
+
+      const started = await startWork(rp.h.dir, vertical, extra, { originKey: origin_key, log: (l) => lines.push(l), dependencies });
+
+      assert.notEqual(started, undefined, "the origin is admitted and COMMITTED through the real PEP");
+      const run = started!.effect_id;
+      assert.equal(started!.origin_key, origin_key, "the result reports the origin it started");
+
+      // B5(9): the seal ADJUDICATED this request as its own run's origin — the durable witness
+      // B5(1)(b) turns into minting-ness at the verified initial dispatch is `run_membership(E, E)`.
+      const witness = rp.h.store.runMembership(run);
+      assert.equal(witness?.effect_id, run, "run_membership's first column is the origin");
+      assert.equal(witness?.work_run_ref, run, "and its second column is the origin itself — the SELF-referential witness");
+      assert.equal(count(rp.h, "run_membership"), 1, "exactly one, never a second for the same origin");
+      assert.equal(count(rp.h, "run_capability"), 1, "and the origin minted exactly once at its own initial dispatch");
+
+      // No leg of B5(3)-(5) fired: the origin path is the ORIGIN path, not the member path.
+      const logged = JSON.stringify(lines);
+      for (const code of RUN_PROFILE_REFUSAL_CODES) {
+        assert.equal(logged.includes(code), false, `${code} must not appear on the valid origin path`);
+      }
+      // B6(4)/B6(3): the delivered capability is a bearer credential for the whole run scope. It is
+      // reported as delivered and NEVER rendered into the process's own log.
+      const secret = rp.h.store.runCapability(run);
+      assert.notEqual(secret, undefined, "the capability row exists");
+      assert.equal(lines.some((l) => l["run_capability_delivered"] === true), true, "its delivery is reported");
+      assert.equal(logged.includes(secret!.capability_digest), false, "and neither it nor its digest is logged");
+
+      // WP control 13/14: the RETRY. Same origin_key ⇒ the same allocation row and the same
+      // effect_id; the re-seal is idempotent, so one K3 row, one witness, and ZERO incidents.
+      const beforeBlobs = blobs.length;
+      await startWork(rp.h.dir, vertical, extra, { originKey: origin_key, log: (l) => lines.push(l), dependencies });
+
+      assert.deepEqual([...new Set(allocated)], [run], "the retry re-derives the SAME effect_id — one origin, one identity");
+      assert.equal(count(rp.h, "effect_allocation"), 1, "and exactly ONE effect_allocation row");
+      assert.equal(count(rp.h, "effect_request"), 1, "the re-seal is idempotent: no second K3 row");
+      assert.equal(count(rp.h, "run_membership"), 1, "and no second witness");
+      assert.equal(rp.h.store.openIncidents().length, 0, "ZERO incidents — no REQUEST_DIGEST_CONFLICT, so no scope hold");
+      assert.deepEqual(blobs.slice(beforeBlobs), blobs.slice(0, beforeBlobs), "because the retry put BYTE-IDENTICAL args and material");
+    } finally {
+      rp.h.close();
+    }
+  });
+}
+
+test("two ops origins over byte-identical work take TWO effect identities, with zero conflicts", async () => {
+  // AP control A5 leg o-i against the live composition: the discriminator identifies the ORIGIN,
+  // so two starts over the same repository, base revision and work item are two runs. A build
+  // fingerprinting the work content instead collides them on one effect_id, and the second seal —
+  // differing on bounds and provider selections — lands REQUEST_DIGEST_CONFLICT, an incident and a
+  // scope hold. That is the failure this asserts is unconstructible here.
+  const rp = await runProfileHarness();
+  try {
+    const { client, allocated } = opsKernelClient(rp);
+    const dependencies = opsDependencies(rp, client);
+    const first = await startWork(rp.h.dir, "development", ["identical work", "8", "6"], { originKey: "ops-origin-a", dependencies });
+    const second = await startWork(rp.h.dir, "development", ["identical work", "8", "5", "", "codex"], { originKey: "ops-origin-b", dependencies });
+
+    assert.notEqual(first!.effect_id, second!.effect_id, "two distinct origins, two distinct effect identities");
+    assert.equal(new Set(allocated).size, 2);
+    assert.equal(count(rp.h, "effect_request"), 2, "each first-seals its OWN WORK_START");
+    assert.equal(rp.h.store.openIncidents().length, 0, "zero REQUEST_DIGEST_CONFLICT, zero KERNEL_INCIDENT");
+    assert.equal(rp.h.store.runMembership(first!.effect_id)?.work_run_ref, first!.effect_id, "each writes its own self-referential witness");
+    assert.equal(rp.h.store.runMembership(second!.effect_id)?.work_run_ref, second!.effect_id);
+    assert.equal(count(rp.h, "run_capability"), 2, "so each origin mints exactly once, never one shared");
+  } finally {
+    rp.h.close();
+  }
+});
+
+test("ops.startWork under a v0.4 kernel: the generation seam allocates v1 and seals what it seals today", async () => {
+  // The LIVE pilot. `cadp.kernel-config.v1` refuses the run-origin schema ALLOCATION_TUPLE_INVALID
+  // on `schema`, which the ops path reads as the generation seam and falls back to the zero-sentinel
+  // v0.4 tuple with no work-run binding. The v0.4 deployment therefore seals, admits and dispatches
+  // exactly as it does today — and, run-origin adjudication being v2-only, acquires no witness.
+  const rp = await runProfileHarness({});
+  try {
+    const { client, allocated } = opsKernelClient(rp);
+    const dependencies = opsDependencies(rp, client);
+    const started = await startWork(rp.h.dir, "development", ["v04 work", "8", "6"], { originKey: "ops-origin-v04", dependencies });
+
+    assert.notEqual(started, undefined, "the live v0.4 start still admits and COMMITs");
+    const request = rp.h.store.effectRequest(started!.effect_id)!;
+    assert.deepEqual(request.work_bindings.map((b) => b.namespace), ["work-item"], "no work-run binding is sealed under v0.4");
+    assert.equal(rp.h.store.runMembership(started!.effect_id), undefined, "v1 adjudicates no origin and writes no witness");
+    assert.equal(count(rp.h, "run_capability"), 0, "and mints nothing");
+    assert.deepEqual(allocated, [started!.effect_id], "one allocation, through the v0.4 tuple");
+    assert.equal(rp.h.store.openIncidents().length, 0);
+  } finally {
+    rp.h.close();
   }
 });
