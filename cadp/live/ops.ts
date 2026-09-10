@@ -560,7 +560,9 @@ export interface StartWorkOptions {
  * RECOVERY, for a direct start whose `origin_key` this function minted: the key is emitted through
  * `log` the moment it is minted, is carried by every failure path's thrown `WorkStartOriginError`,
  * is returned in the result, and is persisted with the pinned material under
- * `<dir>/origin-keys/<sha256(origin_key)>.json` BEFORE the first kernel call. So a crashed process
+ * `<dir>/origin-keys/<sha256(origin_key)>.json` BEFORE the first kernel call. Nothing fallible
+ * precedes the mint — even the manifest read and the Kernel client construction happen after it, so
+ * no environment failure can lose the origin. A crashed process therefore
  * always leaves a recoverable record, and the flow is: list `<dir>/origin-keys/`, read the record,
  * re-invoke `startWork` with `{ originKey: <the record's origin_key> }` — which converges on the
  * SAME effect_id and re-seals byte-identical material.
@@ -574,12 +576,20 @@ export async function startWork(
   const log = options.log ?? SILENT;
   const deps = options.dependencies ?? {};
   const profile = options.originProfile ?? "v04";
-  const m = deps.manifest ?? loadManifest(dir);
-  const c = deps.client ?? liveClient(dir, "cadp-workflow");
   const workerImage = deps.workerImage ?? (() => imageIdentity(readFileSync(join(dir, "worker-image"), "utf8").trim()));
+  // Reading the deployment manifest and standing the Kernel client up are FALLIBLE environment work
+  // (an absent or malformed manifest, a missing principal token, an unreachable store). v0.4 does
+  // both exactly where it always has — before the argument checks below — so that branch's failure
+  // ordering is untouched. v0.5 DEFERS both into the guarded region, after the origin key is minted:
+  // control A4 wants the key identifying this logical origin durable and visible before anything can
+  // fail, and a manifest load that threw ahead of the mint would lose the origin outright — the
+  // operator's retry would mint a fresh key and fork the run, which is the one failure mode the
+  // minted-key durability contract exists to prevent.
+  const loadEnvironment = () => ({ m: deps.manifest ?? loadManifest(dir), c: deps.client ?? liveClient(dir, "cadp-workflow") });
+  let environment = profile === "v04" ? loadEnvironment() : undefined;
   // v0.4 resolves the namespace exactly where it always has, before the argument checks below.
   // v0.5 resolves it inside `openOrigin` instead — once per origin, and never when a record pins it.
-  let namespaceId = profile === "v04" ? (deps.namespaceId ?? temporalNamespaceId)(m) : "";
+  let namespaceId = environment === undefined ? "" : (deps.namespaceId ?? temporalNamespaceId)(environment.m);
 
   if (vertical === "development") {
     const floor = devEffectFloorViolation(boundArg(extra[2], 6));
@@ -612,8 +622,11 @@ export async function startWork(
   // preserves it VERBATIM across retries. A key minted HERE is therefore made visible before
   // anything that can fail — logged on the next line, carried by every throw below, persisted with
   // the pinned material before the first kernel call, and returned in the result. The argument
-  // checks above deliberately run FIRST: they refuse deterministically, touch no kernel state and
-  // seal nothing, so a start that fails one of them is not yet an origin at all.
+  // checks above deliberately run FIRST — and are the ONLY thing that does: they are pure functions
+  // of the arguments, refuse deterministically, read no environment, touch no kernel state and seal
+  // nothing, so a start that fails one of them is not yet an origin at all. Everything that can fail
+  // for a reason OUTSIDE the arguments — the manifest, the client, the namespace, the base ref, the
+  // worker image — happens below this line, under a key that already exists and is already visible.
   const origin_key = profile === "v05" ? options.originKey ?? (deps.mintOriginKey ?? randomUUID)() : undefined;
   if (origin_key !== undefined && options.originKey === undefined) {
     log({ origin: "minted", origin_key, origin_record: originRecordPath(dir, origin_key) });
@@ -623,6 +636,12 @@ export async function startWork(
   // the `origin_key` the retry has to be re-invoked with. With no origin (the v0.4 default) the
   // caught error is re-thrown as-is, so that branch's failures are exactly what they are today.
   try {
+    // v0.5's deferred manifest + client load (see above). It is the first fallible step of the
+    // origin path, and it now runs with the `origin_key` already minted, logged and carried by the
+    // wrapper below — so a manifest that will not load leaves a recoverable origin rather than none.
+    if (environment === undefined) environment = loadEnvironment();
+    const { m, c } = environment;
+
     const origin = origin_key === undefined
       ? undefined
       : openOrigin(dir, origin_key, vertical, extra, {

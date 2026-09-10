@@ -441,6 +441,85 @@ test("a MINTED origin_key is minted once and stays recoverable through a failed 
   rmSync(recovered.dir, { recursive: true, force: true });
 });
 
+test("a manifest/client load that FAILS still leaves the minted key recoverable (the mint precedes every environment read)", async () => {
+  // The environment loads ops.ts performs for itself — `loadManifest(dir)` and `liveClient(dir, …)`
+  // — are fallible, and a direct v0.5 start that ran them BEFORE minting would lose the logical
+  // origin: no key logged, no key thrown, and an operator's retry minting a fresh one forks the run.
+  // Driven here with a real deployment dir that has no manifest file at all, so `loadManifest` is
+  // the thing that throws, exactly as it would in the live composition.
+  for (const note of ["manifest", "client"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "cadp-ops-noenv-"));
+    writeFileSync(join(dir, "worker-image"), "cadp-worker:v1\n");
+    const lines: Array<Record<string, unknown>> = [];
+    const minted: string[] = [];
+    const failure = await startWork(dir, "development", DEV_EXTRA, {
+      originProfile: "v05",
+      log: (line) => lines.push(line),
+      dependencies: {
+        // `manifest` omitted ⇒ ops.ts calls `loadManifest` on a dir with no manifest; in the second
+        // pass the manifest is supplied and `liveClient` is the loader left to fail.
+        ...(note === "client" ? { manifest: MANIFEST } : {}),
+        namespaceId: () => "namespace-1",
+        resolveBase: () => SHA,
+        workerImage: () => ({ image: "i", image_digest: "d", tool_versions: {} }),
+        mintOriginKey: () => {
+          const key = `minted-before-env-${note}`;
+          minted.push(key);
+          return key;
+        },
+        now: () => CREATED_AT,
+      },
+    }).then(() => assert.fail(`${note}: the environment load must fail in this fixture`), (error: unknown) => error);
+
+    assert.ok(failure instanceof WorkStartOriginError, `${note}: ${String(failure)}`);
+    assert.deepEqual(minted, [`minted-before-env-${note}`], `${note}: the key was minted before the environment was touched`);
+    assert.equal(failure.origin_key, `minted-before-env-${note}`, `${note}: the throw carries the key a retry must reuse`);
+    assert.match(failure.message, new RegExp(`minted-before-env-${note}`, "u"));
+    const emitted = lines.find((line) => line["origin"] === "minted");
+    assert.equal(emitted?.["origin_key"], `minted-before-env-${note}`, `${note}: and the log carried it too`);
+    assert.equal(emitted?.["origin_record"], originRecordPath(dir, `minted-before-env-${note}`));
+    // Nothing was resolved, so nothing was recorded — and nothing had to be: the recovered key
+    // re-enters a clean origin below and resolves the whole audited set for the first time.
+    assert.equal(existsSync(originRecordPath(dir, `minted-before-env-${note}`)), false, `${note}: a failed resolution records nothing`);
+
+    // Recovery: the SAME key, now with the environment healthy, opens the origin it was minted for.
+    const kernel = fakeKernel();
+    const recovered = await startWork(dir, "development", DEV_EXTRA, {
+      originProfile: "v05",
+      originKey: failure.origin_key,
+      dependencies: {
+        manifest: MANIFEST, client: kernel.client, namespaceId: () => "namespace-1",
+        resolveBase: () => SHA, workerImage: () => ({ image: "i", image_digest: "d", tool_versions: {} }),
+        mintOriginKey: () => assert.fail(`${note}: a passed key must never be re-minted`),
+        now: () => CREATED_AT,
+      },
+    });
+    assert.equal(recovered?.origin_key, `minted-before-env-${note}`);
+    assert.deepEqual(kernel.tuple(), {
+      schema: "cadp.allocation-key.run-origin.v1",
+      origin_key: `minted-before-env-${note}`,
+      purpose: "work-start",
+    }, `${note}: the recovered key derives the run-origin tuple of the start that failed`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("v0.4 loads the manifest and client exactly where it always has", async () => {
+  // The regression pin for the deferral above: on the DEFAULT branch the environment load still
+  // precedes the argument checks, so a start with both a broken environment and a bad argument
+  // fails the way it does today rather than reporting the argument first.
+  const dir = mkdtempSync(join(tmpdir(), "cadp-ops-v04env-"));
+  await assert.rejects(
+    () => startWork(dir, "development", ["item", "8", "1"], { ordinalArg: "1" }),
+    (error: unknown) => {
+      assert.ok(!(error instanceof WorkStartOriginError), "the v0.4 branch never wraps a failure in the origin error");
+      assert.doesNotMatch(String((error as Error).message), /max_effects|floor/u, "the manifest load fails first, as today");
+      return true;
+    },
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("two direct starts that mint their own keys are two logical origins", async () => {
   const fx = fixture();
   const first = await fx.start("development", DEV_EXTRA, { originProfile: "v05" });
