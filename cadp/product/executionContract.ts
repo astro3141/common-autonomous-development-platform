@@ -117,21 +117,12 @@ export const REQUIRED_INPUT_ROLES: Readonly<Record<SurfaceRole, readonly InputRo
 
 /**
  * B1(1): `executor_profile_payload.v1` IS THE RESOLVED REGISTRY ENTRY VERBATIM, under a closed key
- * set which is "exactly the role's implemented profile interface".
+ * set which B1(1) pins KEY BY KEY. The table below is that pinned enumeration exactly — no key added
+ * to it, for any reason: "no key outside the role's set may appear" in the preimage, and a table that
+ * tracked the interface instead of the TD would let an implementation digest an object the TD does
+ * not describe, which is the one thing (1e) exists to prevent.
  *
- * DRIFT NOTE, stated rather than absorbed. The TD enumerates that interface as of 2026-09-08. The
- * REVIEWER interface has since gained one key — `can_read_workspace` (#259 P0a, 2026-09-10), the
- * measured per-profile capability that scopes the reviewer's mount instruction. The TD's own
- * warrant for its enumeration is the implemented interface it cites (`ReviewProviderProfile`,
- * `reviewProviders.ts`), and the alternative reading — hold the 2026-09-08 list literally — would
- * make EVERY live reviewer profile malformed and refuse every review, which is precisely the
- * "nothing added, renamed, defaulted or re-typed" rule inverted into dropping a key that IS part of
- * the entry. The key set below therefore tracks the interface, and the ops-side payload snapshot
- * (`cadp/tests/ops/conformance-executorprofile.test.ts`) fails loudly on the next such drift
- * instead of letting a new profile key silently widen or silently break the closure.
- *
- * PLANNER remains "the REVIEWER set less `verdict_format`" — and less `can_read_workspace`, which
- * `PlanProviderProfile` does not declare either.
+ * PLANNER is "the REVIEWER set less `verdict_format`", as B1(1) states.
  */
 export const EXECUTOR_PROFILE_KEYS: Readonly<
   Record<SurfaceRole, { readonly required: readonly string[]; readonly optional: readonly string[] }>
@@ -141,13 +132,38 @@ export const EXECUTOR_PROFILE_KEYS: Readonly<
     optional: ["auth_env", "sessions_container_dir", "model_scan", "requested_effort", "effort_argv", "effort_scan"],
   },
   REVIEWER: {
-    required: ["argv_template", "auth_method", "can_read_workspace", "identity_class_product", "verdict_format"],
+    required: ["argv_template", "auth_method", "identity_class_product", "verdict_format"],
     optional: ["sessions_subdir", "sessions_container_dir", "model_scan", "requested_effort", "effort_argv", "effort_scan"],
   },
   PLANNER: {
     required: ["argv_template", "auth_method", "identity_class_product"],
     optional: ["sessions_subdir", "sessions_container_dir", "model_scan", "requested_effort", "effort_argv", "effort_scan"],
   },
+};
+
+/**
+ * INTERFACE KEYS THE TD'S PINNED PREIMAGE DOES NOT CARRY — admitted on the live entry, EXCLUDED from
+ * the payload, enumerated here rather than absorbed into the key set above.
+ *
+ * B1(1) enumerated each role's profile interface as of 2026-09-08. `ReviewProviderProfile` has since
+ * gained one key — `can_read_workspace` (#259 P0a, 2026-09-10), the measured per-profile capability
+ * that scopes the reviewer's mount instruction (`surfaceBroker.ts`). Two readings both fail: adding
+ * it to `EXECUTOR_PROFILE_KEYS.REVIEWER` digests a key outside the pinned set, and refusing the live
+ * entry for carrying it makes every reviewer request malformed and refuses every review. So the key
+ * is admitted on the entry and left out of the preimage — which costs no identity, because the flag
+ * is a FUNCTION of `argv_template`, which IS in the preimage: the flag must equal what the measured
+ * argv's read tools permit, asserted per provider by `conformance-reviewproviders.test.ts` §4.1. Two
+ * profiles that agree on `argv_template` and disagree on this flag cannot both be well-formed, so
+ * omitting it collapses no two distinct executor profiles onto one digest.
+ *
+ * This list is deliberately NOT a general escape hatch: any profile key that is neither pinned above
+ * nor named here is still `UNKNOWN_PROFILE_KEY`, so the next interface addition fails closed and
+ * arrives as a decision — extend the TD's key set, or record the exclusion here with its own reason.
+ */
+export const EXECUTOR_PROFILE_KEYS_EXCLUDED: Readonly<Record<SurfaceRole, readonly string[]>> = {
+  WORKER: [],
+  REVIEWER: ["can_read_workspace"],
+  PLANNER: [],
 };
 
 /** The closed provider name set each role's resolver admits. An unknown name never reaches here. */
@@ -234,13 +250,24 @@ function assertTypedDigest(value: unknown, canonicalization: Digest["canonicaliz
  *
  * DESCRIPTORS ONLY: `auth_files` / `auth_subdir` / `auth_env.env_var` / `auth_method` name WHERE
  * auth comes from, so no credential is ever in the preimage.
+ *
+ * The entry may carry an `EXECUTOR_PROFILE_KEYS_EXCLUDED` key — admitted on the entry, never carried
+ * into the payload, for the reason recorded there. Every other key outside the role's pinned set is
+ * `UNKNOWN_PROFILE_KEY`.
  */
 export function executorProfilePayload(role: SurfaceRole, profile: unknown): Record<string, unknown> {
   if (!isPlainObject(profile)) {
     throw new ExecutionRequestMalformed("MALFORMED_PROFILE_VALUE", `executor_profile_payload.v1 (${role}) must be an object`);
   }
   const keys = EXECUTOR_PROFILE_KEYS[role];
-  assertClosedKeys(profile, keys.required, keys.optional, `executor_profile_payload.v1 (${role})`, "UNKNOWN_PROFILE_KEY", "MISSING_PROFILE_KEY");
+  assertClosedKeys(
+    profile,
+    keys.required,
+    [...keys.optional, ...EXECUTOR_PROFILE_KEYS_EXCLUDED[role]],
+    `executor_profile_payload.v1 (${role})`,
+    "UNKNOWN_PROFILE_KEY",
+    "MISSING_PROFILE_KEY",
+  );
 
   const payload: Record<string, unknown> = {};
   const carry = (key: string, validate: (value: unknown, where: string) => unknown): void => {
@@ -253,10 +280,6 @@ export function executorProfilePayload(role: SurfaceRole, profile: unknown): Rec
   carry("auth_subdir", (v, w) => assertNonEmptyString(v, w, "MALFORMED_PROFILE_VALUE"));
   carry("auth_env", (v, w) => closedAuthEnv(v, w));
   carry("auth_method", (v, w) => closedAuthMethod(v, w));
-  carry("can_read_workspace", (v, w) => {
-    if (typeof v !== "boolean") throw new ExecutionRequestMalformed("MALFORMED_PROFILE_VALUE", `${w} must be a boolean`);
-    return v;
-  });
   carry("sessions_subdir", (v, w) => assertNonEmptyString(v, w, "MALFORMED_PROFILE_VALUE"));
   carry("sessions_container_dir", (v, w) => assertNonEmptyString(v, w, "MALFORMED_PROFILE_VALUE"));
   carry("identity_class_product", (v, w) => assertNonEmptyString(v, w, "MALFORMED_PROFILE_VALUE"));

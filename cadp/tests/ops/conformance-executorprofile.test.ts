@@ -5,11 +5,14 @@
  * sets at every level, typed digests, array-order sensitivity, the malformed-request refusals) are
  * asserted by `cadp/tests/conformance/conformance-execution-request.test.ts`.
  *
- *   P1  THE DRIFT GUARD. `EXECUTOR_PROFILE_KEYS` must COVER every key every live registry entry
- *       declares. It is the one failure mode that is silent and total: a profile interface that
- *       gains a key without this table gaining it makes every request of that role MALFORMED, and
- *       the broker then refuses every run of that surface. (This is not hypothetical — the reviewer
- *       interface gained `can_read_workspace` in #259 P0a, after the TD pinned its enumeration.)
+ *   P1  THE DRIFT GUARD. Every key every live registry entry declares must be ADMITTED — either
+ *       pinned in `EXECUTOR_PROFILE_KEYS` (and so digested) or named in
+ *       `EXECUTOR_PROFILE_KEYS_EXCLUDED` (and so deliberately left out of the preimage). It is the
+ *       one failure mode that is silent and total: a profile interface that gains a key admitted by
+ *       neither table makes every request of that role MALFORMED, and the broker then refuses every
+ *       run of that surface. (This is not hypothetical — the reviewer interface gained
+ *       `can_read_workspace` in #259 P0a, after the TD pinned its enumeration, and that key is
+ *       excluded rather than pinned precisely because B1(1)'s key set is exact.)
  *   P2  the per-provider payload digests, pinned, so a profile edit is visible as a digest move
  *       rather than as a silently different execution identity
  *   P3  determinism: the same entry digests equal on every call, and the payload is a fresh copy
@@ -19,7 +22,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EXECUTOR_PROFILE_KEYS, executorProfileDigest, executorProfilePayload } from "../../product/executionContract.ts";
+import {
+  EXECUTOR_PROFILE_KEYS,
+  EXECUTOR_PROFILE_KEYS_EXCLUDED,
+  executorProfileDigest,
+  executorProfilePayload,
+} from "../../product/executionContract.ts";
 import type { SurfaceRole } from "../../product/executionContract.ts";
 import { WORKER_PROVIDERS } from "../../product/workerProviders.ts";
 import { REVIEW_PROVIDERS } from "../../product/reviewProviders.ts";
@@ -31,14 +39,19 @@ const REGISTRIES: ReadonlyArray<readonly [SurfaceRole, Record<string, Record<str
   ["PLANNER", PLAN_PROVIDERS],
 ];
 
-test("P1: the declared closed key set COVERS every key every live registry entry carries", () => {
+test("P1: every key every live registry entry carries is ADMITTED — pinned or explicitly excluded", () => {
   for (const [role, registry] of REGISTRIES) {
-    const declared = new Set([...EXECUTOR_PROFILE_KEYS[role].required, ...EXECUTOR_PROFILE_KEYS[role].optional]);
+    const pinned = new Set([...EXECUTOR_PROFILE_KEYS[role].required, ...EXECUTOR_PROFILE_KEYS[role].optional]);
+    const excluded = new Set(EXECUTOR_PROFILE_KEYS_EXCLUDED[role]);
+    // The two tables are disjoint: a key cannot be both digested and left out of the preimage.
+    for (const key of excluded) {
+      assert.ok(!pinned.has(key), `${role} lists "${key}" as both pinned and excluded`);
+    }
     for (const [provider, profile] of Object.entries(registry)) {
       for (const key of Object.keys(profile)) {
         assert.ok(
-          declared.has(key),
-          `${role}/${provider} declares "${key}", which EXECUTOR_PROFILE_KEYS.${role} does not admit — add it in the same edit that adds the profile key, or every ${role} execution request becomes malformed and the broker refuses every ${role} run`,
+          pinned.has(key) || excluded.has(key),
+          `${role}/${provider} declares "${key}", which neither EXECUTOR_PROFILE_KEYS.${role} nor EXECUTOR_PROFILE_KEYS_EXCLUDED.${role} admits — decide which in the same edit that adds the profile key, or every ${role} execution request becomes malformed and the broker refuses every ${role} run`,
         );
       }
       for (const key of EXECUTOR_PROFILE_KEYS[role].required) {
@@ -56,9 +69,9 @@ test("P2: the per-provider payload digests are pinned — a profile edit must MO
     { role: "WORKER", provider: "codex", value: "60dc0c968477dddbeb1209aba93215022a4341de4c59c53b64c57bda57409bd0" },
     { role: "WORKER", provider: "grok", value: "3abaaba9fcca0586ac9cf91bd6225b135b9a05ea8099acfa623018c9ff57f455" },
     { role: "WORKER", provider: "claude", value: "fad8c10a77a8bc34cf319b3bda8969a2943122cf094fc51c45a4e275cffdb81b" },
-    { role: "REVIEWER", provider: "claude", value: "0126b3d185490bc6b76f92cecacdda8abad6d861de5ff82c346ed74f9ef078f1" },
-    { role: "REVIEWER", provider: "grok", value: "0656382117a0690f0e9ed62bb2ffcdf9eff89743a816b50c2d94e87a60dabae7" },
-    { role: "REVIEWER", provider: "codex", value: "76c7e295ba4d78b25890206f9555d5aec44e0d0f7b857650f7d97d93619b7dde" },
+    { role: "REVIEWER", provider: "claude", value: "a9399d1f251e67df539e9f80ef499564f9616fe99e469b183970aeea2f090886" },
+    { role: "REVIEWER", provider: "grok", value: "b8a66df2302f4e8c1763816d9fac507b00a94eae202ada0bed21c917cbf93e93" },
+    { role: "REVIEWER", provider: "codex", value: "8fd1bffa33d5887e1ace5089a8efcae093197c0c80f248093a5c04ac5570d09f" },
     { role: "PLANNER", provider: "claude", value: "e757ca5688b5e8dec404091ae46c5275b80b06776e9158492a62fc973f234592" },
     { role: "PLANNER", provider: "grok", value: "1a6fe4047d118580af84ad7e1c368565839f0a7f148668f774dc0a20cc64c01f" },
     { role: "PLANNER", provider: "codex", value: "49d86c52648a8edceec42b38c52d7c07d4aa59f69db6974f67dabcaab0df3db1" },

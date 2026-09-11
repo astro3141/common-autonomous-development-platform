@@ -10,8 +10,10 @@
  *   X2  every digest is TYPED: `executor_profile_digest` under `cadp-jcs-1`, every `input_digests`
  *       entry under `raw-bytes-1` over the exact UTF-8 bytes handed over, never a bare hex string
  *   X3  the required `input_role`s, each present exactly once, in the mandated literal order
- *   X4  `executor_profile_payload.v1` is the resolved registry entry VERBATIM: absent optionals
- *       OMITTED (never null-filled), `auth_env.static_env` the one open map, nothing added
+ *   X4  `executor_profile_payload.v1` is the resolved registry entry VERBATIM under B1(1)'s EXACT
+ *       pinned key set: absent optionals OMITTED (never null-filled), `auth_env.static_env` the one
+ *       open map, nothing added — and no key outside the pinned set digested even when the
+ *       implemented interface has gained one (`can_read_workspace`, #259 P0a)
  *   X5  nested closure — `auth_env`, `model_scan`, `effort_scan`, `effort_argv`, and `auth_method`
  *       closed PER VARIANT with no key of the other variant carried, not even as undefined
  *   X6  ARRAY ORDER is load-bearing: reordering `argv_template` / `auth_files` /
@@ -33,6 +35,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   EXECUTION_REQUEST_SCHEMA,
+  EXECUTOR_PROFILE_KEYS,
   ExecutionRequestMalformed,
   REQUEST_KEYS,
   REQUIRED_INPUT_ROLES,
@@ -163,8 +166,9 @@ test("X3: the required input_roles appear exactly once each, in the mandated lit
 // ------------------------------------------------------------------ X4/X5/X6 — the profile preimage
 
 test("X4: executor_profile_payload.v1 is the resolved registry entry VERBATIM, absent optionals OMITTED", () => {
-  // Every LIVE registry entry round-trips key-for-key and value-for-value: nothing added, renamed,
-  // defaulted or re-typed. (The ops-side snapshot pins the per-provider payloads themselves.)
+  // Every LIVE registry entry round-trips key-for-key and value-for-value over the role's PINNED key
+  // set: nothing added, renamed, defaulted or re-typed. (The ops-side snapshot pins the per-provider
+  // payloads themselves.)
   const live: ReadonlyArray<readonly [SurfaceRole, Record<string, unknown>]> = [
     ...Object.values(WORKER_PROVIDERS).map((p) => ["WORKER", p] as const),
     ...Object.values(REVIEW_PROVIDERS).map((p) => ["REVIEWER", p] as const),
@@ -172,8 +176,54 @@ test("X4: executor_profile_payload.v1 is the resolved registry entry VERBATIM, a
   ];
   for (const [role, profile] of live) {
     const payload = executorProfilePayload(role, profile);
-    assert.deepEqual(Object.keys(payload).sort(), Object.keys(profile).sort(), `${role} payload keys must equal the entry's own keys`);
-    assert.deepEqual(payload, JSON.parse(JSON.stringify(profile)), `${role} payload must equal the entry verbatim`);
+    const pinned = new Set([...EXECUTOR_PROFILE_KEYS[role].required, ...EXECUTOR_PROFILE_KEYS[role].optional]);
+    const expected = Object.keys(profile).filter((key) => pinned.has(key));
+    assert.deepEqual(Object.keys(payload).sort(), expected.sort(), `${role} payload keys must be the entry's own PINNED keys`);
+    assert.deepEqual(
+      payload,
+      JSON.parse(JSON.stringify(Object.fromEntries(expected.map((key) => [key, profile[key]])))),
+      `${role} payload must equal the entry verbatim over the pinned set`,
+    );
+  }
+
+  // B1(1)'s key set is EXACT, so the payload carries no key outside it even when the implemented
+  // interface has one. `ReviewProviderProfile.can_read_workspace` (#259 P0a, added after the TD
+  // pinned its enumeration) is admitted on the live entry and kept OUT of the preimage: digesting it
+  // would be a key outside the role's set, and refusing the entry would refuse every review. No
+  // identity is lost — the flag is a function of `argv_template`, which IS in the preimage
+  // (`conformance-reviewproviders.test.ts` §4.1 asserts the flag matches the measured argv).
+  assert.ok(!Object.prototype.hasOwnProperty.call(REQUEST_KEYS, "can_read_workspace"));
+  for (const role of ["WORKER", "REVIEWER", "PLANNER"] as const) {
+    assert.ok(
+      ![...EXECUTOR_PROFILE_KEYS[role].required, ...EXECUTOR_PROFILE_KEYS[role].optional].includes("can_read_workspace"),
+      `${role}'s pinned key set must not carry can_read_workspace`,
+    );
+  }
+  assert.deepEqual([...EXECUTOR_PROFILE_KEYS.REVIEWER.required].sort(), ["argv_template", "auth_method", "identity_class_product", "verdict_format"]);
+  // PLANNER is exactly "the REVIEWER set less verdict_format".
+  assert.deepEqual(
+    [...EXECUTOR_PROFILE_KEYS.PLANNER.required, ...EXECUTOR_PROFILE_KEYS.PLANNER.optional].sort(),
+    [...EXECUTOR_PROFILE_KEYS.REVIEWER.required, ...EXECUTOR_PROFILE_KEYS.REVIEWER.optional].filter((k) => k !== "verdict_format").sort(),
+  );
+  for (const [provider, profile] of Object.entries(REVIEW_PROVIDERS)) {
+    const payload = executorProfilePayload("REVIEWER", profile);
+    assert.ok(Object.prototype.hasOwnProperty.call(profile, "can_read_workspace"), `${provider} entry declares the flag`);
+    assert.ok(!Object.prototype.hasOwnProperty.call(payload, "can_read_workspace"), `${provider} payload must not carry the flag`);
+    // Flipping an EXCLUDED key cannot move the digest; flipping the argv it tracks must.
+    const flipped = { ...profile, can_read_workspace: !profile.can_read_workspace };
+    assert.equal(executorProfileDigest("REVIEWER", flipped).value, executorProfileDigest("REVIEWER", profile).value);
+  }
+  // The exclusion is NOT a general escape hatch: any other unpinned interface-looking key still fails.
+  const strayReviewer = { ...REVIEW_PROVIDERS.codex, can_write_workspace: true };
+  assert.throws(() => executorProfilePayload("REVIEWER", strayReviewer), (e) => malformedReason(e) === "UNKNOWN_PROFILE_KEY");
+  // And the exclusion is per-role: the worker and planner interfaces never declared the flag, so it
+  // is an unknown key there rather than an admitted one.
+  for (const [role, profile] of [["WORKER", WORKER_PROVIDERS.codex], ["PLANNER", PLAN_PROVIDERS.codex]] as const) {
+    assert.throws(
+      () => executorProfilePayload(role, { ...profile, can_read_workspace: true }),
+      (e) => malformedReason(e) === "UNKNOWN_PROFILE_KEY",
+      `${role} must not admit can_read_workspace`,
+    );
   }
 
   // OMITTED, never null-filled: the codex worker declares no auth_env / sessions_container_dir /
