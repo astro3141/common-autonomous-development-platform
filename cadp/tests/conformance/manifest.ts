@@ -86,6 +86,11 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
 
   // ---- Execution Plane (EP).
   { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract" },
+  {
+    control: "EP-B1-6b",
+    tests: ["conformance-reviewmount.test.ts"],
+    note: "the reviewer EVIDENCE plane is a SANITIZED SNAPSHOT of candidate_sha: no .git and byte-for-byte the tracked tree (the INVERSION of the pre-6b .git-presence leg), plus the fail-closed refusal of symlink/gitlink tree entries before any surface, digest or envelope",
+  },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 
   // ---- v0.4 TD §13.1 constitutional negative controls (C1–C42), with their guard-bites.
@@ -148,7 +153,7 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   {
     control: "TD-4.1",
     tests: ["conformance-osisolation.test.ts", "conformance-isolation.test.ts", "conformance-reviewmount.test.ts"],
-    note: "surface OS/network isolation boundary (F6–F10) and the reviewer's evidence/instruction planes (#259 P0a)",
+    note: "surface OS/network isolation boundary (F6–F10) and the reviewer's evidence/instruction planes (#259 P0a); the evidence plane's SNAPSHOT legs are traced to EP-B1-6b above, in the same file",
   },
   { control: "TD-20.6-item1", tests: ["conformance-composition.test.ts", "conformance-deployment-actuation.test.ts"] },
   { control: "TD-20.6-item2", tests: ["conformance-deployment-actuation.test.ts"] },

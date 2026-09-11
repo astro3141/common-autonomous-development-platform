@@ -20,9 +20,9 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { buildWorkerSandbox } from "./workerProfile.ts";
@@ -458,9 +458,176 @@ function surfaceAuthSubdir(
  * `AGENTS.override.md` there), so mounting the implementer-controlled candidate AS the cwd would
  * put candidate-authored text into the reviewer's INSTRUCTION plane: the candidate could address
  * its own reviewer. The cwd therefore stays the clean empty `review-ws` it has always been, and the
- * exact candidate checkout is mounted beside it, read-only, as material to READ.
+ * candidate is mounted beside it, read-only, as material to READ.
+ *
+ * What is mounted there is the SANITIZED SNAPSHOT built below — exactly the tracked tree of
+ * `candidate_sha` — never the run's clone (EP TD B1(6b)).
  */
 export const REVIEW_EVIDENCE_MOUNT = "/candidate";
+
+// ------------------------------------------------ the candidate evidence snapshot (EP TD B1(6b))
+
+/** One entry of a commit's tracked tree: the mode git records for it, its object id, its path. */
+export interface TrackedTreeEntry {
+  readonly mode: string;
+  readonly oid: string;
+  readonly path: string;
+}
+
+/** The regular-file modes a sanitized snapshot renders, and the tree mode that holds them. */
+const SNAPSHOT_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
+const SNAPSHOT_TREE_MODE = "040000";
+
+/** U+0000, the `git ls-tree -z` record separator — constructed, so this file holds no raw NUL. */
+const TREE_RECORD_SEPARATOR = String.fromCharCode(0);
+
+/** Names for the modes a refusal is likely to report, so the message says WHAT it refused. */
+const TREE_ENTRY_KINDS: Readonly<Record<string, string>> = {
+  "120000": "symlink",
+  "160000": "gitlink/submodule",
+};
+
+/**
+ * Parse `git ls-tree -r -z <commit>` into its entries.
+ *
+ * `-z` because a path git would otherwise quote (spaces, non-ASCII, a literal quote) must arrive
+ * here byte-for-byte: the parsed path is both what a refusal names and where a blob is written.
+ * A record that does not parse is an error rather than a skip — an entry this function cannot read
+ * is an entry the mode check below cannot judge.
+ */
+export function parseTrackedTree(lsTreeZ: string): readonly TrackedTreeEntry[] {
+  const entries: TrackedTreeEntry[] = [];
+  for (const record of lsTreeZ.split(TREE_RECORD_SEPARATOR)) {
+    if (record.length === 0) continue;
+    const parsed = /^(\d{6}) ([a-z]+) ([0-9a-f]{40,64})\t([\s\S]+)$/u.exec(record);
+    if (parsed === null) throw new Error(`unreadable candidate tree entry: ${JSON.stringify(record.slice(0, 120))}`);
+    entries.push({ mode: parsed[1]!, oid: parsed[3]!, path: parsed[4]! });
+  }
+  return entries;
+}
+
+/**
+ * FAIL-CLOSED refusal of a candidate whose tracked tree carries an entry the snapshot cannot
+ * render (EP TD B1(6b)). Called BEFORE the snapshot is written, before the surface is constructed
+ * and before any request digest is computed, so nothing executes against an unsanitizable
+ * candidate: no snapshot, no surface, no envelope.
+ *
+ * BOTH TD grounds, because either alone would justify the refusal and dropping either falsifies
+ * the mount's pure-function claim:
+ *
+ *   PURITY. A symlink's READABLE BYTES are its target's bytes, and the target is resolved in
+ *   container state OUTSIDE the snapshot — so at EQUAL `candidate_sha` a reviewer could read
+ *   DIFFERENT bytes, which is exactly the identity violation the snapshot exists to remove. A
+ *   gitlink is worse: it names content that has no bytes in this tree at all.
+ *
+ *   CONTAINMENT. A tracked symlink pointing outside the snapshot — concretely one at
+ *   `/root/<provider>/auth.json`, the reviewer's OWN injected provider credential (§17.3,
+ *   `reviewerAuthArgs`, isolation.ts) — turns the evidence plane into a read path into the
+ *   container filesystem: an evidence-plane → container-filesystem escape that lets a candidate
+ *   exfiltrate reviewer-side secrets as if they were candidate files. The `:ro` bind does not
+ *   help here; it constrains what may be WRITTEN, never what a symlink RESOLVES TO.
+ *
+ * Rendering the target instead of refusing fails both grounds (the target's bytes are container
+ * state, and `/root/<provider>/auth.json` would be copied INTO the evidence), so the only
+ * sanitizing answer is to refuse the review.
+ *
+ * `040000` is admitted here because it is the mode of the directories that hold the files; with
+ * `-r` git recurses through them and emits none, so in practice this loop sees blobs only.
+ */
+export function assertSnapshotableTree(entries: readonly TrackedTreeEntry[]): void {
+  for (const entry of entries) {
+    // A path that is absolute or climbs would write outside the fresh directory — the same
+    // containment boundary, one layer earlier. Git does not produce such a path, and would refuse
+    // to CHECK OUT a tree carrying a `.git` component at all; the snapshot does not depend on
+    // either fact, so that `/candidate` has no `.git` is a property of THIS writer rather than of
+    // git's own checkout protections.
+    const components = entry.path.split("/");
+    if (entry.path.length === 0 || entry.path.startsWith("/") || components.includes("..")) {
+      throw new Error(`candidate evidence snapshot refused: ${entry.path} escapes the snapshot directory`);
+    }
+    if (components.includes(".git")) {
+      throw new Error(`candidate evidence snapshot refused: ${entry.path} carries a .git path component`);
+    }
+    if (SNAPSHOT_FILE_MODES.has(entry.mode) || entry.mode === SNAPSHOT_TREE_MODE) continue;
+    const kind = TREE_ENTRY_KINDS[entry.mode] ?? "unsupported entry kind";
+    throw new Error(
+      `candidate evidence snapshot refused: ${entry.path} has tree mode ${entry.mode} (${kind}) — the evidence plane admits only regular files (100644, 100755) and directories (040000)`,
+    );
+  }
+}
+
+/**
+ * The committed bytes of every tracked entry, in ONE `git cat-file --batch` process, paired with
+ * `entries` by position. Reading the blob objects the tree NAMES is what makes the snapshot a pure
+ * function of the commit; see `materializeCandidateSnapshot` for why nothing else would be.
+ */
+async function readTrackedBlobs(repoDir: string, entries: readonly TrackedTreeEntry[]): Promise<readonly Buffer[]> {
+  if (entries.length === 0) return [];
+  const batch = await new Promise<{ status: number | null; stdout: Buffer; stderr: string }>((resolve) => {
+    const child = spawn("git", ["cat-file", "--batch"], { cwd: repoDir, stdio: ["pipe", "pipe", "pipe"] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => out.push(c));
+    child.stderr.on("data", (c: Buffer) => err.push(c));
+    child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out), stderr: Buffer.concat(err).toString("utf8") }));
+    child.on("error", (e) => resolve({ status: 127, stdout: Buffer.alloc(0), stderr: String(e) }));
+    // Object ids only — 40/64 hex characters straight off the tree, never caller text.
+    child.stdin.on("error", () => {});
+    child.stdin.end(`${entries.map((e) => e.oid).join("\n")}\n`);
+  });
+  if (batch.status !== 0) throw new Error(`candidate blob read failed: ${batch.stderr.slice(0, 300)}`);
+
+  // `<oid> <type> <size>\n<contents>\n`, one response per requested id, in request order.
+  const blobs: Buffer[] = [];
+  let cursor = 0;
+  for (const entry of entries) {
+    const eol = batch.stdout.indexOf(0x0a, cursor);
+    if (eol < 0) throw new Error(`candidate blob read truncated at ${entry.path}`);
+    const header = /^([0-9a-f]{40,64}) blob (\d+)$/u.exec(batch.stdout.subarray(cursor, eol).toString("utf8"));
+    if (header === null) throw new Error(`candidate blob read failed for ${entry.path}: ${batch.stdout.subarray(cursor, eol).toString("utf8").slice(0, 120)}`);
+    const start = eol + 1;
+    const size = Number(header[2]);
+    if (start + size > batch.stdout.length) throw new Error(`candidate blob read truncated at ${entry.path}`);
+    blobs.push(batch.stdout.subarray(start, start + size));
+    cursor = start + size + 1;
+  }
+  return blobs;
+}
+
+/**
+ * Write the SANITIZED SNAPSHOT of a commit into a FRESH directory: exactly the tracked tree, with
+ * no `.git`, no untracked or modified file, and nothing else environment-dependent — so its byte
+ * content is a pure function of the commit (EP TD B1(6b)).
+ *
+ * MECHANISM: read the tree with `ls-tree` and the blobs with `cat-file`, both against the COMMIT
+ * OBJECT. Chosen over the two obvious alternatives because each of those admits a byte the commit
+ * does not determine:
+ *   - `git archive <commit> | tar -x` renders the tree, but through the export machinery:
+ *     `export-ignore` lets a candidate's own `.gitattributes` DROP tracked files from the evidence
+ *     a reviewer reads, `export-subst` rewrites file content, and eol/clean-smudge conversion is
+ *     steered by `core.autocrlf`/`core.eol` — clone- and host-level config, i.e. exactly the
+ *     environment state the snapshot is supposed to exclude.
+ *   - `git checkout-index` reads the INDEX, not the commit: it renders clone-local state (a stale
+ *     or doctored index) rather than `candidate_sha`, and applies the same conversions.
+ * `cat-file` hands back the stored blob bytes with no attribute or config path in between, so the
+ * only inputs are the commit and the object store it names.
+ *
+ * The mode is set explicitly rather than left to the process umask, for the same reason: an
+ * executable bit in the mount must come from the tree, not from the host the broker runs on.
+ */
+async function materializeCandidateSnapshot(repoDir: string, entries: readonly TrackedTreeEntry[], snapshotDir: string): Promise<void> {
+  mkdirSync(snapshotDir, { recursive: true });
+  // Directories carry no bytes and are created by the files under them; `-r` emits none anyway.
+  const files = entries.filter((entry) => entry.mode !== SNAPSHOT_TREE_MODE);
+  const blobs = await readTrackedBlobs(repoDir, files);
+  for (let i = 0; i < files.length; i += 1) {
+    const entry = files[i]!;
+    const target = join(snapshotDir, entry.path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, blobs[i]!);
+    chmodSync(target, entry.mode === "100755" ? 0o755 : 0o644);
+  }
+}
 
 /**
  * Told verbatim to a reviewer that can actually read files, right after the existing "you are
@@ -511,6 +678,23 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     await git(["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${body.candidate_sha}`], workspace);
     r = await git(["checkout", "--quiet", body.candidate_sha], workspace);
     if (r.status !== 0) throw new Error(`checkout failed: ${r.stderr.slice(0, 300)}`);
+
+    // ---- The reviewer's EVIDENCE plane (EP TD B1(6b)), constructed BEFORE anything else runs.
+    //
+    // Read the commit's tracked tree and REFUSE the whole review fail-closed on any entry the
+    // snapshot cannot render. This is the FIRST thing done after the checkout, and deliberately so:
+    // it precedes the snapshot, the diff, the prompt and the surface, so an unsanitizable candidate
+    // never reaches a digest or a container — no snapshot, no surface, no envelope.
+    const listed = await git(["ls-tree", "-r", "-z", body.candidate_sha], workspace);
+    if (listed.status !== 0) throw new Error(`candidate tree read failed: ${listed.stderr.slice(0, 300)}`);
+    const tracked = parseTrackedTree(listed.stdout);
+    assertSnapshotableTree(tracked);
+    // Then materialize the sanitized snapshot into a FRESH directory. The clone is NOT this
+    // directory and never becomes the mount; it stays host-side for the merge-base/diff below,
+    // which is the job it already served.
+    const snapshot = join(base, "candidate-snapshot");
+    await materializeCandidateSnapshot(workspace, tracked, snapshot);
+
     // The reviewer must see the CANDIDATE'S CUMULATIVE change, not just its tip commit. `git show`
     // shows only the last commit — so a multi-round run whose real fix landed in an earlier round
     // and whose tip is a cosmetic follow-up would be reviewed as "no change", a false REJECT
@@ -525,9 +709,9 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // run outright). NUL-free diffs — every ordinary one — pass through byte-for-byte.
     //
     // The 60 000-char cap is a CONTEXT HINT, not a correctness boundary (#259 P0a): a reviewer that
-    // can read files now has the whole candidate checkout mounted below, so a truncated patch costs
-    // convenience (the summary it opens with), never the ability to see the change. Before that
-    // mount the patch was the reviewer's ONLY view and a cut one really did bound the verdict.
+    // can read files now has the candidate's whole tracked tree mounted below, so a truncated
+    // patch costs convenience (the summary it opens with), never the ability to see the change.
+    // Before that mount the patch was the reviewer's ONLY view and a cut one really did bound it.
     const diff = spawnSafeText((await git(["diff", "--stat", "--patch", forkBase, body.candidate_sha], workspace)).stdout).slice(0, 60_000);
 
     const prompt = buildReviewPrompt(provider, body.candidate_sha, body.work_item, diff);
@@ -544,12 +728,17 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       auth: surfaceProviderAuth(profile.auth_method, base),
       authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
       sessionsDir,
-      // The reviewer's EVIDENCE plane: the candidate checkout the diff above was built from — this
-      // run's own clone, already at candidate_sha — mounted read-only BESIDE the cwd (#259 P0a).
-      // Before this the reviewer got only the empty dir, so it could open neither the Spec/TD
-      // sections it was asked to judge against nor any file outside the patch: "I need to read X"
-      // was a true statement about an impossibility, and codex only worked around it with its own
-      // remote GitHub calls (slow, and an undeclared dependency).
+      // The reviewer's EVIDENCE plane: the SANITIZED SNAPSHOT of candidate_sha built above —
+      // exactly its tracked tree, no `.git` and no clone-local state — mounted read-only BESIDE
+      // the cwd (#259 P0a; EP TD B1(6b)). Before this the reviewer got only the empty dir, so it
+      // could open neither the Spec/TD sections it was asked to judge against nor any file outside
+      // the patch: "I need to read X" was a true statement about an impossibility, and codex only
+      // worked around it with its own remote GitHub calls (slow, and an undeclared dependency).
+      //
+      // The snapshot rather than the clone is what makes `candidate_revision` a SOUND single
+      // binding for this plane: the clone's `.git` — its config, remote refs, reflog and packed
+      // object set — is surface-visible byte content that the sha does NOT determine, so two runs
+      // at an identical candidate_sha could present different inputs to the reviewer.
       //
       // Read-only twice over, and neither layer is weakened here: `extraMountArgs` can only emit
       // `:ro` (its `readonly` field is the literal true), and each provider's argv keeps its own
@@ -557,9 +746,10 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       // WRITABLE state stays where it already was — its own sessions dir, bound separately below
       // and outside both planes.
       //
-      // Nothing secret is inside this mount: it is a clone of the PUBLIC repo and holds only what
-      // the repo itself commits — no auth dir, no session state, no manifest, all of which are
-      // siblings of the checkout rather than entries in it. Nor can the broker leak the PEP secret
+      // Nothing secret is inside this mount: it holds the tracked tree of a PUBLIC repo's commit
+      // and nothing else — no auth dir, no session state, no manifest, all of which are siblings
+      // of the snapshot rather than entries in it, and no symlink that could resolve to one of
+      // them, those being refused outright above. Nor can the broker leak the PEP secret
       // path into it, and that is not a property of this line: the broker process runs under the
       // deny-read isolation profile that excludes that path (the PEP secret-path exclusions of
       // `denyReadProfile` in cadp/live/env.ts, wired for the broker by `startLiveComponent` in
@@ -570,7 +760,7 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       // read tools (claude) cannot open it, so there is nothing to scope, and a read-only bind of
       // public-repo content grants such a surface no reach it did not already have. Keeping it
       // provider-independent leaves the isolation runner with no provider branch.
-      extra_mounts: [{ host_path: workspace, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
+      extra_mounts: [{ host_path: snapshot, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
       ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
