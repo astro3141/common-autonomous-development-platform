@@ -85,7 +85,11 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   { control: "WP-15", tests: ["conformance-basesha.test.ts"], note: "record-vertical generality (§3.6)" },
 
   // ---- Execution Plane (EP).
-  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract — the scheme leg's ingress half (D1–D6)" },
+  {
+    control: "EP-B1",
+    tests: ["conformance-digestscheme.test.ts"],
+    note: "B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract — the scheme leg's ingress half (D1–D6), projecting the enforcement in `ingress.ts` (`submitEvidence` → `bindingContentDigests` → `assertSchemesApproved` against the active `data.cadp.approved_digest_schemes`)",
+  },
   {
     control: "EP-C1",
     tests: ["conformance-digestscheme.test.ts"],

@@ -2,9 +2,15 @@
  * Execution Plane TD B1(3)'s NAMED implementation gap in the Authority Plane's inherited §2.1
  * contract (AP Part A, §2 row): `data.cadp.approved_digest_schemes` in the ACTIVE policy content
  * governs every new write, and "a digest with an unapproved scheme is invalid input, never a
- * different-but-equal identity". The evidence path validated a `SubjectBinding.content_digest`'s
- * typed SHAPE only (`validSubjectBindings`, `records.ts`), while `assertSchemesApproved` ran over
- * K3 digests alone. These legs pin the closed gap and its deliberate limits:
+ * different-but-equal identity". Before the close, the evidence path validated a
+ * `SubjectBinding.content_digest`'s typed SHAPE only (`validSubjectBindings`, `records.ts`), while
+ * `assertSchemesApproved` ran over K3 digests alone.
+ *
+ * THE ENFORCEMENT THAT CLOSES IT LIVES IN `cadp/kernel/ingress.ts`, not here: `bindingContentDigests`
+ * collects every `content_digest` a draft's subject bindings carry, and `submitEvidence` puts that
+ * list through `assertSchemesApproved` against the ACTIVE `data.cadp.approved_digest_schemes` before
+ * the envelope is sealed — the K3 (`material_digest` / `request_digest`) check at `sealEffectRequest`
+ * is untouched beside it. These legs pin that enforcement and its deliberate limits:
  *
  *   D1  an evidence draft whose binding carries an unapproved scheme is refused
  *       DIGEST_SCHEME_UNAPPROVED BEFORE the seal, leaving zero evidence rows
