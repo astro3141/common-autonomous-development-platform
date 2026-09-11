@@ -56,7 +56,12 @@ cadp/product/       commodity-backed autonomous-work composition: Temporal
                     intake
 cadp/deployment/    reference OPA policy (rego + kernel config)
 cadp/live/          disposable live composition (env setup, ctl driver, probes)
-cadp/tests/         deterministic conformance suites (C*/P*/FC*/WB*/T* controls)
+cadp/tests/         deterministic suites, split by what they protect:
+                    conformance/ = the executable assurance projection of TD
+                    authority (C*/P*/FC*/WB* controls + traceability manifest),
+                    gate-protected; ops/ = operational contracts only
+                    (prompt shapes, provider argv, T* timeout budgets), not
+                    gate-protected. Both run in both verifiers.
 devharness/         standalone bootstrap development supervisor for building
                     CADP itself — NOT a platform component
 ```
@@ -123,7 +128,7 @@ requires re-proving the same conformance evidence, never new kernel authority.
 - Constitutional kernel + development/record verticals: landed, deterministic
   conformance green, live-proven (#100/#102, #105, #126).
 - Broker/activity timeout hierarchy and bounded surface lifetime (#127/#128):
-  repaired; see `cadp/product/timeouts.ts` and `cadp/tests/conformance-timeout.test.ts`.
+  repaired; see `cadp/product/timeouts.ts` and `cadp/tests/ops/conformance-timeout.test.ts`.
 - Read-only constitutional observation (TD §12 r8, #96/#106): the `observer`
   caller class, K2 read API with verify-on-read, and the non-authoritative
   trace/attribution projections (`cadp/live/observe.ts`).

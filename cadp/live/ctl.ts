@@ -27,7 +27,8 @@ import { KernelClient } from "../clients/kernelClient.ts";
 import { sha256Hex } from "../kernel/canonical.ts";
 import { sealPlan, startWork, workPlan, runSnapshot } from "./ops.ts";
 import { brokerPostJson } from "../product/brokerTransport.ts";
-import { touchesGateMachinery } from "../product/gateFiles.ts";
+import { comparedChangedPaths, touchesGateMachinery } from "../product/gateFiles.ts";
+import type { ComparedFile } from "../product/gateFiles.ts";
 import { SURFACE_BUDGETS } from "../product/timeouts.ts";
 import { killLiveComponent, startLiveComponent } from "./componentControl.ts";
 import { startAttestRefresh } from "./attestRefresh.ts";
@@ -378,10 +379,14 @@ async function agentApprove(effect_id: string, workflow_id: string): Promise<{ a
   // selection, conformance suite). Such candidates route to a HUMAN_DECISION — neither the agent
   // nor a conductor triggering it can weaken its own checks. Changed files come from the target's
   // authoritative compare API (no local clone needed).
+  // The compare is read as {filename, previous_filename} PAIRS, not filenames alone: a rename is a
+  // change at both names and only the new one appears in `filename`, so a move OUT of a protected
+  // path (e.g. cadp/tests/conformance/x.test.ts -> cadp/tests/ops/x.test.ts) would look entirely
+  // ordinary. `comparedChangedPaths` unions and dedupes the two, so the old name reaches the gate.
   let changedFiles: string[] = [];
   try {
-    const cmp = JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/compare/main...${candidateSha}`, "--jq", "[.files[].filename]"], { encoding: "utf8" })) as string[];
-    changedFiles = cmp;
+    const cmp = JSON.parse(execFileSync("gh", ["api", `/repos/${m.repo_full_name}/compare/main...${candidateSha}`, "--jq", "[.files[] | {filename: .filename, previous_filename: .previous_filename}]"], { encoding: "utf8" })) as ComparedFile[];
+    changedFiles = comparedChangedPaths(cmp);
   } catch (e) {
     return { approved: false, reason: `could not determine changed files for gate-machinery check: ${e instanceof Error ? e.message : String(e)}` };
   }

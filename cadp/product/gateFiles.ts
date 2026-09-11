@@ -29,7 +29,20 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/mcp.ts", // the tool surface a supervising session drives
   "cadp/product/driver.ts", // the run classification / fail-closed loop logic
   "cadp/product/gateFiles.ts", // this rule itself
-  "cadp/tests/", // the conformance suite that decides verification pass/fail
+  // The CONFORMANCE half of the test corpus, whole directory — every control test, the
+  // traceability manifest and the meta-test that guards it. Conformance tests are not authority
+  // themselves: they are the EXECUTABLE ASSURANCE PROJECTION of TD authority, and they are
+  // protected to PREVENT WEAKENING OF THE TD ASSURANCE BOUNDARY (not because changing them
+  // "amends the TD"). `cadp/tests/ops/` is deliberately NOT here — it asserts operational
+  // contracts only (prompt shapes, provider argv snapshots, timeout budgets, effort rendering) —
+  // and both directories keep RUNNING in both verifiers: the split changes protection, not coverage.
+  "cadp/tests/conformance/",
+  // The changed-path collection and gate classification the DELEGATED-MERGE path consumes
+  // (`agentApprove`): the code that decides whether a candidate is gate-touching is gate machinery
+  // by the semantic test above. Protecting the whole operator CLI is broader than it should be —
+  // the planned home is a merge/review-boundary module extracted from this file's classification
+  // half, at which point this entry narrows to that module.
+  "cadp/live/ctl.ts",
   // Reviewer-INSTRUCTION files (#259 P0a). A provider CLI discovers these automatically from its
   // working directory and its ancestors and loads them as its own instructions, so a
   // candidate-authored change to one opens a path to address the reviewer that judges it — gate
@@ -44,11 +57,45 @@ export const GATE_PATH_RULES: readonly string[] = [
   // HUMAN_DECISION. A trailing `*` marks a filename prefix, covering past and future revisions
   // (v0.3, v0.4, next generations) without re-editing this list per revision.
   ".github/", // the external verification workflow — what the Actions verifier actually RUNS
+  // Named explicitly as well: this file carries the EXTERNAL verifier's pinned test invocation
+  // (verification machinery, the twin of surfaceBroker's VERIFIER_TEST_ARGV), so the protection
+  // must not depend on the reader noticing that the broader `.github/` prefix happens to cover it.
+  ".github/workflows/cadp-verify.yml",
   "Authority order.md",
   "Common Autonomous Development Platform — Specification*", // every Spec revision
   "TECHNICAL_DESIGN_*", // every TD document
   "DESIGN_*", // standalone design/authority notes
 ];
+
+/** One file entry of a GitHub compare response, narrowed to the fields the gate reads. */
+export type ComparedFile = {
+  readonly filename?: string | null;
+  /** Present when `status` is `renamed`/`copied`: the path the file had BEFORE the change. */
+  readonly previous_filename?: string | null;
+};
+
+/**
+ * Every path a compare TOUCHES — the union of each file's `filename` and, when the change is a
+ * rename, its `previous_filename`, deduplicated.
+ *
+ * A rename is a change at BOTH names, and only the new one appears in `filename`. Collecting
+ * `filename` alone therefore loses exactly the dangerous direction: moving
+ * `cadp/tests/conformance/x.test.ts` to `cadp/tests/ops/x.test.ts` removes a protected control test
+ * from protection while every collected path looks ordinary, so the candidate would clear the
+ * delegated-merge gate that exists to stop precisely that. The old name must reach
+ * `touchesGateMachinery`, so a protected→ordinary rename trips the gate FLOOR via the path it is
+ * leaving. (The conformance meta-test then still fails on the moved file — this is the merge-gate
+ * leg of the same protection, not a substitute for it.)
+ */
+export function comparedChangedPaths(files: readonly ComparedFile[]): string[] {
+  const paths = new Set<string>();
+  for (const file of files) {
+    for (const path of [file.filename, file.previous_filename]) {
+      if (typeof path === "string" && path.length > 0) paths.add(path);
+    }
+  }
+  return [...paths];
+}
 
 /** Returns the subset of changed paths that touch gate machinery (empty ⇒ ordinary change). */
 export function touchesGateMachinery(changedPaths: readonly string[]): string[] {
