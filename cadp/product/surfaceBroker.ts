@@ -299,6 +299,49 @@ export function scanBackendModel(
 
 // ------------------------------------------------------------------ /verify
 
+/**
+ * The EXACT argv the LOCAL verifier runs inside the `--network none` container.
+ *
+ * Pinned here, in a gate-protected file, rather than reached through `npm test`: the npm script is
+ * a developer convenience and MUST NOT be any verifier's seam — a candidate editing an ordinary,
+ * delegable `package.json` could otherwise change what the verifier executes. The external
+ * verifier (`.github/workflows/cadp-verify.yml`) runs the byte-identical invocation for the same
+ * reason; the two sites are asserted equal by the GF8 control.
+ *
+ * WHY THE BARE FORM, with no positional selectors: on the container runtime (node:22, see
+ * `cadp/live/image/Dockerfile`) `node --test` discovers `*.test.ts` recursively from the working
+ * directory — including the `cadp/tests/conformance/`, `cadp/tests/ops/` and `devharness/tests/`
+ * subdirectories. Naming those directories as POSITIONAL arguments was MEASURED BROKEN on Node 22:
+ * `node --test cadp/tests/conformance/` does not enumerate a directory's `.ts` files, it runs the
+ * directory itself as one failing pseudo-test ("# tests 1 / # fail 1", zero real tests). The
+ * selection is therefore pinned WITHOUT selectors, by three guards instead: the zero-test guard
+ * below (a run that executed nothing can never be reported as success), the conformance meta-test
+ * (`cadp/tests/conformance/conformance-manifest.test.ts` MT2/MT4 — every test file in the repo is
+ * classified and every conformance file is manifest-listed), and gate protection of
+ * `cadp/tests/conformance/` plus this file and the workflow. A future runtime whose directory
+ * positionals DO enumerate `.ts` files may revisit this consciously — re-measure before changing it.
+ */
+export const VERIFIER_TEST_ARGV: readonly string[] = ["node", "--test"];
+
+/**
+ * Number of tests the `node --test` summary reports as EXECUTED, or `undefined` if no summary is
+ * present (a runner that crashed before finishing, or output in a shape this does not know).
+ *
+ * Measured on the container's Node 22, non-TTY (the TAP reporter, which is the default when stdout
+ * is not a terminal): the summary block ends with `# tests <n>`, and a run that discovered NO test
+ * files at all prints `# tests 0` and EXITS 0 — a silent zero-discovery run is indistinguishable
+ * from success by exit code alone, which is exactly what the caller's guard must catch. The `ℹ`
+ * form is the `spec` reporter's rendering of the same line, accepted so an interactive run parses too.
+ */
+export function parseTestsExecuted(output: string): number | undefined {
+  let value: number | undefined;
+  for (const line of output.split("\n")) {
+    const m = /^\s*(?:#|ℹ)\s*tests\s+(\d+)\s*$/u.exec(line);
+    if (m !== null && m[1] !== undefined) value = Number(m[1]); // last summary wins
+  }
+  return value;
+}
+
 export async function brokerVerify(body: { repo_full_name: string; candidate_sha: string }): Promise<
   | { status: "UNKNOWN"; clone_head: string; unknown_reason: string }
   | { status: "PRESENT"; clone_head: string; conclusion: string; started_at: string; completed_at: string; output_digest: string }
@@ -339,8 +382,23 @@ export async function brokerVerify(body: { repo_full_name: string; candidate_sha
         return { status: "UNKNOWN", clone_head, unknown_reason: `DEP_PROVISION_FAILED: ${installResult.stderr.slice(-200)}` };
       }
     }
-    const test = await runVerifier(config(), { workspace, argv: ["node", "--test"], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
+    const test = await runVerifier(config(), { workspace, argv: [...VERIFIER_TEST_ARGV], timeout_ms: SURFACE_BUDGETS.verify.surface_ms });
     const completed_at = nowMs();
+    // ZERO-TEST GUARD. A verifier that silently executed NOTHING must never report success: with
+    // the bare invocation above, a discovery that finds no files still prints `# tests 0` and exits
+    // 0 (measured, Node 22), so exit status alone would turn "nothing was proven" into "success".
+    // The conclusion is UNKNOWN rather than "failure": nothing was observed ABOUT THE CANDIDATE —
+    // its tests did not fail, they did not run — and UNKNOWN is the taxonomy's non-verdict, which
+    // (like DEP_PROVISION_FAILED above) carries no conclusion for any gate to read as a pass. An
+    // unparseable summary takes the same branch: a run whose outcome cannot be read is not a pass.
+    const tests_executed = parseTestsExecuted(test.stdout);
+    if (tests_executed === undefined || tests_executed === 0) {
+      return {
+        status: "UNKNOWN",
+        clone_head,
+        unknown_reason: tests_executed === 0 ? "NO_TESTS_EXECUTED" : "UNPARSEABLE_TEST_SUMMARY",
+      };
+    }
     return {
       status: "PRESENT",
       clone_head,

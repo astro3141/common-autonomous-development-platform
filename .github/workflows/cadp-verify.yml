@@ -29,4 +29,27 @@ jobs:
           chmod +x /usr/local/bin/opa
           opa version
       - run: npm ci --ignore-scripts
-      - run: npm test
+      # PROTECTED INVOCATION. The external verifier's test seam is pinned HERE, in this
+      # gate-protected workflow, and no longer reached through the `npm test` script: package.json
+      # is an ordinary, delegable file, so a candidate that could edit it could change what the
+      # verifier executes without ever touching gate machinery. `npm test` survives only as a
+      # developer convenience. This invocation is byte-identical to the LOCAL verifier's argv
+      # (`VERIFIER_TEST_ARGV` in cadp/product/surfaceBroker.ts; the two sites are asserted equal by
+      # the GF8 control), and both dirs — cadp/tests/conformance/ and cadp/tests/ops/ — plus
+      # devharness/tests/ keep running here: the split changed protection, never coverage.
+      #
+      # WHY BARE, with no positional selectors: `node --test` discovers *.test.ts recursively from
+      # the working directory. Naming the leaf directories positionally was MEASURED BROKEN on the
+      # container runtime (node:22): `node --test cadp/tests/conformance/` does not enumerate a
+      # directory's .ts files, it runs the directory as ONE FAILING PSEUDO-TEST and executes zero
+      # real tests. Revisit only on a re-measurement, not on assumption.
+      #
+      # ZERO-TEST GUARD: a run that discovers NOTHING prints `# tests 0` and EXITS 0 (measured on
+      # Node 22 — node's own exit code does NOT fail a zero-file run), so the summary count is
+      # asserted explicitly. A verifier that executed nothing must never report a green check.
+      - run: |
+          set -o pipefail
+          node --test 2>&1 | tee node-test-output.log
+          grep -qE '^[[:space:]]*# tests [1-9][0-9]*$' node-test-output.log \
+            || { echo "cadp-verify: the pinned invocation executed ZERO tests (or printed no summary) — failing closed"; exit 1; }
+        shell: bash

@@ -7,7 +7,7 @@
  * the pinned surface image are real prerequisites, so a missing one is reported as a FAILURE rather
  * than skipped. A control that silently passes when its prerequisites are absent proves nothing while
  * reading as green — which is why the deterministic half of this proof lives in the always-running T4
- * block of cadp/tests/conformance-timeout.test.ts instead.
+ * block of cadp/tests/ops/conformance-timeout.test.ts instead.
  *
  * What it establishes, end to end, on the real docker control plane:
  *   1. an over-budget surface run ends at its DECLARED bound, bounded end to end;
