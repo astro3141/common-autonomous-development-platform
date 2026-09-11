@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
+import { buildExecutionRequestV1, startBoundSurface } from "./executionContract.ts";
 import { buildWorkerSandbox } from "./workerProfile.ts";
 import { resolveWorkerProvider, WORKER_PROVIDERS, workerArgv } from "./workerProviders.ts";
 import type { WorkerProvider } from "./workerProviders.ts";
@@ -150,24 +151,48 @@ export async function brokerImplement(body: { repo_full_name: string; base_sha: 
       if (r.status !== 0) throw new Error(`checkout ${body.base_sha} failed: ${r.stderr.slice(0, 300)}`);
     }
 
+    // The revision the workspace was ACTUALLY materialized at — what the surface will read — rather
+    // than the requested one restated. They agree on every ordinary run (the checkout above is
+    // verified); when they do not, the execution contract refuses before the surface starts.
+    const materialized_revision = (await git(["rev-parse", "HEAD"], workspace)).stdout.trim();
+
     const sandbox = buildWorkerSandbox(base, provider);
     const sessionsDir = join(sandbox.home, profile.sessions_subdir);
     mkdirSync(sessionsDir, { recursive: true });
-    const workerRun = await runWorker(config(), {
-      workspace,
-      workerAuthDir: join(sandbox.home, profile.auth_subdir),
-      authSubdir: profile.auth_subdir,
-      authFiles: profile.auth_files,
-      // Env-injected auth (claude): the operator-extracted token + measured static env. Resolved
-      // here, never stored in the registry; other providers keep file auth only.
-      ...(profile.auth_env !== undefined
-        ? { authEnv: { env_var: profile.auth_env.env_var, token: claudeProviderToken(), static_env: profile.auth_env.static_env } }
-        : {}),
-      sessionsDir,
-      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
-      argv: workerArgv(provider, spawnSafeText(body.work_item)),
-      timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
-    });
+    // The exact string substituted at WORK_ITEM_SENTINEL — i.e. the final prompt bytes the surface
+    // sees. Hoisted so the digested `surface-prompt` and the spawned argv are the SAME string, not
+    // two computations of it; `spawnSafeText` is identity on NUL-free input, so the argv is
+    // byte-identical to what it was before the contract existed.
+    const surface_prompt = spawnSafeText(body.work_item);
+    // BROKER-to-SURFACE execution contract (EP TD B1(1)): preparation is complete — the profile is
+    // resolved, the workspace is materialized, the prompt bytes are fixed — and nothing has executed
+    // yet. A malformed request is refused HERE: no digest, no attempt identity, no surface, no seal.
+    const workerRun = await startBoundSurface(
+      buildExecutionRequestV1({
+        surface_role: "WORKER",
+        provider,
+        repo_id: body.repo_full_name,
+        base_revision: body.base_sha,
+        workspace_revision: materialized_revision,
+        work_item: body.work_item,
+        surface_prompt,
+      }),
+      () => runWorker(config(), {
+        workspace,
+        workerAuthDir: join(sandbox.home, profile.auth_subdir),
+        authSubdir: profile.auth_subdir,
+        authFiles: profile.auth_files,
+        // Env-injected auth (claude): the operator-extracted token + measured static env. Resolved
+        // here, never stored in the registry; other providers keep file auth only.
+        ...(profile.auth_env !== undefined
+          ? { authEnv: { env_var: profile.auth_env.env_var, token: claudeProviderToken(), static_env: profile.auth_env.static_env } }
+          : {}),
+        sessionsDir,
+        ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
+        argv: workerArgv(provider, surface_prompt),
+        timeout_ms: SURFACE_BUDGETS.implement.surface_ms,
+      }),
+    );
     // Opt-in worker session preservation for debugging (default OFF so runs don't accumulate).
     // Captured BEFORE the status check so a FAILED run's session (the interesting one) is kept too.
     preserveWorkerSession(sessionsDir, workerRun, body.work_item);
@@ -539,42 +564,58 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     mkdirSync(reviewWs, { recursive: true });
     const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
     mkdirSync(sessionsDir, { recursive: true });
-    const review = await runReviewer(config(), {
-      workspace: reviewWs,
-      auth: surfaceProviderAuth(profile.auth_method, base),
-      authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
-      sessionsDir,
-      // The reviewer's EVIDENCE plane: the candidate checkout the diff above was built from — this
-      // run's own clone, already at candidate_sha — mounted read-only BESIDE the cwd (#259 P0a).
-      // Before this the reviewer got only the empty dir, so it could open neither the Spec/TD
-      // sections it was asked to judge against nor any file outside the patch: "I need to read X"
-      // was a true statement about an impossibility, and codex only worked around it with its own
-      // remote GitHub calls (slow, and an undeclared dependency).
-      //
-      // Read-only twice over, and neither layer is weakened here: `extraMountArgs` can only emit
-      // `:ro` (its `readonly` field is the literal true), and each provider's argv keeps its own
-      // sandbox flags (codex `--sandbox read-only`, grok's read-tool allow-list). The reviewer's
-      // WRITABLE state stays where it already was — its own sessions dir, bound separately below
-      // and outside both planes.
-      //
-      // Nothing secret is inside this mount: it is a clone of the PUBLIC repo and holds only what
-      // the repo itself commits — no auth dir, no session state, no manifest, all of which are
-      // siblings of the checkout rather than entries in it. Nor can the broker leak the PEP secret
-      // path into it, and that is not a property of this line: the broker process runs under the
-      // deny-read isolation profile that excludes that path (the PEP secret-path exclusions of
-      // `denyReadProfile` in cadp/live/env.ts, wired for the broker by `startLiveComponent` in
-      // cadp/live/componentControl.ts — cited, not restated here), and every mount arg is fixed by
-      // this file, never caller-supplied.
-      //
-      // The mount itself is unconditional while the PROMPT is capability-scoped: a profile with no
-      // read tools (claude) cannot open it, so there is nothing to scope, and a read-only bind of
-      // public-repo content grants such a surface no reach it did not already have. Keeping it
-      // provider-independent leaves the isolation runner with no provider branch.
-      extra_mounts: [{ host_path: workspace, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
-      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
-      argv: reviewArgv(provider, prompt),
-      timeout_ms: SURFACE_BUDGETS.review.surface_ms,
-    });
+    // BROKER-to-SURFACE execution contract (EP TD B1(1)), constructed after the merge-base, the
+    // cumulative diff and the instruction wrapper have fixed the prompt bytes and immediately
+    // before the surface starts. The reviewer request carries `candidate_revision` and NO
+    // `base_revision`: the broker is never handed one, and the `forkBase` it derived for the diff
+    // is deliberately not promoted — its bytes are covered by the `surface-prompt` digest instead,
+    // which is why a merge-base drift under byte-identical caller arguments changes the request.
+    const review = await startBoundSurface(
+      buildExecutionRequestV1({
+        surface_role: "REVIEWER",
+        provider,
+        repo_id: body.repo_full_name,
+        candidate_revision: body.candidate_sha,
+        work_item: body.work_item,
+        surface_prompt: prompt,
+      }),
+      () => runReviewer(config(), {
+        workspace: reviewWs,
+        auth: surfaceProviderAuth(profile.auth_method, base),
+        authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
+        sessionsDir,
+        // The reviewer's EVIDENCE plane: the candidate checkout the diff above was built from — this
+        // run's own clone, already at candidate_sha — mounted read-only BESIDE the cwd (#259 P0a).
+        // Before this the reviewer got only the empty dir, so it could open neither the Spec/TD
+        // sections it was asked to judge against nor any file outside the patch: "I need to read X"
+        // was a true statement about an impossibility, and codex only worked around it with its own
+        // remote GitHub calls (slow, and an undeclared dependency).
+        //
+        // Read-only twice over, and neither layer is weakened here: `extraMountArgs` can only emit
+        // `:ro` (its `readonly` field is the literal true), and each provider's argv keeps its own
+        // sandbox flags (codex `--sandbox read-only`, grok's read-tool allow-list). The reviewer's
+        // WRITABLE state stays where it already was — its own sessions dir, bound separately below
+        // and outside both planes.
+        //
+        // Nothing secret is inside this mount: it is a clone of the PUBLIC repo and holds only what
+        // the repo itself commits — no auth dir, no session state, no manifest, all of which are
+        // siblings of the checkout rather than entries in it. Nor can the broker leak the PEP secret
+        // path into it, and that is not a property of this line: the broker process runs under the
+        // deny-read isolation profile that excludes that path (the PEP secret-path exclusions of
+        // `denyReadProfile` in cadp/live/env.ts, wired for the broker by `startLiveComponent` in
+        // cadp/live/componentControl.ts — cited, not restated here), and every mount arg is fixed by
+        // this file, never caller-supplied.
+        //
+        // The mount itself is unconditional while the PROMPT is capability-scoped: a profile with no
+        // read tools (claude) cannot open it, so there is nothing to scope, and a read-only bind of
+        // public-repo content grants such a surface no reach it did not already have. Keeping it
+        // provider-independent leaves the isolation runner with no provider branch.
+        extra_mounts: [{ host_path: workspace, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
+        ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
+        argv: reviewArgv(provider, prompt),
+        timeout_ms: SURFACE_BUDGETS.review.surface_ms,
+      }),
+    );
     if (review.status !== 0 || review.stdout.trim().length === 0) {
       throw new Error(`reviewer surface failed — ${surfaceFailure("reviewer", review)}`);
     }
@@ -618,19 +659,39 @@ export async function brokerPlan(body: { repo_full_name: string; base_sha: strin
     r = await git(["checkout", "--quiet", body.base_sha], workspace);
     if (r.status !== 0) throw new Error(`checkout ${body.base_sha} failed: ${r.stderr.slice(0, 300)}`);
 
+    // The revision the workspace was ACTUALLY materialized at — what the planning surface reads.
+    const materialized_revision = (await git(["rev-parse", "HEAD"], workspace)).stdout.trim();
+
     const prompt = buildPlanPrompt(body.intent, body.repo_full_name, body.base_sha);
+    // The exact final prompt bytes handed to the surface, hoisted so the digested `surface-prompt`
+    // and the spawned argv are the same string (identity on NUL-free input, so argv is unchanged).
+    const surface_prompt = spawnSafeText(prompt);
     const sessionsDir = join(base, profile.sessions_subdir ?? `${provider}-sessions`);
     mkdirSync(sessionsDir, { recursive: true });
-    const run = await runReviewer(config(), {
-      workspace,
-      auth: surfaceProviderAuth(profile.auth_method, base),
-      authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
-      sessionsDir,
-      ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
-      // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
-      argv: planArgv(provider, spawnSafeText(prompt)),
-      timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
-    });
+    // BROKER-to-SURFACE execution contract (EP TD B1(1)): the planner's prompt is broker-BUILT by
+    // `buildPlanPrompt`, so `surface-prompt` digests those bytes and not the caller's intent alone
+    // — the intent rides its own entry. Constructed immediately before the surface starts.
+    const run = await startBoundSurface(
+      buildExecutionRequestV1({
+        surface_role: "PLANNER",
+        provider,
+        repo_id: body.repo_full_name,
+        base_revision: body.base_sha,
+        workspace_revision: materialized_revision,
+        intent: body.intent,
+        surface_prompt,
+      }),
+      () => runReviewer(config(), {
+        workspace,
+        auth: surfaceProviderAuth(profile.auth_method, base),
+        authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
+        sessionsDir,
+        ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
+        // Read-only planning surface: reading the checkout is allowed; every mutating/external tool is not.
+        argv: planArgv(provider, surface_prompt),
+        timeout_ms: SURFACE_BUDGETS.plan.surface_ms,
+      }),
+    );
     if (run.status !== 0 || run.stdout.trim().length === 0) {
       throw new Error(`planner surface failed — ${surfaceFailure("planner", run)}`);
     }

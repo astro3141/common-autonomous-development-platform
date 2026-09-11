@@ -85,7 +85,16 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   { control: "WP-15", tests: ["conformance-basesha.test.ts"], note: "record-vertical generality (§3.6)" },
 
   // ---- Execution Plane (EP).
-  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract" },
+  {
+    control: "EP-B1",
+    tests: ["conformance-execution-request.test.ts", "conformance-digestscheme.test.ts"],
+    note: "B1(1)/B1(1e): the broker-to-surface ExecutionRequestV1 construction contract — exact closed role shapes, the verbatim executor-profile payload and the typed request digest; plus B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract",
+  },
+  {
+    control: "EP-C1",
+    tests: ["conformance-execution-request.test.ts"],
+    note: "the surface-input-drift and malformed-request legs: broker-built prompt bytes drift the request digest under byte-identical caller arguments, and a malformed request is refused with no digest, no attempt identity, no surface and no envelope",
+  },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 
   // ---- v0.4 TD §13.1 constitutional negative controls (C1–C42), with their guard-bites.
