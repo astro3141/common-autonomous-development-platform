@@ -4,7 +4,17 @@
  * governs every new write, and "a digest with an unapproved scheme is invalid input, never a
  * different-but-equal identity". The evidence path validated a `SubjectBinding.content_digest`'s
  * typed SHAPE only (`validSubjectBindings`, `records.ts`), while `assertSchemesApproved` ran over
- * K3 digests alone. These legs pin the closed gap and its deliberate limits:
+ * K3 digests alone.
+ *
+ * THE ENFORCEMENT THESE LEGS PIN LIVES IN `cadp/kernel/ingress.ts`, and is already resident there:
+ * `bindingContentDigests` collects every `content_digest` PRESENT on a draft's subject bindings, and
+ * `submitEvidence` hands them to `assertSchemesApproved` against the ACTIVE config's
+ * `approved_digest_schemes` BEFORE `sealEnvelope` — landed by the K2 approved-scheme commit that this
+ * checkout already carries, so no further kernel edit is owed and none is made. The K3 leg at
+ * `sealEffectRequest` (`material_digest`, `request_digest`) is untouched, `records.ts` keeps its
+ * shape-only `validSubjectBindings`, and no namespace is made to REQUIRE a digest.
+ *
+ * These legs pin that closed gap and its deliberate limits:
  *
  *   D1  an evidence draft whose binding carries an unapproved scheme is refused
  *       DIGEST_SCHEME_UNAPPROVED BEFORE the seal, leaving zero evidence rows
