@@ -66,11 +66,17 @@ function nowMs(): string {
   return new Date().toISOString();
 }
 
-async function git(args: string[], cwd?: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
+async function runTool(
+  file: string,
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     // Every element is spawn-bound, and some carry caller text (the commit message embeds the
-    // work item), so the same NUL guard applies here — identity for every real git invocation.
-    const child = spawn("git", args.map(spawnSafeText), { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    // work item), so the same NUL guard applies here — identity for every real invocation.
+    // `env: undefined` is spawn's own default (inherit), so every existing call is byte-identical.
+    const child = spawn(file, args.map(spawnSafeText), { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     child.stdout.on("data", (c: Buffer) => out.push(c));
@@ -78,6 +84,10 @@ async function git(args: string[], cwd?: string): Promise<{ status: number | nul
     child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }));
     child.on("error", (e) => resolve({ status: 127, stdout: "", stderr: String(e) }));
   });
+}
+
+async function git(args: string[], cwd?: string, env?: Record<string, string | undefined>): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return runTool("git", args, cwd, env);
 }
 
 /**
@@ -488,6 +498,91 @@ export function buildReviewPrompt(provider: ReviewProvider, candidate_sha: strin
   return spawnSafeText(`${header}\n\n${mount}${diff}`);
 }
 
+/** U+0000, the `-z` record separator — constructed, so this source file holds no raw NUL byte. */
+const NUL_RECORD_SEPARATOR = String.fromCharCode(0);
+
+/**
+ * The tree-entry modes the sanitized evidence snapshot is DEFINED OVER (EP TD B1(6b)): regular
+ * file, executable file, directory. Every other kind is REFUSED, never rendered.
+ */
+const SNAPSHOT_TREE_MODES = new Set(["100644", "100755", "040000"]);
+
+/**
+ * Fail closed on any tracked entry the evidence snapshot cannot contain — a symlink (`120000`), a
+ * gitlink/submodule (`160000`), or any other kind — reading `git ls-tree -r -t -z` records
+ * (`<mode> SP <type> SP <oid> TAB <path>`, NUL-separated so no path is quoted, escaped or split
+ * wrong). A malformed record is refused too: an unparsed record is an uninspected entry.
+ *
+ * BOTH TD B1(6b) grounds apply, and EITHER ALONE is sufficient to refuse rather than render:
+ *
+ *   PURITY. A symlink's READABLE BYTES are its target's bytes, and the target lives in CONTAINER
+ *   STATE outside the snapshot; a gitlink names content that has no bytes in this tree at all. So
+ *   at an EQUAL candidate_sha the reviewer can read DIFFERENT bytes — which would falsify exactly
+ *   the pure-function-of-the-sha property that lets `candidate_revision` be the evidence plane's
+ *   only binding (B1(6b): no `workspace-revision` input role for REVIEWER).
+ *
+ *   CONTAINMENT. A tracked symlink pointing outside the snapshot — concretely one at
+ *   `/root/<provider>/auth.json`, the reviewer's OWN injected provider credential (`reviewerAuthArgs`,
+ *   isolation.ts) — turns the evidence plane into a read path into the container filesystem: an
+ *   evidence-plane → container-filesystem ESCAPE that exfiltrates reviewer-side secrets as if they
+ *   were candidate files. The `:ro` bind is no answer: read-only constrains WRITES, not what a
+ *   symlink RESOLVES TO.
+ *
+ * Exported as the seam the mode rule is falsifiable through without constructing a repository.
+ */
+export function assertSnapshotSafeTree(ls_tree_z: string, candidate_sha: string): void {
+  for (const record of ls_tree_z.split(NUL_RECORD_SEPARATOR)) {
+    if (record.length === 0) continue;
+    const tab = record.indexOf("\t");
+    if (tab < 0) throw new Error(`candidate ${candidate_sha} tree listing is malformed — refusing to materialize the evidence snapshot`);
+    const mode = record.slice(0, tab).split(" ")[0] ?? "";
+    const path = record.slice(tab + 1);
+    if (!SNAPSHOT_TREE_MODES.has(mode)) {
+      throw new Error(
+        `candidate ${candidate_sha} carries a tracked entry the evidence snapshot cannot contain: ${path} (mode ${mode}) — only regular files and directories are snapshottable; refusing the review`,
+      );
+    }
+  }
+}
+
+/**
+ * Materialize the SANITIZED SNAPSHOT the evidence plane is contractually made of (EP TD B1(6b)):
+ * a fresh directory holding EXACTLY the tracked tree of `candidate_sha` — no `.git`, no untracked
+ * or modified file, nothing environment-dependent — so its bytes are a PURE FUNCTION of the sha.
+ * Before #274 the mount was the run's own clone, whose surface-visible bytes vary with
+ * `.git/config`, remote refs, reflog and the packed object set: two executions at an IDENTICAL
+ * `execution_request_digest` could present DIFFERENT inputs to the reviewer.
+ *
+ * The refusal above runs FIRST, so an unsanitizable candidate never gets a snapshot either.
+ *
+ * MECHANISM — `git archive` OF THE COMMIT, extracted into the fresh directory. Chosen over
+ * `checkout-index` on exactly the property at issue: `git archive <sha>` reads the tree objects
+ * out of the object database, a function of the commit and nothing else, whereas `checkout-index`
+ * writes out whatever the CLONE'S INDEX holds — and an index is clone-local state, precisely the
+ * kind of run-local input this snapshot exists to exclude. The archive runs with the host's global
+ * and system git configuration NEUTRALIZED: a config-defined `filter.<name>.smudge` is the one
+ * remaining way host state could rewrite blob bytes on their way out, so with it unreachable the
+ * extracted bytes are the tree's bytes. What stays attribute-driven is the tree's own
+ * `.gitattributes`, which is part of the tree and therefore pure. Extraction cannot escape the
+ * destination: git normalizes tracked paths, so no entry can carry a `..` component.
+ */
+async function materializeCandidateSnapshot(clone: string, candidate_sha: string, base: string): Promise<string> {
+  const listed = await git(["ls-tree", "-r", "-t", "-z", candidate_sha], clone);
+  if (listed.status !== 0) throw new Error(`candidate tree listing failed: ${listed.stderr.slice(0, 300)}`);
+  assertSnapshotSafeTree(listed.stdout, candidate_sha);
+
+  const snapshot = join(base, "candidate-snapshot");
+  mkdirSync(snapshot, { recursive: true });
+  const tarball = join(base, "candidate-tree.tar");
+  const pureGitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_ATTR_NOSYSTEM: "1" };
+  const archived = await git(["archive", "--format=tar", "-o", tarball, candidate_sha], clone, pureGitEnv);
+  if (archived.status !== 0) throw new Error(`candidate snapshot archive failed: ${archived.stderr.slice(0, 300)}`);
+  const extracted = await runTool("tar", ["-xf", tarball, "-C", snapshot]);
+  if (extracted.status !== 0) throw new Error(`candidate snapshot extraction failed: ${extracted.stderr.slice(0, 300)}`);
+  rmSync(tarball, { force: true });
+  return snapshot;
+}
+
 export async function brokerReview(body: { repo_full_name: string; candidate_sha: string; work_item: string; review_product?: string }): Promise<{
   verdict: string;
   reason: string;
@@ -511,6 +606,14 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     await git(["fetch", "--quiet", "origin", `refs/heads/cadp/candidate/${body.candidate_sha}`], workspace);
     r = await git(["checkout", "--quiet", body.candidate_sha], workspace);
     if (r.status !== 0) throw new Error(`checkout failed: ${r.stderr.slice(0, 300)}`);
+    // The EVIDENCE PLANE, materialized HERE and nowhere later (EP TD B1(6b)): a sanitized snapshot
+    // of the tracked tree, and a FAIL-CLOSED REFUSAL of a candidate that cannot be sanitized. Both
+    // happen BEFORE the diff is built, before any surface is created and before any digest work, so
+    // nothing whatsoever executes against an unsanitizable candidate.
+    //
+    // The CLONE STAYS, unchanged, exactly where it already was: host-side, feeding the merge-base
+    // and diff construction below. What changes is only that it is no longer the thing mounted.
+    const evidence = await materializeCandidateSnapshot(workspace, body.candidate_sha, base);
     // The reviewer must see the CANDIDATE'S CUMULATIVE change, not just its tip commit. `git show`
     // shows only the last commit — so a multi-round run whose real fix landed in an earlier round
     // and whose tip is a cosmetic follow-up would be reviewed as "no change", a false REJECT
@@ -544,12 +647,15 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       auth: surfaceProviderAuth(profile.auth_method, base),
       authSubdir: surfaceAuthSubdir(provider, profile.auth_method),
       sessionsDir,
-      // The reviewer's EVIDENCE plane: the candidate checkout the diff above was built from — this
-      // run's own clone, already at candidate_sha — mounted read-only BESIDE the cwd (#259 P0a).
-      // Before this the reviewer got only the empty dir, so it could open neither the Spec/TD
-      // sections it was asked to judge against nor any file outside the patch: "I need to read X"
-      // was a true statement about an impossibility, and codex only worked around it with its own
-      // remote GitHub calls (slow, and an undeclared dependency).
+      // The reviewer's EVIDENCE plane: the SANITIZED SNAPSHOT of candidate_sha materialized above
+      // — exactly the tracked tree, no `.git` and no clone-local state — mounted read-only BESIDE
+      // the cwd (#259 P0a; sanitized per EP TD B1(6b)). Before this the reviewer got only the empty
+      // dir, so it could open neither the Spec/TD sections it was asked to judge against nor any
+      // file outside the patch: "I need to read X" was a true statement about an impossibility, and
+      // codex only worked around it with its own remote GitHub calls (slow, and an undeclared
+      // dependency). The snapshot keeps all of that readable while making the bytes the reviewer
+      // sees a PURE FUNCTION of candidate_sha — which is what makes `candidate_revision` alone an
+      // honest binding for this plane rather than an assumption about the clone.
       //
       // Read-only twice over, and neither layer is weakened here: `extraMountArgs` can only emit
       // `:ro` (its `readonly` field is the literal true), and each provider's argv keeps its own
@@ -557,9 +663,10 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       // WRITABLE state stays where it already was — its own sessions dir, bound separately below
       // and outside both planes.
       //
-      // Nothing secret is inside this mount: it is a clone of the PUBLIC repo and holds only what
-      // the repo itself commits — no auth dir, no session state, no manifest, all of which are
-      // siblings of the checkout rather than entries in it. Nor can the broker leak the PEP secret
+      // Nothing secret is inside this mount: it holds exactly the tracked tree of a PUBLIC repo's
+      // commit and nothing else — no auth dir, no session state, no manifest, all of which are
+      // siblings of the snapshot rather than entries in it, and no symlink that could RESOLVE to
+      // one of them (refused at materialization). Nor can the broker leak the PEP secret
       // path into it, and that is not a property of this line: the broker process runs under the
       // deny-read isolation profile that excludes that path (the PEP secret-path exclusions of
       // `denyReadProfile` in cadp/live/env.ts, wired for the broker by `startLiveComponent` in
@@ -570,7 +677,7 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
       // read tools (claude) cannot open it, so there is nothing to scope, and a read-only bind of
       // public-repo content grants such a surface no reach it did not already have. Keeping it
       // provider-independent leaves the isolation runner with no provider branch.
-      extra_mounts: [{ host_path: workspace, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
+      extra_mounts: [{ host_path: evidence, container_path: REVIEW_EVIDENCE_MOUNT, readonly: true }],
       ...(profile.sessions_container_dir !== undefined ? { sessionsContainerDir: profile.sessions_container_dir } : {}),
       argv: reviewArgv(provider, prompt),
       timeout_ms: SURFACE_BUDGETS.review.surface_ms,
