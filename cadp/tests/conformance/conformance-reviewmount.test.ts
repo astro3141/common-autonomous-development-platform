@@ -37,7 +37,10 @@ import { REVIEW_PROVIDERS } from "../../product/reviewProviders.ts";
  * tracked tree carries a special entry — symlink (120000) or gitlink (160000) — is REFUSED at
  * materialization, with no surface created and no reviewer run: a symlink's readable bytes are
  * container state (purity), and one aimed at `/root/<provider>/auth.json` would make the evidence
- * plane a read path into the container filesystem (containment).
+ * plane a read path into the container filesystem (containment). (iii) No COMMITTED ATTRIBUTE can
+ * change what the snapshot holds or what it says — `export-ignore` would omit a tracked path and
+ * `export-subst` would rewrite bytes inside one, both chosen by the implementer being judged, so
+ * both are asserted away rather than argued about.
  */
 
 /** U+0000, constructed rather than written literally so this file holds no raw NUL byte. */
@@ -59,6 +62,8 @@ interface TreeEntry {
   readonly path_b64: string;
   readonly kind: "file" | "dir" | "symlink";
   readonly sha256?: string;
+  /** A file's one tree-carried mode bit: `100755` vs `100644`. */
+  readonly exec?: boolean;
 }
 
 interface MountRecord {
@@ -148,10 +153,13 @@ function splitZ(raw: Buffer): Buffer[] {
 }
 
 /**
- * The tracked tree of a commit, derived INDEPENDENTLY of the broker's mechanism: `ls-tree` for the
- * entry set and `cat-file blob` for the bytes, straight out of the origin's object database. The
- * broker materializes its snapshot with `git archive`; if the two ever disagreed on a byte, this
- * comparison is what says so — which it could not do if it re-ran the implementation's own command.
+ * The tracked tree of a commit: `ls-tree` for the entry set and `cat-file blob` for the bytes,
+ * straight out of the ORIGIN's object database. This is the DEFINITION the TD's "exactly the
+ * tracked tree" is a claim about — the objects the sha names, read with no conversion stage in the
+ * way — so it is what the materialized mount is compared against, entry for entry and byte for
+ * byte. It is read from the origin the broker cloned FROM, never from the broker's snapshot or its
+ * clone, so an omitted file, a rewritten byte, a stray file, or a mangled path all show up as a
+ * difference here.
  */
 function trackedTree(originRepo: string, sha: string): TreeEntry[] {
   const listing = execFileSync("git", ["-C", originRepo, "ls-tree", "-r", "-t", "-z", sha], { maxBuffer: 64 * 1024 * 1024 });
@@ -162,7 +170,7 @@ function trackedTree(originRepo: string, sha: string): TreeEntry[] {
     if (type === "tree") return { path_b64, kind: "dir" as const };
     if (type === "blob" && mode === "120000") return { path_b64, kind: "symlink" as const };
     const bytes = execFileSync("git", ["-C", originRepo, "cat-file", "blob", oid ?? ""], { maxBuffer: 64 * 1024 * 1024 });
-    return { path_b64, kind: "file" as const, sha256: createHash("sha256").update(bytes).digest("hex") };
+    return { path_b64, kind: "file" as const, exec: mode === "100755", sha256: createHash("sha256").update(bytes).digest("hex") };
   });
 }
 
@@ -236,7 +244,7 @@ const walk = (absolute, relative) => {
     const stat = lstatSync(child);
     if (stat.isSymbolicLink()) out.push({ path_b64, kind: "symlink" });
     else if (stat.isDirectory()) { out.push({ path_b64, kind: "dir" }); out.push(...walk(child, path)); }
-    else out.push({ path_b64, kind: "file", sha256: createHash("sha256").update(readFileSync(child)).digest("hex") });
+    else out.push({ path_b64, kind: "file", exec: (stat.mode & 0o111) !== 0, sha256: createHash("sha256").update(readFileSync(child)).digest("hex") });
   }
   return out;
 };
@@ -397,7 +405,11 @@ test("§4.1 the reviewer's cwd mount is the CLEAN workspace — a candidate AGEN
 test("EP-B1(6b) the /candidate mount is the SANITIZED tracked tree of candidate_sha — no .git, byte-for-byte, nothing else", async () => {
   const root = mkdtempSync(join(tmpdir(), "cadp-reviewevidence-"));
   try {
-    const repo = makeOrigin(root, { "impl.ts": "export const answer = 42;\n", "docs/nested.md": "# nested\n" });
+    // An executable tracked file too: `100755` is part of the tree the snapshot must reproduce, and
+    // the mode is now reconstructed entry by entry rather than carried by an archive format.
+    const repo = makeOrigin(root, { "impl.ts": "export const answer = 42;\n", "docs/nested.md": "# nested\n", "run.sh": "#!/bin/sh\necho hi\n" }, (origin, g) => {
+      g(["update-index", "--chmod=+x", "run.sh"]);
+    });
     const record = await recordedReview(root, repo, "fix the answer");
 
     assert.ok(record.candidate.source !== null, "a /candidate bind must be present");
@@ -424,7 +436,11 @@ test("EP-B1(6b) the /candidate mount is the SANITIZED tracked tree of candidate_
     assert.equal(record.candidate.td, TD_TEXT);
     // Nothing but the commit's own content is inside the mount: the run's auth dir and session tree
     // are siblings of the snapshot, never entries of it.
-    assert.deepEqual([...record.candidate.entries].sort(), ["TECHNICAL_DESIGN.md", "docs", "impl.ts"]);
+    assert.deepEqual([...record.candidate.entries].sort(), ["TECHNICAL_DESIGN.md", "docs", "impl.ts", "run.sh"]);
+    // The mode comparison above is two-way as well, so it is worth saying which way it bites here:
+    // the executable file is executable and the ordinary ones are not.
+    assert.equal(entryAt(record.candidate.tree, "run.sh").exec, true, "a tracked 100755 file arrives executable");
+    assert.equal(entryAt(record.candidate.tree, "impl.ts").exec, false, "a tracked 100644 file does not");
 
     // The clone STAYS, and still does its host-side job: the merge-base diff it builds is in the
     // prompt exactly as before. Sanitization moved the MOUNT, not the diff construction.
@@ -446,6 +462,50 @@ test("EP-B1(6b) the /candidate mount is the SANITIZED tracked tree of candidate_
     assert.ok(!authBind.startsWith(`${record.candidate.source!}/`), "provider auth is never inside the candidate");
     // The provider's own read-only sandbox flags are untouched by the mount.
     assert.ok(record.argv.includes("--sandbox") && record.argv.includes("read-only"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** The one tree entry at `name`, for a leg that asserts about a specific file. */
+function entryAt(tree: readonly TreeEntry[], name: string): TreeEntry {
+  const entry = tree.find((e) => Buffer.from(e.path_b64, "base64").toString("utf8") === name);
+  assert.ok(entry !== undefined, `${name} must be present in the tree`);
+  return entry;
+}
+
+const digestOf = (text: string): string => createHash("sha256").update(Buffer.from(text)).digest("hex");
+
+// ------------- (b1) no COMMITTED ATTRIBUTE can decide what the snapshot holds or what it says
+
+test("EP-B1(6b) a candidate's own .gitattributes cannot omit or rewrite tracked bytes in /candidate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cadp-reviewattrs-"));
+  try {
+    // The implementer controls `.gitattributes` too, and it is exactly the lever that lets a
+    // materialization mechanism disagree with the tracked tree. `export-ignore` OMITS a tracked
+    // path from a `git archive`, so a candidate could hide the very file under review (or, with
+    // `*`, present an EMPTY evidence plane while the diff still claims a change); `export-subst`
+    // REWRITES bytes inside a tracked file. Neither may reach the mount: `/candidate` is the
+    // tracked tree of the sha, not what the candidate would prefer the reviewer to read.
+    const repo = makeOrigin(root, {
+      "impl.ts": "export const answer = 42;\n",
+      "hidden.ts": "export const smuggled = true;\n",
+      "stamped.txt": "$Format:%H$\n",
+      ".gitattributes": "hidden.ts export-ignore\nstamped.txt export-subst\n",
+    });
+    const record = await recordedReview(root, repo, "add a file and an attribute that would hide it");
+
+    // The whole tree, two-way: an omission and a rewrite are both differences from the objects.
+    assert.deepEqual(byPath(record.candidate.tree), byPath(trackedTree(repo.origin_repo, repo.candidate_sha)));
+    // Named, so a failure says WHICH property broke rather than only that a tree differed.
+    assert.ok(record.candidate.entries.includes("hidden.ts"), "an export-ignore'd tracked file is still in the evidence plane");
+    assert.equal(
+      entryAt(record.candidate.tree, "stamped.txt").sha256,
+      digestOf("$Format:%H$\n"),
+      "an export-subst placeholder reaches the reviewer as its COMMITTED bytes, unexpanded",
+    );
+    assert.notEqual(entryAt(record.candidate.tree, "stamped.txt").sha256, digestOf(`${repo.candidate_sha}\n`), "the sha was not substituted into a tracked file");
+    assert.ok(record.candidate.entries.includes(".gitattributes"), "the attributes file is itself just tracked content here");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -89,7 +89,7 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   {
     control: "EP-B1-6b",
     tests: ["conformance-reviewmount.test.ts"],
-    note: "B1(6b) the evidence plane is a SANITIZED SNAPSHOT: /candidate is the tracked tree of candidate_sha byte-for-byte with NO .git (the inverted assertion), a symlink/gitlink candidate is refused at materialization with no container created, and the mode rule itself at its seam",
+    note: "B1(6b) the evidence plane is a SANITIZED SNAPSHOT: /candidate is the tracked tree of candidate_sha byte-for-byte with NO .git (the inverted assertion) and with no committed .gitattributes able to omit (export-ignore) or rewrite (export-subst) a tracked byte, a symlink/gitlink candidate is refused at materialization with no container created, and the mode rule itself at its seam",
   },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 

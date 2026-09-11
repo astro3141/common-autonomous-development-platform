@@ -20,7 +20,7 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -66,12 +66,17 @@ function nowMs(): string {
   return new Date().toISOString();
 }
 
-async function runTool(
+/**
+ * The raw form: stdout/stderr as BYTES. Every existing caller wants text and goes through `runTool`
+ * below, which is the same decode it always did; only the evidence-snapshot materialization reads
+ * bytes, because a tracked blob and a tracked PATH are byte strings that UTF-8 need not describe.
+ */
+async function runToolBytes(
   file: string,
   args: string[],
   cwd?: string,
   env?: Record<string, string | undefined>,
-): Promise<{ status: number | null; stdout: string; stderr: string }> {
+): Promise<{ status: number | null; stdout: Buffer; stderr: Buffer }> {
   return new Promise((resolve) => {
     // Every element is spawn-bound, and some carry caller text (the commit message embeds the
     // work item), so the same NUL guard applies here — identity for every real invocation.
@@ -81,13 +86,27 @@ async function runTool(
     const err: Buffer[] = [];
     child.stdout.on("data", (c: Buffer) => out.push(c));
     child.stderr.on("data", (c: Buffer) => err.push(c));
-    child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }));
-    child.on("error", (e) => resolve({ status: 127, stdout: "", stderr: String(e) }));
+    child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out), stderr: Buffer.concat(err) }));
+    child.on("error", (e) => resolve({ status: 127, stdout: Buffer.alloc(0), stderr: Buffer.from(String(e)) }));
   });
+}
+
+async function runTool(
+  file: string,
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const r = await runToolBytes(file, args, cwd, env);
+  return { status: r.status, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8") };
 }
 
 async function git(args: string[], cwd?: string, env?: Record<string, string | undefined>): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return runTool("git", args, cwd, env);
+}
+
+async function gitBytes(args: string[], cwd?: string): Promise<{ status: number | null; stdout: Buffer; stderr: Buffer }> {
+  return runToolBytes("git", args, cwd);
 }
 
 /**
@@ -502,6 +521,24 @@ export function buildReviewPrompt(provider: ReviewProvider, candidate_sha: strin
 const NUL_RECORD_SEPARATOR = String.fromCharCode(0);
 
 /**
+ * Split a `git -z` stream on its NUL separator as BYTES, dropping the trailing empty record. `-z`
+ * exists precisely so a path is never quoted, escaped or split wrong; splitting the raw buffer is
+ * what carries that guarantee through to a path whose bytes are not UTF-8.
+ */
+function splitNulRecords(raw: Buffer): Buffer[] {
+  const records: Buffer[] = [];
+  let start = 0;
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] === 0) {
+      if (i > start) records.push(raw.subarray(start, i));
+      start = i + 1;
+    }
+  }
+  if (start < raw.length) records.push(raw.subarray(start));
+  return records;
+}
+
+/**
  * The tree-entry modes the sanitized evidence snapshot is DEFINED OVER (EP TD B1(6b)): regular
  * file, executable file, directory. Every other kind is REFUSED, never rendered.
  */
@@ -545,6 +582,34 @@ export function assertSnapshotSafeTree(ls_tree_z: string, candidate_sha: string)
   }
 }
 
+/** `/` and TAB as bytes — the tree-record separators, matched on RAW path bytes, never on text. */
+const SLASH_BYTE = 0x2f;
+const TAB_BYTE = 0x09;
+
+/**
+ * A tracked path that host-side extraction must not be allowed to interpret. `.` and `..` would
+ * write OUTSIDE the snapshot directory (`..` lands in the run's own temp dir, beside the auth dir
+ * and the session tree), and an empty component means a leading `/` or a `//` — an absolute
+ * destination. Git's own `verify_path` rejects all of these, so no honestly-built tree contains
+ * one; this is the check that keeps that true of a tree we did NOT build, since we write the
+ * entries ourselves rather than handing them to a tool that re-validates them. Compared as bytes
+ * (`latin1` is the identity decode) so a path UTF-8 cannot describe is still checked exactly.
+ */
+function assertContainedPath(path: Buffer, candidate_sha: string): void {
+  let start = 0;
+  for (let i = 0; i <= path.length; i += 1) {
+    if (i === path.length || path[i] === SLASH_BYTE) {
+      const component = path.subarray(start, i).toString("latin1");
+      if (component === "" || component === "." || component === "..") {
+        throw new Error(
+          `candidate ${candidate_sha} carries a tracked entry the evidence snapshot cannot contain: ${path.toString("utf8")} (path component ${JSON.stringify(component)} escapes the snapshot); refusing the review`,
+        );
+      }
+      start = i + 1;
+    }
+  }
+}
+
 /**
  * Materialize the SANITIZED SNAPSHOT the evidence plane is contractually made of (EP TD B1(6b)):
  * a fresh directory holding EXACTLY the tracked tree of `candidate_sha` — no `.git`, no untracked
@@ -555,31 +620,66 @@ export function assertSnapshotSafeTree(ls_tree_z: string, candidate_sha: string)
  *
  * The refusal above runs FIRST, so an unsanitizable candidate never gets a snapshot either.
  *
- * MECHANISM — `git archive` OF THE COMMIT, extracted into the fresh directory. Chosen over
- * `checkout-index` on exactly the property at issue: `git archive <sha>` reads the tree objects
- * out of the object database, a function of the commit and nothing else, whereas `checkout-index`
- * writes out whatever the CLONE'S INDEX holds — and an index is clone-local state, precisely the
- * kind of run-local input this snapshot exists to exclude. The archive runs with the host's global
- * and system git configuration NEUTRALIZED: a config-defined `filter.<name>.smudge` is the one
- * remaining way host state could rewrite blob bytes on their way out, so with it unreachable the
- * extracted bytes are the tree's bytes. What stays attribute-driven is the tree's own
- * `.gitattributes`, which is part of the tree and therefore pure. Extraction cannot escape the
- * destination: git normalizes tracked paths, so no entry can carry a `..` component.
+ * MECHANISM — the OBJECT DATABASE, read directly: `ls-tree` for the entry set and `cat-file blob`
+ * for each file's bytes, written out here. Both are RAW object reads: neither consults
+ * `.gitattributes`, so no attribute can decide what the snapshot contains or what a file says.
+ * That is the whole reason for this mechanism, and it is why the two obvious alternatives are
+ * wrong for this job:
+ *
+ *   `git archive <sha>` (#274's mechanism, and the defect that replaced it) honors the tree's own
+ *   committed `export-ignore` and `export-subst`. `export-ignore` OMITS tracked paths from the
+ *   archive — a candidate committing `.gitattributes` holding `* export-ignore` would present an
+ *   EMPTY `/candidate`, and one naming a single file would hide exactly the file under review —
+ *   and `export-subst` REWRITES bytes inside a tracked file. Either way the mount stops being the
+ *   tracked tree of the sha, and the party choosing the attribute is the implementer whose work is
+ *   being judged. (`text`/`eol`, `ident`, `filter` and `working-tree-encoding` reach archive's
+ *   output the same way.) Neutralizing attributes one by one would make the guarantee an
+ *   enumeration; reading the objects makes it structural.
+ *
+ *   `checkout-index` writes out whatever the CLONE'S INDEX holds — clone-local state, precisely the
+ *   run-local input this snapshot exists to exclude — and it applies the same attribute-driven
+ *   conversions on the way out.
+ *
+ * Nothing here needs the host's git configuration neutralized, because nothing here reads a config
+ * that could alter output: `cat-file blob` has no conversion stage for a `filter.<name>.smudge` to
+ * sit in. Each entry's parent is created before it rather than relying on the listing's order, and
+ * every permission is SET from the tree entry (`100755` → `0755`, `100644` → `0644`, a directory →
+ * `0755`) rather than left to whatever the broker process's umask happens to be — a mode is
+ * observable through the mount too, so it belongs to the sha, not to the host.
  */
 async function materializeCandidateSnapshot(clone: string, candidate_sha: string, base: string): Promise<string> {
-  const listed = await git(["ls-tree", "-r", "-t", "-z", candidate_sha], clone);
-  if (listed.status !== 0) throw new Error(`candidate tree listing failed: ${listed.stderr.slice(0, 300)}`);
-  assertSnapshotSafeTree(listed.stdout, candidate_sha);
+  const listed = await gitBytes(["ls-tree", "-r", "-t", "-z", candidate_sha], clone);
+  if (listed.status !== 0) throw new Error(`candidate tree listing failed: ${listed.stderr.toString("utf8").slice(0, 300)}`);
+  // Modes first, on the whole listing: a candidate carrying ANY unsnapshottable entry is refused
+  // before a single byte is written, so no partial snapshot ever exists.
+  assertSnapshotSafeTree(listed.stdout.toString("utf8"), candidate_sha);
 
   const snapshot = join(base, "candidate-snapshot");
   mkdirSync(snapshot, { recursive: true });
-  const tarball = join(base, "candidate-tree.tar");
-  const pureGitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_ATTR_NOSYSTEM: "1" };
-  const archived = await git(["archive", "--format=tar", "-o", tarball, candidate_sha], clone, pureGitEnv);
-  if (archived.status !== 0) throw new Error(`candidate snapshot archive failed: ${archived.stderr.slice(0, 300)}`);
-  const extracted = await runTool("tar", ["-xf", tarball, "-C", snapshot]);
-  if (extracted.status !== 0) throw new Error(`candidate snapshot extraction failed: ${extracted.stderr.slice(0, 300)}`);
-  rmSync(tarball, { force: true });
+  const root = Buffer.from(`${snapshot}/`);
+  for (const record of splitNulRecords(listed.stdout)) {
+    const tab = record.indexOf(TAB_BYTE);
+    if (tab < 0) throw new Error(`candidate ${candidate_sha} tree listing is malformed — refusing to materialize the evidence snapshot`);
+    const [mode, , oid] = record.subarray(0, tab).toString("utf8").split(" ");
+    // The path as it is IN THE TREE: raw bytes, never round-tripped through a decode that would
+    // replace a byte UTF-8 cannot describe and materialize a DIFFERENT name than the sha names.
+    const path = record.subarray(tab + 1);
+    assertContainedPath(path, candidate_sha);
+    const destination = Buffer.concat([root, path]);
+    if (mode === "040000") {
+      mkdirSync(destination, { recursive: true });
+      chmodSync(destination, 0o755);
+      continue;
+    }
+    const slash = path.lastIndexOf(SLASH_BYTE);
+    if (slash > 0) mkdirSync(Buffer.concat([root, path.subarray(0, slash)]), { recursive: true });
+    const blob = await gitBytes(["cat-file", "blob", oid ?? ""], clone);
+    if (blob.status !== 0) {
+      throw new Error(`candidate ${candidate_sha} tracked file could not be read from the object database: ${path.toString("utf8")} — ${blob.stderr.toString("utf8").slice(0, 200)}`);
+    }
+    writeFileSync(destination, blob.stdout);
+    chmodSync(destination, mode === "100755" ? 0o755 : 0o644);
+  }
   return snapshot;
 }
 
