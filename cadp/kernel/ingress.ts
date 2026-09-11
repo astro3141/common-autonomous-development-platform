@@ -476,7 +476,13 @@ export class Ingress {
    * the §5.3 rules, and for the AP B2/B3 rules a cross-principal `REQUEST_DIGEST_CONFLICT`
    * (`allocation_principal_gate`) or a sealed request whose kernel-namespace subject is ambiguous
    * (`kernel_namespace_lock`); `review_body_retained` (#259 P0b) bites into a sealed `REVIEW`
-   * whose `{body_cas_key, body_digest}` pair does not verify.
+   * whose `{body_cas_key, body_digest}` pair does not verify; `evidence_digest_scheme` (Execution
+   * TD B1(3)) bites into the LOSS OF THE `DIGEST_SCHEME_UNAPPROVED` VERDICT — with it disabled an
+   * unapproved-scheme `content_digest` is no longer graded at the ingress at all, and is left to
+   * `records.ts`'s shape typing to refuse from inside the seal under another name. The bite is
+   * stated on the verdict rather than on a sealed row because, under the bootstrap-RETENTION rule,
+   * no conforming policy can disapprove a scheme `isDigestShape` accepts; see the D8 header in
+   * `cadp/tests/conformance/conformance-digestscheme.test.ts` for why that is deliberate.
    */
   readonly disabledRules: ReadonlySet<string>;
 
@@ -1157,7 +1163,19 @@ export class Ingress {
     // is untouched here. Nothing about REQUIRED-ness is imported: digests that EXIST are validated,
     // none is demanded, and no namespace or field name is consulted — per Execution TD B1(3),
     // required-ness is owned by product construction and the composition gate, not by the ingress.
-    this.assertSchemesApproved(bindingContentDigests(draft.subject_bindings), active);
+    //
+    // The guard-bite knob carries no production behaviour (the composition never passes one); it is
+    // here so the conformance suite can DISABLE this one line and observe what is lost — the
+    // `DIGEST_SCHEME_UNAPPROVED` verdict itself, raised HERE and before sealing. Note what the bite
+    // does NOT produce, because it is the honest scope of this line: no unapproved-scheme digest
+    // reaches a stored envelope even with the rule off, since `isDigestShape` (`canonical.ts`)
+    // accepts exactly the three schemes `policyBundle.ts`'s bootstrap-retention rule forbids any
+    // policy to drop. So this is DEFENCE IN DEPTH over a shape layer that is coincident with today's
+    // approved set — and the layer that owns AP §2.1's "invalid input" verdict under its own name,
+    // which survives any future policy that EXTENDS the approved set past those three.
+    if (this.#ruleEnabled("evidence_digest_scheme")) {
+      this.assertSchemesApproved(bindingContentDigests(draft.subject_bindings), active);
+    }
 
     // Kind-specific ingress rules.
     if (draft.evidence_kind === "BACKEND_EXECUTION" && draft.availability === "PRESENT") {

@@ -14,6 +14,8 @@
  *       (TD B1(3): it is owned by product construction and the composition gate)
  *   D5  malformed digests stay `records.ts`'s shape refusal, and never a crash
  *   D6  K3 sealing is unchanged
+ *   D8  the GUARD-BITE (TD §13.1): the DIGEST_SCHEME_UNAPPROVED verdict is this ingress line's,
+ *       over a shape layer the bootstrap-retention rule keeps coincident with today's approved set
  *
  * D7 is the OTHER Execution Plane leg this file carries, and the reason its manifest entry is
  * many-to-many (EP-B1 above, EP-C1 here): control C1's **AUTHORITY DIRECT-INGRESS** locator leg,
@@ -220,6 +222,73 @@ test("D7 (EP-C1(ii)): a crafted PRESENT output_artifact submitted DIRECTLY, bypa
     assert.equal(evidenceRows(h), before + 1);
   } finally {
     h.close();
+  }
+});
+
+/**
+ * D8 — the TD §13.1 GUARD-BITE, and the leg that says exactly WHICH layer D1's refusal comes from
+ * and what this ingress enforcement does that `records.ts` does not. It also records the ONE
+ * structural fact that makes that question subtle, which a reader auditing this lane must have:
+ *
+ *   under EVERY conforming bundle the approved set is a SUPERSET of the shape layer's fixed three.
+ *
+ * `isDigestShape` (`canonical.ts`) hard-codes `sha256` over exactly `{cadp-jcs-1, raw-bytes-1,
+ * cadp-bundle-payload-1}`, and `policyBundle.ts`'s bootstrap-RETENTION rule (TD §2.1/§4.4 #17) lets
+ * a policy EXTEND `approved_digest_schemes` but never REMOVE one of those three. So no conforming
+ * active policy can disapprove a scheme the shape layer accepts, and the two layers cannot be made
+ * to disagree about whether a WELL-FORMED digest is admissible. The ingress check is therefore
+ * DEFENCE IN DEPTH over a shape layer that happens to coincide with today's approved set — not a
+ * filter catching envelopes that would otherwise be stored. That is a real and deliberate property,
+ * and stating it here is what stops a future reader from "simplifying away" either layer on the
+ * false premise that one is redundant: the coincidence is a consequence of the retention rule, and
+ * an extended approved set plus a widened `isDigestShape` pulls them apart again.
+ *
+ * What the ingress line DOES own, and what this bite therefore observes, is the OBSERVABLE the TD
+ * names — the refusal's CODE and LAYER. With the line disabled, the identical draft is still
+ * refused, but as a `k2.evidence-envelope.v1` SHAPE violation raised from inside `sealEnvelope`
+ * instead of as `DIGEST_SCHEME_UNAPPROVED` raised at the ingress before sealing begins. AP §2.1
+ * requires an unapproved scheme be "invalid input, never a different-but-equal identity", and it is
+ * this line — not the shape typing — that produces that verdict under that name.
+ *
+ * K3 (`material_digest`/`request_digest`) rides `sealEffectRequest`'s own call to the same private
+ * helper, so the bite cannot reach it; D6's claim is re-held here under the bite to pin that.
+ */
+test("D8: the ingress line owns the DIGEST_SCHEME_UNAPPROVED verdict; disabling it drops the draft to the shape layer", async () => {
+  const unapproved = { algorithm: "sha256", canonicalization: "not-a-scheme", value: VALUE };
+
+  const enforced = await makeHarness();
+  try {
+    assert.throws(
+      () => enforced.ingress.submitEvidence(reviewDraft(enforced, [commit("sha-d8", unapproved)]), PRINCIPALS.reviewer),
+      (error: unknown) => (error as { reason?: string }).reason === "DIGEST_SCHEME_UNAPPROVED",
+      "with the rule enabled the ingress names the scheme verdict",
+    );
+  } finally {
+    enforced.close();
+  }
+
+  const bitten = await makeHarness({ disabledIngressRules: new Set(["evidence_digest_scheme"]) });
+  try {
+    const before = evidenceRows(bitten);
+    // The prohibited effect: the scheme verdict is GONE. Nothing at the ingress grades the scheme
+    // any more, and what refuses is the shape layer, from inside the seal, under another name.
+    assert.throws(
+      () => bitten.ingress.submitEvidence(reviewDraft(bitten, [commit("sha-d8", unapproved)]), PRINCIPALS.reviewer),
+      (error: unknown) =>
+        (error as { reason?: string }).reason !== "DIGEST_SCHEME_UNAPPROVED" &&
+        (error as Error).message.includes("k2.evidence-envelope.v1: binding.content_digest"),
+      "with the rule disabled no ingress scheme verdict is reachable",
+    );
+    assert.equal(evidenceRows(bitten), before, "the shape layer still lets no row through — the layers are defence in depth");
+
+    // K3 is the other call site of the same helper and is out of the bite's reach entirely.
+    bitten.sealReach();
+    await bitten.sealTargetIdentity();
+    const { request } = sealScriptedRequest(bitten);
+    assert.equal(request.material_digest.canonicalization, "cadp-jcs-1");
+    assert.ok(bitten.store.effectRequest(request.effect_id) !== undefined);
+  } finally {
+    bitten.close();
   }
 });
 

@@ -85,7 +85,7 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   { control: "WP-15", tests: ["conformance-basesha.test.ts"], note: "record-vertical generality (§3.6)" },
 
   // ---- Execution Plane (EP).
-  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "the SCHEME-INGRESS leg (D1–D6): B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract, closed at the Authority ingress" },
+  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "the SCHEME-INGRESS leg (D1–D6): B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract, closed at the Authority ingress; D8 guard-bites that line and records why it is defence in depth over a coincident shape layer" },
   { control: "EP-C1", tests: ["conformance-digestscheme.test.ts"], note: "the DIRECT-INGRESS LOCATOR leg (D7): C1(ii)'s authority safety net behind C1(i)'s broker refusal — the one C1 leg that runs at this checkout" },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 
