@@ -14,6 +14,21 @@
  *       (TD B1(3): it is owned by product construction and the composition gate)
  *   D5  malformed digests stay `records.ts`'s shape refusal, and never a crash
  *   D6  K3 sealing is unchanged
+ *
+ * D7 is the OTHER Execution Plane leg this file carries, and the reason its manifest entry is
+ * many-to-many (EP-B1 above, EP-C1 here): control C1's **AUTHORITY DIRECT-INGRESS** locator leg,
+ * the one C1 leg that RUNS at this checkout because it deliberately BYPASSES the broker path. A
+ * crafted `BACKEND_EXECUTION` envelope whose `claim.observed.output_artifact` is PRESENT with no
+ * locator is refused `OBSERVED_WITHOUT_LOCATOR` by the ALREADY-IMPLEMENTED
+ * `assertBackendObservedLocators` (`cadp/kernel/ingress.ts`).
+ *
+ * It belongs beside D1–D6 because it is the same seam from the same side: both legs are what the
+ * Authority ingress owes GENERICALLY about a directly submitted envelope, independent of whether a
+ * well-behaved producer built it. C1 splits the locator observable into two controls precisely
+ * because they are different: C1(i)'s product path refuses a locator-less result AT THE BROKER, so
+ * nothing is ever submitted and NO ingress refusal code is observable there. This is C1(ii), the
+ * ingress SAFETY NET as DEFENCE-IN-DEPTH BEHIND that refusal, for any producer that does not come
+ * through this broker — and NEVER the production path's expected observable.
  */
 
 import assert from "node:assert/strict";
@@ -127,6 +142,82 @@ test("D5: malformed content_digests remain the schema layer's refusal and never 
       (error: unknown) => (error as Error).message.includes("bindings must be an array"),
     );
     assert.equal(evidenceRows(h), before, "no malformed draft sealed a row");
+  } finally {
+    h.close();
+  }
+});
+
+/**
+ * The `execution-output` binding of EP B1(2), carried verbatim: the subject in `object_id`
+ * (`<execution_request_digest.value>/<the broker-minted attempt identity>`) and the artifact's own
+ * digest in `content_digest`, typed and under an approved scheme. It is here so D7's two legs differ
+ * in the locator ALONE — the scheme leg D1–D6 pins is satisfied identically on both sides of it.
+ */
+const EXECUTION_OUTPUT_BINDING = {
+  authority_ref: "cadp-store:k04",
+  namespace: "execution-output",
+  object_id: `${"a".repeat(64)}/cadp-surface-worker-d7`,
+  content_digest: { algorithm: "sha256", canonicalization: "raw-bytes-1", value: "c".repeat(64) },
+};
+
+/**
+ * A CRAFTED `BACKEND_EXECUTION` draft, built by hand precisely because the broker would never emit
+ * one: C1(i)'s malformed-result rule refuses a result missing `output_artifact_locator` at
+ * construction, so this envelope reaches the Ingress only by bypassing that path entirely — which is
+ * exactly the producer C1(ii)'s safety net exists for. `observed.model` keeps its own (legitimately
+ * session-file) locator throughout, so the only thing either leg varies is `output_artifact`.
+ */
+const backendDraft = (output_artifact: unknown) =>
+  ({
+    evidence_kind: "BACKEND_EXECUTION",
+    subject_bindings: [
+      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000d7" },
+      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+      EXECUTION_OUTPUT_BINDING,
+    ],
+    availability: "PRESENT",
+    claim_schema: "cadp.backend.v1",
+    claim: {
+      requested: { model: "gpt-5.3-codex" },
+      observed: {
+        model: { availability: "PRESENT", value: "gpt-5.3-codex", locator: "session:rollout-d7.jsonl" },
+        output_artifact,
+      },
+    },
+    producer_ref: "backend-scan:codex",
+    source_ref: "digest-scheme-d7",
+    source_relation: "SELF_REPORT",
+  }) as never;
+
+test("D7 (EP-C1(ii)): a crafted PRESENT output_artifact submitted DIRECTLY, bypassing the broker, is refused for want of a locator", async () => {
+  const h = await makeHarness();
+  try {
+    const before = evidenceRows(h);
+    for (const locatorless of [
+      // No locator member at all — the shape C1(i) refuses at the broker and this net catches here.
+      { availability: "PRESENT", value: "c".repeat(64) },
+      // Present but empty, and present but not a string: the rule is locator PRESENCE, and neither
+      // of these locates anything. Locator SHAPE stays the plane's own obligation (EP B1(3)).
+      { availability: "PRESENT", value: "c".repeat(64), locator: "" },
+      { availability: "PRESENT", value: "c".repeat(64), locator: 7 },
+    ]) {
+      assert.throws(
+        () => h.ingress.submitEvidence(backendDraft(locatorless), PRINCIPALS.backendScan),
+        (error: unknown) => (error as { reason?: string }).reason === "OBSERVED_WITHOUT_LOCATOR",
+        JSON.stringify(locatorless),
+      );
+    }
+    assert.equal(evidenceRows(h), before, "a refused BACKEND_EXECUTION draft seals nothing");
+
+    // The same envelope, differing in the locator ALONE, seals — so the refusals above are the
+    // locator leg biting, not the draft being unsealable for some unrelated reason.
+    const sealed = h.ingress.submitEvidence(
+      backendDraft({ availability: "PRESENT", value: "c".repeat(64), locator: "cas:d7-artifact-bytes" }),
+      PRINCIPALS.backendScan,
+    );
+    assert.equal(sealed.evidence_kind, "BACKEND_EXECUTION");
+    assert.deepEqual(sealed.subject_bindings[2], EXECUTION_OUTPUT_BINDING, "the approved-scheme artifact binding is sealed verbatim");
+    assert.equal(evidenceRows(h), before + 1);
   } finally {
     h.close();
   }
