@@ -14,6 +14,18 @@
  *       (TD B1(3): it is owned by product construction and the composition gate)
  *   D5  malformed digests stay `records.ts`'s shape refusal, and never a crash
  *   D6  K3 sealing is unchanged
+ *
+ * The file also carries Execution Plane TD control C1's AUTHORITY DIRECT-INGRESS locator leg, the
+ * one leg of C1 that runs at this checkout because it deliberately BYPASSES the broker path:
+ *
+ *   L1  a CRAFTED `BACKEND_EXECUTION` envelope submitted DIRECTLY to the Ingress carrying
+ *       `claim.observed.output_artifact.availability = "PRESENT"` with no locator is refused
+ *       OBSERVED_WITHOUT_LOCATOR by the already-implemented `assertBackendObservedLocators`
+ *       (`ingress.ts`), sealing nothing. This is the ingress SAFETY NET as defence-in-depth BEHIND
+ *       the broker's own malformed-result refusal (C1's product-path control), for any producer
+ *       that does not come through that broker — it is never the production path's expected
+ *       observable. Its guard-bite is the same craft carrying the broker-shaped observation
+ *       locator, which seals — so the refusal is the missing locator and not the field itself.
  */
 
 import assert from "node:assert/strict";
@@ -127,6 +139,93 @@ test("D5: malformed content_digests remain the schema layer's refusal and never 
       (error: unknown) => (error as Error).message.includes("bindings must be an array"),
     );
     assert.equal(evidenceRows(h), before, "no malformed draft sealed a row");
+  } finally {
+    h.close();
+  }
+});
+
+/**
+ * A CRAFTED `BACKEND_EXECUTION` draft, built here rather than by the surface broker: this is the
+ * producer C1's direct-ingress leg exists for — one that never went through the broker's own
+ * malformed-result refusal. `backend-scan:codex` may produce the kind under SELF_REPORT per the
+ * reference registry, and the PRESENT surface-role binding satisfies the ingress rule that runs
+ * immediately before the locator rule.
+ */
+const backendDraft = (output_artifact: unknown, content_digest?: unknown) => {
+  const runRef = "cadp-v04:effect:00000000-0000-7000-8000-0000000000c1";
+  return {
+    evidence_kind: "BACKEND_EXECUTION",
+    subject_bindings: [
+      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: runRef },
+      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+      {
+        authority_ref: "cadp-store:k04",
+        namespace: "execution-output",
+        object_id: `${"a".repeat(64)}/container-c1`,
+        ...(content_digest === undefined ? {} : { content_digest }),
+      },
+    ],
+    availability: "PRESENT",
+    claim_schema: "cadp.backend.v1",
+    claim: {
+      requested: { provider: "codex", model: "codex default" },
+      observed: {
+        provider: { availability: "PRESENT", value: "codex", locator: "broker-response#backend_provider" },
+        output_artifact,
+      },
+    },
+    producer_ref: "backend-scan:codex",
+    source_ref: "digest-scheme-direct-ingress",
+    source_relation: "SELF_REPORT",
+  } as never;
+};
+
+test("L1 (EP-C1): a crafted PRESENT output_artifact with no locator is refused OBSERVED_WITHOUT_LOCATOR at direct ingress", async () => {
+  const h = await makeHarness();
+  try {
+    const before = evidenceRows(h);
+    const artifact = { algorithm: "sha256", canonicalization: "raw-bytes-1", value: VALUE };
+    // The observation the broker would refuse to return at all: a digest observed PRESENT with
+    // nothing naming where it was observed. Absent, empty and non-string locators alike.
+    for (const output_artifact of [
+      { availability: "PRESENT", value: artifact.value },
+      { availability: "PRESENT", value: artifact.value, locator: "" },
+      { availability: "PRESENT", value: artifact.value, locator: 7 },
+    ]) {
+      assert.throws(
+        () => h.ingress.submitEvidence(backendDraft(output_artifact, artifact), PRINCIPALS.backendScan),
+        (error: unknown) => (error as { reason?: string }).reason === "OBSERVED_WITHOUT_LOCATOR",
+        JSON.stringify(output_artifact),
+      );
+    }
+    assert.equal(evidenceRows(h), before, "a refused craft seals nothing — the safety net runs before the seal");
+
+    // Guard-bite: the SAME craft with the broker-shaped observation locator seals, so what L1
+    // falsifies is the missing locator and not the presence of an observed artifact field. The
+    // envelope's `execution-output` binding carries its approved-scheme digest verbatim, which is
+    // this file's other leg (EP-B1) meeting EP-C1's on one envelope.
+    const sealed = h.ingress.submitEvidence(
+      backendDraft(
+        { availability: "PRESENT", value: artifact.value, locator: "broker-response#output_artifact" },
+        artifact,
+      ),
+      PRINCIPALS.backendScan,
+    );
+    assert.equal(sealed.evidence_kind, "BACKEND_EXECUTION");
+    assert.deepEqual(
+      sealed.subject_bindings.find((b) => b.namespace === "execution-output")?.content_digest,
+      artifact,
+      "the approved output-artifact digest is sealed unchanged",
+    );
+    assert.equal(evidenceRows(h), before + 1);
+
+    // An UNKNOWN observation needs no locator: the rule binds PRESENT fields only, unchanged here.
+    const unknown = h.ingress.submitEvidence(
+      backendDraft({ availability: "UNKNOWN" }, artifact),
+      PRINCIPALS.backendScan,
+    );
+    assert.equal(unknown.claim_schema, "cadp.backend.v1");
+    assert.equal(evidenceRows(h), before + 2);
   } finally {
     h.close();
   }
