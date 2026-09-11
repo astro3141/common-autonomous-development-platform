@@ -89,7 +89,7 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   {
     control: "EP-B1-6b",
     tests: ["conformance-reviewmount.test.ts"],
-    note: "the reviewer EVIDENCE plane is a SANITIZED SNAPSHOT of candidate_sha: no .git and byte-for-byte the tracked tree (the INVERSION of the pre-6b .git-presence leg), plus the fail-closed refusal of symlink/gitlink tree entries before any surface, digest or envelope",
+    note: "the reviewer EVIDENCE plane is a SANITIZED SNAPSHOT of candidate_sha: no .git and byte-for-byte the tracked tree (the INVERSION of the pre-6b .git-presence leg) — including tracked PATHS, which are carried as bytes so a name UTF-8 cannot describe is neither renamed nor collapsed — plus the fail-closed refusal of symlink/gitlink tree entries before any surface, digest or envelope",
   },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 

@@ -22,7 +22,7 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync, rmSync, cpSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { buildWorkerSandbox } from "./workerProfile.ts";
@@ -66,7 +66,14 @@ function nowMs(): string {
   return new Date().toISOString();
 }
 
-async function git(args: string[], cwd?: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
+/**
+ * `stdout_bytes` is the RAW stdout, kept beside the decoded `stdout` because some git output is not
+ * text at all: a tracked path is an arbitrary byte string (anything but NUL and `/`), so decoding
+ * `ls-tree` as UTF-8 REPLACES every byte no code point describes and yields a name that is not the
+ * one git tracks. Callers that must preserve bytes read `stdout_bytes`; every existing text caller
+ * keeps reading `stdout` unchanged.
+ */
+async function git(args: string[], cwd?: string): Promise<{ status: number | null; stdout: string; stdout_bytes: Buffer; stderr: string }> {
   return new Promise((resolve) => {
     // Every element is spawn-bound, and some carry caller text (the commit message embeds the
     // work item), so the same NUL guard applies here — identity for every real git invocation.
@@ -75,8 +82,11 @@ async function git(args: string[], cwd?: string): Promise<{ status: number | nul
     const err: Buffer[] = [];
     child.stdout.on("data", (c: Buffer) => out.push(c));
     child.stderr.on("data", (c: Buffer) => err.push(c));
-    child.on("close", (status) => resolve({ status, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") }));
-    child.on("error", (e) => resolve({ status: 127, stdout: "", stderr: String(e) }));
+    child.on("close", (status) => {
+      const stdout = Buffer.concat(out);
+      resolve({ status, stdout: stdout.toString("utf8"), stdout_bytes: stdout, stderr: Buffer.concat(err).toString("utf8") });
+    });
+    child.on("error", (e) => resolve({ status: 127, stdout: "", stdout_bytes: Buffer.alloc(0), stderr: String(e) }));
   });
 }
 
@@ -467,19 +477,40 @@ export const REVIEW_EVIDENCE_MOUNT = "/candidate";
 
 // ------------------------------------------------ the candidate evidence snapshot (EP TD B1(6b))
 
-/** One entry of a commit's tracked tree: the mode git records for it, its object id, its path. */
+/**
+ * One entry of a commit's tracked tree: the mode git records for it, its object id, its path.
+ *
+ * `path` is a `Buffer`, not a string, and that is load-bearing rather than stylistic. Git stores a
+ * path as BYTES — every byte but NUL and `/` is legal, and no encoding is recorded — so a decoded
+ * `string` is a LOSSY view of names git accepts: each byte outside UTF-8 becomes U+FFFD, several
+ * distinct paths can collapse onto one rendering, and re-encoding that rendering writes a file
+ * whose name is not the tracked one. Either outcome breaks the same B1(6b) claim the snapshot
+ * exists to make — that `/candidate` is EXACTLY the tracked tree of `candidate_sha` — so the bytes
+ * are carried from `ls-tree` to the filesystem with no decode in between.
+ */
 export interface TrackedTreeEntry {
   readonly mode: string;
   readonly oid: string;
-  readonly path: string;
+  readonly path: Buffer;
 }
 
 /** The regular-file modes a sanitized snapshot renders, and the tree mode that holds them. */
 const SNAPSHOT_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
 const SNAPSHOT_TREE_MODE = "040000";
 
-/** U+0000, the `git ls-tree -z` record separator — constructed, so this file holds no raw NUL. */
-const TREE_RECORD_SEPARATOR = String.fromCharCode(0);
+/**
+ * The three bytes this parser and writer separate on, written as numbers so the source stays plain
+ * UTF-8: NUL (the `git ls-tree -z` record separator), TAB (its metadata/path separator, and the one
+ * byte a path may not reach past because git emits the path last), and `/` (the path separator,
+ * which is also the one byte git forbids inside a component).
+ */
+const TREE_RECORD_SEPARATOR = 0x00;
+const TREE_FIELD_SEPARATOR = 0x09;
+const PATH_SEPARATOR = 0x2f;
+
+/** The two path components a snapshot never renders, as the bytes they are. */
+const DOTDOT_COMPONENT = Buffer.from("..");
+const DOT_GIT_COMPONENT = Buffer.from(".git");
 
 /** Names for the modes a refusal is likely to report, so the message says WHAT it refused. */
 const TREE_ENTRY_KINDS: Readonly<Record<string, string>> = {
@@ -487,21 +518,64 @@ const TREE_ENTRY_KINDS: Readonly<Record<string, string>> = {
   "160000": "gitlink/submodule",
 };
 
+/** The path components of a tracked path, as bytes — `split("/")` over the raw name. */
+function pathComponents(path: Buffer): readonly Buffer[] {
+  const components: Buffer[] = [];
+  let start = 0;
+  for (;;) {
+    const separator = path.indexOf(PATH_SEPARATOR, start);
+    if (separator < 0) {
+      components.push(path.subarray(start));
+      return components;
+    }
+    components.push(path.subarray(start, separator));
+    start = separator + 1;
+  }
+}
+
 /**
- * Parse `git ls-tree -r -z <commit>` into its entries.
+ * A tracked path rendered for a HUMAN-readable message — a refusal, never a filesystem write.
+ *
+ * A name that IS valid UTF-8 renders as itself, so an ordinary refusal reads exactly as the path
+ * does. A name that is not renders with each non-printable-ASCII byte escaped as `\xNN` instead of
+ * being decoded: a lossy decode would map distinct offending paths onto the same message, which is
+ * precisely the confusion a refusal must not introduce at the moment it names what it refused.
+ */
+export function renderTreePath(path: Buffer): string {
+  const decoded = path.toString("utf8");
+  if (Buffer.from(decoded, "utf8").equals(path)) return decoded;
+  let rendered = "";
+  for (const byte of path) {
+    rendered += byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : `\\x${byte.toString(16).padStart(2, "0")}`;
+  }
+  return rendered;
+}
+
+/**
+ * Parse `git ls-tree -r -z <commit>` into its entries, from the RAW stdout bytes.
  *
  * `-z` because a path git would otherwise quote (spaces, non-ASCII, a literal quote) must arrive
  * here byte-for-byte: the parsed path is both what a refusal names and where a blob is written.
+ * Only the metadata ahead of the TAB is decoded — mode, type and object id are ASCII by git's own
+ * format — while the path after it is copied out as bytes and never passed through a decoder.
  * A record that does not parse is an error rather than a skip — an entry this function cannot read
  * is an entry the mode check below cannot judge.
  */
-export function parseTrackedTree(lsTreeZ: string): readonly TrackedTreeEntry[] {
+export function parseTrackedTree(lsTreeZ: Buffer): readonly TrackedTreeEntry[] {
   const entries: TrackedTreeEntry[] = [];
-  for (const record of lsTreeZ.split(TREE_RECORD_SEPARATOR)) {
+  let start = 0;
+  while (start < lsTreeZ.length) {
+    const end = lsTreeZ.indexOf(TREE_RECORD_SEPARATOR, start);
+    const record = lsTreeZ.subarray(start, end < 0 ? lsTreeZ.length : end);
+    start = (end < 0 ? lsTreeZ.length : end) + 1;
     if (record.length === 0) continue;
-    const parsed = /^(\d{6}) ([a-z]+) ([0-9a-f]{40,64})\t([\s\S]+)$/u.exec(record);
-    if (parsed === null) throw new Error(`unreadable candidate tree entry: ${JSON.stringify(record.slice(0, 120))}`);
-    entries.push({ mode: parsed[1]!, oid: parsed[3]!, path: parsed[4]! });
+    const tab = record.indexOf(TREE_FIELD_SEPARATOR);
+    const parsed = tab < 0 ? null : /^(\d{6}) ([a-z]+) ([0-9a-f]{40,64})$/u.exec(record.subarray(0, tab).toString("utf8"));
+    if (parsed === null || tab === record.length - 1) {
+      throw new Error(`unreadable candidate tree entry: ${JSON.stringify(renderTreePath(record.subarray(0, 120)))}`);
+    }
+    // Copied, not aliased: the subarray would otherwise pin the whole ls-tree stdout in memory.
+    entries.push({ mode: parsed[1]!, oid: parsed[3]!, path: Buffer.from(record.subarray(tab + 1)) });
   }
   return entries;
 }
@@ -541,17 +615,21 @@ export function assertSnapshotableTree(entries: readonly TrackedTreeEntry[]): vo
     // to CHECK OUT a tree carrying a `.git` component at all; the snapshot does not depend on
     // either fact, so that `/candidate` has no `.git` is a property of THIS writer rather than of
     // git's own checkout protections.
-    const components = entry.path.split("/");
-    if (entry.path.length === 0 || entry.path.startsWith("/") || components.includes("..")) {
-      throw new Error(`candidate evidence snapshot refused: ${entry.path} escapes the snapshot directory`);
+    //
+    // Compared as BYTES, so a path that is not valid UTF-8 is judged as the name git tracks rather
+    // than as its decoded rendering: `..` and `.git` are ASCII, and a byte comparison recognises
+    // them under any surrounding bytes, where a decode could both hide and invent them.
+    const components = pathComponents(entry.path);
+    if (entry.path.length === 0 || entry.path[0] === PATH_SEPARATOR || components.some((c) => c.equals(DOTDOT_COMPONENT))) {
+      throw new Error(`candidate evidence snapshot refused: ${renderTreePath(entry.path)} escapes the snapshot directory`);
     }
-    if (components.includes(".git")) {
-      throw new Error(`candidate evidence snapshot refused: ${entry.path} carries a .git path component`);
+    if (components.some((c) => c.equals(DOT_GIT_COMPONENT))) {
+      throw new Error(`candidate evidence snapshot refused: ${renderTreePath(entry.path)} carries a .git path component`);
     }
     if (SNAPSHOT_FILE_MODES.has(entry.mode) || entry.mode === SNAPSHOT_TREE_MODE) continue;
     const kind = TREE_ENTRY_KINDS[entry.mode] ?? "unsupported entry kind";
     throw new Error(
-      `candidate evidence snapshot refused: ${entry.path} has tree mode ${entry.mode} (${kind}) — the evidence plane admits only regular files (100644, 100755) and directories (040000)`,
+      `candidate evidence snapshot refused: ${renderTreePath(entry.path)} has tree mode ${entry.mode} (${kind}) — the evidence plane admits only regular files (100644, 100755) and directories (040000)`,
     );
   }
 }
@@ -582,12 +660,12 @@ async function readTrackedBlobs(repoDir: string, entries: readonly TrackedTreeEn
   let cursor = 0;
   for (const entry of entries) {
     const eol = batch.stdout.indexOf(0x0a, cursor);
-    if (eol < 0) throw new Error(`candidate blob read truncated at ${entry.path}`);
+    if (eol < 0) throw new Error(`candidate blob read truncated at ${renderTreePath(entry.path)}`);
     const header = /^([0-9a-f]{40,64}) blob (\d+)$/u.exec(batch.stdout.subarray(cursor, eol).toString("utf8"));
-    if (header === null) throw new Error(`candidate blob read failed for ${entry.path}: ${batch.stdout.subarray(cursor, eol).toString("utf8").slice(0, 120)}`);
+    if (header === null) throw new Error(`candidate blob read failed for ${renderTreePath(entry.path)}: ${batch.stdout.subarray(cursor, eol).toString("utf8").slice(0, 120)}`);
     const start = eol + 1;
     const size = Number(header[2]);
-    if (start + size > batch.stdout.length) throw new Error(`candidate blob read truncated at ${entry.path}`);
+    if (start + size > batch.stdout.length) throw new Error(`candidate blob read truncated at ${renderTreePath(entry.path)}`);
     blobs.push(batch.stdout.subarray(start, start + size));
     cursor = start + size + 1;
   }
@@ -614,16 +692,22 @@ async function readTrackedBlobs(repoDir: string, entries: readonly TrackedTreeEn
  *
  * The mode is set explicitly rather than left to the process umask, for the same reason: an
  * executable bit in the mount must come from the tree, not from the host the broker runs on.
+ *
+ * Each file is addressed by the BYTES of its tracked path — `node:fs` takes a `Buffer` path, and
+ * `node:path`'s helpers take strings only, so the join and the parent-directory split are done here
+ * on bytes. Routing the name through a string would rename every path UTF-8 cannot describe, and a
+ * snapshot holding a renamed file is not the tracked tree of the commit.
  */
 async function materializeCandidateSnapshot(repoDir: string, entries: readonly TrackedTreeEntry[], snapshotDir: string): Promise<void> {
   mkdirSync(snapshotDir, { recursive: true });
+  const root = Buffer.from(snapshotDir, "utf8");
   // Directories carry no bytes and are created by the files under them; `-r` emits none anyway.
   const files = entries.filter((entry) => entry.mode !== SNAPSHOT_TREE_MODE);
   const blobs = await readTrackedBlobs(repoDir, files);
   for (let i = 0; i < files.length; i += 1) {
     const entry = files[i]!;
-    const target = join(snapshotDir, entry.path);
-    mkdirSync(dirname(target), { recursive: true });
+    const target = Buffer.concat([root, Buffer.from([PATH_SEPARATOR]), entry.path]);
+    mkdirSync(target.subarray(0, target.lastIndexOf(PATH_SEPARATOR)), { recursive: true });
     writeFileSync(target, blobs[i]!);
     chmodSync(target, entry.mode === "100755" ? 0o755 : 0o644);
   }
@@ -687,7 +771,9 @@ export async function brokerReview(body: { repo_full_name: string; candidate_sha
     // never reaches a digest or a container — no snapshot, no surface, no envelope.
     const listed = await git(["ls-tree", "-r", "-z", body.candidate_sha], workspace);
     if (listed.status !== 0) throw new Error(`candidate tree read failed: ${listed.stderr.slice(0, 300)}`);
-    const tracked = parseTrackedTree(listed.stdout);
+    // Parsed from the RAW stdout: a tracked path is bytes, and a UTF-8 decode here would both
+    // rename what the snapshot writes and misname what a refusal reports.
+    const tracked = parseTrackedTree(listed.stdout_bytes);
     assertSnapshotableTree(tracked);
     // Then materialize the sanitized snapshot into a FRESH directory. The clone is NOT this
     // directory and never becomes the mount; it stays host-side for the merge-base/diff below,
