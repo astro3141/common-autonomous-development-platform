@@ -85,7 +85,8 @@ export const CONTROL_MAP: readonly ControlEntry[] = [
   { control: "WP-15", tests: ["conformance-basesha.test.ts"], note: "record-vertical generality (§3.6)" },
 
   // ---- Execution Plane (EP).
-  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract" },
+  { control: "EP-B1", tests: ["conformance-digestscheme.test.ts"], note: "D1–D6: the SCHEME-INGRESS leg — B1(3)'s named digest-scheme gap in the inherited AP §2.1 contract, closed over SubjectBinding.content_digest" },
+  { control: "EP-C1", tests: ["conformance-digestscheme.test.ts"], note: "D7: the AUTHORITY DIRECT-INGRESS locator leg only — C1's other legs run through B1(1)–(2)'s broker path, which does not exist at this checkout" },
   { control: "EP-C2", tests: ["conformance-isolation.test.ts"], note: "custody; the EP §C text names this file and its F2 control by path" },
 
   // ---- v0.4 TD §13.1 constitutional negative controls (C1–C42), with their guard-bites.

@@ -14,6 +14,16 @@
  *       (TD B1(3): it is owned by product construction and the composition gate)
  *   D5  malformed digests stay `records.ts`'s shape refusal, and never a crash
  *   D6  K3 sealing is unchanged
+ *
+ * D7 is the OTHER control this file carries, EP-C1's AUTHORITY DIRECT-INGRESS locator leg. It is
+ * here rather than with the product-path legs because it is the same observable this file's other
+ * legs are: what the generic Ingress refuses about a crafted evidence draft, with no broker in the
+ * path at all. C1 splits the locator legs into two controls precisely because the two paths yield
+ * DIFFERENT observables — B1(2)'s malformed-result rule means a result with a digest but no locator
+ * is refused broker-side and never reaches the Ingress, so the product path's observable is a
+ * BACKEND_EXECUTION delta of zero and no ingress code at all. D7 is the other half: the ingress
+ * safety net as DEFENCE-IN-DEPTH BEHIND that refusal, for any producer that does not come through
+ * this broker — never the production path's expected observable.
  */
 
 import assert from "node:assert/strict";
@@ -127,6 +137,66 @@ test("D5: malformed content_digests remain the schema layer's refusal and never 
       (error: unknown) => (error as Error).message.includes("bindings must be an array"),
     );
     assert.equal(evidenceRows(h), before, "no malformed draft sealed a row");
+  } finally {
+    h.close();
+  }
+});
+
+/**
+ * The crafted `BACKEND_EXECUTION` draft D7 submits DIRECTLY, with no broker anywhere in the path.
+ * It is built to reach the locator rule rather than trip anything earlier: the surface-role binding
+ * `assertBackendSurfaceRole` demands is present, and the artifact binding carries its
+ * `content_digest` under an APPROVED scheme, so D1–D6's scheme leg passes on this very draft and the
+ * only thing left to refuse is the locator. `observed.output_artifact` is the C1 field specifically —
+ * C13 (`conformance-authority.test.ts`) already pins `observed.model`, and the two are separate
+ * facts about separate legs of the rule.
+ */
+const backendDraft = (output_artifact: Record<string, unknown>) =>
+  ({
+    evidence_kind: "BACKEND_EXECUTION",
+    subject_bindings: [
+      { authority_ref: "cadp-store:k04", namespace: "work-run", object_id: "cadp-v04:effect:00000000-0000-7000-8000-0000000000d7" },
+      { authority_ref: "cadp-store:k04", namespace: "surface-role", object_id: "WORKER" },
+      {
+        authority_ref: "cadp-store:k04",
+        namespace: "execution-output",
+        object_id: `${"c".repeat(64)}/attempt-d7`,
+        content_digest: { algorithm: "sha256", canonicalization: "raw-bytes-1", value: VALUE },
+      },
+    ],
+    availability: "PRESENT",
+    claim_schema: "cadp.backend.v1",
+    claim: { requested: {}, observed: { output_artifact } },
+    producer_ref: "backend-scan:codex",
+    source_ref: "digest-scheme-direct-ingress",
+    source_relation: "SELF_REPORT",
+  }) as never;
+
+test("D7 (EP-C1): a crafted BACKEND_EXECUTION submitted DIRECTLY with a PRESENT output_artifact and no locator is refused", async () => {
+  const h = await makeHarness();
+  try {
+    const before = evidenceRows(h);
+    // The safety net bites on the direct submission the broker never mediated.
+    assert.throws(
+      () => h.ingress.submitEvidence(backendDraft({ availability: "PRESENT", value: VALUE }), PRINCIPALS.backendScan),
+      (error: unknown) => (error as { reason?: string }).reason === "OBSERVED_WITHOUT_LOCATOR",
+    );
+    // An empty-string locator is no locator: presence is the rule, so it cannot be satisfied vacuously.
+    assert.throws(
+      () => h.ingress.submitEvidence(backendDraft({ availability: "PRESENT", value: VALUE, locator: "" }), PRINCIPALS.backendScan),
+      (error: unknown) => (error as { reason?: string }).reason === "OBSERVED_WITHOUT_LOCATOR",
+    );
+    assert.equal(evidenceRows(h), before, "a refused direct submission seals nothing");
+
+    // ATTRIBUTION: the same crafted draft with a locator seals, so the two refusals above are the
+    // locator's absence alone — not the surface-role binding, the artifact digest's scheme, or the
+    // claim schema, each of which is byte-identical across all three submissions.
+    const sealed = h.ingress.submitEvidence(
+      backendDraft({ availability: "PRESENT", value: VALUE, locator: "cas://d7-artifact" }),
+      PRINCIPALS.backendScan,
+    );
+    assert.equal(sealed.evidence_kind, "BACKEND_EXECUTION");
+    assert.equal(evidenceRows(h), before + 1);
   } finally {
     h.close();
   }
