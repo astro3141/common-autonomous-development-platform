@@ -78,18 +78,33 @@ export const SURFACE_TERMINATION_MS = 10_000;
  * is unaffected by a higher ceiling — the bound only caps a run that would otherwise never stop.
  * grok is a slower agentic worker: the 3rd/4th pilots showed it engaging edit tools (once
  * #152 unblocked headless edits) but burning the full 900_000ms ceiling without converging on the
- * multi-file #149 task, so it was TERMINATED before committing a candidate. The ceiling is raised
+ * multi-file #149 task, so it was TERMINATED before committing a candidate. The ceiling was raised
  * to 1_800_000ms (30m) to cover the slowest SUPPORTED worker (grok), not just codex's measured
- * pace. codex's normal ~301s exit is unchanged. grok's actual convergence time remains UNMEASURED —
- * we only know it exceeds 15m; if 30m still TERMINATES, that is an honest signal grok is not
- * converging on this class of task rather than merely being slow. The four layers keep their
- * MIN_LAYER_MARGIN_MS spacing (30k/30k/60k) so the #128 termination→cleanup→response hierarchy holds.
+ * pace. codex's normal ~301s exit is unchanged.
+ *
+ * The ceiling is now 2_700_000ms (45m), fitting the time budget to the workload rather than the
+ * reverse, on both halves of one decision:
+ *
+ *   - A surface retry does NOT accumulate progress: the second attempt starts from scratch, so a
+ *     task sitting near the ceiling burns a full surface, is TERMINATED, and burns another. That
+ *     was measured repeatedly on move-heavy and contract-dense lanes, where the retry — a second
+ *     from-scratch attempt — then SUCCEEDED, showing the work sat just past the old bound rather
+ *     than failing to converge. The raise converts fail-fail-pass into pass.
+ *   - The ceiling is ALSO the blast-radius bound on a wasted surface — how much compute and
+ *     provider egress one non-converging run may burn before it is killed. That is why this is 45m
+ *     and not more. The LANE-SIZING DISCIPLINE IS UNCHANGED: work items keep targeting completion
+ *     within a single 30-minute surface. The extra headroom absorbs variance (dependency install,
+ *     test runtime) at the tail of a correctly sized lane; it is not license for bigger lanes.
+ *
+ * A run TERMINATED at 45m remains an honest signal that the worker is not converging on that class
+ * of task rather than merely being slow. The four layers keep their MIN_LAYER_MARGIN_MS spacing
+ * (30k/30k/60k) so the #128 termination→cleanup→response hierarchy holds.
  */
 export const IMPLEMENT_BUDGET: SurfaceOperationBudget = {
-  surface_ms: 1_800_000,
-  broker_response_ms: 1_830_000,
-  rpc_ms: 1_860_000,
-  activity_attempt_ms: 1_920_000,
+  surface_ms: 2_700_000,
+  broker_response_ms: 2_730_000,
+  rpc_ms: 2_760_000,
+  activity_attempt_ms: 2_820_000,
 };
 
 /** `/verify`: `node --test` inside the `--network none` verifier container. */
