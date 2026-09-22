@@ -113,7 +113,8 @@ async function api(path, body) {
 const CONN = {connected:["연결됨","ok"], not_connected:["연결 안 됨","bad"], waiting_for_browser:["브라우저 대기","warn"],
               waiting_for_code:["코드 입력 대기","warn"], starting:["시작 중","warn"], failed:["실패","bad"]};
 const CFG = {applied:["적용됨","ok"], saved:["저장됨 (미적용)","warn"], changed_since_apply:["변경됨 — 적용 필요","warn"],
-             replaced:["다른 정책이 계정에 적용됨 — 적용 필요","warn"], apply_failed:["적용 실패","bad"]};
+             replaced:["다른 정책이 계정에 적용됨 — 적용 필요","warn"], apply_failed:["적용 실패","bad"],
+             unknown:["적용 중단 — 계정의 현재 정책 불명, 다시 적용 필요","bad"]};
 const DEC = {PASS:"ok", ADMIT:"ok", COMPLETED:"ok", DENIED:"warn", REFUTE:"warn", HOLD:"bad", BLOCK:"bad", FAILED:"bad"};
 const ago = (s) => s == null ? "—" : s < 90 ? `${s}초 전` : s < 5400 ? `${Math.round(s/60)}분 전` : `${Math.round(s/3600)}시간 전`;
 

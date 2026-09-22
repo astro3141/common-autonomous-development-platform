@@ -14,8 +14,9 @@ and its own TMPDIR, and Conductor writes its event log under the temp directory
 holds this run's event log and nothing else. The view is read from that log — no second copy
 of the run's progress is kept.
 
-A run whose launcher is gone (container restarted, process killed) without Conductor having
-recorded an end is marked `interrupted`. It is not resumed.
+The event log decides whether a run ended. If it records the end (completed or failed) but the
+launcher died before writing that down, the run is restored as `finished` with the logged outcome.
+A run whose launcher is gone without an end in the log is marked `interrupted`. Nothing is resumed.
 """
 import glob, json, os, re, subprocess, sys, time
 from pathlib import Path
@@ -90,7 +91,7 @@ def view(meta):
     ui = meta["ui_id"]
     out = {**meta, "steps": [], "current_step": None, "route": None, "terminated_at": None,
            "termination_reason": None, "output": None, "conductor_run": None, "error": None,
-           "mlflow": None, "workspace_prefix": None, "ended": False}
+           "mlflow": None, "workspace_prefix": None, "ended": False, "ended_event_at": None}
     p = events_for(ui)
     if p:
         out["conductor_run"] = p.name.rsplit("-", 1)[-1].split(".")[0]
@@ -123,25 +124,36 @@ def view(meta):
                 out["terminated_at"] = d.get("agent_name")
                 out["termination_reason"] = d.get("termination_reason")
             elif t == "workflow_completed":
-                out["output"] = d.get("output"); out["ended"] = True
+                out["output"] = d.get("output"); out["ended"] = True; out["ended_event_at"] = e.get("timestamp")
             elif t in ("workflow_failed", "agent_failed", "script_failed"):
                 # an explicit failed terminate (HOLD, BLOCK, DENIED …) carries the workflow output
                 if isinstance(d.get("output"), dict):
                     out["output"] = d["output"]
                 if t == "workflow_failed":
-                    out["ended"] = True
+                    out["ended"] = True; out["ended_event_at"] = e.get("timestamp")
                     # a failed terminate reports where and why only here
                     out["terminated_at"] = out["terminated_at"] or d.get("terminated_by") or d.get("agent_name")
                     out["termination_reason"] = out["termination_reason"] or d.get("termination_reason")
                 if not d.get("is_explicit"):
                     out["error"] = json.dumps(d)[:500]
-    if meta.get("state") == "running" and not out["ended"] and not launcher_alive(meta):
+    if meta.get("state") == "running" and out["ended"]:
+        # Conductor recorded the end; the launcher may have died before writing it down (restart
+        # right after the end event). The event log is the record: the run is finished with the
+        # outcome read above. Persist only once the launcher is gone, so a live launcher's own
+        # write (with the exit code) is not raced.
+        out["state"] = "finished"
+        if not launcher_alive(meta):
+            meta.update({"state": "finished", "exit": None, "ended_at": out.get("ended_event_at"),
+                         "recovered_from_event_log": True})
+            meta_path(ui).write_text(json.dumps(meta))
+            out.update({k: meta[k] for k in ("exit", "ended_at", "recovered_from_event_log")})
+    elif meta.get("state") == "running" and not launcher_alive(meta):
         meta.update({"state": "interrupted", "interrupted_detected_at": time.time()})
         meta_path(ui).write_text(json.dumps(meta))
         out.update({"state": "interrupted",
                     "error": "the run's launcher is gone (container restart or process killed) and "
                              "Conductor recorded no end; it was not resumed"})
-    if meta.get("state") == "finished" and not out["output"] and not out["error"]:
+    if meta.get("state") == "finished" and not out["output"] and not out["error"] and not out["ended"]:
         log = run_dir(ui) / "run.log"
         out["error"] = log.read_text(errors="replace")[-600:] if log.exists() else "no output"
     return out

@@ -16,7 +16,7 @@ Sources are edited (by hand or by the UI); config/generated/ is derived and neve
 generated file records the hash of the source it came from, so "saved" and "applied" can be told
 apart: a target is `applied` only when what was last applied came from the current source.
 """
-import hashlib, json, os, subprocess, sys, time, urllib.request
+import hashlib, json, os, posixpath, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,7 +61,10 @@ FSMCP_ROOT = "/ws"   # what cadp278-fsmcp serves (docker/fsmcp.Dockerfile); the 
 def validate_env(env):
     errs = []
     ws = (env.get("paths") or {}).get("workspace_root") or ""
-    if ws and not (ws == FSMCP_ROOT or ws.startswith(FSMCP_ROOT + "/")):
+    # normalise first: "/ws/../data" is /data. A non-normal spelling is rejected outright, so the
+    # value every consumer joins paths onto is the one checked here.
+    norm = posixpath.normpath(ws) if ws else ""
+    if ws and (ws.rstrip("/") != norm or not (norm == FSMCP_ROOT or norm.startswith(FSMCP_ROOT + "/"))):
         errs.append(f"environment: paths.workspace_root {ws!r} must be {FSMCP_ROOT} or below it — "
                     "the filesystem MCP server serves only that directory")
     for sect, keys in {"preloop": ["api_url", "mcp_url"], "mlflow": ["url"], "egress": ["proxy"],
@@ -251,20 +254,33 @@ def cmd_apply(dry_run=False):
         # Preloop holds ONE policy per account. "Already applied" means: the policy active on the
         # account is this file at this content — not merely that this file was applied once.
         # (A → B → A must apply A again: B replaced it.)
+        # Skipped only when the last apply of this content finished both stages (policy + scan).
         active = st.get("preloop_active") or {}
-        if active.get("policy") == pol and active.get("sha256") == src and not t.get("apply_error"):
+        if (active.get("policy") == pol and active.get("sha256") == src and active.get("scan") == "done"
+                and not t.get("apply_error")):
             results[key] = "already applied"
             continue
         if dry_run:
             results[key] = "would apply"
             continue
         t["last_attempt_at"] = now()
+        # From here until `policy apply` reports success, which policy is on the account is not
+        # known (a timeout may still have replaced it). Record that before calling, so neither an
+        # error nor a crash leaves an older policy recorded as active.
+        st["preloop_active"] = {"policy": None, "unknown_since": t["last_attempt_at"], "attempted": pol}
+        save_state(st)
+        stage = "policy"
         try:
             r = subprocess.run(["preloop", "policy", "apply", str(ROOT / pol)], capture_output=True,
                                text=True, timeout=120)
             if r.returncode:
                 raise RuntimeError((r.stderr or r.stdout).strip()[-300:])
+            # The policy is on the account now, whatever happens to the scan.
+            st["preloop_active"] = {"policy": pol, "sha256": src, "applied_at": now(), "scan": "pending"}
+            t.update({"applied_sha256": src, "applied_at": st["preloop_active"]["applied_at"]})
+            save_state(st)
             # Preloop 0.15.0 does not expose a new MCP server's tools until it is scanned.
+            stage = "scan"
             token = preloop_token()
             servers = {s["name"]: s["id"] for s in preloop_call(env, "GET", "/api/v1/mcp-servers", token)}
             scanned = []
@@ -272,14 +288,17 @@ def cmd_apply(dry_run=False):
                 if s.get("name") in servers:
                     preloop_call(env, "POST", f"/api/v1/mcp-servers/{servers[s['name']]}/scan", token)
                     scanned.append(s["name"])
-            t.update({"applied_sha256": src, "applied_at": now(), "apply_error": "", "scanned": scanned})
-            st["preloop_active"] = {"policy": pol, "sha256": src, "applied_at": t["applied_at"]}
+            st["preloop_active"].update({"scan": "done", "scanned_at": now()})
+            t.update({"apply_error": "", "scanned": scanned})
             results[key] = "applied"
         except Exception as e:
-            t["apply_error"] = f"{type(e).__name__}: {e}"[:400]
-            results[key] = "apply failed"
+            if stage == "scan":
+                st["preloop_active"]["scan"] = "failed"
+            t["apply_error"] = f"{stage} stage: {type(e).__name__}: {e}"[:400]
+            results[key] = "apply failed" if stage == "policy" else "policy applied, scan failed"
     save_state(st)
-    print(json.dumps({"ok": all(v != "apply failed" for v in results.values()), "results": results}, indent=1))
+    print(json.dumps({"ok": all(v in ("applied", "already applied", "would apply") for v in results.values()),
+                      "results": results}, indent=1))
     return 0
 
 
@@ -306,9 +325,11 @@ def cmd_status():
         if key.startswith("preloop-policy:"):
             pol = key.split(":", 1)[1]
             if t.get("apply_error"):
-                s = "apply_failed"
-            elif active.get("policy") == pol and active.get("sha256") == src:
+                s = "apply_failed"        # the error names the stage (policy / scan)
+            elif active.get("policy") == pol and active.get("sha256") == src and active.get("scan") == "done":
                 s = "applied"
+            elif not active.get("policy") and active.get("unknown_since"):
+                s = "unknown"             # an apply was interrupted; which policy is active is not known
             elif active.get("policy") and active.get("policy") != pol:
                 s = "replaced"            # another policy is active on the account now
             elif t.get("applied_sha256"):
@@ -317,7 +338,8 @@ def cmd_status():
                 s = "saved"
             rows.append({"target": key, "state": s, "applied_at": t.get("applied_at"),
                          "error": t.get("apply_error") or "", "used_by": t.get("used_by", []),
-                         "active_on_account": active.get("policy")})
+                         "active_on_account": active.get("policy") or ("unknown" if active.get("unknown_since") else None),
+                         "scan": active.get("scan") if active.get("policy") == pol else None})
         else:
             s = "applied" if t.get("source_sha256") == src else ("changed_since_apply" if t else "saved")
             rows.append({"target": key, "state": s, "applied_at": t.get("generated_at"), "error": ""})

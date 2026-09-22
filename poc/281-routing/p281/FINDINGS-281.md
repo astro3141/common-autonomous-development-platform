@@ -1299,3 +1299,21 @@ checked against the running stack. No screen features were added.
 The approval for check 4 was synthetic: one permission-check request with the adapter's own
 endpoint and token, marked `source: p281_test`, because a model under the current policy does not
 reach a human-approval tool on its own. It was declined immediately; the test script was removed.
+
+### Second review of #284 (@ 52728bc) — failure and restart boundaries (2026-09-23)
+
+The first fixes held on the normal path; the reviewer reproduced three failures at the edges, plus
+a path-spelling gap. All four reproduce on 52728bc and are fixed; `p281/review_controls.py` holds
+them as controls (real functions, temporary inputs; 12/30 pass on 52728bc, 30/30 now).
+
+| issue | cause | fix |
+|---|---|---|
+| A applied → B `policy apply` OK → B's MCP scan times out → A again: account B, answer "already applied" | the active record moved only after apply **and** scan succeeded, so a scan failure left A recorded | the account state is recorded per stage: before `policy apply` it is `unknown` (a timeout may still have replaced the policy); after it, the new policy with `scan: pending`; after the scan, `scan: done`. "Already applied" needs policy + content + `scan: done`. Results: `applied` / `policy applied, scan failed` / `apply failed`; status `unknown` when an apply was cut. A record without the scan stage (older state) is not trusted |
+| a valid reading of the selected Codex login B was dropped because A's shared-observer reading was 1 s newer | the newest source was picked first, the account compared after | sources whose account is the executing one are chosen first, newest among them; another account's reading is used only if nothing matches (the router then excludes it as before) |
+| Conductor logged the end, the launcher died before writing `finished` → `ended=true, state=running` forever | the end event only exempted the run from `interrupted` | an end in the log restores `finished` with the logged outcome (persisted once the launcher is gone, marked `recovered_from_event_log`); no end + launcher gone → `interrupted`; no resume |
+| `/ws/../data` passed `workspace_root` validation | prefix check on the raw string | the value must be a normal absolute path (`normpath` equal to itself) at or below `/ws` |
+
+Live stack afterwards: the current policy was re-applied once (its record predates the scan
+stage), then "already applied"; status `applied`; the account screen evaluates all three
+providers eligible under `cost-first`; `up.sh --check` all pass. The hub image was rebuilt for the
+`unknown` label.

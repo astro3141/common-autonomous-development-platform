@@ -154,7 +154,11 @@ except FileNotFoundError:
     pass
 if cands:
     ts = lambda c: datetime.fromisoformat((c["observed_at"] or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
-    pick = max(cands, key=ts)
+    # Sources about the executing account first, newest among them. A newer reading of another
+    # account (the shared observer follows the default login) must not displace a valid reading of
+    # the selected one; it is picked only when nothing matches, and the router then excludes it.
+    same = [c for c in cands if executing and c.get("observed_account") == executing and not c.get("error")]
+    pick = max(same or cands, key=ts)
     write("codex", {"provider": "codex", **pick, "executing_account": executing,
                     "model_route": ROUTES.get("codex", "preloop_gateway"),
                     "other_sources": [{k: c[k] for k in ("source", "observed_at")} for c in cands if c is not pick]})
