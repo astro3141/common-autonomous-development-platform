@@ -127,3 +127,50 @@ experiment: `p281-routing`.
 - Provider terms for subscription use through acpx not reviewed.
 
 Details and every measurement: `p281/FINDINGS-281.md`.
+
+---
+
+## UX track (2026-09-23) — one command up, one settings source, one screen
+
+### Bring-up and recovery
+
+```bash
+scripts/up.sh             # PoC stack → Preloop with docker/preloop.cadp.yaml → 16 checks
+scripts/up.sh --check     # checks only
+scripts/up.sh --recreate  # force-recreate every PoC and Preloop container, then check
+```
+
+`docker/preloop.cadp.yaml` attaches Preloop's api/console/gateway to the PoC networks with their
+aliases (replacing the manual `docker network connect`). All PoC containers restart on their own;
+the quota observer's loop is its container command. Measured: after `--recreate` of both
+projects, every check passes with no manual step and a task completes.
+
+### Settings (source → generated → applied)
+
+| layer | source | set when |
+|---|---|---|
+| environment | `config/environment.yaml` | install |
+| profile | `config/profiles/<name>.yaml` (providers + order, route, login, quota limits, tool policy, timeout, MLflow experiment) | creating a profile |
+| workflow | `p281/workflows/*.yaml`, `-i profile=<name>` | creating a task |
+
+```bash
+docker exec cadp278-agent /opt/venv/bin/python /work/p281/cfg.py validate|generate|apply|status
+```
+
+`config/generated/` is derived (git-ignored). `status` reports per target `saved`, `applied`,
+`changed_since_apply`, `apply_failed`. All profiles must name the same Preloop policy (Preloop
+applies one per account).
+
+### Screen and API
+
+- **UI:** <http://127.0.0.1:8780> (`cadp278-hub`, no Docker access). Accounts & state (connect /
+  reconnect a provider via its official login; device code with a copy button, or a code field for
+  Claude), settings apply, run with pre-check, live run detail with the stop reason and links.
+- **API:** `cadp278-ops` on 127.0.0.1:8781 — the only component with the Docker socket, fixed
+  routes (see `ops/server.py`). Approving stays in the Preloop console.
+
+### Approval separation — open
+
+On Preloop OSS 0.15.0 the agent's enrolment token resolves to the owner user and carries
+`decide_approvals`; the OSS API has no user or role management to issue it a credential without
+that right. The screen never approves; it links to Preloop.

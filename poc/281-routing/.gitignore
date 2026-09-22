@@ -10,3 +10,6 @@ docker/ca/*.crt
 .env
 __pycache__/
 *.pyc
+
+# derived from config/*.yaml by p281/cfg.py
+config/generated/

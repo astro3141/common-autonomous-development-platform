@@ -13,6 +13,9 @@
 name: cadp278
 
 networks:
+  # UX track: the ops API's own network (nothing else joins it; the UI will).
+  opsnet:
+    name: cadp278-opsnet
   # #281 option B: internet side of the routing layer's allowlist proxy.
   egressnet:
     name: cadp278-egressnet
@@ -65,6 +68,7 @@ services:
       dockerfile: agent.Dockerfile
     image: cadp278/governed-runtime:local
     container_name: cadp278-agent
+    restart: unless-stopped
     networks:
       - governed
     volumes:
@@ -100,6 +104,7 @@ services:
       dockerfile: mlflow.Dockerfile
     image: cadp278/mlflow:3.16.1
     container_name: cadp278-mlflow
+    restart: unless-stopped
     networks:
       - governed
       - observe
@@ -128,6 +133,7 @@ services:
       dockerfile: toolsvc.Dockerfile
     image: cadp278/toolsvc:local
     container_name: cadp278-toolsvc
+    restart: unless-stopped
     networks:
       - toolnet
     volumes:
@@ -143,6 +149,7 @@ services:
       dockerfile: fsmcp.Dockerfile
     image: cadp278/fsmcp:local
     container_name: cadp278-fsmcp
+    restart: unless-stopped
     networks:
       - toolnet
     volumes:
@@ -154,12 +161,18 @@ services:
   quota:
     image: cadp278/governed-runtime:local
     container_name: cadp278-quota
+    restart: unless-stopped
     networks:
       - quotanet
     volumes:
       - quota-home:/home/agent
       - quota-obs:/obs
-    command: ["sleep", "infinity"]
+      - type: bind
+        source: ${POC_HOST_DIR:-..}/p281/observer_loop.sh
+        target: /opt/p281/observer_loop.sh
+        read_only: true
+    # the observation loop is the container's process, so it comes back with every restart
+    command: ["sh", "/opt/p281/observer_loop.sh"]
 
   # #281 option B: the routing layer's egress — allowlisted provider hosts only.
   egress:
@@ -168,7 +181,41 @@ services:
       dockerfile: egress.Dockerfile
     image: cadp278/egress:local
     container_name: cadp278-egress
+    restart: unless-stopped
     networks:
       governed:
         aliases: [egress]
       egressnet: {}
+
+  # UX track: the only component with Docker control — a fixed set of actions over HTTP.
+  # Published on 127.0.0.1 only, which narrows who can reach it, not what it can do.
+  ops:
+    build:
+      context: ..
+      dockerfile: docker/ops.Dockerfile
+    image: cadp278/ops:local
+    container_name: cadp278-ops
+    restart: unless-stopped
+    networks:
+      - opsnet
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      OPS_AGENT_CONTAINER: cadp278-agent
+    ports:
+      - "127.0.0.1:8781:8781"
+
+  # UX track: the UI. Talks only to the ops API; holds no Docker access and no credentials.
+  hub:
+    build:
+      context: ..
+      dockerfile: docker/hub.Dockerfile
+    image: cadp278/hub:local
+    container_name: cadp278-hub
+    restart: unless-stopped
+    networks:
+      - opsnet
+    environment:
+      HUB_OPS_URL: http://cadp278-ops:8781
+    ports:
+      - "127.0.0.1:8780:8780"

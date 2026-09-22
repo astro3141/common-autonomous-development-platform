@@ -1,0 +1,33 @@
+# Execution profile — chosen by a workflow by name. Everything a model step needs besides the
+# task itself: which providers may run it and in what order, on which route and login, under
+# which quota limits and which tool policy, and where the run is recorded.
+name: research-default
+description: Default for research tasks — Claude first, then Codex, then Grok; all direct.
+
+providers:                        # order = preference
+  - name: claude
+    route: direct                 # direct: routing-layer login + allowlist egress
+    login: claude                 # a directory under paths.logins_root
+  - name: codex
+    route: direct
+    login: codex
+  - name: grok
+    route: direct
+    login: grok
+
+quota:
+  max_age_s: 1800                 # an observation older than this is "stale" → not eligible
+  require_windows: [weekly]       # a provider must report these windows to be eligible
+  max_used_percent:               # at or above → "exhausted"
+    session: 80
+    weekly: 90
+
+tools:
+  native_tools: false             # native write/shell removed; file work only via Preloop MCP
+  preloop_policy: policy/b-fsmcp.yaml   # applied to Preloop by `cfg.py apply`
+
+execution:
+  timeout_ms: 600000
+
+record:
+  mlflow_experiment: p281-routing

@@ -5,11 +5,15 @@ recorded as data. Tagged with conductor.run_id, the same attribute Conductor's o
 carry (#278 F1), so the run and its trace join on it.
 """
 import json, os, sys, time, urllib.request
+sys.path.insert(0, "/work/p281")
+import settings
 
-MLFLOW = os.environ.get("MLFLOW_URL", "http://mlflow:5000")
-EXPERIMENT = "p281-routing"
 d = json.load(sys.stdin)
 ex, ck, rt = d.get("execute"), d.get("check"), d.get("route") or {}
+_prof = settings.profile(rt.get("profile") or (ex or {}).get("profile") or "research-default") or {}
+# MLFLOW_URL still overrides (the observation-failure tests point it at a dead host)
+MLFLOW = os.environ.get("MLFLOW_URL") or settings.runtime()["mlflow"]["url"]
+EXPERIMENT = (_prof.get("record") or {}).get("mlflow_experiment", "p281-routing")
 
 def call(path, body=None, method="POST"):
     r = urllib.request.Request(MLFLOW + path, method=method,
@@ -49,7 +53,8 @@ def record():
             "model.adapter_reported": ex["model_adapter_reported"], "model.served": ex["model_served"],
             "evidence_dir": ex["evidence_dir"], "file_sha256": ck["file_sha256"],
             "route.decision": rt.get("decision", "manual"), "route.reason": rt.get("reason", "provider given as input"),
-            "route.evaluated": rt.get("evaluated", ""), "ledger_error": ex.get("ledger_error", "")}
+            "route.evaluated": rt.get("evaluated", ""), "ledger_error": ex.get("ledger_error", ""),
+            "profile": rt.get("profile") or ex.get("profile", "")}
     call("/api/2.0/mlflow/runs/log-batch", {"run_id": rid,
          "params": [{"key": "provider", "value": ex["provider"]}, {"key": "native_tools", "value": "false"}],
          "tags": [{"key": k, "value": str(v)[:5000]} for k, v in tags.items()],

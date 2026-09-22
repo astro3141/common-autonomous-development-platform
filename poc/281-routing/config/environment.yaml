@@ -1,0 +1,17 @@
+# Environment layer — set once at install time. Source of truth: edit this file (or the UI);
+# never edit anything under config/generated/, which is derived from it.
+#
+# Addresses are as seen from inside the governed agent container.
+preloop:
+  api_url: http://api:8000              # approvals, permission checks, policy API
+  mcp_url: http://console/mcp/v1        # the MCP endpoint agents call (Preloop rules decide)
+mlflow:
+  url: http://mlflow:5000
+egress:
+  proxy: http://egress:8888             # the routing layer's allowlist proxy
+  no_proxy: [console, api, gateway, mlflow, localhost, 127.0.0.1]
+paths:
+  workspace_root: /ws                   # per-run workspaces (shared with the filesystem MCP)
+  evidence_root: /work/evidence/p281    # per-run evidence written by the execution layer
+  observations: /obs                    # quota observer output (read-only in the agent)
+  logins_root: /route                   # the routing layer's own provider logins

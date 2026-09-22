@@ -25,16 +25,26 @@ import { createAgentRegistry } from "/opt/npm-global/lib/node_modules/acpx/dist/
 // with a 504 page, just before Preloop answers `timed_out` (~302 s), turning "approval expired"
 // into "control unavailable".
 // Own variable: the container already sets PRELOOP_URL=http://console for the Preloop CLI.
-const PRELOOP_URL = process.env.PRELOOP_API_URL ?? "http://api:8000";
+// Addresses and paths come from the generated settings (config/generated/runtime.json, from
+// config/environment.yaml via cfg.py); the literals are only the fallback for an unconfigured
+// checkout.
+const RT = (() => {
+  try { return JSON.parse(readFileSync("/work/config/generated/runtime.json", "utf8")); } catch { return {}; }
+})();
+const PRELOOP_URL = process.env.PRELOOP_API_URL ?? RT.preloop?.api_url ?? "http://api:8000";
+const PRELOOP_MCP_URL = RT.preloop?.mcp_url ?? `${process.env.PRELOOP_URL ?? "http://console"}/mcp/v1`;
+const LOGINS = RT.paths?.logins_root ?? "/route";
+// The login directory for a provider: the profile names it (request `login`), under LOGINS.
+let LOGIN = null;
+const loginDir = (provider) => `${LOGINS}/${LOGIN ?? provider}`;
 
 // Option B egress: the routing layer's allowlist proxy. Preloop (tools, approvals), MLflow and
 // in-network names stay direct.
-const EGRESS = {
-  HTTPS_PROXY: "http://egress:8888", HTTP_PROXY: "http://egress:8888",
-  https_proxy: "http://egress:8888", http_proxy: "http://egress:8888",
-  NO_PROXY: "console,api,gateway,mlflow,localhost,127.0.0.1",
-  no_proxy: "console,api,gateway,mlflow,localhost,127.0.0.1",
-};
+const EGRESS = (() => {
+  const proxy = RT.egress?.proxy ?? "http://egress:8888";
+  const np = (RT.egress?.no_proxy ?? ["console", "api", "gateway", "mlflow", "localhost", "127.0.0.1"]).join(",");
+  return { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, https_proxy: proxy, http_proxy: proxy, NO_PROXY: np, no_proxy: np };
+})();
 
 // ---- vendor-specific: the only place a provider is named -------------------------------
 const PROVIDERS = {
@@ -55,7 +65,7 @@ const PROVIDERS = {
     // from env() are NOT passed on this route (directReplacesEnv), so nothing points at Preloop's
     // gateway. CLAUDE_CONFIG_DIR also moves Claude's user tier (settings, .claude.json) away from
     // ~/.claude, where onboarding installed the Preloop hook and MCP entry.
-    directEnv() { return { CLAUDE_CONFIG_DIR: "/route/claude", ...EGRESS }; },
+    directEnv() { return { CLAUDE_CONFIG_DIR: loginDir("claude"), ...EGRESS }; },
     directReplacesEnv: true,
     // This principal's Preloop MCP bearer (onboarding wrote it into ~/.claude.json).
     mcpAuth() {
@@ -90,18 +100,18 @@ const PROVIDERS = {
     // /route/codex (not the Preloop-custodied one in ~/.codex); traffic leaves only through the
     // allowlist proxy. The Preloop gateway is not on this path.
     directEnv() {
-      return { CODEX_HOME: "/route/codex", ...EGRESS };
+      return { CODEX_HOME: loginDir("codex"), ...EGRESS };
     },
     // Rollouts record no account. The adapter therefore writes a ledger entry per run binding
     // Codex's session id to the login it ran as, so the quota collector can refuse a rollout
     // written under another login (A→B re-login in the same CODEX_HOME).
     accountFingerprint(direct) {
-      const home = direct ? "/route/codex" : join(homedir(), ".codex");
+      const home = direct ? loginDir("codex") : join(homedir(), ".codex");
       const tok = JSON.parse(readFileSync(join(home, "auth.json"), "utf8")).tokens?.id_token ?? "";
       const claims = JSON.parse(Buffer.from((tok.split(".")[1] ?? "").replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8") || "{}");
       return claims.email ? "email:" + createHash("sha256").update(claims.email.toLowerCase()).digest("hex").slice(0, 16) : null;
     },
-    sessionLedger: "/route/codex-session-ledger.jsonl",
+    get sessionLedger() { return `${LOGINS}/codex-session-ledger.jsonl`; },
     mcpAuth() {
       const t = readFileSync(join(homedir(), ".codex/config.toml"), "utf8");
       const m = t.match(/\[mcp_servers\.preloop\.http_headers\][^[]*?Authorization\s*=\s*'([^']+)'/);
@@ -121,7 +131,7 @@ const PROVIDERS = {
       return { CODEX_CONFIG: JSON.stringify({
         features: { shell_tool: false, unified_exec: false },
         mcp_servers: { preloop: {
-          url: `${process.env.PRELOOP_URL ?? "http://console"}/mcp/v1`,
+          url: PRELOOP_MCP_URL,
           http_headers: { Authorization: this.mcpAuth() },
           default_tools_approval_mode: "approve",
         } },
@@ -144,7 +154,7 @@ const PROVIDERS = {
     // ~/.claude.json) for compatibility. Measured: it ran the Preloop PreToolUse hook that
     // onboarding installed for Claude on every Grok tool call — each became a human approval
     // request labelled `claude_code`, and each stalled the run for the hook's 300 s timeout.
-    directEnv() { return { GROK_HOME: "/route/grok", HOME: "/route/grok/home", ...EGRESS }; },
+    directEnv() { return { GROK_HOME: loginDir("grok"), HOME: `${loginDir("grok")}/home`, ...EGRESS }; },
     directOnly: true,
     // Grok is not onboarded to Preloop, so it has no principal of its own yet; see FINDINGS.
     mcpAuth() {
@@ -244,6 +254,7 @@ async function askPreloop(req, { provider, runId, cwd, signal, log, mcpOnly }) {
 async function main() {
   const req = JSON.parse(readFileSync(process.argv[2], "utf8"));
   const prof = PROVIDERS[req.provider];
+  LOGIN = req.login ?? null;
   if (!prof) throw new Error(`unknown provider ${req.provider}`);
   const evDir = req.evidence_dir ?? `/tmp/p281/runs/${req.run_id}`;
   mkdirSync(evDir, { recursive: true });
@@ -261,7 +272,7 @@ async function main() {
   if (direct && !prof.directEnv) throw new Error(`no direct route for ${req.provider}`);
   const routeEnv = direct ? prof.directEnv() : {};
   const mcpServers = mcpOnly && !prof.mcpViaConfig ? [{
-    type: "http", name: "preloop", url: `${process.env.PRELOOP_URL ?? "http://console"}/mcp/v1`,
+    type: "http", name: "preloop", url: PRELOOP_MCP_URL,
     headers: [{ name: "Authorization", value: prof.mcpAuth() }],
   }] : undefined;
 
