@@ -1,8 +1,5 @@
 # #278 PoC — governed runtime, isolated from the host's daily Claude installation.
 #
-# #281 layout: this file sits in poc/281-routing/docker; relative bind sources resolve against
-# this directory, so /work in the agent is poc/281-routing/ in a fresh clone.
-#
 # Network design (per review):
 #   governed  : internal, NO route to the internet. The agent lives here only.
 #   provision : ordinary bridge, attached TEMPORARILY for credential minting only.
@@ -10,24 +7,24 @@
 # The Preloop containers (api / console / gateway) are attached to `governed` out of
 # band with `docker network connect`, because they are owned by the upstream release
 # compose in ~/.preloop-oss and are not redefined here.
-name: cadp278
+name: ${STACK:-cadp278}
 
 networks:
   # UX track: the ops API's own network (nothing else joins it; the UI will).
   opsnet:
-    name: cadp278-opsnet
+    name: ${STACK:-cadp278}-opsnet
   # #281 option B: internet side of the routing layer's allowlist proxy.
   egressnet:
-    name: cadp278-egressnet
+    name: ${STACK:-cadp278}-egressnet
   # #281 quota observer: ordinary bridge (egress) for the observer ONLY. The agent is never on
   # it; observations reach the agent through a read-only volume, not over the network.
   quotanet:
-    name: cadp278-quotanet
+    name: ${STACK:-cadp278}-quotanet
   governed:
-    name: cadp278-governed
+    name: ${STACK:-cadp278}-governed
     internal: true
   provision:
-    name: cadp278-provision
+    name: ${STACK:-cadp278}-provision
   # Inbound-only path for the operator's browser to reach MLflow. Measured:
   # a published port does NOT work on an `internal: true` network in this Docker
   # version (docker port reports no mapping), so MLflow is dual-homed here.
@@ -35,31 +32,31 @@ networks:
   # and no container runs a forwarder or proxy, so this does not give the agent a
   # route out. Recorded in FINDINGS.md F9.
   observe:
-    name: cadp278-observe
+    name: ${STACK:-cadp278}-observe
   # The underlying MCP tool lives here. The agent is deliberately NOT a member,
   # so the only route from the agent to the tool is through Preloop's MCP safety
   # layer. Preloop's api container is attached out of band.
   toolnet:
-    name: cadp278-toolnet
+    name: ${STACK:-cadp278}-toolnet
     internal: true
 
 volumes:
   agent-home:
-    name: cadp278-agent-home
+    name: ${STACK:-cadp278}-agent-home
   # #281 option B: the workspace the agent works in, also mounted (same path) in fsmcp so
   # file tools served over MCP act on the same files.
   ws:
-    name: cadp278-ws
+    name: ${STACK:-cadp278}-ws
   # #281 quota observer: its own credentials (a separate login lineage), and the observation
   # files it writes (mounted read-only in the agent).
   quota-home:
-    name: cadp278-quota-home
+    name: ${STACK:-cadp278}-quota-home
   # #281 option B: the routing layer's own provider logins (a lineage separate from the
   # credentials Preloop custodies), mounted in the agent at /route.
   route-creds:
-    name: cadp278-route-creds
+    name: ${STACK:-cadp278}-route-creds
   quota-obs:
-    name: cadp278-quota-obs
+    name: ${STACK:-cadp278}-quota-obs
 
 services:
   agent:
@@ -67,18 +64,18 @@ services:
       context: .
       dockerfile: agent.Dockerfile
     image: cadp278/governed-runtime:local
-    container_name: cadp278-agent
+    container_name: ${STACK:-cadp278}-agent
     restart: unless-stopped
     networks:
       - governed
     volumes:
       # The PoC workspace, shared with the host so evidence stays inspectable.
       - type: bind
-        source: ${POC_HOST_DIR:-..}
+        source: ${POC_HOST_DIR:-D:/Work/poc-278}
         target: /work
       # The #280 research workspace, kept separate from the PoC workspace.
       - type: bind
-        source: ${RESEARCH_HOST_DIR:-../evidence/research}
+        source: ${RESEARCH_HOST_DIR:-D:/Work/research-280}
         target: /research
       # Container-only HOME. The host's ~/.claude is NEVER mounted here.
       - agent-home:/home/agent
@@ -103,14 +100,14 @@ services:
       context: .
       dockerfile: mlflow.Dockerfile
     image: cadp278/mlflow:3.16.1
-    container_name: cadp278-mlflow
+    container_name: ${STACK:-cadp278}-mlflow
     restart: unless-stopped
     networks:
       - governed
       - observe
     volumes:
       - type: bind
-        source: ${POC_HOST_DIR:-..}/evidence/mlflow
+        source: ${POC_HOST_DIR:-D:/Work/poc-278}/evidence/mlflow
         target: /mlflow
     environment:
       # MLflow rejects Host headers outside localhost/private-IP by default
@@ -121,7 +118,7 @@ services:
     ports:
       # Inbound only. Publishing a port does not give any container egress,
       # so this does not weaken the N7 claim.
-      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
     command: >
       mlflow server --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
@@ -132,13 +129,13 @@ services:
       context: .
       dockerfile: toolsvc.Dockerfile
     image: cadp278/toolsvc:local
-    container_name: cadp278-toolsvc
+    container_name: ${STACK:-cadp278}-toolsvc
     restart: unless-stopped
     networks:
       - toolnet
     volumes:
       - type: bind
-        source: ${POC_HOST_DIR:-..}/evidence/n1-markers
+        source: ${POC_HOST_DIR:-D:/Work/poc-278}/evidence/n1-markers
         target: /markers
 
   # #281 option B: filesystem MCP behind Preloop. On toolnet only: the agent cannot reach it
@@ -148,7 +145,7 @@ services:
       context: .
       dockerfile: fsmcp.Dockerfile
     image: cadp278/fsmcp:local
-    container_name: cadp278-fsmcp
+    container_name: ${STACK:-cadp278}-fsmcp
     restart: unless-stopped
     networks:
       - toolnet
@@ -160,7 +157,7 @@ services:
   # agent is on; it only writes observation files into quota-obs.
   quota:
     image: cadp278/governed-runtime:local
-    container_name: cadp278-quota
+    container_name: ${STACK:-cadp278}-quota
     restart: unless-stopped
     networks:
       - quotanet
@@ -180,7 +177,7 @@ services:
       context: .
       dockerfile: egress.Dockerfile
     image: cadp278/egress:local
-    container_name: cadp278-egress
+    container_name: ${STACK:-cadp278}-egress
     restart: unless-stopped
     networks:
       governed:
@@ -194,16 +191,16 @@ services:
       context: ..
       dockerfile: docker/ops.Dockerfile
     image: cadp278/ops:local
-    container_name: cadp278-ops
+    container_name: ${STACK:-cadp278}-ops
     restart: unless-stopped
     networks:
       - opsnet
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      OPS_AGENT_CONTAINER: cadp278-agent
+      OPS_AGENT_CONTAINER: ${STACK:-cadp278}-agent
     ports:
-      - "127.0.0.1:8781:8781"
+      - "127.0.0.1:${OPS_PORT:-8781}:8781"
 
   # UX track: the UI. Talks only to the ops API; holds no Docker access and no credentials.
   hub:
@@ -211,11 +208,11 @@ services:
       context: ..
       dockerfile: docker/hub.Dockerfile
     image: cadp278/hub:local
-    container_name: cadp278-hub
+    container_name: ${STACK:-cadp278}-hub
     restart: unless-stopped
     networks:
       - opsnet
     environment:
-      HUB_OPS_URL: http://cadp278-ops:8781
+      HUB_OPS_URL: http://${STACK:-cadp278}-ops:8781
     ports:
-      - "127.0.0.1:8780:8780"
+      - "127.0.0.1:${HUB_PORT:-8780}:8780"

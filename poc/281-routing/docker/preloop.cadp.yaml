@@ -5,27 +5,37 @@
 #
 # `default` is listed explicitly because naming any network replaces a service's implicit one.
 # The PoC networks are created by compose.poc.yaml, so the PoC stack comes up first.
+#
+# STACK and the port variables default to the live instance. A restored copy runs beside it under
+# another name and other ports (scripts/restore.sh), which is how a restore is verified without
+# touching the instance in use.
 services:
   api:
     networks:
       default: {}
-      cadp278-governed:
+      ${STACK:-cadp278}-governed:
         aliases: [api]
-      cadp278-toolnet:
+      ${STACK:-cadp278}-toolnet:
         aliases: [api]
+    ports:
+      - "${PRELOOP_API_PORT:-8000}:8000"
   console:
     networks:
       default: {}
-      cadp278-governed:
+      ${STACK:-cadp278}-governed:
         aliases: [console]
+    ports:
+      - "${PRELOOP_CONSOLE_PORT:-3000}:80"
   gateway:
     networks:
       default: {}
-      cadp278-governed:
+      ${STACK:-cadp278}-governed:
         aliases: [gateway]
+    ports:
+      - "${PRELOOP_GATEWAY_PORT:-8001}:8000"
 
 networks:
-  cadp278-governed:
+  ${STACK:-cadp278}-governed:
     external: true
-  cadp278-toolnet:
+  ${STACK:-cadp278}-toolnet:
     external: true
