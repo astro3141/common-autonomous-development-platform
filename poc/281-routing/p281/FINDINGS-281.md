@@ -1022,3 +1022,40 @@ Validated: choosing a provider for a **fixed file task** from provider-reported 
 Not validated: per-task capability or allowed-model filtering, per-model quota windows
 (e.g. Claude's "Fable only" window is recorded but not used), served-model identity. This
 result does not extend to arbitrary research/development tasks or to model-level routing.
+
+---
+
+## #280 Phase R through the routing layer (option A: the model proposes and reviews, never verifies)
+
+`p281/workflows/research-r.yaml`: `route` → `stage_in` → **propose** (routed) → `normalize` →
+`manifest` → `verify_primary` (SymPy) → `verify_independent` (no CAS) → `stage_review` →
+**review** (routed, same provider) → `stage_back` → `input_verify` → `gate` → `preserve` →
+`record`. The deterministic spine is #280's `stack/steps.py` and `stack/gate.py`, unchanged.
+
+- Agents can write only through the Preloop MCP server, which serves `/ws`; #280's steps use
+  `/research/artifacts/runs/<run>`. `steps/r_stage.py` copies between them without editing;
+  `input-verify` re-hashes everything anyway.
+- `steps/agent_task.py` is the generic routed model step (prompt file, expected output file).
+- Option B (a code-execution MCP for the agent) was not built: here it would make the proposer
+  its own verifier. It belongs to exploratory tasks and needs its own sandbox design.
+
+### Results
+
+| run | route | provider / path | Gate | candidate sha256 | review | tokens (propose + review) | model-step time | Preloop gateway |
+|---|---|---|---|---|---|---|---|---|
+| default policy | `ROUTE claude` | Claude, direct | **ADMIT** | `829946630c89…` | PASS, no blocking | 70,916 + 76,936 = **147,852** | 26 s + 32 s | 0 |
+| weekly limit 50 % (claude's real 55 % excluded) | `ROUTE codex` | Codex, direct | **ADMIT** | `829946630c89…` | PASS, no blocking | 16,830 + 19,177 = **36,007** | 30 s + 33 s | 0 |
+
+- Both runs produced the **same canonical candidate as #280's direct baseline and its stacked
+  run** (`829946630c89df12af172809df9dd29df6015cb7feaa52e0aec81e872cdd633c`); both checkers
+  returned `EXACT_IDENTITY_VERIFIED`; the review is bound to that hash.
+- No human approvals, no rule denials, no Preloop gateway model requests in either run.
+- For reference, #280's stacked run (Conductor's own Claude provider, via the Preloop gateway):
+  168,966 tokens, 89 s. The same step via Codex here: ~4× fewer tokens.
+
+### Scope
+
+This is one known-answer research step whose verification is fully deterministic. It shows
+the routing path carries a research task end to end with the #280 Gate intact and with the
+provider chosen from quota. It says nothing about the model's contribution on open problems
+(#280's own conclusion), nor about tasks where the agent must compute (option B).

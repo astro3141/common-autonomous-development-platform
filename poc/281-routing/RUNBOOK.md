@@ -92,6 +92,8 @@ falls through or holds (fail closed).
 docker exec cadp278-agent sh -c 'cd /work && conductor run p281/workflows/auto.yaml'
 # fixed provider instead of the router:
 docker exec cadp278-agent sh -c 'cd /work && conductor run p281/workflows/route.yaml -i provider=codex'
+# #280 Phase R through the routing layer (option A: model proposes and reviews, never verifies):
+docker exec cadp278-agent sh -c 'cd /work && conductor run p281/workflows/research-r.yaml'   # needs /research mounted (#280 workspace)
 # router fault injection (no model):
 docker exec cadp278-agent sh -c 'python3 /work/p281/collect_obs.py /tmp/obs && python3 /work/p281/router_controls.py /tmp/obs'
 ```
