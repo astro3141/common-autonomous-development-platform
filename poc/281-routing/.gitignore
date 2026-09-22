@@ -1,0 +1,12 @@
+# Measured output and stores are never versioned; the directories are, because compose
+# bind-mounts them and a missing bind source is an error.
+evidence/**
+!evidence/*/
+!evidence/*/.gitkeep
+
+# Host-specific TLS roots (see docker/ca/README.md)
+docker/ca/*.crt
+
+.env
+__pycache__/
+*.pyc

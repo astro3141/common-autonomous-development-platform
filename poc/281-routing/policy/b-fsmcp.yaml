@@ -1,0 +1,58 @@
+# #281 option B: file tools served over MCP (cadp278-fsmcp), decided by Preloop rules.
+# Reads are allowed. Writes are allowed inside the workspace except:
+#   - anything under a .claude/ directory: the per-run project settings that remove Claude's
+#     native Write/Bash live there, so an agent must not be able to rewrite them;
+#   - any file named forbidden.txt: the rule-based deny control for this PoC.
+# Rules are evaluated by Preloop, not by the agent or the adapter.
+version: '1.0'
+metadata:
+  name: cadp278-b-fsmcp
+  description: Option B - filesystem MCP behind Preloop with path rules
+mcp_servers:
+- name: cadp278-toolsvc
+  url: http://cadp278-toolsvc:8000/mcp
+  transport: http-streaming
+  auth_type: none
+- name: cadp278-fsmcp
+  url: http://cadp278-fsmcp:8000/mcp
+  transport: http-streaming
+  auth_type: none
+tools:
+- name: write_marker
+  source: cadp278-toolsvc
+  enabled: true
+- name: list_markers
+  source: cadp278-toolsvc
+  enabled: true
+- name: write_file
+  source: cadp278-fsmcp
+  enabled: true
+  conditions:
+  - expression: "args.path.contains('/.claude') || args.path.endsWith('forbidden.txt')"
+    action: deny
+    description: no writes to agent settings or to the forbidden control file
+- name: edit_file
+  source: cadp278-fsmcp
+  enabled: true
+  conditions:
+  - expression: "args.path.contains('/.claude') || args.path.endsWith('forbidden.txt')"
+    action: deny
+    description: no edits to agent settings or to the forbidden control file
+- name: create_directory
+  source: cadp278-fsmcp
+  enabled: true
+  conditions:
+  - expression: "args.path.contains('/.claude')"
+    action: deny
+    description: no new agent-settings directories
+- name: move_file
+  source: cadp278-fsmcp
+  enabled: true
+  conditions:
+  - expression: "args.source.contains('/.claude') || args.destination.contains('/.claude') || args.destination.endsWith('forbidden.txt')"
+    action: deny
+    description: no moves into or out of agent settings, none onto the control file
+defaults:
+  unknown_tools: allow
+  require_approval_for_new_tools: false
+  inherit_from_parent: true

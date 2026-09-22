@@ -1,0 +1,113 @@
+# #281 — one Conductor workflow, provider chosen by input only.
+#
+# The workflow names no vendor. `provider` is passed through to the routing/execution layer
+# (p281/run-agent.mjs), which holds every vendor difference. Preloop governs the file write
+# (MCP rules) and MLflow records the outcome through one shared step.
+#
+#   conductor run p281/workflows/route.yaml -i provider=claude
+#   conductor run p281/workflows/route.yaml -i provider=codex
+workflow:
+  name: p281-route
+  description: Same request, same Gate, same record — provider selected by the routing layer
+  entry_point: execute
+  input:
+    provider:
+      type: string
+      description: routing choice passed to the execution layer
+    file_name:
+      type: string
+      required: false
+      default: routed.txt
+    content:
+      type: string
+      required: false
+      default: R1
+  limits:
+    max_iterations: 6
+    timeout_seconds: 900
+
+agents:
+  - name: execute
+    type: script
+    description: Run the task through the routing/execution layer (acpx + Preloop)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/execute.py", "{{ workflow.input.provider }}",
+           "{{ workflow.input.file_name }}", "{{ workflow.input.content }}"]
+    timeout: 600
+    output:
+      status: {type: string}
+      provider: {type: string}
+      model_route: {type: string}
+      run_id: {type: string}
+      workspace: {type: string}
+      target_path: {type: string}
+      model_session_reported: {type: string}
+      model_adapter_reported: {type: string}
+      model_served: {type: string}
+      measurements:
+        type: object
+        properties:
+          total_tokens: {type: number, required: false}
+          wall_ms: {type: number, required: false}
+      approvals_requested: {type: number}
+      mcp_rule_denials: {type: number}
+      retryable_elsewhere: {type: boolean}
+      evidence_dir: {type: string}
+    routes:
+      - to: check
+
+  - name: check
+    type: script
+    description: Deterministic outcome check — the file, not the agent's account of it
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/check.py", "{{ execute.output.target_path }}",
+           "{{ workflow.input.content }}", "{{ execute.output.status }}"]
+    output:
+      decision: {type: string}
+      reason: {type: string}
+      file_exists: {type: boolean}
+      content_matches: {type: boolean}
+      file_sha256: {type: string}
+    routes:
+      - to: record
+
+  - name: record
+    type: script
+    description: Record the routed execution in MLflow (shared, vendor-neutral)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'execute': execute.output, 'check': check.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: done_pass
+        when: "{{ check.output.decision == 'PASS' }}"
+      - to: done_denied
+        when: "{{ check.output.decision == 'DENIED' }}"
+      - to: done_block
+
+  - name: done_pass
+    type: terminate
+    status: success
+    reason: "PASS: {{ check.output.reason }}"
+
+  - name: done_denied
+    type: terminate
+    status: failed
+    reason: "DENIED: {{ check.output.reason }}"
+
+  - name: done_block
+    type: terminate
+    status: failed
+    reason: "BLOCK: {{ check.output.reason }}"
+
+output:
+  decision: "{{ check.output.decision }}"
+  provider: "{{ execute.output.provider }}"
+  status: "{{ execute.output.status }}"
+  model_adapter_reported: "{{ execute.output.model_adapter_reported }}"
+  model_served: "{{ execute.output.model_served }}"
+  mlflow_run_id: "{{ record.output.mlflow_run_id }}"
+  record_error: "{{ record.output.record_error }}"

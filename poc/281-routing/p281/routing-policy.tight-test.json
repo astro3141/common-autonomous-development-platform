@@ -1,0 +1,1 @@
+{"candidates":["claude","codex","grok"],"model_route":{"claude":"preloop_gateway","codex":"direct","grok":"direct"},"max_age_s":1800,"require_windows":["weekly"],"max_used_percent":{"session":80,"weekly":15}}
