@@ -1,0 +1,15 @@
+# Measured raw logs and stores are not versioned (sensitive and/or large). The directories
+# themselves are, because compose bind-mounts them and a missing bind source is an error.
+evidence/**
+!evidence/*/
+!evidence/*/.gitkeep
+
+# Host-specific TLS roots (see docker/ca/README.md)
+docker/ca/*.crt
+
+# Local environment; copy from .env.example
+.env
+
+__pycache__/
+*.pyc
+.venv/

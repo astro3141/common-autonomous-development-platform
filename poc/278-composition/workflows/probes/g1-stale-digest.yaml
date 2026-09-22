@@ -1,0 +1,80 @@
+# Gate binding probe 1 — is the artifact digest bound to the artifact at DECISION time,
+# or only to whatever the test step measured earlier?
+#
+# Model-free by construction: review and governance are injected as literals so the probe
+# isolates the binding question and nothing else.
+workflow:
+  name: g1-stale-digest
+  entry_point: test
+agents:
+  - name: test
+    type: script
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/run_tests.py"]
+    output:
+      tests_exit_code: {type: number}
+      tests_failed: {type: number}
+      artifact_sha256: {type: string}
+    routes:
+      - to: tamper
+
+  # Between measurement and decision, the artifact changes — exactly what a review agent
+  # with Edit tools could do, or any concurrent writer.
+  - name: tamper
+    type: script
+    command: sh
+    args: ["-c", "printf '\n# tampered after measurement\n' >> ${POC_DIR:-/work}/fixture/src/slugify.py; printf '{\"tampered\": true}\n'"]
+    output:
+      tampered: {type: boolean}
+    routes:
+      - to: verify_artifact
+
+  # Decision-time re-measurement (the G1 fix).
+  - name: verify_artifact
+    type: script
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/verify_artifact.py", "{{ test.output.artifact_sha256 }}"]
+    output:
+      artifact_sha256_at_decision: {type: string}
+      artifact_matches_tested: {type: boolean}
+    routes:
+      - to: collect_evidence
+
+  - name: collect_evidence
+    type: set
+    values:
+      tests: "{exit_code: {{ test.output.tests_exit_code }}, failed: {{ test.output.tests_failed }}}"
+      review: "{verdict: PASS}"
+      artifact: "{sha256: {{ test.output.artifact_sha256 }}, matches_tested: {{ verify_artifact.output.artifact_matches_tested }}}"
+      governance: "{status: APPROVED, bound_to_target: true}"
+    routes:
+      - to: gate
+
+  - name: gate
+    type: script
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/gate.py"]
+    stdin: "{{ collect_evidence.output | tojson }}"
+    output:
+      decision: {type: string}
+      reason: {type: string}
+    routes:
+      - to: preserve
+
+  - name: preserve
+    type: script
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/preserve_evidence.py"]
+    stdin: "{{ collect_evidence.output | tojson }}"
+    output:
+      preserved_dir: {type: string}
+      event_logs_copied: {type: number}
+    routes:
+      - to: $end
+
+output:
+  decision: "{{ gate.output.decision }}"
+  digest_at_measurement: "{{ test.output.artifact_sha256 }}"
+  digest_at_decision: "{{ verify_artifact.output.artifact_sha256_at_decision }}"
+  reason: "{{ gate.output.reason }}"
+  preserved: "{{ preserve.output.preserved_dir }}"

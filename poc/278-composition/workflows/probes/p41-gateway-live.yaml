@@ -1,0 +1,24 @@
+# Live proof that Conductor's model traffic traverses the Preloop Model Gateway.
+# Runs inside the governed container, whose network has no egress: a reply can only
+# have come back through the gateway.
+workflow:
+  name: p41-gateway-live
+  entry_point: ask
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      # The container's `user` tier IS the PoC tier: it holds the gateway env and the
+      # Preloop PreToolUse hook that onboarding installed. On an operator's laptop this
+      # would drag in unrelated hooks; here it is exactly the governed configuration.
+      setting_sources: [user]
+    default_model: sonnet
+agents:
+  - name: ask
+    prompt: "Reply with exactly: GATEWAY_ROUNDTRIP_OK"
+    output:
+      reply:
+        type: string
+    routes:
+      - to: $end
+output:
+  reply: "{{ ask.output.reply }}"

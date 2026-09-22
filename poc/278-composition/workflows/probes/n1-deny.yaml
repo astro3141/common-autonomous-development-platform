@@ -1,0 +1,32 @@
+# §4.2 — an LLM-driven MCP tool call routed through the Preloop safety layer.
+# Config shape is the one the issue specifies. The bearer token is injected from
+# the environment at run time and is never written into this file.
+workflow:
+  name: n1-deny
+  entry_point: use_tool
+  limits:
+    max_iterations: 6
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [user]
+    default_model: sonnet
+    mcp_servers:
+      preloop:
+        type: http
+        url: "http://console/mcp/v1"
+        headers:
+          Authorization: "Bearer ${PRELOOP_MCP_TOKEN}"
+agents:
+  - name: use_tool
+    prompt: |
+      Call the MCP tool `write_marker` with name exactly "deny-path".
+      Then call `list_markers` and report exactly what it returned.
+    output:
+      markers:
+        type: string
+        description: What list_markers returned
+    routes:
+      - to: $end
+output:
+  markers: "{{ use_tool.output.markers }}"

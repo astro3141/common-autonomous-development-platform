@@ -1,0 +1,164 @@
+# Vertical-slice workflow for issue #278, running inside the governed container.
+#
+# Conductor is the sole workflow/state/routing authority: RETRY is a route back to
+# `implement`, bounded by workflow.limits.max_iterations. The Gate owns no state.
+#
+# All four components participate:
+#   Conductor  - executes the graph, owns routing and retry
+#   Preloop    - governs the model path (gateway) and one MCP tool path
+#   MLflow     - receives the trace (observability only, never an input to the Gate)
+#   Gate       - deterministic evidence -> decision
+workflow:
+  name: n4-failed-test
+  description: Research -> Implement -> Test -> Review -> Gate composition slice
+  entry_point: research
+  limits:
+    max_iterations: 14
+    timeout_seconds: 2400
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      # In this container the `user` tier IS the PoC tier: it carries the Preloop
+      # gateway env and the PreToolUse hook that onboarding installed.
+      setting_sources: [user]
+    default_model: sonnet
+    working_dir: "${POC_DIR:-/work}/fixture"
+    mcp_servers:
+      preloop:
+        type: http
+        url: "http://console/mcp/v1"
+        headers:
+          Authorization: "Bearer ${PRELOOP_MCP_TOKEN}"
+
+agents:
+  - name: research
+    prompt: |
+      The working directory holds `src/slugify.py` and a pytest suite under `tests/`.
+      Read both. Do not edit anything and do not run the tests.
+
+      Report what the failing tests require of `slugify`.
+    output:
+      findings:
+        type: string
+    routes:
+      - to: implement
+
+  - name: implement
+    prompt: |
+      Do NOT modify any file. This run deliberately leaves the code broken.
+
+      Do exactly one thing: call the MCP tool `write_marker` with name exactly
+      "n4-{{ workflow.name }}". That is the governed action for this run.
+    output:
+      summary:
+        type: string
+    routes:
+      - to: test
+
+  - name: test
+    type: script
+    description: Deterministic test execution; emits observed evidence only
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/run_tests.py"]
+    output:
+      tests_exit_code:
+        type: number
+      tests_total:
+        type: number
+      tests_failed:
+        type: number
+      artifact_sha256:
+        type: string
+    routes:
+      - to: review
+
+  - name: review
+    prompt: |
+      Review the current `src/slugify.py` against `tests/test_slugify.py`.
+
+      Observed test evidence (deterministic, not your own claim):
+        exit_code: {{ test.output.tests_exit_code }}
+        failed:    {{ test.output.tests_failed }}
+        total:     {{ test.output.tests_total }}
+
+      Give a verdict of exactly PASS or FAIL. Your verdict is a model opinion,
+      not evidence; the Gate types it as such.
+    output:
+      verdict:
+        type: string
+      summary:
+        type: string
+    routes:
+      - to: governance
+
+  - name: governance
+    type: script
+    description: Governance facts read from Conductor's own event stream (see F16)
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/governance_probe.py"]
+    output:
+      status:
+        type: string
+      governed_calls:
+        type: number
+      denied_calls:
+        type: number
+    routes:
+      - to: collect_evidence
+
+  - name: collect_evidence
+    type: set
+    values:
+      tests: "{exit_code: {{ test.output.tests_exit_code }}, failed: {{ test.output.tests_failed }}}"
+      review: "{verdict: {{ review.output.verdict }}}"
+      artifact: "{sha256: {{ test.output.artifact_sha256 }}}"
+      governance: "{status: {{ governance.output.status }}}"
+    routes:
+      - to: gate
+
+  - name: gate
+    type: script
+    description: Deterministic evidence -> decision, a pure function
+    command: "${POC_PY:-/home/agent/venv/bin/python}"
+    args: ["${POC_DIR:-/work}/gate/gate.py"]
+    stdin: "{{ collect_evidence.output | tojson }}"
+    output:
+      decision:
+        type: string
+      reason:
+        type: string
+    routes:
+      - to: gate_pass
+        when: "decision == 'PASS'"
+      - to: gate_not_pass
+        when: "decision == 'RETRY'"
+      - to: gate_human
+        when: "decision == 'HUMAN_REQUIRED'"
+      - to: gate_block
+
+  - name: gate_pass
+    type: terminate
+    status: success
+    reason: "Gate PASS: {{ gate.output.reason }}"
+
+  - name: gate_not_pass
+    type: terminate
+    status: failed
+    reason: "N4 control — Gate did not PASS: {{ gate.output.reason }}"
+
+  - name: gate_human
+    type: terminate
+    status: failed
+    reason: "Gate HUMAN_REQUIRED: {{ gate.output.reason }}"
+
+  - name: gate_block
+    type: terminate
+    status: failed
+    reason: "Gate BLOCK: {{ gate.output.reason }}"
+
+output:
+  decision: "{{ gate.output.decision }}"
+  reason: "{{ gate.output.reason }}"
+  tests_exit_code: "{{ test.output.tests_exit_code }}"
+  governance_status: "{{ governance.output.status }}"
+  governed_calls: "{{ governance.output.governed_calls }}"

@@ -1,0 +1,35 @@
+# N7 — exercise every action path the provider offers, then read the hook log to
+# see which of them Preloop actually saw.
+workflow:
+  name: n7-bypass-inventory
+  entry_point: exercise
+  limits:
+    max_iterations: 8
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [user]
+    default_model: sonnet
+    working_dir: "${POC_DIR:-/work}/fixture"
+    mcp_servers:
+      preloop:
+        type: http
+        url: "http://console/mcp/v1"
+        headers:
+          Authorization: "Bearer ${PRELOOP_MCP_TOKEN}"
+agents:
+  - name: exercise
+    prompt: |
+      Perform these four actions, in order, using the matching tool each time:
+      1. Read the file `src/slugify.py`.
+      2. Run the shell command `echo n7-native-bash` with the Bash tool.
+      3. Write the text `n7` to a new file `n7-probe.txt` in the working directory.
+      4. Call the MCP tool `list_markers`.
+      Then report which ones succeeded.
+    output:
+      report:
+        type: string
+    routes:
+      - to: $end
+output:
+  report: "{{ exercise.output.report }}"

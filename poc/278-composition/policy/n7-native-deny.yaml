@@ -1,0 +1,28 @@
+# Corrected N7: can Preloop actually deny a NATIVE tool via the PreToolUse hook?
+version: '1.0'
+metadata:
+  name: cadp278-n7-native-deny
+  description: Deny the native Bash tool to test native-tool enforcement
+mcp_servers:
+- name: cadp278-toolsvc
+  url: http://cadp278-toolsvc:8000/mcp
+  transport: http-streaming
+  auth_type: none
+tools:
+- name: Bash
+  source: builtin
+  enabled: true
+  conditions:
+  - expression: "true"
+    action: deny
+    description: N7 control - deny every native Bash call
+- name: write_marker
+  source: cadp278-toolsvc
+  enabled: true
+- name: list_markers
+  source: cadp278-toolsvc
+  enabled: true
+defaults:
+  unknown_tools: allow
+  require_approval_for_new_tools: false
+  inherit_from_parent: true

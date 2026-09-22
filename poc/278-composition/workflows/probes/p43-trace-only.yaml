@@ -1,0 +1,16 @@
+workflow:
+  name: p43-trace-only
+  description: Model-free trace probe for the Conductor -> MLflow OTLP path
+  entry_point: emit
+agents:
+  - name: emit
+    type: script
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["-c", "import json;print(json.dumps({'ok': True}))"]
+    output:
+      ok:
+        type: boolean
+    routes:
+      - to: $end
+output:
+  ok: "{{ emit.output.ok }}"

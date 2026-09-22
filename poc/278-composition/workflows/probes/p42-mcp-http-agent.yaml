@@ -1,0 +1,17 @@
+workflow:
+  name: p42-mcp-http-agent
+  entry_point: use_tool
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-5
+    mcp_servers:
+      preloop:
+        type: http
+        url: "https://preloop.invalid/mcp/v1"
+        headers:
+          Authorization: "Bearer ${PRELOOP_API_KEY}"
+agents:
+  - name: use_tool
+    prompt: "Call one harmless tool exposed by the preloop server."
+    routes:
+      - to: $end
