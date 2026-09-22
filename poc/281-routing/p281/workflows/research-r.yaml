@@ -1,0 +1,247 @@
+# #281 × #280: the Phase R research step (Lyness invariant) through the routing layer.
+#
+# Same deterministic spine as /research/stack/phase-r-smoke.yaml — normalize, manifest, two
+# independent exact checkers, input-verify, Gate, preserve — unchanged. What changes is who runs
+# the two model steps: the router picks a provider from quota; the routing/execution layer runs it
+# (its own login, allowlist egress); the agent can write only through the Preloop MCP server.
+# The model proposes and reviews; it never verifies (option A).
+#
+#   conductor run p281/workflows/research-r.yaml
+workflow:
+  name: p281-research-r
+  description: Phase R (#280) with routed model steps; deterministic verification and Gate unchanged
+  entry_point: route
+  limits:
+    max_iterations: 24
+    timeout_seconds: 2400
+
+agents:
+  - name: route
+    type: script
+    description: Collect quota observations and choose a provider (fail closed on HOLD)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/route.py"]
+    output:
+      decision: {type: string}
+      provider: {type: string}
+      reason: {type: string}
+      evaluated: {type: string}
+      model_route: {type: string}
+      evidence_dir: {type: string}
+    routes:
+      - to: stage_in
+        when: "{{ route.output.decision == 'ROUTE' }}"
+      - to: record_hold
+
+  - name: stage_in
+    type: script
+    description: Reference fixture into the agents' workspace
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/r_stage.py", "in"]
+    routes:
+      - to: propose
+
+  # ---- model step 1: propose (routed) ----
+  - name: propose
+    type: script
+    description: Routed model step — propose a candidate as term lists
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/agent_task.py", "{{ route.output.provider }}", "{{ route.output.model_route }}",
+           "propose", "/work/p281/prompts/r-propose.md", "proposal.json"]
+    timeout: 700
+    output: &agent_out
+      status: {type: string}
+      provider: {type: string}
+      model_route: {type: string}
+      run_id: {type: string}
+      workspace: {type: string}
+      produced_path: {type: string}
+      produced: {type: boolean}
+      model_session_reported: {type: string}
+      model_adapter_reported: {type: string}
+      model_served: {type: string}
+      approvals_requested: {type: number}
+      mcp_rule_denials: {type: number}
+      retryable_elsewhere: {type: boolean}
+      evidence_dir: {type: string}
+      ledger_error: {type: string}
+      measurements:
+        type: object
+        properties:
+          total_tokens: {type: number, required: false}
+          wall_ms: {type: number, required: false}
+    routes:
+      - to: normalize
+        when: "{{ propose.output.produced }}"
+      - to: propose_failed
+
+  # ---- deterministic spine, identical to #280 Phase R ----
+  - name: normalize
+    type: script
+    description: Validate the proposal as term lists and pin it into this run's directory
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "normalize", "{{ propose.output.produced_path }}"]
+    routes:
+      - to: reject_proposal
+        when: "not ok"
+      - to: manifest
+
+  - name: manifest
+    type: script
+    description: Pin candidate, checker code and Gate rules by hash
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "manifest", "{{ normalize.output.candidate_path }}"]
+    routes:
+      - to: verify_primary
+
+  - name: verify_primary
+    type: script
+    description: Exact identity check, SymPy engine
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "verify", "primary", "{{ normalize.output.candidate_path }}"]
+    routes:
+      - to: verify_independent
+
+  - name: verify_independent
+    type: script
+    description: Exact identity check, no CAS
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "verify", "independent", "{{ normalize.output.candidate_path }}"]
+    routes:
+      - to: stage_review
+
+  - name: stage_review
+    type: script
+    description: Candidate and both verifications into the agents' workspace, for the reviewer
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/r_stage.py", "review"]
+    routes:
+      - to: review
+
+  # ---- model step 2: review (same routed provider) ----
+  - name: review
+    type: script
+    description: Routed model step — review opinion, not evidence
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/agent_task.py", "{{ route.output.provider }}", "{{ route.output.model_route }}",
+           "review", "/work/p281/prompts/r-review.md", "review.json"]
+    timeout: 700
+    output: *agent_out
+    routes:
+      - to: stage_back
+
+  - name: stage_back
+    type: script
+    description: review.json into the run directory; input-verify re-hashes and binds it
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/r_stage.py", "back"]
+    routes:
+      - to: input_verify
+
+  - name: input_verify
+    type: script
+    description: Read every required artifact back, hash it, and freeze the Gate bundle
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "input-verify"]
+    routes:
+      - to: gate
+
+  - name: gate
+    type: script
+    description: Pure function, frozen bundle in, decision out
+    command: /opt/venv/bin/python
+    args: ["/research/stack/gate.py"]
+    stdin: "{{ input_verify.output.bundle | tojson }}"
+    output:
+      decision: {type: string}
+      reason: {type: string}
+    routes:
+      - to: preserve
+
+  - name: preserve
+    type: script
+    description: Copy the run's event log next to its artifacts, on every decision path
+    command: /opt/venv/bin/python
+    args: ["/research/stack/steps.py", "preserve"]
+    routes:
+      - to: record
+
+  - name: record
+    type: script
+    description: Record the routed research run in MLflow (a record failure never changes the outcome)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'execute': propose.output, 'check': {'decision': gate.output.decision, 'reason': gate.output.reason, 'file_sha256': normalize.output.candidate_sha256}, 'route': route.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: admitted
+        when: "{{ gate.output.decision == 'ADMIT' }}"
+      - to: refuted
+        when: "{{ gate.output.decision == 'REFUTE' }}"
+      - to: blocked
+        when: "{{ gate.output.decision == 'BLOCK' }}"
+      - to: gate_held
+
+  - name: record_hold
+    type: script
+    description: Record the HOLD decision in MLflow — not starting is a result too
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'route': route.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: held
+
+  - name: admitted
+    type: terminate
+    status: success
+    reason: "ADMIT: {{ gate.output.reason }}"
+
+  - name: refuted
+    type: terminate
+    status: success
+    reason: "REFUTE (a valid research outcome): {{ gate.output.reason }}"
+
+  - name: blocked
+    type: terminate
+    status: failed
+    reason: "BLOCK: {{ gate.output.reason }}"
+
+  - name: gate_held
+    type: terminate
+    status: failed
+    reason: "Gate HOLD: {{ gate.output.reason }}"
+
+  - name: held
+    type: terminate
+    status: failed
+    reason: "Router HOLD: {{ route.output.reason }}"
+
+  - name: propose_failed
+    type: terminate
+    status: failed
+    reason: "propose produced no proposal: {{ propose.output.status }}"
+
+  - name: reject_proposal
+    type: terminate
+    status: failed
+    reason: "proposal rejected before verification: {{ normalize.output.reason }}"
+
+output:
+  route: "{{ route.output.decision }}: {{ route.output.reason }}"
+  provider: "{% if propose is defined %}{{ propose.output.provider }}{% endif %}"
+  model_route: "{% if propose is defined %}{{ propose.output.model_route }}{% endif %}"
+  decision: "{% if gate is defined %}{{ gate.output.decision }}{% endif %}"
+  reason: "{% if gate is defined %}{{ gate.output.reason }}{% endif %}"
+  candidate_sha256: "{% if normalize is defined %}{{ normalize.output.candidate_sha256 }}{% endif %}"
+  primary_status: "{% if verify_primary is defined %}{{ verify_primary.output.math_status }}{% endif %}"
+  independent_status: "{% if verify_independent is defined %}{{ verify_independent.output.math_status }}{% endif %}"
+  review_status: "{% if review is defined %}{{ review.output.status }}{% endif %}"
+  mlflow_run_id: "{% if record is defined %}{{ record.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
+  record_error: "{% if record is defined %}{{ record.output.record_error }}{% elif record_hold is defined %}{{ record_hold.output.record_error }}{% endif %}"
