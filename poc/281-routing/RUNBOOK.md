@@ -158,8 +158,9 @@ docker exec cadp278-agent /opt/venv/bin/python /work/p281/cfg.py validate|genera
 ```
 
 `config/generated/` is derived (git-ignored). `status` reports per target `saved`, `applied`,
-`changed_since_apply`, `apply_failed`. All profiles must name the same Preloop policy (Preloop
-applies one per account).
+`replaced`, `changed_since_apply`, `apply_failed`, plus the policy this tool last made active on the
+account. All profiles must name the same Preloop policy (Preloop applies one per account).
+`paths.workspace_root` must be `/ws` or below it (the filesystem MCP serves only `/ws`).
 
 ### Screen and API
 
@@ -168,6 +169,9 @@ applies one per account).
   Claude), settings apply, run with pre-check, live run detail with the stop reason and links.
 - **API:** `cadp278-ops` on 127.0.0.1:8781 — the only component with the Docker socket, fixed
   routes (see `ops/server.py`). Approving stays in the Preloop console.
+- **Runs:** each UI run lives in `evidence/ui-runs/<id>/` with its own `TMPDIR`, so Conductor's event
+  log there is exactly that run's. A run whose launcher disappeared (e.g. agent restart) is shown
+  as `interrupted` and is not resumed — start it again.
 
 ### Approval separation — open
 

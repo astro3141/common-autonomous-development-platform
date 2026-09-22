@@ -1,26 +1,47 @@
 """Start and read workflow runs for the ops API — runs inside the agent container.
 
 usage:
-  run_workflow.py start <ui-id> <workflow> <profile> [key=value ...]   (runs in the foreground; the
-                                                                     ops API starts it detached)
+  run_workflow.py start <ui-id> <workflow> <profile> [key=value ...]   (foreground; ops starts it detached)
   run_workflow.py show  <ui-id>                                       JSON view of one run
   run_workflow.py list                                                JSON list, newest first
 
-Only workflows in WORKFLOWS may be started. Arguments are passed to Conductor as an argv list,
-never through a shell. The view is read from Conductor's own event log; nothing here keeps a
-second copy of the run's progress.
+Only workflows in WORKFLOWS may be started; arguments reach Conductor as an argv list, never
+through a shell.
+
+Binding a UI run to *its* Conductor run is exact, not inferred: each run gets its own directory
+and its own TMPDIR, and Conductor writes its event log under the temp directory
+(<tmp>/conductor/conductor-<workflow>-<ts>-<run id>.events.jsonl). That directory therefore
+holds this run's event log and nothing else. The view is read from that log — no second copy
+of the run's progress is kept.
+
+A run whose launcher is gone (container restarted, process killed) without Conductor having
+recorded an end is marked `interrupted`. It is not resumed.
 """
 import glob, json, os, re, subprocess, sys, time
 from pathlib import Path
 
+sys.path.insert(0, "/work/p281")
+import settings
+
 WORKFLOWS = {"auto": "p281/workflows/auto.yaml", "research-r": "p281/workflows/research-r.yaml"}
 RUNS = Path("/work/evidence/ui-runs")
-EVENTS = Path(os.environ.get("CONDUCTOR_EVENT_DIR", "/tmp/conductor"))
 SAFE = re.compile(r"[A-Za-z0-9._\- ]{0,200}")
 
 
+def instance_id():
+    """Identifies this container instance: PID 1's start time changes on every (re)start."""
+    try:
+        return open("/proc/1/stat").read().split(")")[1].split()[19] + "@" + os.uname().nodename
+    except Exception:
+        return "unknown"
+
+
+def run_dir(ui):
+    return RUNS / ui
+
+
 def meta_path(ui):
-    return RUNS / f"{ui}.json"
+    return run_dir(ui) / "meta.json"
 
 
 def cmd_start(ui, workflow, profile, pairs):
@@ -32,45 +53,50 @@ def cmd_start(ui, workflow, profile, pairs):
         if not re.fullmatch(r"[a-z_]{1,30}", k) or not SAFE.fullmatch(v):
             print(json.dumps({"error": f"invalid input {k!r}"})); return 2
         inputs[k] = v
-    RUNS.mkdir(parents=True, exist_ok=True)
-    started = time.time()
+    d = run_dir(ui)
+    tmp = d / "tmp"
+    (tmp / "conductor").mkdir(parents=True, exist_ok=False)     # a fresh id only
     meta = {"ui_id": ui, "workflow": workflow, "profile": profile, "inputs": inputs,
-            "started_at": started, "state": "running"}
+            "started_at": time.time(), "state": "running",
+            "launcher_pid": os.getpid(), "instance": instance_id()}
     meta_path(ui).write_text(json.dumps(meta))
     argv = ["conductor", "--silent", "run", WORKFLOWS[workflow], "--no-interactive", "-i", f"profile={profile}"]
     for k, v in inputs.items():
         argv += ["-i", f"{k}={v}"]
-    with open(RUNS / f"{ui}.log", "wb") as log:
-        rc = subprocess.run(argv, cwd="/work", stdout=log, stderr=subprocess.STDOUT).returncode
+    env = {**os.environ, "TMPDIR": str(tmp), "CONDUCTOR_EVENT_DIR": str(tmp / "conductor")}
+    with open(d / "run.log", "wb") as log:
+        rc = subprocess.run(argv, cwd="/work", stdout=log, stderr=subprocess.STDOUT, env=env).returncode
     meta.update({"state": "finished", "exit": rc, "ended_at": time.time()})
     meta_path(ui).write_text(json.dumps(meta))
     return 0
 
 
-def events_for(meta):
-    """Conductor's event log for this run: the p281 workflow's file created after the start."""
-    name = {"auto": "p281-route-auto", "research-r": "p281-research-r"}[meta["workflow"]]
-    cands = [Path(p) for p in glob.glob(str(EVENTS / f"conductor-{name}-*.events.jsonl"))
-             if os.path.getmtime(p) >= meta["started_at"] - 2]
-    cands.sort(key=lambda p: p.stat().st_ctime)
-    # the earliest file started after this run began is this run's (runs are started one per id)
-    for p in cands:
-        try:
-            first = json.loads(p.open().readline())
-        except Exception:
-            continue
-        if first.get("timestamp", 0) >= meta["started_at"] - 2:
-            return p
-    return None
+def events_for(ui):
+    files = glob.glob(str(run_dir(ui) / "tmp" / "conductor" / "*.events.jsonl"))
+    return Path(files[0]) if len(files) == 1 else None    # exactly this run's log, or nothing
+
+
+def launcher_alive(meta):
+    if meta.get("instance") != instance_id():
+        return False
+    try:
+        os.kill(int(meta.get("launcher_pid", 0)), 0)
+        return True
+    except (ProcessLookupError, ValueError, PermissionError):
+        return False
 
 
 def view(meta):
+    ui = meta["ui_id"]
     out = {**meta, "steps": [], "current_step": None, "route": None, "terminated_at": None,
            "termination_reason": None, "output": None, "conductor_run": None, "error": None,
-           "mlflow": None, "workspace": None}
-    p = events_for(meta)
+           "mlflow": None, "workspace_prefix": None, "ended": False}
+    p = events_for(ui)
     if p:
-        out["conductor_run"] = p.name.split("-")[-1].split(".")[0]
+        out["conductor_run"] = p.name.rsplit("-", 1)[-1].split(".")[0]
+        # every model step of this run works under <workspace_root>/<conductor run id>… — known
+        # from the start, so a pending approval can be tied to the run while the step still waits
+        out["workspace_prefix"] = f"{settings.runtime()['paths']['workspace_root']}/{out['conductor_run']}"
         for line in p.open():
             try:
                 e = json.loads(line)
@@ -93,42 +119,46 @@ def view(meta):
                                      "error": r.get("record_error")}
                 except Exception:
                     pass
-            elif t == "script_completed" and d.get("agent_name") in ("execute", "propose"):
-                try:
-                    out["workspace"] = json.loads(d.get("stdout") or "{}").get("workspace")
-                except Exception:
-                    pass
             elif t == "agent_completed" and d.get("agent_type") == "terminate":
                 out["terminated_at"] = d.get("agent_name")
                 out["termination_reason"] = d.get("termination_reason")
             elif t == "workflow_completed":
-                out["output"] = d.get("output")
+                out["output"] = d.get("output"); out["ended"] = True
             elif t in ("workflow_failed", "agent_failed", "script_failed"):
                 # an explicit failed terminate (HOLD, BLOCK, DENIED …) carries the workflow output
-                # here; show it as the output, and keep only a genuine error as an error
                 if isinstance(d.get("output"), dict):
                     out["output"] = d["output"]
+                if t == "workflow_failed":
+                    out["ended"] = True
+                    # a failed terminate reports where and why only here
+                    out["terminated_at"] = out["terminated_at"] or d.get("terminated_by") or d.get("agent_name")
+                    out["termination_reason"] = out["termination_reason"] or d.get("termination_reason")
                 if not d.get("is_explicit"):
                     out["error"] = json.dumps(d)[:500]
-    if meta.get("state") == "finished" and not out["output"]:
-        log = RUNS / f"{meta['ui_id']}.log"
-        out["error"] = out["error"] or (log.read_text(errors="replace")[-600:] if log.exists() else "no output")
+    if meta.get("state") == "running" and not out["ended"] and not launcher_alive(meta):
+        meta.update({"state": "interrupted", "interrupted_detected_at": time.time()})
+        meta_path(ui).write_text(json.dumps(meta))
+        out.update({"state": "interrupted",
+                    "error": "the run's launcher is gone (container restart or process killed) and "
+                             "Conductor recorded no end; it was not resumed"})
+    if meta.get("state") == "finished" and not out["output"] and not out["error"]:
+        log = run_dir(ui) / "run.log"
+        out["error"] = log.read_text(errors="replace")[-600:] if log.exists() else "no output"
     return out
 
 
 def cmd_show(ui):
-    m = meta_path(ui)
-    if not m.exists():
+    if not re.fullmatch(r"[a-z0-9-]{6,40}", ui) or not meta_path(ui).exists():
         print(json.dumps({"error": "no such run"})); return 1
-    print(json.dumps(view(json.loads(m.read_text()))))
+    print(json.dumps(view(json.loads(meta_path(ui).read_text()))))
     return 0
 
 
 def cmd_list():
     rows = []
-    for m in sorted(RUNS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
-        meta = json.loads(m.read_text())
-        v = view(meta)
+    metas = sorted(RUNS.glob("*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]
+    for m in metas:
+        v = view(json.loads(m.read_text()))
         rows.append({k: v.get(k) for k in ("ui_id", "workflow", "profile", "state", "started_at", "current_step",
                                             "terminated_at", "route")} | {"decision": (v.get("output") or {}).get("decision")})
     print(json.dumps(rows))

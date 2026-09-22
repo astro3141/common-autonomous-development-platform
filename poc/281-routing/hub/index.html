@@ -112,7 +112,8 @@ async function api(path, body) {
 }
 const CONN = {connected:["연결됨","ok"], not_connected:["연결 안 됨","bad"], waiting_for_browser:["브라우저 대기","warn"],
               waiting_for_code:["코드 입력 대기","warn"], starting:["시작 중","warn"], failed:["실패","bad"]};
-const CFG = {applied:["적용됨","ok"], saved:["저장됨 (미적용)","warn"], changed_since_apply:["변경됨 — 적용 필요","warn"], apply_failed:["적용 실패","bad"]};
+const CFG = {applied:["적용됨","ok"], saved:["저장됨 (미적용)","warn"], changed_since_apply:["변경됨 — 적용 필요","warn"],
+             replaced:["다른 정책이 계정에 적용됨 — 적용 필요","warn"], apply_failed:["적용 실패","bad"]};
 const DEC = {PASS:"ok", ADMIT:"ok", COMPLETED:"ok", DENIED:"warn", REFUTE:"warn", HOLD:"bad", BLOCK:"bad", FAILED:"bad"};
 const ago = (s) => s == null ? "—" : s < 90 ? `${s}초 전` : s < 5400 ? `${Math.round(s/60)}분 전` : `${Math.round(s/3600)}시간 전`;
 
@@ -266,7 +267,8 @@ $("#start").onclick = async () => {
 async function loadRuns() {
   const rs = await api("/api/runs");
   $("#run-rows").innerHTML = (Array.isArray(rs) ? rs : []).map((r) => {
-    const st = r.state === "running" ? `<span class="warn">진행 중 · ${esc(r.current_step||"")}</span>` : `종료 · ${esc(r.terminated_at||"")}`;
+    const st = r.state === "running" ? `<span class="warn">진행 중 · ${esc(r.current_step||"")}</span>`
+             : r.state === "interrupted" ? `<span class="bad">중단됨 · ${esc(r.current_step||"")}</span>` : `종료 · ${esc(r.terminated_at||"")}`;
     const d = r.decision || (r.route && r.route.decision === "HOLD" ? "HOLD" : "");
     return `<tr style="cursor:pointer" onclick="showRun('${esc(r.ui_id)}')"><td>${new Date(r.started_at*1000).toLocaleString()}</td><td>${esc(r.workflow)}</td>
       <td>${esc(r.profile)}</td><td>${esc((r.route||{}).provider||"—")}</td><td>${st}</td><td class="${DEC[d]||""}"><b>${esc(d)}</b></td></tr>`; }).join("");
@@ -277,13 +279,14 @@ async function showRun(id) {
   const draw = async () => {
     const r = await api("/api/runs/" + id); const el = $("#run-detail"); el.classList.remove("hidden");
     const o = r.output || {}; const rt = r.route || {};
-    const waiting = r.state === "running" && r.workspace ? (await api("/api/approvals")).filter?.((a) => a.cwd && a.cwd.startsWith(r.workspace)) : [];
+    const waiting = r.state === "running" && r.workspace_prefix ? (await api("/api/approvals")).filter?.((a) => a.cwd && a.cwd.startsWith(r.workspace_prefix)) : [];
     const decision = o.decision || (rt.decision === "HOLD" ? "HOLD" : "");
     const why = rt.decision === "HOLD" ? `라우터가 실행을 보류했습니다: ${rt.reason}` :
                 waiting && waiting.length ? `Preloop 승인 대기 중 (${waiting.map((w) => w.tool + " " + (w.target||"")).join(", ")}) — Preloop 콘솔에서 승인/거절` :
+                r.state === "interrupted" ? "중단됨 — 실행이 끝나기 전에 실행기가 사라졌습니다(재시작 등). 자동 재개하지 않습니다." :
                 r.termination_reason || (r.state === "running" ? "진행 중" : "");
     const ml = r.mlflow && r.mlflow.run_id ? `<a href="http://127.0.0.1:5000/#/experiments/${esc(r.mlflow.experiment_id)}/runs/${esc(r.mlflow.run_id)}" target="_blank" rel="noopener">MLflow 기록 열기</a>` : "—";
-    el.innerHTML = `<h2>실행 ${esc(r.ui_id)} <span class="chip">${r.state === "running" ? "진행 중" : "종료"}</span></h2>
+    el.innerHTML = `<h2>실행 ${esc(r.ui_id)} <span class="chip">${r.state === "running" ? "진행 중" : r.state === "interrupted" ? "중단됨" : "종료"}</span></h2>
       <div class="steps">${(r.steps||[]).map((s, i, a) => `<span class="${r.state === "running" && i === a.length-1 ? "cur" : ""}">${esc(s.step)}</span>`).join("")}</div>
       <div class="kv" style="margin-top:12px">
         <div>판정</div><div class="${DEC[decision]||""}"><b>${esc(decision || "—")}</b></div>

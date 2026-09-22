@@ -55,9 +55,10 @@ def accounts(profile):
     # quota observations + the router's own evaluation, with this profile's policy
     obs_dir = f"/tmp/ops-obs-{secrets.token_hex(4)}"
     routes = json.dumps(routing["model_route"])
-    ev = jexec(["sh", "-c", 'P281_MODEL_ROUTES="$1" "$2" /work/p281/collect_obs.py "$3" >/dev/null 2>&1; '
+    logins = json.dumps(routing.get("login") or {})
+    ev = jexec(["sh", "-c", 'P281_MODEL_ROUTES="$1" P281_LOGINS="$5" "$2" /work/p281/collect_obs.py "$3" >/dev/null 2>&1; '
                 'printf %s "$4" > "$3/policy.json"; "$2" /work/p281/router.py "$3/policy.json" "$3"; rm -rf "$3"',
-                "sh", routes, PY, obs_dir, json.dumps(routing)], timeout=180)
+                "sh", routes, PY, obs_dir, json.dumps(routing), logins], timeout=180)
     evaluated = {e["provider"]: e for e in (ev.get("evaluated") or [])}
     rows = []
     for name in routing["candidates"]:

@@ -1281,3 +1281,21 @@ Operator feedback, applied: a **copy button** next to the device code (Codex, Gr
 box now redraws only when the URL or code changes, so the "복사됨" confirmation or a manual
 selection is not wiped by the 2 s poll. Verified in the browser with a throwaway login name
 (button present → click → "복사됨" → still present after polls), then cancelled and cleaned up.
+
+## UX track — review fixes before merging #284 (2026-09-23)
+
+Review of #284 @ 615c470: "basic UX demo succeeded, fix before merge". Six issues, all fixed and
+checked against the running stack. No screen features were added.
+
+| # | issue | fix | checked |
+|---|---|---|---|
+| 1 | quota was read for the default login, not the profile's selected login (all three providers) | `route.py` passes the profile's logins (`P281_LOGINS`); `collect_obs.py` reads each provider's quota, identity and ledger from that login's directory | profile naming `codex-b`, `grok-b`, `claude-b`: each read from its own directory; a login with no credentials is excluded and the router falls through; `research-default` unchanged |
+| 2 | policy A→B→A showed A "applied" while B stayed on the account | `generate` drops policy targets no profile references; `apply` only applies referenced policies and records `preloop_active` (policy + hash); status says `applied` / `replaced` / `changed_since_apply` / `saved` / `apply_failed` with the policy actually active on the account | real Preloop: A→B→A ends on A; re-applying A reports "already applied" |
+| 3 | a UI run was bound to its Conductor run by start time | each UI run has its own directory and `TMPDIR`; Conductor writes its event log under it, so the directory holds exactly that run's log; the view reads the Conductor run id from it | two runs started 1 s apart: PASS (`7f7e0fa0`) and DENIED (`552e1957`), each with its own result and MLflow run; a failed terminate now also fills where/why |
+| 4 | a pending approval was not visible while a model step waited | the view gives `workspace_prefix` = `<workspace_root>/<conductor run id>` from the start; the screen matches pending approvals against it | `research-r` run `20260922-163951-6d6bb6`: during `propose`, run detail showed "Preloop 승인 대기 중 (Write /ws/e13fe17b-codex/synthetic.txt)"; the request was declined |
+| 5 | runs cut by a restart stayed "running" forever | meta records launcher pid + container instance (PID 1 start time); a running run whose launcher is gone and whose log has no end becomes `interrupted` — not resumed | same run: `docker restart cadp278-agent` during `propose` → `interrupted`, screen "중단됨"; `up.sh --check` all pass after |
+| 6 | `r_stage` ignored `workspace_root` (fixed `/ws`) | `r_stage` reads the setting; `validate` rejects any root outside `/ws` (the only directory the filesystem MCP serves) | `workspace_root: /ws/alt` → `research-r` ADMIT, every file incl. the model's MCP writes under `/ws/alt/189cd1a8`, candidate `829946630c89…`; `/data` rejected by validate; restored to `/ws` |
+
+The approval for check 4 was synthetic: one permission-check request with the adapter's own
+endpoint and token, marked `source: p281_test`, because a model under the current policy does not
+reach a human-approval tool on its own. It was declined immediately; the test script was removed.

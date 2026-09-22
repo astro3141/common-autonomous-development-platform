@@ -27,7 +27,8 @@ else:
     json.dump(pol, open(policy_path, "w"), indent=1)
 routes = pol.get("model_route", {})
 subprocess.run([sys.executable, f"{here}/collect_obs.py", f"{d}/obs"], check=True, capture_output=True,
-               env={**os.environ, "P281_MODEL_ROUTES": json.dumps(routes)})
+               env={**os.environ, "P281_MODEL_ROUTES": json.dumps(routes),
+                    "P281_LOGINS": json.dumps(pol.get("login") or {})})
 r = json.loads(subprocess.run([sys.executable, f"{here}/router.py", policy_path, f"{d}/obs"],
                               check=True, capture_output=True, text=True).stdout)
 json.dump(r, open(f"{d}/decision.json", "w"), indent=1)

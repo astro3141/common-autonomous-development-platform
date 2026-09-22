@@ -55,8 +55,15 @@ def sources():
 
 
 # ---------------------------------------------------------------------------- validate
+FSMCP_ROOT = "/ws"   # what cadp278-fsmcp serves (docker/fsmcp.Dockerfile); the agents can write only there
+
+
 def validate_env(env):
     errs = []
+    ws = (env.get("paths") or {}).get("workspace_root") or ""
+    if ws and not (ws == FSMCP_ROOT or ws.startswith(FSMCP_ROOT + "/")):
+        errs.append(f"environment: paths.workspace_root {ws!r} must be {FSMCP_ROOT} or below it — "
+                    "the filesystem MCP server serves only that directory")
     for sect, keys in {"preloop": ["api_url", "mcp_url"], "mlflow": ["url"], "egress": ["proxy"],
                        "paths": ["workspace_root", "evidence_root", "observations", "logins_root"]}.items():
         for k in keys:
@@ -177,6 +184,7 @@ def cmd_generate(quiet=False):
     g = write_generated(GEN / "runtime.json", env, env_sha)
     st["targets"]["runtime"] = {"kind": "generated", "source": str(env_p.relative_to(ROOT)),
                                 "source_sha256": env_sha, "generated_sha256": g, "generated_at": now()}
+    referenced = {}
     for pp in profs:
         raw = pp.read_bytes(); p = yaml.safe_load(raw); src = sha_bytes(raw)
         routing = {
@@ -198,9 +206,14 @@ def cmd_generate(quiet=False):
             key = f"preloop-policy:{pol}"
             t = st["targets"].setdefault(key, {"kind": "applied", "source": pol})
             t["source_sha256"] = sha_bytes((ROOT / pol).read_bytes())
-            t.setdefault("used_by", [])
-            if pp.stem not in t["used_by"]:
-                t["used_by"].append(pp.stem)
+            referenced.setdefault(key, []).append(pp.stem)
+    # used_by is recomputed from the current profiles; a policy no profile names any more is
+    # dropped from the targets, so `apply` can never re-apply it (A → B → A must end on A)
+    for key in [k for k in st["targets"] if k.startswith("preloop-policy:")]:
+        if key in referenced:
+            st["targets"][key]["used_by"] = referenced[key]
+        else:
+            del st["targets"][key]
     save_state(st)
     if not quiet:
         print(json.dumps({"ok": True, "generated": sorted(k for k, v in st["targets"].items() if v["kind"] == "generated")}, indent=1))
@@ -231,11 +244,15 @@ def cmd_apply(dry_run=False):
     env = load_yaml(CFG / "environment.yaml")
     results = {}
     for key, t in st["targets"].items():
-        if t.get("kind") != "applied" or not key.startswith("preloop-policy:"):
+        if t.get("kind") != "applied" or not key.startswith("preloop-policy:") or not t.get("used_by"):
             continue
         pol = t["source"]
         src = sha_bytes((ROOT / pol).read_bytes())
-        if t.get("applied_sha256") == src and not t.get("apply_error"):
+        # Preloop holds ONE policy per account. "Already applied" means: the policy active on the
+        # account is this file at this content — not merely that this file was applied once.
+        # (A → B → A must apply A again: B replaced it.)
+        active = st.get("preloop_active") or {}
+        if active.get("policy") == pol and active.get("sha256") == src and not t.get("apply_error"):
             results[key] = "already applied"
             continue
         if dry_run:
@@ -256,6 +273,7 @@ def cmd_apply(dry_run=False):
                     preloop_call(env, "POST", f"/api/v1/mcp-servers/{servers[s['name']]}/scan", token)
                     scanned.append(s["name"])
             t.update({"applied_sha256": src, "applied_at": now(), "apply_error": "", "scanned": scanned})
+            st["preloop_active"] = {"policy": pol, "sha256": src, "applied_at": t["applied_at"]}
             results[key] = "applied"
         except Exception as e:
             t["apply_error"] = f"{type(e).__name__}: {e}"[:400]
@@ -273,6 +291,7 @@ def cmd_status():
     their next run). An applied target is in effect only when the last successful apply came from
     the current source."""
     st = load_state()
+    active = st.get("preloop_active") or {}
     v = cmd_validate(quiet=True)
     env_p, profs = sources()
     rows = []
@@ -285,16 +304,20 @@ def cmd_status():
     for key, src in sorted(cur.items()):
         t = st["targets"].get(key, {})
         if key.startswith("preloop-policy:"):
+            pol = key.split(":", 1)[1]
             if t.get("apply_error"):
                 s = "apply_failed"
-            elif t.get("applied_sha256") == src:
+            elif active.get("policy") == pol and active.get("sha256") == src:
                 s = "applied"
+            elif active.get("policy") and active.get("policy") != pol:
+                s = "replaced"            # another policy is active on the account now
             elif t.get("applied_sha256"):
                 s = "changed_since_apply"
             else:
                 s = "saved"
             rows.append({"target": key, "state": s, "applied_at": t.get("applied_at"),
-                         "error": t.get("apply_error") or "", "used_by": t.get("used_by", [])})
+                         "error": t.get("apply_error") or "", "used_by": t.get("used_by", []),
+                         "active_on_account": active.get("policy")})
         else:
             s = "applied" if t.get("source_sha256") == src else ("changed_since_apply" if t else "saved")
             rows.append({"target": key, "state": s, "applied_at": t.get("generated_at"), "error": ""})

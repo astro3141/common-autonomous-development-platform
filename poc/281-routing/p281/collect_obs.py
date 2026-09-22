@@ -43,10 +43,14 @@ def iso_from_epoch(v):
 # Which model route each provider will execute on (policy "model_route"); it decides whose
 # login is the executing account.
 ROUTES = json.loads(os.environ.get("P281_MODEL_ROUTES", "{}"))
+# Which login each provider executes as (policy "login"). The collector must read quota from the
+# SAME login the execution layer will use — otherwise account A's quota could admit a run as B.
+LOGIN_NAMES = json.loads(os.environ.get("P281_LOGINS", "{}"))
+login_dir = lambda provider: f"{LOGINS}/{LOGIN_NAMES.get(provider, provider)}"
 
 
 # ---- codex ------------------------------------------------------------------------------
-CODEX_HOME = f"{LOGINS}/codex" if ROUTES.get("codex") == "direct" else os.path.expanduser("~/.codex")
+CODEX_HOME = login_dir("codex") if ROUTES.get("codex") == "direct" else os.path.expanduser("~/.codex")
 
 
 def codex_email_fp(home):
@@ -163,9 +167,11 @@ if cands:
 if ROUTES.get("grok") == "direct":
     import subprocess
     try:
+        if not os.path.isfile(f"{login_dir('grok')}/auth.json"):
+            raise FileNotFoundError(f"no Grok login at {login_dir('grok')}")
         p = subprocess.run(["codexbar", "usage", "--provider", "grok", "--json"], capture_output=True,
-                           text=True, timeout=60, env={**os.environ, "HOME": f"{LOGINS}/grok/home",
-                           "GROK_HOME": f"{LOGINS}/grok", **EGRESS})
+                           text=True, timeout=60, env={**os.environ, "HOME": f"{login_dir('grok')}/home",
+                           "GROK_HOME": login_dir("grok"), **EGRESS})
         item = next((x for x in json.loads(p.stdout or "[]") if x.get("provider") == "grok"), None)
         u = (item or {}).get("usage") or {}
         wins = {}
@@ -193,7 +199,7 @@ def codexbar_claude_direct():
     import subprocess
     p = subprocess.run(["codexbar", "usage", "--provider", "claude", "--source", "oauth", "--json"],
                        capture_output=True, text=True, timeout=60,
-                       env={**os.environ, "CLAUDE_CONFIG_DIR": f"{LOGINS}/claude", **EGRESS})
+                       env={**os.environ, "CLAUDE_CONFIG_DIR": login_dir("claude"), **EGRESS})
     item = next((x for x in json.loads(p.stdout or "[]") if x.get("provider") == "claude"), None)
     u = (item or {}).get("usage") or {}
     wins = {}
@@ -202,7 +208,7 @@ def codexbar_claude_direct():
         if w and w.get("usedPercent") is not None:
             wins[window_name(w.get("windowMinutes"))] = {"used_percent": w["usedPercent"],
                 "resets_at": w.get("resetsAt"), "window_minutes": w.get("windowMinutes")}
-    ident = "route-login:claude:" + (json.load(open(f"{LOGINS}/claude/.claude.json")).get("oauthAccount") or {}).get("organizationUuid", "unknown")
+    ident = "route-login:claude:" + (json.load(open(f"{login_dir('claude')}/.claude.json")).get("oauthAccount") or {}).get("organizationUuid", "unknown")
     return {"provider": "claude", "source": f"codexbar:{(item or {}).get('source')}",
             "observed_at": u.get("updatedAt"), "observed_account": ident if item else None,
             "executing_account": ident, "identity_basis": "same-credential", "model_route": "direct",
