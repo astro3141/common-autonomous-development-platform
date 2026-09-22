@@ -1093,3 +1093,227 @@ failure; the observation failure is visible, not silent.
 Test policies updated to route all three providers directly (the strict one still referenced
 Claude's old gateway route; it made no difference to the HOLD, since all candidates were over the
 limit or stale).
+
+---
+
+## UX track, step 1 — minimal run base (2026-09-22)
+
+Completion criterion (agreed): after **recreating** the containers, networks, the observer and
+the logins come back with no manual step, and a small task succeeds.
+
+What changed:
+
+- `docker/preloop.cadp.yaml`: an extra compose file on top of the upstream Preloop install that
+  attaches `api` / `console` / `gateway` to `cadp278-governed` (and `api` to `cadp278-toolnet`)
+  with the aliases the agent resolves. Replaces the out-of-band `docker network connect`, which
+  was lost on every Preloop restart. (`default` is listed explicitly — naming any network
+  replaces a service's implicit one.)
+- `restart: unless-stopped` on all six PoC containers (there was none).
+- The quota observer's loop is now the `quota` container's command (script bind-mounted
+  read-only), so it restarts with the container.
+- The image pre-creates `/ws`, `/obs`, `/route` agent-owned, so fresh volumes need no `chown`.
+- `scripts/up.sh`: brings up the PoC stack, then Preloop with the override, then runs 13 checks
+  (isolation ×3, services ×5, routing-layer and observer logins ×4, observation freshness).
+  `--check` only checks; `--recreate` forces recreation of every container in both projects.
+  (Windows note: docker needs native paths; the script converts with `cygpath -m`.)
+
+Measured:
+
+| state | checks | small task (`auto.yaml`) |
+|---|---|---|
+| before (running stack) | 13 / 13 | — |
+| after `up.sh --recreate` (image rebuilt; every PoC **and** Preloop container recreated) | **13 / 13**, no manual step | `ROUTE claude` → direct → Gate `PASS` → MLflow, `record_error` empty |
+
+Preloop's recreated `api` / `console` / `gateway` carry the PoC networks and aliases from the
+override; the observer wrote a fresh observation seconds after its recreate.
+
+Not covered: a Docker Desktop restart (the stale-socket failure seen earlier is a Docker
+Desktop issue outside the stack; its workaround is in the RUNBOOK).
+
+## UX track, step 2 — settings model (2026-09-22)
+
+Goal: settings are not repeated per solution × per workflow. Three layers, one source of truth,
+generated settings kept apart, and a visible difference between *saved*, *applied* and *apply
+failed*.
+
+| layer | file (source, edited by hand or UI) | holds |
+|---|---|---|
+| environment | `config/environment.yaml` | Preloop api / MCP addresses, MLflow address, egress proxy + no_proxy, workspace / evidence / observation / login roots |
+| profile | `config/profiles/<name>.yaml` | providers in preference order, each with route and login; quota limits; tool policy (native tools, Preloop policy file); execution timeout; MLflow experiment |
+| workflow | `p281/workflows/*.yaml` | steps, and one input: `-i profile=<name>` (default `research-default`) |
+
+`p281/cfg.py` (PyYAML 6.0.2 added to the image's venv):
+
+- `validate` — known providers, route supported by that provider (Grok: direct only), numbers
+  in range, login present (warning if not), policy file exists; and **all profiles must name the
+  same Preloop policy**, because Preloop 0.15.0 applies one policy per account (two different
+  ones would overwrite each other on apply).
+- `generate` — `config/generated/runtime.json` and `config/generated/profiles/<name>.json`,
+  each stamped with the sha256 of the source it came from and "edit config/*.yaml instead".
+  `config/generated/` is git-ignored (derived).
+- `apply` — what lives in another solution: `preloop policy apply` + the MCP scan Preloop needs
+  before new tools are visible. Records `applied_sha256` / `applied_at` / `apply_error`.
+- `status` — per target: `saved`, `applied`, `changed_since_apply`, `apply_failed` (+ error).
+
+Consumers now read the generated settings, with the old literals only as fallback:
+`run-agent.mjs` (Preloop addresses, egress, login root + the profile's login name),
+`collect_obs.py`, `steps/route.py` (the profile's routing policy; `ROUTING_POLICY` still
+overrides for tests), `steps/execute.py` / `steps/agent_task.py` (timeout, native-tools flag,
+workspace and evidence roots, login), `steps/record.py` (MLflow address, the profile's
+experiment; `MLFLOW_URL` still overrides for failure tests).
+
+Profiles shipped: `research-default` (claude → codex → grok, as before) and `cost-first`
+(codex → grok → claude).
+
+Measured:
+
+| check | result |
+|---|---|
+| validate → generate → apply | 4 targets `applied` (runtime, two profiles, the Preloop policy — applied and scanned) |
+| edit a profile, no regenerate | that profile `changed_since_apply`; others unchanged |
+| regenerate | back to `applied` |
+| temporary profile naming a malformed Preloop policy, apply | that policy `apply_failed` with Preloop's validation error; the real policy stays `applied` |
+| two profiles naming different Preloop policies | `validate` fails with the conflict named |
+| `auto.yaml -i profile=cost-first` | `ROUTE codex` → PASS → MLflow (tagged `profile=cost-first`) |
+| `auto.yaml -i profile=no-such-profile` | HOLD "unknown profile" — no guessing — recorded in MLflow |
+| `research-r.yaml -i profile=cost-first` | `ROUTE codex` → **ADMIT**, candidate `829946630c89…`; the request carried the profile's login, timeout and native-tools setting |
+
+Limitation: `applied` for the Preloop policy is what *this tool* last applied. A policy applied
+to Preloop by other means is not detected (no drift check against Preloop's current policy).
+
+## UX track — approval separation, checked against Preloop 0.15.0 (2026-09-22)
+
+Completion condition (agreed): the operator *can* approve and the agent's credential *cannot*,
+measured. Result: **not achievable on Preloop OSS 0.15.0; kept open.**
+
+- The agent's enrolment token (`agt_…`) is an API key. `get_current_user` resolves an API key to
+  its owner **user**; `approve_request` is guarded by `require_permission("decide_approvals")`
+  on that user; `has_permission` is role-based. The key was issued by the account owner, so it
+  carries the owner role's `decide_approvals`. (`ApiKey.scopes` exists in the model but is not
+  checked on authentication.)
+- Roles without `decide_approvals` exist (`analyst`, `viewer`, `tracker_manager`), so a
+  dedicated agent user with such a role would separate the two. But the OSS API has **no user
+  creation, invitation or role-assignment endpoint** (only `GET /api/v1/roles` and
+  `/auth/users/me`); registration is closed after the first user. Only an unsupported database
+  edit could create one — not done.
+- Consequence for the design: approval actions will be issued only with an operator credential
+  held **outside** the agent container (the ops side), so the gap closes as soon as Preloop can
+  issue the agent a credential without approval rights.
+
+## UX track, step 3 — login and run API with a Docker-operation boundary (2026-09-22)
+
+- `cadp278-ops` (`docker/ops.Dockerfile`: `docker:27.5.1-cli` + Python stdlib; `ops/server.py`):
+  the **only** component with the Docker socket. A fixed route table; every route is one
+  predetermined `docker exec` into the agent with an argv list (no shell) and validated
+  arguments (provider allowlist, `[a-z0-9-]` names, workflow allowlist, input charset). Published
+  on `127.0.0.1:8781` — which limits who reaches it, not what it can do. Request bodies (which
+  carry authorization codes) are never logged. The UI will call only this API.
+- `p281/login_helper.py` (agent side): runs the provider's official login CLI under a
+  pseudo-terminal, through the allowlist proxy, into `<logins_root>/<login>`; parses the official
+  URL and device code; hands a pasted code to the CLI through a FIFO (never on disk, never
+  logged); reports `starting` / `waiting_for_browser` / `waiting_for_code` / `connected` /
+  `failed` plus the account state. umask 077.
+- `p281/run_workflow.py` (agent side): starts an allowlisted workflow with a profile and inputs as
+  an argv list; the run view is read from Conductor's own event log (steps, current step, the
+  router's decision, termination step and reason, final output) — no second copy of progress.
+
+Measured through the API:
+
+| call | result |
+|---|---|
+| `GET /api/profiles`, `/api/config/status`, `POST /api/config/apply` | profiles listed; four targets `applied`; apply → "already applied" |
+| `GET /api/accounts?profile=research-default` | per provider: `connected`, account match true, age, weekly/session use, identity basis; router decision `ROUTE claude` |
+| login start / status / cancel (test login name) | Codex: official device URL + code, `waiting_for_browser`; earlier direct test of the helper: Grok URL + code, Claude URL + `waiting_for_code` |
+| invalid login name (`../etc`), invalid workflow (`rm -rf`) | rejected (400) |
+| `POST /api/runs {auto, cost-first}` then poll `GET /api/runs/<id>` | steps `route → execute → check → record → done_pass`; route `codex`/direct/`cost-first`; `PASS`; `record_error` empty |
+| ops log | method + path only; no code-like strings |
+
+Not yet exercised: a real account connection completed through the API (needs the operator);
+planned through the UI in step 4.
+
+## UX track, step 4 — one screen from account to result (2026-09-22)
+
+`cadp278-hub` (`docker/hub.Dockerfile`, `hub/server.py`, `hub/index.html`): serves one page and
+forwards `/api/*` to the ops API. **No mounts, no Docker access, no credentials** (checked by
+`up.sh`). Published on `127.0.0.1:8780`. The page reads state from the owning systems via ops and
+hands actions to them; it keeps none of its own.
+
+Screens (Korean):
+
+- **계정·상태** — for the selected profile: each provider's connection state, route and plan;
+  whether the executing account equals the observed account (and on what basis); weekly / 5 h
+  use ("보고 안 됨" when the provider does not report a window); observation age; usable now or
+  why not; the router's current choice. "계정 연결 / 재연결" starts the provider's official
+  login: the device URL and code for Codex / Grok, a code field for Claude; polled until
+  `connected`. Settings targets with 적용됨 / 저장됨 (미적용) / 변경됨 — 적용 필요 / 적용 실패 and an
+  apply button. Pending Preloop approvals (read-only; expired ones hidden), with the Preloop
+  console link — approving stays in Preloop.
+- **워크플로 실행** — template (`auto`, `research-r`), inputs, profile; **실행 전 검사** (settings
+  valid, all applied, predicted provider or HOLD) gates the run button.
+- **실행 기록 / 상세** — steps as they happen, current step, chosen provider and why, the reason it
+  stopped (router HOLD with each provider's reason; "Preloop 승인 대기" with the pending tool and
+  target when a run's workspace has a pending approval), decision, output, record error, links to
+  the MLflow run and the Preloop console, Conductor run id.
+
+Measured in the browser (built-in browser pane):
+
+| action | shown |
+|---|---|
+| open the page | 3 providers connected, accounts match, quota + age, usable; config 4 × 적용됨 |
+| profile `cost-first`, template `research-r`, 실행 전 검사 | 설정 유효 · 모두 적용됨 · 예상 제공자 codex |
+| 실행 | live steps `route → stage_in → propose → … → review → … → admitted`; then **ADMIT**, reason, `codex direct`, candidate `829946630c89…`, MLflow link |
+| a run under a temporary profile with every limit at 1 % (via API, viewed in the UI) | **HOLD**, "라우터가 실행을 보류했습니다: codex … 26.0% ≥ 1%; grok … 2% ≥ 1%; claude … 60% ≥ 1%", `route → record_hold → held`, MLflow link |
+
+Fixed on the way: an explicitly failed terminate (HOLD/BLOCK/DENIED) carries the workflow output
+in Conductor's `workflow_failed` event; the view now shows it as output, not as an error.
+
+Not yet done against the first UX completion criterion: **an account connection completed by the
+operator through this screen** (every login so far was made before the screen existed).
+
+### First UX completion criterion — met (2026-09-23)
+
+The operator reconnected **all three** providers through the screen (no container access):
+Claude with the pasted code, Codex and Grok with device codes. Afterwards: every login `exit 0`,
+no FIFO left, all `connected`, executing = observed account for each, Codex still the same
+account (email fingerprint unchanged), `up.sh --check` all passed.
+
+Operator feedback, applied: a **copy button** next to the device code (Codex, Grok). The login
+box now redraws only when the URL or code changes, so the "복사됨" confirmation or a manual
+selection is not wiped by the 2 s poll. Verified in the browser with a throwaway login name
+(button present → click → "복사됨" → still present after polls), then cancelled and cleaned up.
+
+## UX track — review fixes before merging #284 (2026-09-23)
+
+Review of #284 @ 615c470: "basic UX demo succeeded, fix before merge". Six issues, all fixed and
+checked against the running stack. No screen features were added.
+
+| # | issue | fix | checked |
+|---|---|---|---|
+| 1 | quota was read for the default login, not the profile's selected login (all three providers) | `route.py` passes the profile's logins (`P281_LOGINS`); `collect_obs.py` reads each provider's quota, identity and ledger from that login's directory | profile naming `codex-b`, `grok-b`, `claude-b`: each read from its own directory; a login with no credentials is excluded and the router falls through; `research-default` unchanged |
+| 2 | policy A→B→A showed A "applied" while B stayed on the account | `generate` drops policy targets no profile references; `apply` only applies referenced policies and records `preloop_active` (policy + hash); status says `applied` / `replaced` / `changed_since_apply` / `saved` / `apply_failed` with the policy actually active on the account | real Preloop: A→B→A ends on A; re-applying A reports "already applied" |
+| 3 | a UI run was bound to its Conductor run by start time | each UI run has its own directory and `TMPDIR`; Conductor writes its event log under it, so the directory holds exactly that run's log; the view reads the Conductor run id from it | two runs started 1 s apart: PASS (`7f7e0fa0`) and DENIED (`552e1957`), each with its own result and MLflow run; a failed terminate now also fills where/why |
+| 4 | a pending approval was not visible while a model step waited | the view gives `workspace_prefix` = `<workspace_root>/<conductor run id>` from the start; the screen matches pending approvals against it | `research-r` run `20260922-163951-6d6bb6`: during `propose`, run detail showed "Preloop 승인 대기 중 (Write /ws/e13fe17b-codex/synthetic.txt)"; the request was declined |
+| 5 | runs cut by a restart stayed "running" forever | meta records launcher pid + container instance (PID 1 start time); a running run whose launcher is gone and whose log has no end becomes `interrupted` — not resumed | same run: `docker restart cadp278-agent` during `propose` → `interrupted`, screen "중단됨"; `up.sh --check` all pass after |
+| 6 | `r_stage` ignored `workspace_root` (fixed `/ws`) | `r_stage` reads the setting; `validate` rejects any root outside `/ws` (the only directory the filesystem MCP serves) | `workspace_root: /ws/alt` → `research-r` ADMIT, every file incl. the model's MCP writes under `/ws/alt/189cd1a8`, candidate `829946630c89…`; `/data` rejected by validate; restored to `/ws` |
+
+The approval for check 4 was synthetic: one permission-check request with the adapter's own
+endpoint and token, marked `source: p281_test`, because a model under the current policy does not
+reach a human-approval tool on its own. It was declined immediately; the test script was removed.
+
+### Second review of #284 (@ 52728bc) — failure and restart boundaries (2026-09-23)
+
+The first fixes held on the normal path; the reviewer reproduced three failures at the edges, plus
+a path-spelling gap. All four reproduce on 52728bc and are fixed; `p281/review_controls.py` holds
+them as controls (real functions, temporary inputs; 12/30 pass on 52728bc, 30/30 now).
+
+| issue | cause | fix |
+|---|---|---|
+| A applied → B `policy apply` OK → B's MCP scan times out → A again: account B, answer "already applied" | the active record moved only after apply **and** scan succeeded, so a scan failure left A recorded | the account state is recorded per stage: before `policy apply` it is `unknown` (a timeout may still have replaced the policy); after it, the new policy with `scan: pending`; after the scan, `scan: done`. "Already applied" needs policy + content + `scan: done`. Results: `applied` / `policy applied, scan failed` / `apply failed`; status `unknown` when an apply was cut. A record without the scan stage (older state) is not trusted |
+| a valid reading of the selected Codex login B was dropped because A's shared-observer reading was 1 s newer | the newest source was picked first, the account compared after | sources whose account is the executing one are chosen first, newest among them; another account's reading is used only if nothing matches (the router then excludes it as before) |
+| Conductor logged the end, the launcher died before writing `finished` → `ended=true, state=running` forever | the end event only exempted the run from `interrupted` | an end in the log restores `finished` with the logged outcome (persisted once the launcher is gone, marked `recovered_from_event_log`); no end + launcher gone → `interrupted`; no resume |
+| `/ws/../data` passed `workspace_root` validation | prefix check on the raw string | the value must be a normal absolute path (`normpath` equal to itself) at or below `/ws` |
+
+Live stack afterwards: the current policy was re-applied once (its record predates the scan
+stage), then "already applied"; status `applied`; the account screen evaluates all three
+providers eligible under `cost-first`; `up.sh --check` all pass. The hub image was rebuilt for the
+`unknown` label.

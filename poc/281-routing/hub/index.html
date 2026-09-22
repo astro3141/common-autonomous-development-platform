@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADP 실행 허브</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#5f6b7d; --line:#e2e6ec;
+          --ok:#1f7a4d; --warn:#9a6700; --bad:#b42318; --info:#1d4ed8; --chip:#eef1f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1a1f27; --ink:#e6e9ef; --muted:#9aa4b2; --line:#2a313c;
+            --ok:#4cc38a; --warn:#e3b341; --bad:#f47067; --info:#6ca4f8; --chip:#232a34; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  nav button { background:none; border:0; padding:6px 10px; border-radius:6px; color:var(--muted); cursor:pointer; font:inherit; }
+  nav button.on { background:var(--chip); color:var(--ink); font-weight:600; }
+  main { padding:18px 20px; max-width:1100px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  .chip { display:inline-block; padding:1px 8px; border-radius:999px; background:var(--chip); font-size:12px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .muted { color:var(--muted); }
+  button.act { background:var(--info); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit; }
+  button.act:disabled { opacity:.5; cursor:default; }
+  button.sub { background:var(--chip); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
+  select, input { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  .steps { display:flex; gap:6px; flex-wrap:wrap; }
+  .steps span { padding:2px 8px; border-radius:6px; background:var(--chip); font-size:12px; }
+  .steps span.cur { outline:2px solid var(--info); }
+  code, .mono { font-family:ui-monospace, Consolas, monospace; font-size:12.5px; }
+  .login-box { border:1px dashed var(--line); border-radius:8px; padding:12px; margin-top:10px; }
+  .big-code { font:600 22px ui-monospace, Consolas, monospace; letter-spacing:2px; }
+  .hidden { display:none; }
+  .kv { display:grid; grid-template-columns:140px 1fr; gap:4px 12px; }
+  .kv div:nth-child(odd) { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>CADP 실행 허브</h1>
+  <nav>
+    <button data-tab="accounts" class="on">계정·상태</button>
+    <button data-tab="run">워크플로 실행</button>
+    <button data-tab="runs">실행 기록</button>
+  </nav>
+  <span class="muted" style="margin-left:auto">프로필
+    <select id="profile"></select></span>
+</header>
+<main>
+
+<!-- ============ 계정·상태 ============ -->
+<section id="tab-accounts">
+  <div class="card">
+    <h2>제공자 계정 — <span id="acct-profile"></span></h2>
+    <div class="row muted" id="acct-decision">불러오는 중…</div>
+    <table>
+      <thead><tr><th>제공자</th><th>연결</th><th>실행 계정 = 조회 계정</th><th>잔여량 (주간 / 5시간)</th><th>조회 시각</th><th>지금 사용</th><th></th></tr></thead>
+      <tbody id="acct-rows"></tbody>
+    </table>
+    <div id="login-box" class="login-box hidden"></div>
+  </div>
+  <div class="card">
+    <h2>설정 상태</h2>
+    <div class="row muted" id="cfg-summary"></div>
+    <table><thead><tr><th>대상</th><th>상태</th><th>적용 시각</th><th>오류</th></tr></thead><tbody id="cfg-rows"></tbody></table>
+    <div class="row"><button class="act" id="cfg-apply">생성·적용</button><span id="cfg-msg" class="muted"></span></div>
+  </div>
+  <div class="card">
+    <h2>승인 대기 (Preloop)</h2>
+    <div id="appr" class="muted">불러오는 중…</div>
+    <div class="row muted">승인·거절은 Preloop 콘솔에서 합니다: <a href="http://localhost:3000" target="_blank" rel="noopener">localhost:3000</a></div>
+  </div>
+</section>
+
+<!-- ============ 워크플로 실행 ============ -->
+<section id="tab-run" class="hidden">
+  <div class="card">
+    <h2>새 실행</h2>
+    <div class="row">템플릿
+      <select id="wf">
+        <option value="auto">파일 작업 (auto)</option>
+        <option value="research-r">연구 단계 — #280 Phase R (research-r)</option>
+      </select></div>
+    <div id="wf-inputs"></div>
+    <div class="row"><button class="sub" id="precheck">실행 전 검사</button><button class="act" id="start" disabled>실행</button></div>
+    <div id="precheck-out" class="muted"></div>
+  </div>
+</section>
+
+<!-- ============ 실행 기록 ============ -->
+<section id="tab-runs" class="hidden">
+  <div class="card">
+    <h2>실행 기록</h2>
+    <table><thead><tr><th>시작</th><th>워크플로</th><th>프로필</th><th>제공자</th><th>상태</th><th>판정</th></tr></thead><tbody id="run-rows"></tbody></table>
+  </div>
+  <div class="card hidden" id="run-detail"></div>
+</section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  return r.json();
+}
+const CONN = {connected:["연결됨","ok"], not_connected:["연결 안 됨","bad"], waiting_for_browser:["브라우저 대기","warn"],
+              waiting_for_code:["코드 입력 대기","warn"], starting:["시작 중","warn"], failed:["실패","bad"]};
+const CFG = {applied:["적용됨","ok"], saved:["저장됨 (미적용)","warn"], changed_since_apply:["변경됨 — 적용 필요","warn"],
+             replaced:["다른 정책이 계정에 적용됨 — 적용 필요","warn"], apply_failed:["적용 실패","bad"],
+             unknown:["적용 중단 — 계정의 현재 정책 불명, 다시 적용 필요","bad"]};
+const DEC = {PASS:"ok", ADMIT:"ok", COMPLETED:"ok", DENIED:"warn", REFUTE:"warn", HOLD:"bad", BLOCK:"bad", FAILED:"bad"};
+const ago = (s) => s == null ? "—" : s < 90 ? `${s}초 전` : s < 5400 ? `${Math.round(s/60)}분 전` : `${Math.round(s/3600)}시간 전`;
+
+// ---- tabs
+document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
+  ["accounts","run","runs"].forEach((t) => $("#tab-"+t).classList.toggle("hidden", t !== b.dataset.tab));
+  if (b.dataset.tab === "runs") loadRuns();
+});
+
+// ---- profiles
+async function loadProfiles() {
+  const ps = await api("/api/profiles");
+  $("#profile").innerHTML = ps.map((p) => `<option value="${esc(p.name)}" title="${esc(p.description)}">${esc(p.name)} (${esc((p.candidates||[]).join(" → "))})</option>`).join("");
+  $("#profile").value = ps.some((p) => p.name === "research-default") ? "research-default" : (ps[0]||{}).name;
+  $("#profile").onchange = () => { loadAccounts(); $("#start").disabled = true; $("#precheck-out").textContent = ""; };
+}
+
+// ---- accounts
+async function loadAccounts() {
+  const prof = $("#profile").value; $("#acct-profile").textContent = prof;
+  const a = await api("/api/accounts?profile=" + encodeURIComponent(prof));
+  if (a.error) { $("#acct-decision").innerHTML = `<span class="bad">${esc(a.error)}</span>`; return; }
+  $("#acct-decision").innerHTML = a.decision === "ROUTE"
+    ? `지금 실행하면 <b>${esc(a.chosen)}</b>가 선택됩니다 <span class="muted">(${esc(a.reason)})</span>`
+    : `<span class="bad">실행 보류(HOLD)</span> — ${esc(a.reason)}`;
+  $("#acct-rows").innerHTML = a.providers.map((p) => {
+    const [ct, cc] = CONN[p.connection] || [p.connection, "muted"];
+    const match = p.account_match == null ? "—" : p.account_match ? `<span class="ok">일치</span> <span class="muted">(${esc(p.identity_basis)})</span>` : `<span class="bad">불일치</span>`;
+    const quota = `${p.weekly_used ?? "—"}% / ${typeof p.session_used === "number" ? p.session_used + "%" : "보고 안 됨"}`;
+    const use = p.eligible ? `<span class="ok">가능</span>` : `<span class="bad">불가</span> <span class="muted">${esc(p.why)}</span>`;
+    return `<tr><td><b>${esc(p.provider)}</b><div class="muted">${esc(p.route)} · ${esc(p.plan||"")}</div></td>
+      <td class="${cc}">${ct}</td><td>${match}</td><td>${quota}</td><td>${ago(p.age_s)}</td><td>${use}</td>
+      <td><button class="sub" onclick="startLogin('${esc(p.provider)}','${esc(p.login)}')">${p.connection === "connected" ? "재연결" : "계정 연결"}</button></td></tr>`;
+  }).join("");
+}
+
+// ---- login
+let loginTimer = null;
+async function startLogin(provider, login) {
+  const box = $("#login-box"); box.classList.remove("hidden");
+  box.innerHTML = `<b>${esc(provider)}</b> 계정 연결을 시작합니다…`;
+  await api(`/api/accounts/${provider}/login`, {login});
+  clearInterval(loginTimer);
+  loginTimer = setInterval(() => pollLogin(provider, login), 2000);
+  pollLogin(provider, login);
+}
+async function pollLogin(provider, login) {
+  const s = await api(`/api/accounts/${provider}/login?login=${encodeURIComponent(login)}`);
+  const box = $("#login-box");
+  const cancel = `<button class="sub" onclick="cancelLogin('${esc(provider)}','${esc(login)}')">취소</button>`;
+  if (s.state === "connected") {
+    clearInterval(loginTimer);
+    box.innerHTML = `<span class="ok">✓ ${esc(provider)} 연결됨</span> <span class="muted">(${esc(login)})</span>`;
+    loadAccounts(); return;
+  }
+  if (s.state === "failed") { clearInterval(loginTimer); box.innerHTML = `<span class="bad">연결 실패</span><pre class="mono">${esc(s.detail)}</pre>`; return; }
+  if (s.state === "waiting_for_browser") {
+    // redraw only when something changed, so a copy confirmation or a selection is not wiped
+    const key = `${s.state}|${s.url}|${s.user_code}`;
+    if (box.dataset.key === key) return;
+    box.dataset.key = key;
+    box.innerHTML = `<div>1. 공식 로그인 페이지를 엽니다: <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url)}</a></div>
+      <div class="row">2. 이 코드를 입력합니다: <span class="big-code" id="device-code">${esc(s.user_code || "")}</span>
+        ${s.user_code ? `<button class="sub" onclick="copyCode(this)">복사</button>` : ""}</div>
+      <div class="muted">완료되면 이 화면이 자동으로 바뀝니다. ${cancel}</div>`;
+  } else if (s.state === "waiting_for_code") {
+    if (!$("#login-code")) box.innerHTML = `<div>1. 공식 로그인 페이지를 엽니다: <a href="${esc(s.url)}" target="_blank" rel="noopener">로그인 페이지 열기</a></div>
+      <div class="row">2. 승인 후 표시된 코드를 붙여 넣습니다: <input id="login-code" size="40" autocomplete="off">
+      <button class="act" onclick="sendCode('${esc(provider)}','${esc(login)}')">보내기</button> ${cancel}</div>`;
+  } else {
+    box.innerHTML = `준비 중… ${cancel}`;
+  }
+}
+async function copyCode(btn) {
+  const text = $("#device-code").textContent.trim();
+  try {
+    await navigator.clipboard.writeText(text);          // 127.0.0.1 counts as a secure context
+  } catch {
+    const r = document.createRange(); r.selectNodeContents($("#device-code"));   // fallback: select it
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    document.execCommand && document.execCommand("copy");
+  }
+  btn.textContent = "복사됨"; setTimeout(() => (btn.textContent = "복사"), 1500);
+}
+async function sendCode(provider, login) {
+  const el = $("#login-code"); const code = el.value; el.value = ""; el.disabled = true;
+  const r = await api(`/api/accounts/${provider}/code`, {login, code});
+  if (!r.ok) { el.disabled = false; alert(r.error || "코드 전달 실패"); }
+}
+async function cancelLogin(provider, login) {
+  clearInterval(loginTimer); await api(`/api/accounts/${provider}/cancel`, {login});
+  $("#login-box").classList.add("hidden");
+}
+
+// ---- config
+async function loadConfig() {
+  const c = await api("/api/config/status");
+  $("#cfg-summary").innerHTML = c.valid ? `<span class="ok">설정 유효</span>` : `<span class="bad">설정 오류</span> ${esc((c.errors||[]).join(" · "))}`;
+  if ((c.warnings||[]).length) $("#cfg-summary").innerHTML += ` <span class="warn">${esc(c.warnings.join(" · "))}</span>`;
+  $("#cfg-rows").innerHTML = (c.targets||[]).map((t) => { const [l, k] = CFG[t.state] || [t.state, "muted"];
+    return `<tr><td class="mono">${esc(t.target)}</td><td class="${k}">${l}</td><td class="muted">${esc(t.applied_at||"—")}</td><td class="bad">${esc(t.error||"")}</td></tr>`; }).join("");
+}
+$("#cfg-apply").onclick = async () => {
+  $("#cfg-msg").textContent = "적용 중…";
+  const r = await api("/api/config/apply", {});
+  $("#cfg-msg").textContent = r.ok ? "완료" : ("실패: " + (r.error || JSON.stringify(r.results)));
+  loadConfig(); loadProfiles().then(loadAccounts);
+};
+
+// ---- approvals
+async function loadApprovals() {
+  const a = await api("/api/approvals");
+  $("#appr").innerHTML = Array.isArray(a) && a.length
+    ? `<table><tr><th>도구</th><th>대상</th><th>작업 폴더</th><th>요청</th><th>만료</th></tr>` + a.map((r) =>
+        `<tr><td>${esc(r.tool)}</td><td class="mono">${esc(r.target)}</td><td class="mono">${esc(r.cwd)}</td><td>${esc((r.requested_at||"").slice(11,19))}</td><td>${esc((r.expires_at||"").slice(11,19))}</td></tr>`).join("") + `</table>`
+    : (Array.isArray(a) ? "승인 대기 없음" : `<span class="bad">${esc(a.error)}</span>`);
+}
+
+// ---- run
+const INPUTS = { auto: [["file_name","routed.txt"],["content","R1"]], "research-r": [] };
+function renderInputs() {
+  const wf = $("#wf").value;
+  $("#wf-inputs").innerHTML = INPUTS[wf].map(([k, v]) => `<div class="row">${esc(k)} <input data-k="${esc(k)}" value="${esc(v)}"></div>`).join("")
+    || `<div class="muted">입력 없음 — 참조 자료는 #280 작업 공간에서 가져옵니다.</div>`;
+  $("#start").disabled = true; $("#precheck-out").textContent = "";
+}
+$("#wf").onchange = renderInputs;
+$("#precheck").onclick = async () => {
+  const out = $("#precheck-out"); out.textContent = "검사 중…";
+  const [c, a] = await Promise.all([api("/api/config/status"), api("/api/accounts?profile=" + encodeURIComponent($("#profile").value))]);
+  const lines = [];
+  const pending = (c.targets||[]).filter((t) => t.state !== "applied");
+  lines.push(c.valid ? `<span class="ok">✓ 설정 유효</span>` : `<span class="bad">✗ 설정 오류: ${esc((c.errors||[]).join(" · "))}</span>`);
+  lines.push(pending.length ? `<span class="warn">! 미적용 설정: ${esc(pending.map((t) => t.target).join(", "))}</span>` : `<span class="ok">✓ 설정 모두 적용됨</span>`);
+  lines.push(a.decision === "ROUTE" ? `<span class="ok">✓ 예상 제공자: ${esc(a.chosen)}</span> <span class="muted">(${esc(a.reason)})</span>`
+                                    : `<span class="bad">✗ 지금 실행하면 보류(HOLD): ${esc(a.reason || a.error)}</span>`);
+  out.innerHTML = lines.join("<br>");
+  $("#start").disabled = !(c.valid && a.decision === "ROUTE");
+};
+$("#start").onclick = async () => {
+  const inputs = {}; document.querySelectorAll("#wf-inputs input").forEach((i) => inputs[i.dataset.k] = i.value);
+  $("#start").disabled = true;
+  const r = await api("/api/runs", {workflow: $("#wf").value, profile: $("#profile").value, inputs});
+  if (r.error) { $("#precheck-out").innerHTML = `<span class="bad">${esc(r.error)}</span>`; return; }
+  document.querySelector('nav button[data-tab="runs"]').click();
+  showRun(r.ui_id);
+};
+
+// ---- runs
+async function loadRuns() {
+  const rs = await api("/api/runs");
+  $("#run-rows").innerHTML = (Array.isArray(rs) ? rs : []).map((r) => {
+    const st = r.state === "running" ? `<span class="warn">진행 중 · ${esc(r.current_step||"")}</span>`
+             : r.state === "interrupted" ? `<span class="bad">중단됨 · ${esc(r.current_step||"")}</span>` : `종료 · ${esc(r.terminated_at||"")}`;
+    const d = r.decision || (r.route && r.route.decision === "HOLD" ? "HOLD" : "");
+    return `<tr style="cursor:pointer" onclick="showRun('${esc(r.ui_id)}')"><td>${new Date(r.started_at*1000).toLocaleString()}</td><td>${esc(r.workflow)}</td>
+      <td>${esc(r.profile)}</td><td>${esc((r.route||{}).provider||"—")}</td><td>${st}</td><td class="${DEC[d]||""}"><b>${esc(d)}</b></td></tr>`; }).join("");
+}
+let runTimer = null;
+async function showRun(id) {
+  clearInterval(runTimer);
+  const draw = async () => {
+    const r = await api("/api/runs/" + id); const el = $("#run-detail"); el.classList.remove("hidden");
+    const o = r.output || {}; const rt = r.route || {};
+    const waiting = r.state === "running" && r.workspace_prefix ? (await api("/api/approvals")).filter?.((a) => a.cwd && a.cwd.startsWith(r.workspace_prefix)) : [];
+    const decision = o.decision || (rt.decision === "HOLD" ? "HOLD" : "");
+    const why = rt.decision === "HOLD" ? `라우터가 실행을 보류했습니다: ${rt.reason}` :
+                waiting && waiting.length ? `Preloop 승인 대기 중 (${waiting.map((w) => w.tool + " " + (w.target||"")).join(", ")}) — Preloop 콘솔에서 승인/거절` :
+                r.state === "interrupted" ? "중단됨 — 실행이 끝나기 전에 실행기가 사라졌습니다(재시작 등). 자동 재개하지 않습니다." :
+                r.termination_reason || (r.state === "running" ? "진행 중" : "");
+    const ml = r.mlflow && r.mlflow.run_id ? `<a href="http://127.0.0.1:5000/#/experiments/${esc(r.mlflow.experiment_id)}/runs/${esc(r.mlflow.run_id)}" target="_blank" rel="noopener">MLflow 기록 열기</a>` : "—";
+    el.innerHTML = `<h2>실행 ${esc(r.ui_id)} <span class="chip">${r.state === "running" ? "진행 중" : r.state === "interrupted" ? "중단됨" : "종료"}</span></h2>
+      <div class="steps">${(r.steps||[]).map((s, i, a) => `<span class="${r.state === "running" && i === a.length-1 ? "cur" : ""}">${esc(s.step)}</span>`).join("")}</div>
+      <div class="kv" style="margin-top:12px">
+        <div>판정</div><div class="${DEC[decision]||""}"><b>${esc(decision || "—")}</b></div>
+        <div>이유</div><div>${esc(why)}</div>
+        <div>선택된 제공자</div><div>${esc(rt.provider || "—")} <span class="muted">${esc(rt.model_route||"")} · ${esc(rt.reason||"")}</span></div>
+        <div>프로필</div><div>${esc(r.profile)}</div>
+        <div>기록</div><div>${ml} ${r.mlflow && r.mlflow.error ? `<span class="bad">기록 오류: ${esc(r.mlflow.error)}</span>` : ""}</div>
+        <div>출력</div><div class="mono">${esc(JSON.stringify(o))}</div>
+        ${r.error ? `<div>오류</div><div class="bad mono">${esc(r.error)}</div>` : ""}
+        <div>추적</div><div class="muted">Conductor 실행 ${esc(r.conductor_run||"—")} · <a href="http://localhost:3000" target="_blank" rel="noopener">Preloop 콘솔</a></div>
+      </div>`;
+    if (r.state !== "running") { clearInterval(runTimer); loadRuns(); }
+  };
+  await draw(); runTimer = setInterval(draw, 3000);
+}
+
+// ---- boot
+loadProfiles().then(() => { loadAccounts(); loadConfig(); loadApprovals(); renderInputs(); });
+</script>
+</body>
+</html>

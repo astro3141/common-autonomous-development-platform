@@ -10,6 +10,11 @@ workflow:
   description: Provider chosen by the router from quota observations; same Gate and record
   entry_point: route
   input:
+    profile:
+      type: string
+      required: false
+      default: research-default
+      description: execution profile (config/profiles/<name>.yaml)
     file_name:
       type: string
       required: false
@@ -27,13 +32,15 @@ agents:
     type: script
     description: Collect quota observations and choose a provider (fail closed on HOLD)
     command: "${POC_PY:-/opt/venv/bin/python}"
-    args: ["/work/p281/steps/route.py"]
+    args: ["/work/p281/steps/route.py", "{{ workflow.input.profile }}"]
     output:
       decision: {type: string}
       provider: {type: string}
       reason: {type: string}
       evaluated: {type: string}
       model_route: {type: string}
+      login: {type: string}
+      profile: {type: string}
       evidence_dir: {type: string}
     routes:
       - to: execute
@@ -45,7 +52,8 @@ agents:
     description: Run the task through the routing/execution layer (acpx + Preloop)
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/execute.py", "{{ route.output.provider }}",
-           "{{ workflow.input.file_name }}", "{{ workflow.input.content }}", "{{ route.output.model_route }}"]
+           "{{ workflow.input.file_name }}", "{{ workflow.input.content }}", "{{ route.output.model_route }}",
+           "{{ route.output.profile }}", "{{ route.output.login }}"]
     timeout: 600
     output:
       status: {type: string}
@@ -136,6 +144,7 @@ agents:
     reason: "BLOCK: {{ check.output.reason }}"
 
 output:
+  profile: "{{ route.output.profile }}"
   route: "{{ route.output.decision }}: {{ route.output.reason }}"
   decision: "{% if check is defined %}{{ check.output.decision }}{% endif %}"
   provider: "{% if execute is defined %}{{ execute.output.provider }}{% endif %}"

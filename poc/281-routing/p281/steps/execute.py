@@ -5,17 +5,23 @@ Knows nothing about any vendor: it builds the common request, calls run-agent.mj
 re-emits the normalized result as one flat JSON object for Conductor's output schema.
 """
 import json, os, subprocess, sys
+sys.path.insert(0, "/work/p281")
+import settings
 
 provider, file_name, content = sys.argv[1:4]
 model_route = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else "preloop_gateway"
+prof_name = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else "research-default"
+login = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else provider
+RT, PROF = settings.runtime(), settings.profile(prof_name) or {}
 run = os.environ.get("CONDUCTOR_SELF_RUN_ID", "manual")
 run_id = f"{run}-{provider}"
-cwd = f"/ws/{run_id}"
+cwd = f"{RT['paths']['workspace_root']}/{run_id}"
 os.makedirs(cwd, exist_ok=True)
-evid = f"/work/evidence/p281/{run_id}"
+evid = f"{RT['paths']['evidence_root']}/{run_id}"
 req = {
-    "run_id": run_id, "provider": provider, "cwd": cwd, "timeout_ms": 400000,
-    "native_tools": False, "evidence_dir": evid, "model_route": model_route,
+    "run_id": run_id, "provider": provider, "cwd": cwd, "login": login, "profile": prof_name,
+    "timeout_ms": (PROF.get("execution") or {}).get("timeout_ms", 400000),
+    "native_tools": (PROF.get("tools") or {}).get("native_tools", False), "evidence_dir": evid, "model_route": model_route,
     "prompt": (f"Create a file named {file_name} in the directory {cwd} containing exactly: "
                f"{content}. Use the write_file tool from the preloop MCP server with the "
                f"absolute path. Do not do anything else."),
@@ -47,6 +53,7 @@ out = {
     "retryable_elsewhere": bool(r.get("retryable_elsewhere")),
     "wall_ms": r.get("wall_ms"),
     "evidence_dir": evid,
+    "profile": prof_name,
     "ledger_error": r.get("ledger_error") or "",
 }
 # Measurements go in an object whose fields are optional (Conductor allows optional fields only

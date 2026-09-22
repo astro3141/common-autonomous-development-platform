@@ -10,9 +10,11 @@ two, deterministically, and never edits content.
 """
 import hashlib, json, os, shutil, sys
 from pathlib import Path
+sys.path.insert(0, "/work/p281")
+import settings
 
 run = os.environ.get("CONDUCTOR_SELF_RUN_ID", "manual")
-ws = Path(f"/ws/{run}"); ws.mkdir(parents=True, exist_ok=True)
+ws = Path(settings.runtime()["paths"]["workspace_root"]) / run; ws.mkdir(parents=True, exist_ok=True)
 rd = Path("/research/artifacts/runs") / run
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
 mode = sys.argv[1]

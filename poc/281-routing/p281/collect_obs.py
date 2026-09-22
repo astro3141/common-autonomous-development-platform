@@ -18,6 +18,12 @@ place where each source's shape is translated; router.py sees only the common fo
 import base64, glob, hashlib, json, os, sys, urllib.request
 from datetime import datetime, timezone
 
+sys.path.insert(0, "/work/p281")
+import settings
+RT = settings.runtime()
+EGRESS = settings.egress_env(RT)
+LOGINS = RT["paths"]["logins_root"]
+OBS = RT["paths"]["observations"]
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
 fp = lambda s: "email:" + hashlib.sha256(s.lower().encode()).hexdigest()[:16] if s else None
@@ -37,10 +43,14 @@ def iso_from_epoch(v):
 # Which model route each provider will execute on (policy "model_route"); it decides whose
 # login is the executing account.
 ROUTES = json.loads(os.environ.get("P281_MODEL_ROUTES", "{}"))
+# Which login each provider executes as (policy "login"). The collector must read quota from the
+# SAME login the execution layer will use — otherwise account A's quota could admit a run as B.
+LOGIN_NAMES = json.loads(os.environ.get("P281_LOGINS", "{}"))
+login_dir = lambda provider: f"{LOGINS}/{LOGIN_NAMES.get(provider, provider)}"
 
 
 # ---- codex ------------------------------------------------------------------------------
-CODEX_HOME = "/route/codex" if ROUTES.get("codex") == "direct" else os.path.expanduser("~/.codex")
+CODEX_HOME = login_dir("codex") if ROUTES.get("codex") == "direct" else os.path.expanduser("~/.codex")
 
 
 def codex_email_fp(home):
@@ -58,7 +68,7 @@ def window_name(minutes):
     return "session" if minutes <= 24 * 60 else "weekly"
 
 
-LEDGER = os.environ.get("P281_CODEX_LEDGER", "/route/codex-session-ledger.jsonl")
+LEDGER = os.environ.get("P281_CODEX_LEDGER", f"{LOGINS}/codex-session-ledger.jsonl")
 
 
 def ledger_sessions(account):
@@ -104,7 +114,7 @@ def codex_from_rollouts(home, account):
 
 
 def codex_from_observer():
-    raw = json.load(open("/obs/codex.raw.json"))
+    raw = json.load(open(f"{OBS}/codex.raw.json"))
     item = next((x for x in (raw.get("payload") or []) if x.get("provider") == "codex"), None)
     if not item:
         return {"observed_at": raw.get("collected_at"), "windows": {}, "account": None,
@@ -144,7 +154,11 @@ except FileNotFoundError:
     pass
 if cands:
     ts = lambda c: datetime.fromisoformat((c["observed_at"] or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
-    pick = max(cands, key=ts)
+    # Sources about the executing account first, newest among them. A newer reading of another
+    # account (the shared observer follows the default login) must not displace a valid reading of
+    # the selected one; it is picked only when nothing matches, and the router then excludes it.
+    same = [c for c in cands if executing and c.get("observed_account") == executing and not c.get("error")]
+    pick = max(same or cands, key=ts)
     write("codex", {"provider": "codex", **pick, "executing_account": executing,
                     "model_route": ROUTES.get("codex", "preloop_gateway"),
                     "other_sources": [{k: c[k] for k in ("source", "observed_at")} for c in cands if c is not pick]})
@@ -157,11 +171,11 @@ if cands:
 if ROUTES.get("grok") == "direct":
     import subprocess
     try:
+        if not os.path.isfile(f"{login_dir('grok')}/auth.json"):
+            raise FileNotFoundError(f"no Grok login at {login_dir('grok')}")
         p = subprocess.run(["codexbar", "usage", "--provider", "grok", "--json"], capture_output=True,
-                           text=True, timeout=60, env={**os.environ, "HOME": "/route/grok/home",
-                           "GROK_HOME": "/route/grok", "HTTPS_PROXY": "http://egress:8888",
-                           "https_proxy": "http://egress:8888", "HTTP_PROXY": "http://egress:8888",
-                           "NO_PROXY": "console,api,mlflow,localhost"})
+                           text=True, timeout=60, env={**os.environ, "HOME": f"{login_dir('grok')}/home",
+                           "GROK_HOME": login_dir("grok"), **EGRESS})
         item = next((x for x in json.loads(p.stdout or "[]") if x.get("provider") == "grok"), None)
         u = (item or {}).get("usage") or {}
         wins = {}
@@ -189,9 +203,7 @@ def codexbar_claude_direct():
     import subprocess
     p = subprocess.run(["codexbar", "usage", "--provider", "claude", "--source", "oauth", "--json"],
                        capture_output=True, text=True, timeout=60,
-                       env={**os.environ, "CLAUDE_CONFIG_DIR": "/route/claude",
-                            "HTTPS_PROXY": "http://egress:8888", "https_proxy": "http://egress:8888",
-                            "HTTP_PROXY": "http://egress:8888", "NO_PROXY": "console,api,mlflow,localhost"})
+                       env={**os.environ, "CLAUDE_CONFIG_DIR": login_dir("claude"), **EGRESS})
     item = next((x for x in json.loads(p.stdout or "[]") if x.get("provider") == "claude"), None)
     u = (item or {}).get("usage") or {}
     wins = {}
@@ -200,7 +212,7 @@ def codexbar_claude_direct():
         if w and w.get("usedPercent") is not None:
             wins[window_name(w.get("windowMinutes"))] = {"used_percent": w["usedPercent"],
                 "resets_at": w.get("resetsAt"), "window_minutes": w.get("windowMinutes")}
-    ident = "route-login:claude:" + (json.load(open("/route/claude/.claude.json")).get("oauthAccount") or {}).get("organizationUuid", "unknown")
+    ident = "route-login:claude:" + (json.load(open(f"{login_dir('claude')}/.claude.json")).get("oauthAccount") or {}).get("organizationUuid", "unknown")
     return {"provider": "claude", "source": f"codexbar:{(item or {}).get('source')}",
             "observed_at": u.get("updatedAt"), "observed_account": ident if item else None,
             "executing_account": ident, "identity_basis": "same-credential", "model_route": "direct",
@@ -222,7 +234,7 @@ else:
       import subprocess
       tok = subprocess.run(["preloop", "auth", "token"], capture_output=True, text=True, timeout=30).stdout.strip().split()[-1]
       d = json.load(urllib.request.urlopen(urllib.request.Request(
-          "http://api:8000/api/v1/account/gateway-usage/rate-limits",
+          RT["preloop"]["api_url"] + "/api/v1/account/gateway-usage/rate-limits",
           headers={"Authorization": "Bearer " + tok}), timeout=20))
       snaps = [s for s in d.get("latest_snapshots", []) if s.get("provider_name") == "anthropic"
                and ((s.get("rate_limit") or {}).get("headers") or {}).get("anthropic-ratelimit-unified-5h-utilization")]

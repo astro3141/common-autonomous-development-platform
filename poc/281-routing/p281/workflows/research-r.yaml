@@ -11,6 +11,12 @@ workflow:
   name: p281-research-r
   description: Phase R (#280) with routed model steps; deterministic verification and Gate unchanged
   entry_point: route
+  input:
+    profile:
+      type: string
+      required: false
+      default: research-default
+      description: execution profile (config/profiles/<name>.yaml)
   limits:
     max_iterations: 24
     timeout_seconds: 2400
@@ -20,13 +26,15 @@ agents:
     type: script
     description: Collect quota observations and choose a provider (fail closed on HOLD)
     command: "${POC_PY:-/opt/venv/bin/python}"
-    args: ["/work/p281/steps/route.py"]
+    args: ["/work/p281/steps/route.py", "{{ workflow.input.profile }}"]
     output:
       decision: {type: string}
       provider: {type: string}
       reason: {type: string}
       evaluated: {type: string}
       model_route: {type: string}
+      login: {type: string}
+      profile: {type: string}
       evidence_dir: {type: string}
     routes:
       - to: stage_in
@@ -47,7 +55,8 @@ agents:
     description: Routed model step — propose a candidate as term lists
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/agent_task.py", "{{ route.output.provider }}", "{{ route.output.model_route }}",
-           "propose", "/work/p281/prompts/r-propose.md", "proposal.json"]
+           "propose", "/work/p281/prompts/r-propose.md", "proposal.json",
+           "{{ route.output.profile }}", "{{ route.output.login }}"]
     timeout: 700
     output: &agent_out
       status: {type: string}
@@ -65,6 +74,7 @@ agents:
       retryable_elsewhere: {type: boolean}
       evidence_dir: {type: string}
       ledger_error: {type: string}
+      profile: {type: string}
       measurements:
         type: object
         properties:
@@ -124,7 +134,8 @@ agents:
     description: Routed model step — review opinion, not evidence
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/agent_task.py", "{{ route.output.provider }}", "{{ route.output.model_route }}",
-           "review", "/work/p281/prompts/r-review.md", "review.json"]
+           "review", "/work/p281/prompts/r-review.md", "review.json",
+           "{{ route.output.profile }}", "{{ route.output.login }}"]
     timeout: 700
     output: *agent_out
     routes:
@@ -234,6 +245,7 @@ agents:
     reason: "proposal rejected before verification: {{ normalize.output.reason }}"
 
 output:
+  profile: "{{ route.output.profile }}"
   route: "{{ route.output.decision }}: {{ route.output.reason }}"
   provider: "{% if propose is defined %}{{ propose.output.provider }}{% endif %}"
   model_route: "{% if propose is defined %}{{ propose.output.model_route }}{% endif %}"

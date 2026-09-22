@@ -1,0 +1,31 @@
+# Attaches Preloop's api / console / gateway to the PoC networks, with the aliases the agent
+# resolves. Replaces the out-of-band `docker network connect` step, which did not survive a
+# restart or recreate of the Preloop containers. Used as an extra compose file on top of the
+# upstream Preloop install (~/.preloop-oss): see scripts/up.sh.
+#
+# `default` is listed explicitly because naming any network replaces a service's implicit one.
+# The PoC networks are created by compose.poc.yaml, so the PoC stack comes up first.
+services:
+  api:
+    networks:
+      default: {}
+      cadp278-governed:
+        aliases: [api]
+      cadp278-toolnet:
+        aliases: [api]
+  console:
+    networks:
+      default: {}
+      cadp278-governed:
+        aliases: [console]
+  gateway:
+    networks:
+      default: {}
+      cadp278-governed:
+        aliases: [gateway]
+
+networks:
+  cadp278-governed:
+    external: true
+  cadp278-toolnet:
+    external: true

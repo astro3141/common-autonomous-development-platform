@@ -57,7 +57,7 @@ RUN test -x /home/agent/.local/bin/preloop
 # sympy must be baked in at all: the governed runtime has no egress, so installing it at
 # run time fails by design.
 USER root
-RUN python -m venv /opt/venv     && /opt/venv/bin/pip install --no-cache-dir -q pytest 'sympy==1.14.0'     && chmod -R a+rX /opt/venv
+RUN python -m venv /opt/venv     && /opt/venv/bin/pip install --no-cache-dir -q pytest 'sympy==1.14.0' 'PyYAML==6.0.2'     && chmod -R a+rX /opt/venv
 USER agent
 
 # ---- #281: common agent execution layer -------------------------------------------------
@@ -79,7 +79,9 @@ RUN mkdir -p /opt/codexbar     && curl -fsSL -o /tmp/cb.tgz https://github.com/s
 # so the named volume is seeded agent-owned. (Native-tool removal is per run, in the
 # workspace's project settings — not managed settings, which would also strip Write/Bash
 # from the #278 and #280 workflows running in this same container.)
-RUN mkdir -p /ws && chown agent:agent /ws
+# /obs (quota observations) and /route (routing-layer logins) likewise, so fresh volumes start
+# agent-owned and nothing needs a manual chown after a recreate.
+RUN mkdir -p /ws /obs /route && chown agent:agent /ws /obs /route && chmod 700 /route
 USER agent
 
 WORKDIR /work

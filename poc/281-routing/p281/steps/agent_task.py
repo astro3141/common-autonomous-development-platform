@@ -7,16 +7,23 @@ Writes are only possible through the Preloop MCP server (native write/shell are 
 Preloop's rules decide them. Emits the normalized result flat for Conductor.
 """
 import json, os, subprocess, sys
+sys.path.insert(0, "/work/p281")
+import settings
 
 provider, model_route, label, prompt_file, expected = sys.argv[1:6]
+prof_name = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "research-default"
+login = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else provider
+RT, PROF = settings.runtime(), settings.profile(prof_name) or {}
 run = os.environ.get("CONDUCTOR_SELF_RUN_ID", "manual")
-ws = f"/ws/{run}"
+ws = f"{RT['paths']['workspace_root']}/{run}"
 os.makedirs(ws, exist_ok=True)
 run_id = f"{run}-{label}-{provider}"
-evid = f"/work/evidence/p281/{run_id}"
+evid = f"{RT['paths']['evidence_root']}/{run_id}"
 os.makedirs(evid, exist_ok=True)
 req = {"run_id": run_id, "provider": provider, "model_route": model_route or "preloop_gateway",
-       "cwd": ws, "timeout_ms": 600000, "native_tools": False, "evidence_dir": evid,
+       "login": login, "profile": prof_name,
+       "cwd": ws, "timeout_ms": (PROF.get("execution") or {}).get("timeout_ms", 600000),
+       "native_tools": (PROF.get("tools") or {}).get("native_tools", False), "evidence_dir": evid,
        "prompt": open(prompt_file, encoding="utf-8").read().replace("{WS}", ws)}
 rp = os.path.join(evid, "request.json")
 json.dump(req, open(rp, "w"), indent=1)
@@ -44,6 +51,7 @@ print(json.dumps({
     "mcp_rule_denials": len(r.get("mcp_denials", [])),
     "retryable_elsewhere": bool(r.get("retryable_elsewhere")),
     "evidence_dir": evid,
+    "profile": prof_name,
     "ledger_error": r.get("ledger_error") or "",
     # missing measurements are omitted, never 0
     "measurements": {k: v for k, v in meas.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},
