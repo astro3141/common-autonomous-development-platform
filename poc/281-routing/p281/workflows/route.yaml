@@ -53,6 +53,7 @@ agents:
       mcp_rule_denials: {type: number}
       retryable_elsewhere: {type: boolean}
       evidence_dir: {type: string}
+      ledger_error: {type: string}
     routes:
       - to: check
 

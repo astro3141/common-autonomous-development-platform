@@ -81,8 +81,10 @@ def main():
     evaluated = []
     for cand in policy["candidates"]:
         p = os.path.join(d, f"{cand}.json")
-        obs = json.load(open(p)) if os.path.exists(p) else None
         try:
+            # reading and parsing are inside the per-candidate guard too: one corrupt file makes
+            # that candidate unknown, it does not stop the choice among the others
+            obs = json.load(open(p)) if os.path.exists(p) else None
             evaluated.append(evaluate(cand, obs, policy, now))
         except Exception as e:   # one malformed observation must not stop the whole choice
             evaluated.append({"provider": cand, "eligible": False,

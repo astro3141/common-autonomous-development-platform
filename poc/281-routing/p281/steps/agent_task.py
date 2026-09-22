@@ -44,6 +44,7 @@ print(json.dumps({
     "mcp_rule_denials": len(r.get("mcp_denials", [])),
     "retryable_elsewhere": bool(r.get("retryable_elsewhere")),
     "evidence_dir": evid,
+    "ledger_error": r.get("ledger_error") or "",
     # missing measurements are omitted, never 0
     "measurements": {k: v for k, v in meas.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},
 }))

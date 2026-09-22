@@ -310,14 +310,22 @@ async function main() {
   let status = null;
   try { if (handle) status = await runtime.getStatus({ handle }); } catch { /* best effort */ }
   try { await runtime.shutdown(); } catch { /* best effort */ }
+  // The ledger only feeds quota attribution. Failing to write it must not overwrite the task's
+  // own result: the session is then simply absent from the ledger, so the collector ignores its
+  // rollout, and the error is reported next to the (unchanged) result.
+  let ledgerError = null;
   if (prof.sessionLedger && status?.backendSessionId) {
-    let accountAtEnd = null;
-    try { accountAtEnd = prof.accountFingerprint(direct); } catch { accountAtEnd = null; }
-    appendFileSync(prof.sessionLedger, JSON.stringify({
-      session_id: status.backendSessionId, run_id: req.run_id, at: new Date().toISOString(),
-      // a login that changed during the run binds the session to no account
-      account: accountAtStart && accountAtStart === accountAtEnd ? accountAtStart : null,
-      account_at_start: accountAtStart, account_at_end: accountAtEnd }) + "\n");
+    try {
+      let accountAtEnd = null;
+      try { accountAtEnd = prof.accountFingerprint(direct); } catch { accountAtEnd = null; }
+      appendFileSync(process.env.P281_CODEX_LEDGER ?? prof.sessionLedger, JSON.stringify({
+        session_id: status.backendSessionId, run_id: req.run_id, at: new Date().toISOString(),
+        // a login that changed during the run binds the session to no account
+        account: accountAtStart && accountAtStart === accountAtEnd ? accountAtStart : null,
+        account_at_start: accountAtStart, account_at_end: accountAtEnd }) + "\n");
+    } catch (e) {
+      ledgerError = String(e?.message ?? e);
+    }
   }
 
   // Normalized status. TIMED_OUT = the run deadline passed while an approval was still open;
@@ -353,6 +361,7 @@ async function main() {
     text: text.join(""),
     wall_ms: Date.now() - t0,
     evidence_dir: evDir,
+    ledger_error: ledgerError,
   };
   writeFileSync(join(evDir, "result.json"), JSON.stringify({ ...out, status_raw: status, usage_events: usage }, null, 1));
   process.stdout.write(JSON.stringify(out) + "\n");

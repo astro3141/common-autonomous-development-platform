@@ -66,6 +66,7 @@ agents:
       mcp_rule_denials: {type: number}
       retryable_elsewhere: {type: boolean}
       evidence_dir: {type: string}
+      ledger_error: {type: string}
     routes:
       - to: check
 
@@ -141,5 +142,5 @@ output:
   status: "{% if execute is defined %}{{ execute.output.status }}{% endif %}"
   model_adapter_reported: "{% if execute is defined %}{{ execute.output.model_adapter_reported }}{% endif %}"
   model_served: "{% if execute is defined %}{{ execute.output.model_served }}{% endif %}"
-  mlflow_run_id: "{% if record is defined %}{{ record.output.mlflow_run_id }}{% endif %}"
-  record_error: "{% if record is defined %}{{ record.output.record_error }}{% endif %}"
+  mlflow_run_id: "{% if record is defined %}{{ record.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
+  record_error: "{% if record is defined %}{{ record.output.record_error }}{% elif record_hold is defined %}{{ record_hold.output.record_error }}{% endif %}"

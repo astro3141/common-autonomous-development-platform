@@ -17,12 +17,18 @@ def fresh(o, age_s=60):
     o["observed_at"] = iso(now - timedelta(seconds=age_s)); return o
 
 
+class Raw(str):
+    """Written to the observation file verbatim — used to inject a corrupt (non-JSON) file."""
+
+
 def case(name, mutate, expect_decision, expect_provider=""):
     obs = copy.deepcopy(base)
     mutate(obs)
     with tempfile.TemporaryDirectory() as d:
         for k, v in obs.items():
-            if v is not None:
+            if isinstance(v, Raw):
+                open(os.path.join(d, f"{k}.json"), "w").write(v)
+            elif v is not None:
                 json.dump(v, open(os.path.join(d, f"{k}.json"), "w"))
         r = json.loads(subprocess.run(
             [sys.executable, os.path.join(os.path.dirname(__file__), "router.py"),
@@ -100,6 +106,10 @@ cases = [
          set_(["claude", "windows"], [1, 2]), "ROUTE", "codex"),
     case("claude observed_at is a number → codex, no crash",
          set_(["claude", "observed_at"], 12345), "ROUTE", "codex"),
+    case("claude observation file is corrupt JSON → claude unknown; codex, no crash",
+         set_(["claude"], Raw('{"provider": "claude", "windows": ')), "ROUTE", "codex"),
+    case("every observation file corrupt → HOLD, no crash",
+         seq(set_(["claude"], Raw("not json")), set_(["codex"], Raw("{")), set_(["grok"], Raw(""))), "HOLD"),
     case("every candidate malformed → HOLD, no crash",
          seq(set_(["claude", "windows", "weekly", "used_percent"], "x"),
              set_(["codex", "windows", "weekly", "used_percent"], -5),

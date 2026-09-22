@@ -49,7 +49,7 @@ def record():
             "model.adapter_reported": ex["model_adapter_reported"], "model.served": ex["model_served"],
             "evidence_dir": ex["evidence_dir"], "file_sha256": ck["file_sha256"],
             "route.decision": rt.get("decision", "manual"), "route.reason": rt.get("reason", "provider given as input"),
-            "route.evaluated": rt.get("evaluated", "")}
+            "route.evaluated": rt.get("evaluated", ""), "ledger_error": ex.get("ledger_error", "")}
     call("/api/2.0/mlflow/runs/log-batch", {"run_id": rid,
          "params": [{"key": "provider", "value": ex["provider"]}, {"key": "native_tools", "value": "false"}],
          "tags": [{"key": k, "value": str(v)[:5000]} for k, v in tags.items()],

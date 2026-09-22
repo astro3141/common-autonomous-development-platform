@@ -64,6 +64,7 @@ agents:
       mcp_rule_denials: {type: number}
       retryable_elsewhere: {type: boolean}
       evidence_dir: {type: string}
+      ledger_error: {type: string}
       measurements:
         type: object
         properties:
@@ -242,4 +243,5 @@ output:
   primary_status: "{% if verify_primary is defined %}{{ verify_primary.output.math_status }}{% endif %}"
   independent_status: "{% if verify_independent is defined %}{{ verify_independent.output.math_status }}{% endif %}"
   review_status: "{% if review is defined %}{{ review.output.status }}{% endif %}"
-  mlflow_run_id: "{% if record is defined %}{{ record.output.mlflow_run_id }}{% endif %}"
+  mlflow_run_id: "{% if record is defined %}{{ record.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
+  record_error: "{% if record is defined %}{{ record.output.record_error }}{% elif record_hold is defined %}{{ record_hold.output.record_error }}{% endif %}"

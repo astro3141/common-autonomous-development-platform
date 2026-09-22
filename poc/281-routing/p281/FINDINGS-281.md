@@ -1059,3 +1059,37 @@ This is one known-answer research step whose verification is fully deterministic
 the routing path carries a research task end to end with the #280 Gate intact and with the
 provider chosen from quota. It says nothing about the model's contribution on open problems
 (#280's own conclusion), nor about tasks where the agent must compute (option B).
+
+### Closing the review fixes (second pass, 2026-09-22)
+
+Three remaining boundaries, found on review of `f3070f9`:
+
+1. **A corrupt observation file stopped the whole choice.** Reading and parsing were outside the
+   per-candidate guard. Now inside it: a corrupt file makes that candidate `unknown`. Controls
+   added — first candidate corrupt → routes to the next; every file corrupt → HOLD. **26 / 26.**
+2. **A ledger write failure overwrote a finished result.** The throw happened before
+   `result.json` was written, so a completed task came out `FAILED`. Now the write is guarded:
+   the result is unchanged, `ledger_error` is reported beside it (and surfaced by the workflow
+   steps and MLflow tags), and the session is simply absent from the ledger, so its rollout is
+   not used for quota. Measured with the ledger path unwritable: `COMPLETED`, `result.json`
+   present, `ledger_error: ENOENT …`, no ledger line.
+3. **Record errors did not reach the final output on every branch.** `auto.yaml` read only
+   `record`, not `record_hold`; `research-r.yaml` had no `record_error` output. Both now take it
+   from whichever record step ran.
+
+End-to-end with MLflow unreachable (`MLFLOW_URL=http://mlflow-down:5000`), final workflow output:
+
+| workflow | outcome | terminated at | decision | `record_error` in final output |
+|---|---|---|---|---|
+| `auto.yaml` | completed | success | `PASS` | yes (`URLError … name resolution`) |
+| `auto.yaml` | denied by Preloop rule | `done_denied` | `DENIED` | yes |
+| `auto.yaml` | HOLD (strict test policy) | `held` | — | yes |
+| `research-r.yaml` | HOLD (strict test policy) | `held` | — | yes |
+| `research-r.yaml` | completed (Codex) | success | `ADMIT`, candidate `829946630c89…` | yes |
+
+In every case the decision and the terminal step are the ones the run would have without the
+failure; the observation failure is visible, not silent.
+
+Test policies updated to route all three providers directly (the strict one still referenced
+Claude's old gateway route; it made no difference to the HOLD, since all candidates were over the
+limit or stale).

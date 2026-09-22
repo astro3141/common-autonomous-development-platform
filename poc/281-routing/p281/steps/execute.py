@@ -47,6 +47,7 @@ out = {
     "retryable_elsewhere": bool(r.get("retryable_elsewhere")),
     "wall_ms": r.get("wall_ms"),
     "evidence_dir": evid,
+    "ledger_error": r.get("ledger_error") or "",
 }
 # Measurements go in an object whose fields are optional (Conductor allows optional fields only
 # inside objects): one the adapter did not report is left out, never recorded as 0.
