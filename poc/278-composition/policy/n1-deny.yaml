@@ -1,0 +1,27 @@
+# N1 negative control: policy DENIES write_marker.
+# Expected: the agent's call is refused by Preloop and the underlying marker file
+# is never created by the tool service.
+version: '1.0'
+metadata:
+  name: cadp278-n1-deny
+  description: Deny write_marker to test that policy prevents the underlying effect
+mcp_servers:
+- name: cadp278-toolsvc
+  url: http://cadp278-toolsvc:8000/mcp
+  transport: http-streaming
+  auth_type: none
+tools:
+- name: write_marker
+  source: cadp278-toolsvc
+  enabled: true
+  conditions:
+  - expression: "true"
+    action: deny
+    description: N1 control — deny every write_marker call
+- name: list_markers
+  source: cadp278-toolsvc
+  enabled: true
+defaults:
+  unknown_tools: allow
+  require_approval_for_new_tools: false
+  inherit_from_parent: true

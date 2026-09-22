@@ -1,0 +1,36 @@
+# N2 negative control: write_marker requires human approval before it may execute.
+version: '1.0'
+metadata:
+  name: cadp278-n2-approval
+  description: Require approval for write_marker to exercise the approval branch
+mcp_servers:
+- name: cadp278-toolsvc
+  url: http://cadp278-toolsvc:8000/mcp
+  transport: http-streaming
+  auth_type: none
+approval_workflows:
+- name: Default Approval Workflow
+  description: Default workflow for tool approval requests. Approval requests will be shown in the Preloop UI.
+  timeout_seconds: 300
+  require_reason: false
+  is_default: true
+  workflow_type: simple
+  approvals_required: 1
+  approval_type: standard
+  async_approval: false
+tools:
+- name: write_marker
+  source: cadp278-toolsvc
+  enabled: true
+  approval_workflow: Default Approval Workflow
+  conditions:
+  - expression: "true"
+    action: require_approval
+    description: N2 control — every write_marker call needs human approval
+- name: list_markers
+  source: cadp278-toolsvc
+  enabled: true
+defaults:
+  unknown_tools: allow
+  require_approval_for_new_tools: false
+  inherit_from_parent: true

@@ -1,0 +1,113 @@
+# #278 PoC — governed runtime, isolated from the host's daily Claude installation.
+#
+# Relative bind sources resolve against this file's directory, so the defaults below point
+# at poc/278-composition/ in a fresh clone. Override with POC_HOST_DIR if needed.
+#
+# Network design (per review):
+#   governed  : internal, NO route to the internet. The agent lives here only.
+#   provision : ordinary bridge, attached TEMPORARILY for credential minting only.
+#
+# The Preloop containers (api / console / gateway) are attached to `governed` out of
+# band with `docker network connect`, because they are owned by the upstream release
+# compose in ~/.preloop-oss and are not redefined here.
+name: cadp278
+
+networks:
+  governed:
+    name: cadp278-governed
+    internal: true
+  provision:
+    name: cadp278-provision
+  # Inbound-only path for the operator's browser to reach MLflow. Measured:
+  # a published port does NOT work on an `internal: true` network in this Docker
+  # version (docker port reports no mapping), so MLflow is dual-homed here.
+  # This grants egress to MLFLOW ONLY. The agent stays single-homed on `governed`,
+  # and no container runs a forwarder or proxy, so this does not give the agent a
+  # route out. Recorded in FINDINGS.md F9.
+  observe:
+    name: cadp278-observe
+  # The underlying MCP tool lives here. The agent is deliberately NOT a member,
+  # so the only route from the agent to the tool is through Preloop's MCP safety
+  # layer. Preloop's api container is attached out of band.
+  toolnet:
+    name: cadp278-toolnet
+    internal: true
+
+volumes:
+  agent-home:
+    name: cadp278-agent-home
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: agent.Dockerfile
+    image: cadp278/governed-runtime:local
+    container_name: cadp278-agent
+    networks:
+      - governed
+    volumes:
+      # The PoC workspace, shared with the host so evidence stays inspectable.
+      - type: bind
+        source: ${POC_HOST_DIR:-..}
+        target: /work
+      # The #280 research workspace, kept separate from the PoC workspace. Not part of
+      # #278; defaults to an empty placeholder so a fresh clone starts without it.
+      - type: bind
+        source: ${RESEARCH_HOST_DIR:-../evidence/research}
+        target: /research
+      # Container-only HOME. The host's ~/.claude is NEVER mounted here.
+      - agent-home:/home/agent
+    environment:
+      POC_DIR: /work
+      POC_PY: /opt/venv/bin/python
+      PYTHONUTF8: "1"
+      # Preloop control plane, reached over the governed network by service name.
+      PRELOOP_URL: http://console
+      # Traces go to the in-network MLflow, not the host.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://mlflow:5000
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_EXPORTER_OTLP_HEADERS: x-mlflow-experiment-id=1
+      OTEL_SERVICE_NAME: cadp-commodity-composition-poc
+    command: ["sleep", "infinity"]
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: mlflow.Dockerfile
+    image: cadp278/mlflow:3.16.1
+    container_name: cadp278-mlflow
+    networks:
+      - governed
+      - observe
+    volumes:
+      - type: bind
+        source: ${POC_HOST_DIR:-..}/evidence/mlflow
+        target: /mlflow
+    environment:
+      # MLflow rejects Host headers outside localhost/private-IP by default
+      # (DNS-rebinding protection). In-network clients address it as `mlflow:5000`,
+      # so that name has to be allowed explicitly. Measured: without this, OTLP
+      # ingest answers 403 "Invalid Host header".
+      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000"
+    ports:
+      # Inbound only. Publishing a port does not give any container egress,
+      # so this does not weaken the N7 claim.
+      - "127.0.0.1:5000:5000"
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+
+  toolsvc:
+    build:
+      context: .
+      dockerfile: toolsvc.Dockerfile
+    image: cadp278/toolsvc:local
+    container_name: cadp278-toolsvc
+    networks:
+      - toolnet
+    volumes:
+      - type: bind
+        source: ${POC_HOST_DIR:-..}/evidence/n1-markers
+        target: /markers

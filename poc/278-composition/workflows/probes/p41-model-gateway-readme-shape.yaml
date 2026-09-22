@@ -1,0 +1,16 @@
+workflow:
+  name: p41-model-gateway-readme-shape
+  entry_point: ask
+  runtime:
+    provider:
+      name: copilot
+      type: openai
+      wire_api: completions
+      base_url: "https://preloop.invalid/openai/v1"
+      api_key: "${PRELOOP_API_KEY}"
+    default_model: gpt-5-mini
+agents:
+  - name: ask
+    prompt: "Reply with the single word OK."
+    routes:
+      - to: $end

@@ -1,0 +1,33 @@
+# Gate C probe — is the SDK turn cap finite, configurable and ACTUALLY enforced?
+# The #280 design treats this as a HOLD condition: if the cap cannot be shown to block,
+# the model path does not start.
+workflow:
+  name: c1-turn-cap
+  entry_point: capped
+  limits:
+    max_iterations: 4
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [user]
+    default_model: sonnet
+    working_dir: "${POC_DIR:-/work}/fixture"
+agents:
+  - name: capped
+    max_agent_iterations: 2
+    prompt: |
+      Do this strictly one tool call at a time, never batching:
+      1. Read src/slugify.py
+      2. Read tests/test_slugify.py
+      3. Run `echo one` with Bash
+      4. Run `echo two` with Bash
+      5. Run `echo three` with Bash
+      6. Run `echo four` with Bash
+      Then report how many of the six steps you completed.
+    output:
+      completed:
+        type: string
+    routes:
+      - to: $end
+output:
+  completed: "{{ capped.output.completed }}"

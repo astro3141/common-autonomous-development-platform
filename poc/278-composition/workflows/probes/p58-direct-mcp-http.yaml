@@ -1,0 +1,21 @@
+workflow:
+  name: p58-direct-mcp-http
+  entry_point: direct_call
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-5
+    mcp_servers:
+      preloop:
+        type: http
+        url: "https://preloop.invalid/mcp/v1"
+        headers:
+          Authorization: "Bearer ${PRELOOP_API_KEY}"
+agents:
+  - name: direct_call
+    type: mcp
+    server: preloop
+    tool: echo
+    arguments:
+      text: "n8 probe"
+    routes:
+      - to: $end
