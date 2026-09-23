@@ -1,17 +1,16 @@
-# #281 routing layer — provider execution separated from Conductor, Preloop and MLflow
+# Moved — this work now lives in its own repository
 
-PoC artifacts for #281, on top of the #278 baseline in `poc/278-composition/`.
+The routing/execution layer and the stack around it (`#281`) are developed and operated in
+**[astro3141/agent-stack](https://github.com/astro3141/agent-stack)** (private).
 
-The goal: Conductor (workflow), Preloop (policy/approval) and MLflow (records) must not own
-providers, so that their coverage intersection no longer limits which providers can be used.
-A routing layer built on acpx owns each provider's model path, login and quota view. Claude,
-Codex and Grok (subscription logins) run through it, and a router chooses among them from
-provider-reported quota. Preloop keeps tool governance only.
+**Why it moved.** The measurements were made in a working tree beside this repository and mirrored
+into it here. Two trees produced exactly one class of bug: code that was published but could not
+run, because the copy that ran was the other one. The tree that runs is now the repository, and
+there is nothing left to keep in step.
 
-- Start with [RUNBOOK.md](RUNBOOK.md); every measurement is in
-  [p281/FINDINGS-281.md](p281/FINDINGS-281.md).
-- Status: provider-separation PoC succeeded; #281 overall **PARTIAL** (open items in the
-  RUNBOOK).
-- No credentials, tokens or measured raw output are in this directory.
+**What is still here.** Everything already merged: the history of `poc/281-routing/` up to and
+including [#292](https://github.com/astro3141/common-autonomous-development-platform/pull/292), and
+the composition work it grew out of under [`poc/278-composition/`](../278-composition). Links from
+those pull requests keep working — they point at commits, not at this tip.
 
-PoC material, not CADP implementation; the #277 freeze is unaffected (AUTHORITY_EFFECT: NONE).
+Issue #281 stays here as the record of what was asked and decided.
