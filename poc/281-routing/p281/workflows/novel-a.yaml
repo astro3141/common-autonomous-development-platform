@@ -62,11 +62,12 @@ agents:
     type: script
     description: Bind each role to its vendor, with that vendor's login and route
     command: "${POC_PY:-/opt/venv/bin/python}"
-    args: ["/work/p281/steps/roles.py", "{{ route.output.profile }}",
+    args: ["/work/p281/steps/roles.py", "{{ route.output.profile }}", "{{ route.output.evidence_dir }}",
            "architect=codex", "author=claude", "story=codex", "history=claude", "cold=grok"]
     output:
       ok: {type: string}
       missing: {type: string}
+      ineligible: {type: string}
       architect_provider: {type: string}
       architect_login: {type: string}
       architect_route: {type: string}
@@ -225,12 +226,16 @@ agents:
     routes:
       - to: done_pass
 
+  # A BLOCK is a judgement about an execution that happened, so it is recorded as one: the same
+  # execute record the PASS path uses, with the real decision and reason. Called without it, the
+  # recorder takes its "the router started nothing" path and a reviewed-then-blocked chapter was
+  # stored as status=HOLD, gate.decision=NOT_RUN (measured).
   - name: record_block
     type: script
     description: Record a blocked run
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/record.py"]
-    stdin: "{{ {'check': {'decision': 'BLOCK', 'reason': 'novel-a blocked'}, 'route': route.output} | tojson }}"
+    stdin: "{{ {'execute': (author.output if author is defined else architect.output), 'check': {'decision': 'BLOCK', 'reason': (triage.output.reason if triage is defined else ('author produced no draft' if author is defined else 'architect produced no contract')), 'file_sha256': (triage.output.draft_sha256 if triage is defined else '')}, 'route': route.output} | tojson }}"
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
@@ -264,7 +269,7 @@ agents:
   - name: done_hold
     type: terminate
     status: failed
-    reason: "HOLD: {{ route.output.reason }} {{ roles.output.missing }}"
+    reason: "HOLD: {{ route.output.reason }} {{ roles.output.missing }} {{ roles.output.ineligible }}"
 
 
 output:

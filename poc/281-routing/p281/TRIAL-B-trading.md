@@ -57,5 +57,16 @@ Per-lane results of the first run (scored against returns the lanes never saw):
 3. **The recorder wants one shape.** `record.py` is built around a single "execute" record; a
    multi-lane cycle had to flatten itself into that shape (valid-lane count and model calls as
    measurements). A real lane experiment would want one record per lane.
-4. **Not tried:** a schedule, market-data egress, per-lane tool policies (one Preloop policy per
-   account), and interrupt/resume of a long lane.
+4. **Not tried:** a schedule, market-data egress, and interrupt/resume of a long lane. Per-lane
+   tool policy was listed here as impossible ("one Preloop policy per account"); that was wrong —
+   see OPERATIONS.md §10, where rights per credential and per role are measured.
+
+## Defects review found in these steps, and what closed them (2026-09-23)
+
+| defect | what happened | fix |
+|---|---|---|
+| one malformed proposal ended the whole evaluation | only a JSON syntax error was caught; `[]`, `{"targets":[null]}` and a non-numeric `model_calls` raised through `evaluate`, so no lane was scored and no comparison was written. A `NaN` weight passed as VALID | every lane is read inside its own guard and every shape is checked (object, target object, string symbol, finite weight, list refs, integer `model_calls`); anything else is that lane's `INVALID`. Verified: six malformed lanes beside one sound lane → six INVALID, the sound lane scored, the report written |
+| the run screen showed no MLflow link | the view parser knew the step names `record` and `record_hold`; this workflow records in `record_cycle` (and the novel one in `record_pass` / `record_block`) | the parser reads every step whose name begins with `record`. Verified on a real cycle: the link is there, `record_error` empty |
+
+Both are pinned by `p281/trial_controls.py` (36/36), which drives the real functions with fake
+inputs and needs no model call.

@@ -68,5 +68,19 @@ Claude, cold reader = Grok** — three vendors inside one run, each on its own l
 
 ## What was not tried here
 
-Scheduling, multiple operators, interrupt/resume of a long step, and per-role tool policies (one
-Preloop policy per account still applies — every role in this trial ran under the same one).
+Scheduling, multiple operators, and interrupt/resume of a long step. Per-role tool policy was
+listed here as impossible ("one Preloop policy per account"); that was wrong and is measured in
+OPERATIONS.md §10 — rights are given per credential, and a role can now present one of its own.
+
+## Defects review found in these steps, and what closed them (2026-09-23)
+
+A review drove the real functions with synthetic inputs and found three faults in this trial's own
+code. Each is fixed and pinned by `p281/trial_controls.py` (36/36, no model call, no network).
+
+| defect | what happened | fix |
+|---|---|---|
+| a repaired draft passed on the previous round's reviews | review files from round *n−1* stayed on disk, so a reviewer that failed in round *n* still counted as usable — two required reviews of `{}` also passed | `freeze` clears the round, `novel_reviews.py` writes a receipt (draft id + sha256 + each member's outcome), and triage accepts a review only when this round produced it, the file is unchanged, and the document is shaped like a review |
+| a role ran on a provider quota had excluded | `roles.py` admitted any provider the *profile* listed; with Codex and Claude over their limits and only Grok eligible, their roles were still bound | `roles.py` reads this run's router evaluation and binds a role only to a provider it found eligible; no evaluation to read is a hold, not a pass |
+| a blocked chapter was recorded as "the router started nothing" | `record_block` called the recorder without an execute record, so MLflow stored `status=HOLD`, `gate.decision=NOT_RUN` | `record_block` sends the same execute record the PASS path sends. Measured on a real blocked run: `status=COMPLETED`, `gate.decision=BLOCK`, the triage reason and the draft's sha256 |
+
+A fourth, in the run screen, is in trial B's record.

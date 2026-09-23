@@ -48,10 +48,12 @@ agents:
     type: script
     description: Bind each model lane to a vendor of its own
     command: "${POC_PY:-/opt/venv/bin/python}"
-    args: ["/work/p281/steps/roles.py", "{{ route.output.profile }}", "ai=codex", "ai2=claude"]
+    args: ["/work/p281/steps/roles.py", "{{ route.output.profile }}", "{{ route.output.evidence_dir }}",
+           "ai=codex", "ai2=claude"]
     output:
       ok: {type: string}
       missing: {type: string}
+      ineligible: {type: string}
       ai_provider: {type: string}
       ai_login: {type: string}
       ai_route: {type: string}
@@ -157,7 +159,7 @@ agents:
   - name: done_hold
     type: terminate
     status: failed
-    reason: "HOLD: {{ route.output.reason }} {{ roles.output.missing }}"
+    reason: "HOLD: {{ route.output.reason }} {{ roles.output.missing }} {{ roles.output.ineligible }}"
 
 output:
   profile: "{{ route.output.profile }}"
