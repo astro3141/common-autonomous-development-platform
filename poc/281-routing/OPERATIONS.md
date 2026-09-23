@@ -225,3 +225,45 @@ Third exercise, end to end (archive `20260923-011845`): fresh clone → `cadp278
 16/16 checks → counts match → `auto` workflow **PASS** → the research data restored (48 MB of the
 49 MB directory, the difference being files the backup excludes) → `down.sh --volumes` removed only
 this instance's six volumes → the live instance came back with 16/16 checks and its correct mounts.
+
+## 8. Update and rollback (measured 2026-09-23)
+
+```bash
+scripts/release.sh record [--tag NAME]         # keep what is running now
+scripts/release.sh list
+scripts/release.sh update --to REV             # record, move the workspace to REV, rebuild, check
+scripts/release.sh rollback --to TAG           # put a kept release back (the operator runs this)
+```
+
+**A release is not an image tag.** Because Claude, Conductor and the Preloop CLI live in the
+`agent-home` volume that masks the image's copy (§3), replacing the image does not change what
+runs. A release here is therefore four things, kept together:
+
+| part | how it is kept |
+|---|---|
+| code revision | the workspace's git revision (an update and a rollback check it out) |
+| images | each running image is tagged `…:rel-<tag>`, so a later build of `:local` cannot take it away |
+| configuration | `config/`, `policy/` and `docker/.env` |
+| the toolchain itself | `/home/agent/.local` from the volume — 256 MB compressed |
+
+**Data is not part of a release.** Logins, the Preloop database, MLflow and the run history stay
+where they are and must survive both directions. `scripts/backup.sh` is what covers them.
+
+Only changes to **tracked** files block an update or a rollback; run evidence living in the
+workspace is untracked data and is not a reason to refuse. After either command the workspace sits
+on that revision (detached); check out a branch again to continue development.
+
+**Exercise.**
+
+| step | result |
+|---|---|
+| `record --tag base` | 7 images tagged `rel-base`, toolchain 256 MB, configuration 8 KB, six tool versions read from the container |
+| `update --to <rev>` (a visible change in the hub) | the release in use was recorded first, images rebuilt, stack recreated, **16/16 checks** |
+| after the update | the hub showed the new version; **logins, policy state (`applied`), the run history (8 runs) and the MLflow experiments were unchanged** |
+| a change made only inside the volume | a file added under `/home/agent/.local/bin` — the case an image rollback would not undo |
+| `rollback --to base` (operator-run) | workspace back at its revision, `…:local` re-tagged from `rel-base`, **the volume's toolchain put back (the added file was gone)**, configuration restored, **16/16 checks** |
+| after the rollback | the hub showed the old version again; policy, runs and MLflow unchanged; `auto` workflow **PASS** |
+
+Automatic rollback on a failed update is deliberately not included: the update prints the command
+and the operator decides. A database migration that changes Preloop's schema is not covered by
+image rollback either — that would need a restore from a backup taken before the update.
