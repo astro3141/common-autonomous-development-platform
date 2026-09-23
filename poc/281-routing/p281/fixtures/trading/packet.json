@@ -1,0 +1,34 @@
+{
+  "packet_version": "trial-b-packet-v1.0",
+  "as_of": "2026-09-18",
+  "note": "Fixture for capability trial B. Invented numbers; no market data, no external API.",
+  "cash": 10000000,
+  "constraints": {
+    "max_gross": 1.0,
+    "max_weight_per_symbol": 0.25,
+    "min_weight": 0.02,
+    "universe_only": true
+  },
+  "universe": [
+    {"symbol": "A001", "name": "가전", "price": 74000, "ret_20d": 0.061, "ret_60d": 0.112, "vol_20d": 0.018},
+    {"symbol": "A002", "name": "조선", "price": 31500, "ret_20d": 0.144, "ret_60d": 0.203, "vol_20d": 0.031},
+    {"symbol": "A003", "name": "정유", "price": 58200, "ret_20d": -0.032, "ret_60d": 0.008, "vol_20d": 0.015},
+    {"symbol": "A004", "name": "제약", "price": 122500, "ret_20d": 0.027, "ret_60d": -0.041, "vol_20d": 0.022},
+    {"symbol": "A005", "name": "통신", "price": 45300, "ret_20d": 0.004, "ret_60d": 0.019, "vol_20d": 0.009},
+    {"symbol": "A006", "name": "반도체", "price": 89400, "ret_20d": 0.098, "ret_60d": 0.156, "vol_20d": 0.027}
+  ],
+  "benchmark": {"symbol": "BENCH", "ret_20d": 0.041, "ret_60d": 0.072},
+  "evidence": [
+    {"source_id": "EV-001", "symbol": "A002", "available_at": "2026-09-17",
+     "text": "조선: 분기 수주 잔고가 전년 대비 증가했다고 공시."},
+    {"source_id": "EV-002", "symbol": "A003", "available_at": "2026-09-16",
+     "text": "정유: 정기 보수로 가동률이 일시 하락한다고 공시."},
+    {"source_id": "EV-003", "symbol": "A006", "available_at": "2026-09-18",
+     "text": "반도체: 장비 반입 일정이 앞당겨졌다고 공시."}
+  ],
+  "next_session": {
+    "note": "Deterministic scoring only. Held back from every lane's input.",
+    "returns": {"A001": 0.004, "A002": -0.011, "A003": 0.009, "A004": 0.002,
+                "A005": 0.001, "A006": 0.017, "BENCH": 0.003}
+  }
+}
