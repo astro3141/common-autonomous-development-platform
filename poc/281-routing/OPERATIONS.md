@@ -419,9 +419,22 @@ Read in the running image (`ghcr.io/preloop/preloop:0.15.0`):
 | the MCP proxy fills that context on every call and also filters the tool **list** per subject | `services/dynamic_fastmcp.py` |
 | per-key governance is readable and writable over the API | `GET/PUT /api/v1/auth/api-keys/{id}/governance` |
 
-**And each provider here already is a different subject.** Every CLI was enrolled as its own
-managed agent, so the account holds one credential per provider — Codex and Claude carry different
-`api_key_id` *and* different `managed_agent_id`.
+**Two of the three providers are different subjects; the third is not.** Codex and Claude were each
+enrolled as their own managed agent, and the account holds a credential for each, with different
+`api_key_id` *and* `managed_agent_id` (read from the API). **Grok presents Claude's credential**:
+comparing the bearer token each provider sends to the Preloop MCP endpoint (hashes only, never the
+values) gives
+
+| provider | MCP credential |
+|---|---|
+| Claude | `57dfc1f6…` — the same token the adapter uses for permission checks |
+| Grok | `57dfc1f6…` — **the same one** |
+| Codex | `5f90701f…` — its own |
+
+So a per-credential rule aimed at Claude would hit Grok as well. That is a fact about this
+installation, not about Preloop: Grok's Preloop registration was never separate here (see
+`run-agent.mjs`, the Grok profile — it has no Preloop principal of its own, a known open item of
+#281), and nothing has given it one.
 
 **Measured end to end on the live stack**, with one policy and one account:
 
@@ -432,8 +445,12 @@ managed agent, so the account holds one credential per provider — Codex and Cl
 | Claude asked to write the same file, unchanged | **COMPLETED**, file written |
 | the override cleared, Codex asked again | **COMPLETED**, file written |
 
-So per-caller tool permission works today, at the granularity of a credential. Because the trials
-bind each role to a vendor, that is also per-role for those workflows. What is *not* built is the
+So per-caller tool permission works today, **at the granularity of a credential** — which is what
+was measured, and no further. It is not per role: in the novel trial one credential carries two
+roles on each side (Codex is architect *and* story reviewer, Claude is author *and* history
+reviewer), so "the author may write, the history reviewer may not" was **not** shown and does not
+follow from this test. Telling two roles of the same vendor apart would need a credential per
+role. What is *not* built is the
 connection: nothing in this stack sets or tracks per-credential governance — `cfg.py` manages the
 account policy only, and a role's credential is chosen for its login, not for its permissions.
 
@@ -451,7 +468,10 @@ account policy only, and a role's credential is chosen for its login, not for it
   from reading or writing another run's directory. This document said "each run works in its own
   directory", which is true and was easy to misread as isolation; it is not.
 
-**What remains open**, stated as the review put it: per-role governance is **unimplemented here**,
-not impossible. The pieces measured above are the ones a design would use — a role names a
-credential, and that credential carries the tool rights — and `cfg.py` would have to own that
-mapping the way it owns the account policy today.
+**Where this leaves it**, in the reviewer's words: *differentiated rights per credential inside one
+account are reported working; choosing a Preloop credential per role, and managing those settings,
+is unimplemented.* The pieces measured above are the ones a design would use — a role names a
+credential, and that credential carries the tool rights, which for two roles of the same vendor
+means a credential per role — and `cfg.py` would have to own that mapping the way it owns the
+account policy today. Per-lane recovery (§ trial records) and this mapping both stay on the same
+footing: built when something actually needs them.
