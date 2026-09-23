@@ -49,7 +49,8 @@
     <button data-tab="run">워크플로 실행</button>
     <button data-tab="runs">실행 기록</button>
   </nav>
-  <span class="muted" style="margin-left:auto">프로필
+  <span class="muted" id="checkline" style="margin-left:auto">점검 상태 확인 중…</span>
+  <span class="muted">프로필
     <select id="profile"></select></span>
 </header>
 <main>
@@ -234,6 +235,23 @@ async function loadApprovals() {
     : (Array.isArray(a) ? "승인 대기 없음" : `<span class="bad">${esc(a.error)}</span>`);
 }
 
+// ---- checks: when the stack was last checked, and what failed
+async function loadChecks() {
+  const c = await api("/api/checks");
+  const el = $("#checkline");
+  if (!c || !c.at) { el.innerHTML = `<span class="warn">점검 기록 없음${c && c.error ? " — " + esc(c.error) : ""}</span>`; return; }
+  const at = new Date(c.at.replace(" ", "T"));
+  const mins = Math.round((Date.now() - at.getTime()) / 60000);
+  const age = mins < 60 ? `${mins}분 전` : (mins < 60 * 24 ? `${Math.round(mins / 60)}시간 전` : `${Math.round(mins / 1440)}일 전`);
+  const stale = mins > 60 * 24;
+  if (c.ok) {
+    el.innerHTML = `점검 <span class="${stale ? "warn" : "ok"}">통과</span> · ${esc(age)}${stale ? " (오래됨)" : ""}`;
+  } else {
+    const why = (c.failed || []).map((f) => `${f.check}: ${f.expected} 기대, ${f.got || "없음"}`).join("; ");
+    el.innerHTML = `점검 <span class="bad">실패</span> · ${esc(age)} · ${esc(why)}`;
+  }
+}
+
 // ---- run
 const INPUTS = { auto: [["file_name","routed.txt"],["content","R1"]], "research-r": [] };
 function renderInputs() {
@@ -305,7 +323,7 @@ async function showRun(id) {
 }
 
 // ---- boot
-loadProfiles().then(() => { loadAccounts(); loadConfig(); loadApprovals(); renderInputs(); });
+loadProfiles().then(() => { loadAccounts(); loadConfig(); loadApprovals(); loadChecks(); renderInputs(); });
 </script>
 </body>
 </html>

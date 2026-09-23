@@ -53,9 +53,11 @@ if [ "$MODE" != "--check" ]; then
 fi
 
 fail=0
+FAILED=""
 check() {  # name, expected, actual
   if [ "$2" = "$3" ]; then printf '  ok    %-44s %s\n' "$1" "$3"
-  else printf '  FAIL  %-44s expected %s, got %s\n' "$1" "$2" "$3"; fail=1; fi
+  else printf '  FAIL  %-44s expected %s, got %s\n' "$1" "$2" "$3"; fail=1
+       FAILED="$FAILED{\"check\":\"$1\",\"expected\":\"$2\",\"got\":\"$3\"},"; fi
 }
 in_agent() { docker exec "$STACK-agent" sh -c "$1" 2>/dev/null; }
 
@@ -83,4 +85,11 @@ import json,datetime as d
 r=json.load(open(\"/obs/codex.raw.json\")); t=d.datetime.fromisoformat(r[\"collected_at\"].replace(\"Z\",\"+00:00\"))
 print(\"yes\" if r.get(\"exit\")==0 and (d.datetime.now(d.timezone.utc)-t).total_seconds()<600 else \"no\")"')"
 echo
+# Leave the result where the screen can read it: when the checks last ran and what failed.
+# A check that has not run for a long time is itself worth seeing.
+mkdir -p "$HERE/evidence/checks"
+printf '{"at":"%s","stack":"%s","ok":%s,"failed":[%s]}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$STACK" "$([ $fail = 0 ] && echo true || echo false)" \
+  "${FAILED%,}" > "$HERE/evidence/checks/last.json"
+
 [ $fail = 0 ] && echo "ALL CHECKS PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }

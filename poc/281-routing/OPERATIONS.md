@@ -311,3 +311,53 @@ aborts the script, and the candidate build takes a native path for its context.
 workspace this script lives in — including the script. A shell reads a script as it runs, so the
 file changed underneath it. `release.sh` now copies itself to a temporary file and re-executes that
 copy, so the running code cannot change halfway.
+
+## 9. Cleanup and check reporting (measured 2026-09-23)
+
+```bash
+scripts/cleanup.sh [--days N] [--keep N] [--apply] [--include-orphans] [--json]
+scripts/up.sh --check        # also writes evidence/checks/last.json
+```
+
+**Cleanup removes runs, not directories.** A run leaves three traces — the screen's record
+(`evidence/ui-runs/<id>/`, with Conductor's event log), the workspace it worked in
+(`<workspace_root>/<run>…`) and the adapter's evidence (`evidence/p281/<run>-…`). They are grouped
+by the Conductor run id and removed together or not at all, so the screen never lists a run whose
+artifacts are gone.
+
+**Preview is the default.** Nothing is deleted without `--apply`.
+
+**A run is kept, whatever its age, when** it is still running; Preloop has a pending approval under
+its workspace; the operator marked it (a `keep` file in its directory); or it is inside the
+retention window (`--days`, default 14) or among the newest (`--keep`, default 20). Traces that
+belong to no run on the screen are reported as orphans and are only removed with
+`--include-orphans`.
+
+Run times come from the run id, not from file timestamps — a restored or copied file carries the
+wrong date.
+
+**Checks now leave a record.** `scripts/up.sh --check` writes `evidence/checks/last.json` with the
+time, the instance, whether it passed and each failing check with what was expected and what was
+found. `ops` serves it at `/api/checks`, and the hub shows one line in the header:
+
+- `점검 통과 · 3분 전` — passed, and how long ago;
+- `점검 통과 · 2일 전 (오래됨)` — passed, but the last check is over a day old;
+- `점검 실패 · 3일 전 · grok /route login: yes 기대, no; MLflow: 200 기대, 000` — what failed.
+
+That is the only screen addition in this step.
+
+**What the exercise found**
+
+| case | result |
+|---|---|
+| preview by default | with no `--apply`, nothing was deleted and the grouped list was printed |
+| a run marked `keep` | kept under `--days 0 --keep 0` ("marked keep") |
+| a run still going | kept ("still running") |
+| a pending approval under a run's workspace | kept ("an approval is pending under its workspace") |
+| **the approvals reader failing** | **the first version deleted anyway** — the reader's non-zero exit produced an empty list. It now stops with "nothing was removed", for a failed reader and for unreadable output alike |
+| check reporting | passing, stale and failing states all shown on the screen, with the failing checks named |
+
+The bad case above was found by running it: 15 old runs were removed while the approvals reader was
+broken. Everything tracked in git came back with `git checkout`, and the 11 untracked evidence
+directories were restored from the backup taken earlier (§7) — which is the first time a backup was
+used for its actual purpose here.
