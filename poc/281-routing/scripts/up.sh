@@ -32,9 +32,13 @@ OPS_PORT="${OPS_PORT:-8781}"; HUB_PORT="${HUB_PORT:-8780}"; MLFLOW_PORT="${MLFLO
 PRELOOP_PROJECT="${PRELOOP_PROJECT:-preloop-oss}"
 PRELOOP_API_PORT="${PRELOOP_API_PORT:-8000}"; PRELOOP_GATEWAY_PORT="${PRELOOP_GATEWAY_PORT:-8001}"
 PRELOOP_CONSOLE_PORT="${PRELOOP_CONSOLE_PORT:-3000}"
-POC_HOST_DIR="${POC_HOST_DIR:-$HERE}"
-RESEARCH_HOST_DIR="${RESEARCH_HOST_DIR:-$HERE/evidence/research}"
-export STACK OPS_PORT HUB_PORT MLFLOW_PORT POC_HOST_DIR RESEARCH_HOST_DIR
+# Paths are NOT defaulted here. Compose reads docker/.env (this host's own paths) and falls back
+# to the relative defaults in compose.poc.yaml; a shell variable would win over both, so one is
+# exported only when something actually set it — the environment, or a restored workspace's
+# config/instance.env. See docs.docker.com/compose/how-tos/environment-variables/.
+export STACK OPS_PORT HUB_PORT MLFLOW_PORT
+[ -n "${POC_HOST_DIR:-}" ] && export POC_HOST_DIR
+[ -n "${RESEARCH_HOST_DIR:-}" ] && export RESEARCH_HOST_DIR
 export PRELOOP_API_PORT PRELOOP_GATEWAY_PORT PRELOOP_CONSOLE_PORT
 FORCE=""; [ "$MODE" = "--recreate" ] && FORCE="--force-recreate"
 

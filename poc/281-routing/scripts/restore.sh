@@ -67,9 +67,57 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   # a stray PRELOOP_PROJECT in the environment must never point the DROP DATABASE at the live one
   docker ps -a --format '{{.Names}}' | grep -q "^$PRELOOP_PROJECT-postgres" && \
     refuse "a Preloop postgres container already exists for project $PRELOOP_PROJECT"
-  realpath_of() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-  [ "$(realpath_of "$PRELOOP_RESTORE_DIRU")" != "$(realpath_of "$LIVE_PRELOOP_DIRU")" ] || \
-    refuse "the Preloop install directory is the live one ($LIVE_PRELOOP_DIR)"
+
+  # Every directory this script writes to or deletes is compared with every directory the live
+  # instance uses — in both directions, on normalised paths. "Same path" is not enough: a parent
+  # of the live Preloop directory would be removed with it inside.
+  realpath_of() {  # resolve the part that exists, keep the rest — a path that does not exist yet
+    p="$1"; rest=""                       # must still compare as itself, not as its parent
+    while [ -n "$p" ] && [ ! -d "$p" ]; do
+      rest="/$(basename "$p")$rest"; q="$(dirname "$p")"
+      [ "$q" = "$p" ] && break
+      p="$q"
+    done
+    base="$( (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p" )"
+    printf '%s%s' "${base%/}" "$rest"
+  }
+  overlaps() {  # a, b → true when either contains the other
+    a="$(realpath_of "$1")"; b="$(realpath_of "$2")"
+    [ "$a" = "$b" ] && return 0
+    case "$a/" in "$b"/*) return 0;; esac
+    case "$b/" in "$a"/*) return 0;; esac
+    return 1
+  }
+  # Docker Desktop reports a bind source either as the host path (D:/Work/…) or in the VM's own
+  # form (/run/desktop/mnt/host/d/Work/…, /host_mnt/d/…). Unnormalised, the second form matches
+  # nothing and the check silently passes.
+  norm_host() {
+    case "$1" in
+      /run/desktop/mnt/host/?/*|/host_mnt/?/*)
+        p="${1#/run/desktop/mnt/host/}"; p="${p#/host_mnt/}"
+        d="${p%%/*}"; printf '%s:/%s' "$(printf '%s' "$d" | tr 'a-z' 'A-Z')" "${p#*/}";;
+      *) printf '%s' "$1";;
+    esac
+  }
+  # the live instance's own directories: its Preloop install and every bind mount it has
+  LIVE_DIRS_FILE="$(mktemp)"
+  printf '%s\n' "$LIVE_PRELOOP_DIRU" > "$LIVE_DIRS_FILE"
+  docker inspect $(docker ps -aq --filter "name=$LIVE_STACK-") \
+    --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
+    | sed '/^$/d' | while IFS= read -r p; do u "$(norm_host "$p")"; done >> "$LIVE_DIRS_FILE"
+  check_against_live() {  # path, what it is used for
+    while IFS= read -r live; do
+      [ -n "$live" ] || continue
+      overlaps "$1" "$live" && { rm -f "$LIVE_DIRS_FILE"; refuse "$2 ($1) overlaps a directory the live instance uses ($live)"; }
+    done < "$LIVE_DIRS_FILE"
+    return 0          # "no overlap" is success; without this, set -e would end the run silently
+  }
+  check_against_live "$PRELOOP_RESTORE_DIRU" "the Preloop install directory for the restore"
+  check_against_live "$WORKSPACEU" "the restore workspace"
+  # …and the two restore targets must not contain each other either
+  overlaps "$PRELOOP_RESTORE_DIRU" "$WORKSPACEU" && \
+    refuse "the Preloop directory and the workspace of the restore overlap"
+  rm -f "$LIVE_DIRS_FILE"
   # a leftover directory from an earlier restore is ours to replace (it is named after this
   # project and has no containers, both checked just above); the live one is never touched
 
@@ -88,9 +136,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   EXISTING="$(docker ps -a --format '{{.Names}}' | grep -E "^$STACK-" || true)"
   [ -z "$EXISTING" ] || refuse "containers of $STACK already exist: $(echo "$EXISTING" | tr '\n' ' ')"
 
-  # the workspace must not be one the live instance uses, and must not be overwritten by accident
-  LIVE_PATHS="$(docker inspect $(docker ps -aq --filter "name=$LIVE_STACK-") \
-      --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null | sort -u || true)"
+  # the workspace must not be overwritten by accident (its overlap with the live instance's
+  # directories was checked above, on normalised paths and without splitting on spaces)
   if [ -n "$CLONE_FROM" ]; then
     [ -e "$WORKSPACEU" ] && refuse "$WORKSPACE already exists (a clone needs a new directory)"
   else
@@ -100,12 +147,6 @@ if [ "$VERIFY_ONLY" = 0 ]; then
         refuse "$WORKSPACE already holds config/ or evidence/ — they would be replaced (pass --into-existing to accept)"
     fi
   fi
-  TARGET_REAL="$(realpath_of "$WORKSPACEU")"
-  for p in $LIVE_PATHS; do
-    pr="$(realpath_of "$(u "$p")")"
-    case "$TARGET_REAL/" in "$pr"/*) refuse "$WORKSPACE is inside a path the live instance mounts ($p)";; esac
-    case "$pr/" in "$TARGET_REAL"/*) refuse "$WORKSPACE contains a path the live instance mounts ($p)";; esac
-  done
   say "target" "$STACK (workspace $WORKSPACE)"
   say "preloop" "$PRELOOP_PROJECT in $PRELOOP_RESTORE_DIR"
   say "live instance" "stopped; its volumes and paths untouched"

@@ -135,11 +135,30 @@ IMAGE="$(docker inspect -f '{{.Config.Image}}' "$AGENT")"
   for c in $(docker ps -a --format '{{.Names}}' | grep -E "^($STACK-|$PRELOOP_PROJECT-)" | sort); do
     echo "image.$c=$(docker inspect -f '{{.Config.Image}}' "$c")@$(docker inspect -f '{{.Image}}' "$c")"
   done
-  # what a restore must find again: counts of Preloop's key tables
-  for t in account user api_key mcp_server approval_request; do
-    echo "dbcount.$t=$(count "$t")"
-  done
 } > "$WORKU/release.kv"
+
+# ---------------------------------------------------------------- 2. quiesce
+if [ "$STOP" = 1 ]; then
+  echo "== stopping writers"
+  STOPPED="$(docker ps --format '{{.Names}}' | grep -E "^($STACK-|$PRELOOP_PROJECT-)" | grep -v -- "-postgres" || true)"
+  # Postgres stays up: its dump is taken transactionally, everything else must not write.
+  [ -n "$STOPPED" ] && docker stop $STOPPED >/dev/null
+  say "stopped" "$(echo "$STOPPED" | wc -w | tr -d ' ') containers"
+fi
+
+# ---------------------------------------------------------------- 3. copy
+# The row counts a restore is checked against must describe the SAME state as the dump, so they
+# are taken after the writers are stopped and immediately before it. Taken earlier, one approval
+# arriving in between would make a perfectly good dump look wrong.
+echo "== Preloop database"
+for t in account user api_key mcp_server approval_request; do
+  echo "dbcount.$t=$(count "$t")" >> "$WORKU/release.kv"
+done
+docker exec "$PG" pg_dump -U postgres -d preloop --format=custom > "$WORKU/preloop.dump" \
+  || fail "pg_dump failed"
+[ -s "$WORKU/preloop.dump" ] || fail "the database dump is empty"
+say "preloop.dump" "$(du -h "$WORKU/preloop.dump" | cut -f1)"
+
 # real JSON, written and parsed by a JSON library — not by string concatenation
 docker run --rm -i -v "$WORK:/w" --entrypoint /opt/venv/bin/python "$IMAGE" - <<'PY'
 import json
@@ -165,22 +184,6 @@ for t in account user api_key mcp_server approval_request; do
   grep -q "\"$t\": [0-9]" "$WORKU/release.json" || MISSING="$MISSING release:dbcount.$t"
 done
 say "release recorded" "$(grep -o '"workspace_revision": "[^"]*"' "$WORKU/release.json" | cut -d'"' -f4 | cut -c1-8)"
-
-# ---------------------------------------------------------------- 2. quiesce
-if [ "$STOP" = 1 ]; then
-  echo "== stopping writers"
-  STOPPED="$(docker ps --format '{{.Names}}' | grep -E "^($STACK-|$PRELOOP_PROJECT-)" | grep -v -- "-postgres" || true)"
-  # Postgres stays up: its dump is taken transactionally, everything else must not write.
-  [ -n "$STOPPED" ] && docker stop $STOPPED >/dev/null
-  say "stopped" "$(echo "$STOPPED" | wc -w | tr -d ' ') containers"
-fi
-
-# ---------------------------------------------------------------- 3. copy
-echo "== Preloop database"
-docker exec "$PG" pg_dump -U postgres -d preloop --format=custom > "$WORKU/preloop.dump" \
-  || fail "pg_dump failed"
-[ -s "$WORKU/preloop.dump" ] || fail "the database dump is empty"
-say "preloop.dump" "$(du -h "$WORKU/preloop.dump" | cut -f1)"
 
 echo "== volumes"
 for v in route-creds agent-home quota-home; do
