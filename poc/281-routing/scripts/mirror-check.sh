@@ -22,14 +22,21 @@
 # config/environment.yaml and this host's values) and anything holding credentials — neither is
 # published, and both are per-host by design.
 #
-# Exit 1 on any difference. Two files are expected to differ and are listed, not compared (§1):
-# docker/compose.poc.yaml and docker/agent.Dockerfile.
+# Exit 1 on any difference, in either direction — a file changed here and not published, and a
+# file still published that no longer exists here. The documented exceptions are listed, not
+# compared (OPERATIONS.md §1).
 set -euo pipefail
 
 repo="${1:-D:/Work/cadp}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 sub="poc/281-routing"
-known_different="docker/compose.poc.yaml docker/agent.Dockerfile"
+# Documented in OPERATIONS.md §1: the repository pins what this host installs unpinned, and it
+# carries the CA directory's note while this host's certificate is unversioned.
+# README.md and RUNBOOK.md are different documents that happen to share a name: the repository's
+# are written for #281 and its readers, this workspace's RUNBOOK.md is the #278 stack's own and
+# predates them. Checked, not assumed — the first version of this script never looked at the root
+# documents, which is how they were noticed.
+known_different="docker/compose.poc.yaml docker/agent.Dockerfile docker/ca/README.md README.md RUNBOOK.md"
 
 [ -d "$repo/$sub" ] || { echo "no $sub in $repo"; exit 2; }
 
@@ -42,7 +49,16 @@ is_known() {
   return 1
 }
 
-# Every code and document file of the workspace's published surface.
+# Every code and document file of the workspace's published surface — including the documents at
+# its root (OPERATIONS.md, CONTRACT.md, RUNBOOK.md …), which the first version did not look at.
+list_tree() {                                # $1: a tree's root
+  ( cd "$1" && ls *.md 2>/dev/null
+    find p281 ops hub scripts config docker policy \
+      -type f \( -name '*.py' -o -name '*.mjs' -o -name '*.sh' -o -name '*.yaml' \
+                 -o -name '*.yml' -o -name '*.md' -o -name '*.html' -o -name '*.js' \
+                 -o -name '*.json' -o -name '*.Dockerfile' \) 2>/dev/null ) | sed 's|^\./||' | sort
+}
+
 while IFS= read -r rel; do
   case "$rel" in
     */.*|.*) continue ;;                      # workspace scratch (.pol.py, .show.py …)
@@ -63,10 +79,24 @@ while IFS= read -r rel; do
     echo "  DIFFERS                        $rel"
     drift=$((drift + 1))
   fi
-done < <(cd "$here" && find p281 ops hub scripts config docker policy \
-           -type f \( -name '*.py' -o -name '*.mjs' -o -name '*.sh' -o -name '*.yaml' \
-                      -o -name '*.yml' -o -name '*.md' -o -name '*.html' -o -name '*.js' \
-                      -o -name '*.json' -o -name '*.Dockerfile' \) 2>/dev/null | sed 's|^\./||' | sort)
+done < <(list_tree "$here")
+
+# The other direction: a file that is still published but no longer exists here. A step deleted in
+# the workspace (steps/novel_reviews.py, steps/trade_lanes.py when their work moved into the
+# platform capability) stays in the repository unless it is removed there too, and a reader would
+# run code that nothing here produces any more.
+while IFS= read -r rel; do
+  case "$rel" in
+    */.*|.*) continue ;;
+    p281/comment-*|p281/pr-*|comment-*|issue-*) continue ;;
+    config/generated/*) continue ;;
+  esac
+  is_known "$rel" && continue
+  if [ ! -f "$here/$rel" ]; then
+    echo "  PUBLISHED, NOT HERE            $rel"
+    drift=$((drift + 1))
+  fi
+done < <(list_tree "$repo/$sub")
 
 echo
 echo "compared $checked file(s); $drift differ, $missing not published yet"
