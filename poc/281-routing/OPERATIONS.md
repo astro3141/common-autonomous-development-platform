@@ -361,3 +361,22 @@ The bad case above was found by running it: 15 old runs were removed while the a
 broken. Everything tracked in git came back with `git checkout`, and the 11 untracked evidence
 directories were restored from the backup taken earlier (§7) — which is the first time a backup was
 used for its actual purpose here.
+
+### Review of the cleanup — four boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the approvals reader asked for the first 50 requests of the whole history, so fifty decided ones hid a waiting one and its run was removed | it asks for `status=pending` and keeps asking until a page comes back short; `--all` reports whether the answer is **complete**, and the cleanup stops unless it is | a reader reporting `complete: false` stops the run with "nothing was removed"; a pending request that only a full scan reaches protects its run and its orphan traces |
+| 2 | orphans were collected separately and deleted straight away, with none of the protections | orphans are held to the same rules: a pending approval under them, a recent change, or **any** run whose state could not be read keeps them | each case exercised; an unreadable `meta.json` alone is enough to keep every orphan |
+| 3 | `ignore_errors=True` meant a group could half-disappear and still be reported as removed | every path of a group is moved aside first; if one move fails the others are put back and the run is reported as **failed**, not removed (exit code 1) | with a move made to fail, nothing of that run was gone and it was listed under "could NOT be removed" |
+| 4 | a run was judged by the state on the screen, so one whose launcher was still writing its final state could be removed | the launcher process is checked directly, whatever the log and the state say | a run with an end in its event log but a live launcher is kept ("its launcher is still alive") |
+
+These are covered by `p281/cleanup_controls.py` (13 checks), which runs against temporary
+directories with a stubbed approvals reader — no run of the instance is read or removed.
+
+**Cost of testing this badly.** Two of these cases were first exercised against the live
+workspace with `--apply`, which removed real run evidence. Everything tracked in git came back
+with `git checkout`, and 36 untracked evidence directories were restored from the backup, in two
+goes. The scratch workspaces under `/ws` for those runs are gone for good — they are classified
+as regenerate/discard in §4, which is the only reason this was recoverable at all. The controls
+exist so that these paths are never again exercised on live data.
