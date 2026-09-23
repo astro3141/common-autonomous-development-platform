@@ -32,6 +32,13 @@ published interface — and `scripts/mirror-check.sh` now compares every file th
 sides, with these two as its only documented exceptions. It is run before publishing, and a
 difference fails it.
 
+Its first version compared code and documents only: a changed `p281/fixtures/trading/packet.json`
+(what every lane decides from) and a changed `policy/b-fsmcp.yaml` (what the tools may do) both
+passed as `MIRROR OK`, which review demonstrated on two temporary trees. Inputs and policy decide
+what a run produces, so both are compared now (83 files); each of those two cases fails the check.
+Generated configuration (`config/generated/`, written by `cfg.py` per host) and anything holding
+credentials stay out of it — they are not published and are per-host by design.
+
 So **the running agent image was built from the unpinned Dockerfile**, and the versions in it are
 whatever the installers returned on 2026-09-22 (§3). The pinned Dockerfile in the repository has
 never been built here. The compose defaults are the repository's relative ones on both sides;

@@ -11,6 +11,17 @@
 # published pair could not start, and every "measured on the running stack" line in that PR was
 # about code nobody could read. This check exists so that cannot be reported again.
 #
+# What is compared: code, documents, workflows, **policies** (`policy/`) and the JSON a run reads
+# — fixtures and routing policies. A review found the first version searching neither `policy/`
+# nor `.json`, so a changed `p281/fixtures/trading/packet.json` (what every lane decides from) and
+# a changed `policy/b-fsmcp.yaml` (what the tools are allowed to do) both passed as MIRROR OK.
+# Inputs and policy decide what a run produces, so they are part of "the published copy is what
+# was measured".
+#
+# What is not compared: generated configuration (`config/generated/`, written by cfg.py from
+# config/environment.yaml and this host's values) and anything holding credentials — neither is
+# published, and both are per-host by design.
+#
 # Exit 1 on any difference. Two files are expected to differ and are listed, not compared (§1):
 # docker/compose.poc.yaml and docker/agent.Dockerfile.
 set -euo pipefail
@@ -36,6 +47,7 @@ while IFS= read -r rel; do
   case "$rel" in
     */.*|.*) continue ;;                      # workspace scratch (.pol.py, .show.py …)
     p281/comment-*|p281/pr-*|comment-*|issue-*) continue ;;   # drafts, never published as files
+    config/generated/*) continue ;;           # written by cfg.py per host, not published
   esac
   if is_known "$rel"; then
     echo "  skip (documented difference)  $rel"
@@ -51,10 +63,10 @@ while IFS= read -r rel; do
     echo "  DIFFERS                        $rel"
     drift=$((drift + 1))
   fi
-done < <(cd "$here" && find p281 ops hub scripts config docker \
+done < <(cd "$here" && find p281 ops hub scripts config docker policy \
            -type f \( -name '*.py' -o -name '*.mjs' -o -name '*.sh' -o -name '*.yaml' \
                       -o -name '*.yml' -o -name '*.md' -o -name '*.html' -o -name '*.js' \
-                      -o -name '*.Dockerfile' \) 2>/dev/null | sed 's|^\./||' | sort)
+                      -o -name '*.json' -o -name '*.Dockerfile' \) 2>/dev/null | sed 's|^\./||' | sort)
 
 echo
 echo "compared $checked file(s); $drift differ, $missing not published yet"
