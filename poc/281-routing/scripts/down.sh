@@ -28,7 +28,8 @@ VOLUMES=0; [ "${1:-}" = "--volumes" ] && VOLUMES=1
 echo "instance : $STACK   (Preloop project $PRELOOP_PROJECT)"
 echo "workspace: ${POC_HOST_DIR:-$HERE (compose defaults / docker/.env)}"
 echo "== stopping"
-(cd "$HERE/docker" && docker compose -f compose.poc.yaml down) || exit 1
+# every profile, whatever composition was up: nothing may be left behind because it was optional
+(cd "$HERE/docker" && COMPOSE_PROFILES="record,ui" docker compose -f compose.poc.yaml down) || exit 1
 docker compose --project-directory "$PRELOOP_DIR" -p "$PRELOOP_PROJECT" \
   -f "$PRELOOP_DIR/docker-compose.yaml" -f "$PRELOOP_DIR/docker-compose.auth.yaml" down || exit 1
 

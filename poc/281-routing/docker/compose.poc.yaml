@@ -102,6 +102,8 @@ services:
     image: cadp278/mlflow:3.16.1
     container_name: ${STACK:-cadp278}-mlflow
     restart: unless-stopped
+    # Recording is a capability a composition may leave out (scripts/up.sh --composition).
+    profiles: ["record"]
     networks:
       - governed
       - observe
@@ -115,6 +117,11 @@ services:
       # so that name has to be allowed explicitly. Measured: without this, OTLP
       # ingest answers 403 "Invalid Host header".
       MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:${MLFLOW_PORT:-5000},127.0.0.1,127.0.0.1:${MLFLOW_PORT:-5000}"
+      # This stack uses MLflow to log runs and keep artifacts — nothing submits server-side jobs.
+      # Left on, 3.16.1 starts a fleet of huey consumers (measured: 18 processes, workers
+      # 10+10+5+2+10+5) and the container was the largest in the stack by a wide margin.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+      MLFLOW_SERVER_JOB_ENABLE_PERIODIC_TASKS: "false"
     ports:
       # Inbound only. Publishing a port does not give any container egress,
       # so this does not weaken the N7 claim.
@@ -123,6 +130,7 @@ services:
       mlflow server --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --artifacts-destination /mlflow/artifacts
+      --workers 1
 
   toolsvc:
     build:
@@ -197,6 +205,8 @@ services:
     image: cadp278/ops:local
     container_name: ${STACK:-cadp278}-ops
     restart: unless-stopped
+    # The screen is optional in a reduced composition; runs still start from the CLI.
+    profiles: ["ui"]
     networks:
       - opsnet
     volumes:
@@ -214,6 +224,8 @@ services:
     image: cadp278/hub:local
     container_name: ${STACK:-cadp278}-hub
     restart: unless-stopped
+    # The screen is optional in a reduced composition; runs still start from the CLI.
+    profiles: ["ui"]
     networks:
       - opsnet
     environment:

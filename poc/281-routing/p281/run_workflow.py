@@ -1,13 +1,19 @@
 """Start and read workflow runs for the ops API — runs inside the agent container.
 
 usage:
-  run_workflow.py start <ui-id> <workflow> <profile> [key=value ...]   (foreground; ops starts it detached)
+  run_workflow.py start <ui-id> <workflow> <profile> [key=value ...] [--allow-unrecorded]
   run_workflow.py resume <ui-id>                                      continue an interrupted run
   run_workflow.py show  <ui-id>                                       JSON view of one run
   run_workflow.py list                                                JSON list, newest first
 
 Only workflows in WORKFLOWS may be started; arguments reach Conductor as an argv list, never
 through a shell.
+
+A run is refused when the stack cannot do what a run needs (p281/capabilities.py): without
+Preloop no tool is governed and no permission request can be answered, and without the egress
+proxy there is no route to a provider. Recording is the one capability a run can do without —
+a composition may leave MLflow out — but only when the caller says so with `--allow-unrecorded`,
+so an unrecorded run is a decision someone made and not something noticed afterwards.
 
 Binding a UI run to *its* Conductor run is exact, not inferred: each run gets its own directory
 and its own TMPDIR, and Conductor writes its event log under the temp directory
@@ -24,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/work/p281")
 import settings
+import capabilities
 
 WORKFLOWS = {"auto": "p281/workflows/auto.yaml", "research-r": "p281/workflows/research-r.yaml",
              "novel-a": "p281/workflows/novel-a.yaml",
@@ -48,9 +55,18 @@ def meta_path(ui):
     return run_dir(ui) / "meta.json"
 
 
-def cmd_start(ui, workflow, profile, pairs):
+def cmd_start(ui, workflow, profile, pairs, allow_unrecorded=False):
     if workflow not in WORKFLOWS or not re.fullmatch(r"[a-z0-9-]{1,40}", profile) or not re.fullmatch(r"[a-z0-9-]{6,40}", ui):
         print(json.dumps({"error": "invalid workflow, profile or id"})); return 2
+    caps = capabilities.probe()
+    gone = capabilities.missing(caps, need_record=not allow_unrecorded)
+    if gone:
+        print(json.dumps({"error": "the stack cannot run this now: " + ", ".join(gone),
+                          "why": {k: caps[k]["without_it"] for k in gone},
+                          "detail": {k: caps[k]["detail"] for k in gone},
+                          "hint": ("add --allow-unrecorded to run without recording"
+                                   if gone == ["record"] else "")}))
+        return 3
     inputs = {}
     for kv in pairs:
         k, _, v = kv.partition("=")
@@ -62,6 +78,10 @@ def cmd_start(ui, workflow, profile, pairs):
     (tmp / "conductor").mkdir(parents=True, exist_ok=False)     # a fresh id only
     meta = {"ui_id": ui, "workflow": workflow, "profile": profile, "inputs": inputs,
             "started_at": time.time(), "state": "running",
+            # what the stack could do when this run started, so a run read later is read in
+            # the light of the stack it actually ran on
+            "capabilities": {k: c["available"] for k, c in caps.items()},
+            "unrecorded": bool(allow_unrecorded and not caps["record"]["available"]),
             "launcher_pid": os.getpid(), "instance": instance_id()}
     meta_path(ui).write_text(json.dumps(meta))
     argv = ["conductor", "--silent", "run", WORKFLOWS[workflow], "--no-interactive", "-i", f"profile={profile}"]
@@ -216,6 +236,8 @@ def cmd_list():
 
 if __name__ == "__main__":
     a = sys.argv[1]
-    sys.exit({"start": lambda: cmd_start(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]),
+    rest = [x for x in sys.argv[5:] if x != "--allow-unrecorded"]
+    sys.exit({"start": lambda: cmd_start(sys.argv[2], sys.argv[3], sys.argv[4], rest,
+                                         "--allow-unrecorded" in sys.argv[5:]),
               "resume": lambda: cmd_resume(sys.argv[2]),
               "show": lambda: cmd_show(sys.argv[2]), "list": cmd_list}[a]())

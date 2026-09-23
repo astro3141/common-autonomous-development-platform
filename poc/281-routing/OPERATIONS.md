@@ -15,11 +15,12 @@ containers, not from the compose files.
 | research workspace (`D:\Work\research-280`, mounted as `/research`) | not a git tree; 49 MB of data |
 
 **The workspace and the repository are not the same tree.** The workspace is the ancestor: it
-carries #278 material and local notes that were never mirrored. Two differences change behaviour:
+carries #278 material and local notes that were never mirrored. One difference changes behaviour
+(`docker/compose.poc.yaml` used to be listed here as a second one; the two copies are in fact
+identical — what differs per host is `docker/.env`, which is not published):
 
 | file | workspace (running) | repository |
 |---|---|---|
-| `docker/compose.poc.yaml` | same defaults as the repository; this host's paths come from `docker/.env` (git-ignored: `POC_HOST_DIR=D:/Work/poc-278`, `RESEARCH_HOST_DIR=D:/Work/research-280`) | relative defaults (`..`, `../evidence/research`) — a fresh clone resolves inside `poc/281-routing/` |
 | `docker/agent.Dockerfile` | unpinned installs; copies one host CA file | Claude 2.1.278, Conductor `87f7788e`, Preloop CLI 0.15.0 pinned; `ca/` directory, certificates unversioned |
 
 **Everything else on both sides must be identical, and that is now checked.** A review of the
@@ -52,6 +53,48 @@ workflow had re-implemented (now `p281/steps/tasks.py`), the "required review" j
 inside it, the trading baseline computed in a platform step, and `record.py` accepting only one
 execution per run (now a parent run with a child run per execution, so a lane's own tokens and
 duration can be compared).
+
+### Compositions: running with less, and knowing what that costs
+
+Memory pressure was being answered by stopping containers by hand, which left no record of what
+had been switched off. It is a choice the stack now offers, with the consequence stated:
+
+```
+scripts/up.sh --composition full        everything (default)
+scripts/up.sh --composition no-record   without MLflow
+scripts/up.sh --composition runtime     without MLflow and without the screen
+```
+
+Measured on this host (`docker stats`, no run in flight):
+
+| | containers | memory |
+|---|---|---|
+| before this change | 16 | 3,908 MiB |
+| `full` | 16 | 2,239 MiB |
+| `no-record` | 15 | 1,753 MiB |
+| `runtime` | 13 | 1,728 MiB |
+
+**Most of the saving is not in dropping services.** MLflow 3.16.1 starts a fleet of job consumers
+(measured: 18 processes, huey workers 10+10+5+2+10+5) for work this stack never submits; it was
+2,157 MiB, the largest container by far — more than all eight Preloop containers together.
+`MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`, `MLFLOW_SERVER_JOB_ENABLE_PERIODIC_TASKS=false` and
+`--workers 1` bring it to 387 MiB with logging, artifacts and existing runs unaffected. Dropping
+the screen, which looked like the obvious saving before it was measured, is worth 25 MiB.
+
+**What may never be dropped**: Preloop (tool rights and approvals), the egress allowlist proxy,
+the file tool server, the quota observer. A stack without those is not a smaller stack, it is one
+that cannot say what an agent was allowed to do — so no composition offers it, and a control
+fails if a service is ever marked optional.
+
+**What a composition changes for a run.** `p281/capabilities.py` probes the services themselves
+(a declared composition can be stale, a probe cannot) and `run_workflow.py` refuses a run whose
+capabilities are missing. Recording is the one a run can do without, and only when the caller
+says so: `--allow-unrecorded` on the CLI, `"allow_unrecorded": true` on `POST /api/runs`. The run
+then records that it started unrecorded, and which capabilities the stack had at that moment.
+
+Measured: in `no-record`, a start is refused with *"the stack cannot run this now: record"*; with
+the opt-in the same cycle ran to 3/3 valid lanes and its `record_error` names the unreachable
+MLflow instead of the run pretending to have been recorded.
 
 ## 2. Containers and images
 
