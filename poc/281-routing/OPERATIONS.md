@@ -281,3 +281,20 @@ image rollback either — that would need a restore from a backup taken before t
 After these, a release is: revision + images + configuration **sources** + the toolchain, with the
 Preloop policy applied again on both paths. Data (logins, database, MLflow, run history) still
 belongs to `backup.sh`, not to a release.
+
+### Second review of the release path — four boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | a policy that could not be applied was ignored (`|| true`), so an update ended "done" with the account still on the previous policy | an unapplied policy fails the update, with the rollback command | with `preloop policy apply` made to fail and a policy that really had to be applied: `"apply failed"`, "the update left the Preloop policy unapplied", exit 1 |
+| 2 | the toolchain comparison happened after the workspace and images had already moved, so a refusal left a mixed state | the target revision is built in a throw-away worktree under its own tag and compared there; the workspace, the `:local` tags and the containers are touched only after that passes | refused with the workspace at its revision, the agent image id unchanged, and no release recorded |
+| 3 | a valid tar with no real tools passed (only the link's presence was checked) and the swap then removed the running toolchain | the staged copy is followed *inside itself* — every required tool must exist and be non-empty — and the previous copy is kept until the new one answers | an archive whose `bin/claude` pointed at a missing target and whose `share/claude` was empty: "the release's toolchain has no usable tools in it — the running one is untouched"; Claude, Conductor and the Preloop CLI still answered |
+| 4 | restoring a release recorded by the older script brought its `config/generated/state.json` back, so the re-apply was skipped as "already applied" | generated settings are excluded on extraction as well, and a new record carries `format=2` | rolling back to the old-format `base`: configuration restored without generated settings, policy **applied** (not "already"), `active_on_account` correct |
+
+The candidate build also showed why this matters: the workspace's `agent.Dockerfile` was unpinned,
+so a rebuild fetched Claude 2.1.280, Conductor 0.1.39 and Preloop CLI 0.16.0 against a stack running
+2.1.278 / 0.1.37 / 0.15.0. The versions in use are now pinned there as well (they already were in
+the repository copy).
+
+Two smaller faults came out of the same run and are fixed: a tool that cannot answer no longer
+aborts the script, and the candidate build takes a native path for its context.

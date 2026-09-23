@@ -29,6 +29,8 @@ ENV HOME=/home/agent \
 
 # Claude Code (agent runtime). Installs to $HOME/.local/bin.
 # Pinned to the measured version (RUNBOOK). The installer takes the version as its argument.
+# Unpinned, a rebuild drifts: a candidate build on 2026-09-23 pulled Claude 2.1.280,
+# Conductor 0.1.39 and Preloop CLI 0.16.0 against a stack running 2.1.278 / 0.1.37 / 0.15.0.
 ARG CLAUDE_CODE_VERSION=2.1.278
 RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}
 
