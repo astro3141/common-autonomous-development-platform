@@ -1,8 +1,0 @@
-# Everything here is read inside Linux containers (shell scripts are mounted straight in), and a
-# Windows clone would otherwise check them out with CRLF: /bin/sh then fails with
-# "Syntax error: end of file unexpected". Measured on a fresh clone during a restore test.
-* text=auto eol=lf
-*.png binary
-*.jpg binary
-*.gz binary
-*.db binary
