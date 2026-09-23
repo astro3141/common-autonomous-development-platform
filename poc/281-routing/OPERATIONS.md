@@ -628,3 +628,73 @@ revokes its credential immediately — the same token went from HTTP 200 to 401 
 rows stay listed until deleted separately (`DELETE /api/v1/auth/api-keys/{key_id}`). The probe
 principals, their eight credentials and every probe file were removed after the measurement; the
 account is back to the four principals it had (Grok, Codex, two Claude).
+
+## 11. Long operation
+
+Everything measured until now was a single run. Running the same workflow over and over is a
+different question, and it was answered by doing it rather than by reading the code:
+`scripts/soak.sh <cycles> <workflow>` runs cycles back to back and samples, before and after each
+one, every container's memory, the disk under the workspace and evidence trees, the process and
+zombie count of each of this stack's containers, and the cycle's own outcome and wall time. It
+cleans nothing up, so growth is growth.
+
+### What twelve cycles showed (trading-b, back to back)
+
+| | |
+|---|---|
+| wall time per cycle | 28–34 s, no trend (first 30 s, last 33 s) |
+| result | 3/3 lanes valid in **every** cycle; lane overlap 1.88–2.00 |
+| disk per cycle | workspace +36 KB, evidence +246 KB (MLflow +61 KB, adapter evidence +156 KB) |
+| directories per cycle | one workspace, three evidence directories, one UI run |
+| memory | total 2,055 → 2,593 MiB, of which **+510 MiB is the agent container alone** |
+
+The memory number is not what it looks like, and the difference matters: inside the agent
+container the cgroup reports `anon` (what processes actually hold) at **4 MB** and `file` (page
+cache from reading and writing evidence) at **997 MB**. `docker stats` counts the cache, the kernel
+reclaims it under pressure, and the processes are not growing. Reported as cache, not as a leak.
+
+### What it found that nothing else would have
+
+**Every provider call left a zombie process.** PID 1 in these containers was the service itself —
+`sleep` in the agent, `node` in the file server — and a service is not a reaper: a child whose
+parent exits is reparented to PID 1 and stays a zombie until someone waits for it. Measured after
+two days of runs: **111 zombies in the agent, 550 in the file server**, one per call that had ever
+run. Nothing in memory or disk shows this; it ends in a container that cannot fork.
+
+Fixed by putting an init process in front of all eight of this stack's services (`init: true`,
+Docker's tini). Measured after the change: PID 1 is `docker-init`, and five further cycles left
+**0 zombies in every container** (agent 5 processes, file server 5). The soak now samples processes
+and zombies per container, so a future regression is visible in the same place as the rest.
+
+### Running unattended
+
+`scripts/cycle.sh <workflow> [profile] [--retain-days N] [--retain-keep M]` is one cycle for a
+scheduler to call. What it adds over starting a run by hand is only what unattended operation
+needs:
+
+- **one at a time.** A tick that arrives while the last cycle is still running is skipped, not
+  queued — two cycles would share logins and workspaces. A lock left behind by a killed run would
+  skip every later cycle, so the skip records how long the lock has been held and
+  `p281/ops_health.py` shows it; clearing it stays an operator's decision, because this script may
+  not declare another cycle dead.
+- **it refuses rather than pretends.** The capabilities are checked before the run starts
+  (§ compositions): a cycle that cannot be governed does not run, and the refusal is recorded with
+  the reason.
+- **it leaves a record.** One line per cycle in `evidence/ops/cycles.jsonl` — when, which run, how
+  long, how it ended **and why**, and what the stack could do at the time. Skips and refusals are
+  lines too, which is what a scheduler otherwise hides.
+- **retention only when asked.** With `--retain-days` / `--retain-keep` it runs the same cleanup as
+  by hand (§9: whole runs, live runs and pending approvals protected) and records what went.
+
+`p281/ops_health.py` reads all of that back: how many cycles ran, were skipped or were refused, the
+spread of durations, how they ended and why, which ones never reached MLflow, whether a lock is
+held now, when the stack was last checked, what it can do at this moment, and what the last soaks
+found growing. It decides nothing — whether 12 holds in a week is acceptable is the operator's
+judgement.
+
+### Still not measured
+
+Operation across days rather than cycles: a real schedule, quota exhausting and resetting, a login
+expiring mid-week (it expired once during this work and the router held the cycle, which is the
+designed behaviour, but that was not a controlled measurement), and recovery after the host
+restarts.

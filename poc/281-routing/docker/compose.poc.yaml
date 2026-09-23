@@ -65,6 +65,11 @@ services:
       dockerfile: agent.Dockerfile
     image: cadp278/governed-runtime:local
     container_name: ${STACK:-cadp278}-agent
+    # PID 1 here is the service itself, and a service is not a reaper: every provider CLI
+    # the adapter starts and every child the file server spawns is left as a zombie when
+    # its parent exits. Measured after two days of runs — agent 111, file server 550 — and
+    # they only ever accumulate. `init: true` puts tini in front, which reaps them.
+    init: true
     restart: unless-stopped
     networks:
       - governed
@@ -101,6 +106,7 @@ services:
       dockerfile: mlflow.Dockerfile
     image: cadp278/mlflow:3.16.1
     container_name: ${STACK:-cadp278}-mlflow
+    init: true
     restart: unless-stopped
     # Recording is a capability a composition may leave out (scripts/up.sh --composition).
     profiles: ["record"]
@@ -138,6 +144,7 @@ services:
       dockerfile: toolsvc.Dockerfile
     image: cadp278/toolsvc:local
     container_name: ${STACK:-cadp278}-toolsvc
+    init: true
     restart: unless-stopped
     networks:
       toolnet:
@@ -156,6 +163,7 @@ services:
       dockerfile: fsmcp.Dockerfile
     image: cadp278/fsmcp:local
     container_name: ${STACK:-cadp278}-fsmcp
+    init: true
     restart: unless-stopped
     networks:
       toolnet:
@@ -170,6 +178,7 @@ services:
   quota:
     image: cadp278/governed-runtime:local
     container_name: ${STACK:-cadp278}-quota
+    init: true
     restart: unless-stopped
     networks:
       - quotanet
@@ -190,6 +199,7 @@ services:
       dockerfile: egress.Dockerfile
     image: cadp278/egress:local
     container_name: ${STACK:-cadp278}-egress
+    init: true
     restart: unless-stopped
     networks:
       governed:
@@ -204,6 +214,7 @@ services:
       dockerfile: docker/ops.Dockerfile
     image: cadp278/ops:local
     container_name: ${STACK:-cadp278}-ops
+    init: true
     restart: unless-stopped
     # The screen is optional in a reduced composition; runs still start from the CLI.
     profiles: ["ui"]
@@ -223,6 +234,7 @@ services:
       dockerfile: docker/hub.Dockerfile
     image: cadp278/hub:local
     container_name: ${STACK:-cadp278}-hub
+    init: true
     restart: unless-stopped
     # The screen is optional in a reduced composition; runs still start from the CLI.
     profiles: ["ui"]
