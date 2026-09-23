@@ -225,3 +225,89 @@ Third exercise, end to end (archive `20260923-011845`): fresh clone → `cadp278
 16/16 checks → counts match → `auto` workflow **PASS** → the research data restored (48 MB of the
 49 MB directory, the difference being files the backup excludes) → `down.sh --volumes` removed only
 this instance's six volumes → the live instance came back with 16/16 checks and its correct mounts.
+
+## 8. Update and rollback (measured 2026-09-23)
+
+```bash
+scripts/release.sh record [--tag NAME]         # keep what is running now
+scripts/release.sh list
+scripts/release.sh update --to REV             # record, move the workspace to REV, rebuild, check
+scripts/release.sh rollback --to TAG           # put a kept release back (the operator runs this)
+```
+
+**A release is not an image tag.** Because Claude, Conductor and the Preloop CLI live in the
+`agent-home` volume that masks the image's copy (§3), replacing the image does not change what
+runs. A release here is therefore four things, kept together:
+
+| part | how it is kept |
+|---|---|
+| code revision | the workspace's git revision (an update and a rollback check it out) |
+| images | each running image is tagged `…:rel-<tag>`, so a later build of `:local` cannot take it away |
+| configuration | `config/`, `policy/` and `docker/.env` |
+| the toolchain itself | `/home/agent/.local` from the volume — 256 MB compressed |
+
+**Data is not part of a release.** Logins, the Preloop database, MLflow and the run history stay
+where they are and must survive both directions. `scripts/backup.sh` is what covers them.
+
+Only changes to **tracked** files block an update or a rollback; run evidence living in the
+workspace is untracked data and is not a reason to refuse. After either command the workspace sits
+on that revision (detached); check out a branch again to continue development.
+
+**Exercise.**
+
+| step | result |
+|---|---|
+| `record --tag base` | 7 images tagged `rel-base`, toolchain 256 MB, configuration 8 KB, six tool versions read from the container |
+| `update --to <rev>` (a visible change in the hub) | the release in use was recorded first, images rebuilt, stack recreated, **16/16 checks** |
+| after the update | the hub showed the new version; **logins, policy state (`applied`), the run history (8 runs) and the MLflow experiments were unchanged** |
+| a change made only inside the volume | a file added under `/home/agent/.local/bin` — the case an image rollback would not undo |
+| `rollback --to base` (operator-run) | workspace back at its revision, `…:local` re-tagged from `rel-base`, **the volume's toolchain put back (the added file was gone)**, configuration restored, **16/16 checks** |
+| after the rollback | the hub showed the old version again; policy, runs and MLflow unchanged; `auto` workflow **PASS** |
+
+Automatic rollback on a failed update is deliberately not included: the update prints the command
+and the operator decides. A database migration that changes Preloop's schema is not covered by
+image rollback either — that would need a restore from a backup taken before the update.
+
+### Review of the release path — five points closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the release carried `config/generated/state.json`, so a rollback claimed a policy the account did not have (A kept → B applied → back to A left the account on B, reported `applied`) | generated settings are not part of a release; after an update or a rollback the restored policy is **applied again** and the resulting state is printed | kept `polA` (policy `b-fsmcp`) → switched the profiles to a variant and applied it (account: variant) → rolled back: the account is on `b-fsmcp` again, `state: applied`, `active_on_account: policy/b-fsmcp.yaml` |
+| 2 | the rollback deleted `/home/agent/.local` and then unpacked; a damaged archive left the agent with no toolchain | images, both archives and the unpacked toolchain are verified **before** anything changes, and the running one is swapped only for a staged copy that looks usable | a truncated toolchain archive: "the release's archives do not verify — nothing was changed", and Claude and Conductor still ran |
+| 3 | the revision and configuration were read from wherever the script sat, the images from the running containers — they could describe different checkouts | every command first checks that this workspace is the one the agent mounts as `/work` (Docker's internal mount form normalised) | running `record` from the repository checkout: "this script is in … but cadp278-agent runs D:/Work/poc-278" |
+| 4 | an update rebuilt images but left the volume's toolchain in place, so a Dockerfile version bump changed nothing | the update compares the running tool versions with the new image's and **refuses** when they differ, unless `--replace-toolchain` is given, which stages the image's `/home/agent/.local` and swaps it in | with a deliberately different version in the volume the update refused and named the difference; with `--replace-toolchain` it replaced the toolchain and the intended version ran |
+| 5 | `record` accepted uncommitted changes to tracked files while keeping only the revision | `record` refuses them too (untracked run evidence is still fine) | refused with an edited tracked file |
+
+After these, a release is: revision + images + configuration **sources** + the toolchain, with the
+Preloop policy applied again on both paths. Data (logins, database, MLflow, run history) still
+belongs to `backup.sh`, not to a release.
+
+### Second review of the release path — four boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | a policy that could not be applied was ignored (`|| true`), so an update ended "done" with the account still on the previous policy | an unapplied policy fails the update, with the rollback command | with `preloop policy apply` made to fail and a policy that really had to be applied: `"apply failed"`, "the update left the Preloop policy unapplied", exit 1 |
+| 2 | the toolchain comparison happened after the workspace and images had already moved, so a refusal left a mixed state | the target revision is built in a throw-away worktree under its own tag and compared there; the workspace, the `:local` tags and the containers are touched only after that passes | refused with the workspace at its revision, the agent image id unchanged, and no release recorded |
+| 3 | a valid tar with no real tools passed (only the link's presence was checked) and the swap then removed the running toolchain | the staged copy is followed *inside itself* — every required tool must exist and be non-empty — and the previous copy is kept until the new one answers | an archive whose `bin/claude` pointed at a missing target and whose `share/claude` was empty: "the release's toolchain has no usable tools in it — the running one is untouched"; Claude, Conductor and the Preloop CLI still answered |
+| 4 | restoring a release recorded by the older script brought its `config/generated/state.json` back, so the re-apply was skipped as "already applied" | generated settings are excluded on extraction as well, and a new record carries `format=2` | rolling back to the old-format `base`: configuration restored without generated settings, policy **applied** (not "already"), `active_on_account` correct |
+
+The candidate build also showed why this matters: the workspace's `agent.Dockerfile` was unpinned,
+so a rebuild fetched Claude 2.1.280, Conductor 0.1.39 and Preloop CLI 0.16.0 against a stack running
+2.1.278 / 0.1.37 / 0.15.0. The versions in use are now pinned there as well (they already were in
+the repository copy).
+
+Two smaller faults came out of the same run and are fixed: a tool that cannot answer no longer
+aborts the script, and the candidate build takes a native path for its context.
+
+### Third review of the release path — three boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the toolchain was judged only after the checks and the policy had passed, so a replacement that installed but could not run was left in place | the swapped-in toolchain is judged immediately after the stack comes back, whatever the checks said; a copy that does not answer is put back and the command fails | a release whose Claude was present and non-empty but not executable: "the new toolchain does not answer (claude) — putting the previous one back", exit 1, and the working tools answered again |
+| 2 | a refused toolchain left the agent stopped, because it was stopped before verification | staging and verification happen while the agent runs; only the swap stops it | the hollow-archive refusal now ends with the agent still `running` and Claude answering |
+| 3 | the candidate build looked for `docker/agent.Dockerfile` at the worktree root, which is wrong wherever this stack sits below the repository root (the restored copies from §7 do) | the candidate uses the same prefix this workspace has inside its own repository (`git rev-parse --show-prefix`) and says so if the file is not there | the prefix is empty in the PoC workspace and `poc/281-routing/` in a repository checkout; a worktree of this repository resolves `poc/281-routing/docker/agent.Dockerfile` |
+
+**One more, found while testing.** An update or a rollback checks out another revision of the very
+workspace this script lives in — including the script. A shell reads a script as it runs, so the
+file changed underneath it. `release.sh` now copies itself to a temporary file and re-executes that
+copy, so the running code cannot change halfway.
