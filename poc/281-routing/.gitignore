@@ -1,15 +1,21 @@
-# Measured output and stores are never versioned; the directories are, because compose
-# bind-mounts them and a missing bind source is an error.
-evidence/**
-!evidence/*/
-!evidence/*/.gitkeep
-
-# Host-specific TLS roots (see docker/ca/README.md)
-docker/ca/*.crt
-
-.env
+# local interpreters and caches
+.venv/
 __pycache__/
 *.pyc
 
+# MLflow backing store: binary, regenerable, and holds trace content
+evidence/mlflow/
+
+# Holds a (revoked) Preloop gateway key and sidecar bearer from the F8 incident.
+# Kept on disk as evidence, never versioned.
+evidence/incident-20260920/
+
+# scratch
+*.tmp
+
+# #281 run evidence (raw ACP events, permission requests)
+evidence/p281/
+
 # derived from config/*.yaml by p281/cfg.py
 config/generated/
+docker/.env
