@@ -71,11 +71,11 @@ services:
     volumes:
       # The PoC workspace, shared with the host so evidence stays inspectable.
       - type: bind
-        source: ${POC_HOST_DIR:-D:/Work/poc-278}
+        source: ${POC_HOST_DIR:-..}
         target: /work
       # The #280 research workspace, kept separate from the PoC workspace.
       - type: bind
-        source: ${RESEARCH_HOST_DIR:-D:/Work/research-280}
+        source: ${RESEARCH_HOST_DIR:-../evidence/research}
         target: /research
       # Container-only HOME. The host's ~/.claude is NEVER mounted here.
       - agent-home:/home/agent
@@ -107,7 +107,7 @@ services:
       - observe
     volumes:
       - type: bind
-        source: ${POC_HOST_DIR:-D:/Work/poc-278}/evidence/mlflow
+        source: ${POC_HOST_DIR:-..}/evidence/mlflow
         target: /mlflow
     environment:
       # MLflow rejects Host headers outside localhost/private-IP by default
@@ -137,7 +137,7 @@ services:
         aliases: [toolsvc]
     volumes:
       - type: bind
-        source: ${POC_HOST_DIR:-D:/Work/poc-278}/evidence/n1-markers
+        source: ${POC_HOST_DIR:-..}/evidence/n1-markers
         target: /markers
 
   # #281 option B: filesystem MCP behind Preloop. On toolnet only: the agent cannot reach it

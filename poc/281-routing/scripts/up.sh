@@ -10,6 +10,16 @@
 # and logins / Preloop's database / MLflow live in volumes or bind mounts.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# A workspace that is a restored copy says so in config/instance.env (written by scripts/
+# restore.sh): its instance name, Preloop project, paths and ports. Reading it here is what keeps
+# a later `up.sh --check` or `down.sh` in that directory from acting on the live instance instead.
+# Values already set in the environment win, so a deliberate override still works.
+if [ -f "$HERE/config/instance.env" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in ''|'#'*) continue;; esac
+    eval "[ -n \"\${$k:-}\" ]" || eval "$k=\$v"
+  done < "$HERE/config/instance.env"
+fi
 PRELOOP_DIR="${PRELOOP_DIR:-$HOME/.preloop-oss}"
 # docker on Windows needs native paths; path conversion is off below (MSYS_NO_PATHCONV)
 command -v cygpath >/dev/null && { PRELOOP_DIR="$(cygpath -m "$PRELOOP_DIR")"; HERE="$(cygpath -m "$HERE")"; }
@@ -20,7 +30,12 @@ MODE="${1:-up}"
 STACK="${STACK:-cadp278}"
 OPS_PORT="${OPS_PORT:-8781}"; HUB_PORT="${HUB_PORT:-8780}"; MLFLOW_PORT="${MLFLOW_PORT:-5000}"
 PRELOOP_PROJECT="${PRELOOP_PROJECT:-preloop-oss}"
-export STACK OPS_PORT HUB_PORT MLFLOW_PORT
+PRELOOP_API_PORT="${PRELOOP_API_PORT:-8000}"; PRELOOP_GATEWAY_PORT="${PRELOOP_GATEWAY_PORT:-8001}"
+PRELOOP_CONSOLE_PORT="${PRELOOP_CONSOLE_PORT:-3000}"
+POC_HOST_DIR="${POC_HOST_DIR:-$HERE}"
+RESEARCH_HOST_DIR="${RESEARCH_HOST_DIR:-$HERE/evidence/research}"
+export STACK OPS_PORT HUB_PORT MLFLOW_PORT POC_HOST_DIR RESEARCH_HOST_DIR
+export PRELOOP_API_PORT PRELOOP_GATEWAY_PORT PRELOOP_CONSOLE_PORT
 FORCE=""; [ "$MODE" = "--recreate" ] && FORCE="--force-recreate"
 
 if [ "$MODE" != "--check" ]; then

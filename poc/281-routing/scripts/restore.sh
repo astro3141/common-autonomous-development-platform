@@ -3,32 +3,39 @@
 # project and its own ports. The instance in use is never written to.
 #
 #   scripts/restore.sh --archive FILE --workspace DIR [--stack NAME] [--key FILE]
-#                      [--clone-from REPO --rev REV] [--verify-only]
+#                      [--clone-from REPO --rev REV] [--verify-only] [--into-existing]
 #
 #   --workspace DIR    where the restored instance's /work lives. With --clone-from it is created
 #                      as a fresh clone (the repository layout: <clone>/poc/281-routing).
 #   --stack NAME       instance name for containers, volumes and networks (default cadp278r).
+#   --into-existing    allow a workspace that already holds config/ or evidence/ to be overwritten.
 #
-# Ports of the restored instance default to the live ones + 10 (hub 8790, ops 8791, MLflow 5010,
-# Preloop api 8010 / gateway 8011 / console 3010).
+# Ports default to the live ones + 10 (hub 8790, ops 8791, MLflow 5010, Preloop 8010/8011/3010).
 #
-# The two instances hold the SAME provider credentials, so they must not run at the same time:
-# the script refuses to start while the live stack is up, and says how to stop it.
+# Every check that protects the live instance runs BEFORE the first write: nothing is unpacked,
+# no volume is created and no database is touched until the target is known to be separate.
+# The restored instance records what it is in config/instance.env, and scripts/up.sh and
+# scripts/down.sh in that workspace read it — so later start, check and teardown commands act on
+# the restored copy and not on the live one.
+#
+# Both copies hold the SAME provider credentials, so they must not run at the same time: the
+# script refuses to start while the live instance is up, and says how to stop it.
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
-command -v cygpath >/dev/null && HERE="$(cygpath -m "$HERE")"
 export MSYS_NO_PATHCONV=1
 u() { if command -v cygpath >/dev/null; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
 m() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 
-ARCHIVE=""; WORKSPACE=""; CLONE_FROM=""; REV=""; VERIFY_ONLY=0
+ARCHIVE=""; WORKSPACE=""; CLONE_FROM=""; REV=""; VERIFY_ONLY=0; INTO_EXISTING=0
 STACK="${STACK:-cadp278r}"
 LIVE_STACK="${LIVE_STACK:-cadp278}"
+LIVE_PRELOOP_PROJECT="${LIVE_PRELOOP_PROJECT:-preloop-oss}"
+LIVE_PRELOOP_DIR="${LIVE_PRELOOP_DIR:-$HOME/.preloop-oss}"
 KEY="${BACKUP_KEY:-$HOME/.cadp-backup.key}"
-PRELOOP_PROJECT="${PRELOOP_PROJECT:-preloop-restore}"
-export HUB_PORT="${HUB_PORT:-8790}" OPS_PORT="${OPS_PORT:-8791}" MLFLOW_PORT="${MLFLOW_PORT:-5010}"
-export PRELOOP_API_PORT="${PRELOOP_API_PORT:-8010}" PRELOOP_GATEWAY_PORT="${PRELOOP_GATEWAY_PORT:-8011}"
-export PRELOOP_CONSOLE_PORT="${PRELOOP_CONSOLE_PORT:-3010}"
+PRELOOP_PROJECT="${RESTORE_PRELOOP_PROJECT:-preloop-restore}"
+PRELOOP_RESTORE_DIR="${RESTORE_PRELOOP_DIR:-$HOME/.preloop-restore}"
+HUB_PORT="${HUB_PORT:-8790}"; OPS_PORT="${OPS_PORT:-8791}"; MLFLOW_PORT="${MLFLOW_PORT:-5010}"
+PRELOOP_API_PORT="${PRELOOP_API_PORT:-8010}"; PRELOOP_GATEWAY_PORT="${PRELOOP_GATEWAY_PORT:-8011}"
+PRELOOP_CONSOLE_PORT="${PRELOOP_CONSOLE_PORT:-3010}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --archive) ARCHIVE="$2"; shift 2;;
@@ -38,29 +45,75 @@ while [ $# -gt 0 ]; do
     --clone-from) CLONE_FROM="$2"; shift 2;;
     --rev) REV="$2"; shift 2;;
     --verify-only) VERIFY_ONLY=1; shift;;
+    --into-existing) INTO_EXISTING=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+say()    { printf '  %-42s %s\n' "$1" "$2"; }
+refuse() { echo "refusing: $*" >&2; exit 2; }
+
 [ -n "$ARCHIVE" ] && [ -n "$WORKSPACE" ] || { echo "need --archive and --workspace" >&2; exit 2; }
-[ "$STACK" != "$LIVE_STACK" ] || { echo "refusing: --stack must differ from the live stack" >&2; exit 2; }
 ARCHIVEU="$(u "$ARCHIVE")"; KEYU="$(u "$KEY")"; WORKSPACEU="$(u "$WORKSPACE")"
+PRELOOP_RESTORE_DIRU="$(u "$PRELOOP_RESTORE_DIR")"; LIVE_PRELOOP_DIRU="$(u "$LIVE_PRELOOP_DIR")"
 [ -f "$ARCHIVEU" ] || { echo "no such archive: $ARCHIVE" >&2; exit 2; }
 [ -f "$KEYU" ] || { echo "no key file: $KEY" >&2; exit 2; }
 
-say() { printf '  %-42s %s\n' "$1" "$2"; }
+# ---------------------------------------------------------------- 0. checks, before any write
+if [ "$VERIFY_ONLY" = 0 ]; then
+  echo "== checks"
+  [ "$STACK" != "$LIVE_STACK" ] || refuse "--stack must differ from the live stack ($LIVE_STACK)"
+  [ "$PRELOOP_PROJECT" != "$LIVE_PRELOOP_PROJECT" ] || \
+    refuse "the Preloop project ($PRELOOP_PROJECT) is the live one — set RESTORE_PRELOOP_PROJECT"
+  # a stray PRELOOP_PROJECT in the environment must never point the DROP DATABASE at the live one
+  docker ps -a --format '{{.Names}}' | grep -q "^$PRELOOP_PROJECT-postgres" && \
+    refuse "a Preloop postgres container already exists for project $PRELOOP_PROJECT"
+  realpath_of() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+  [ "$(realpath_of "$PRELOOP_RESTORE_DIRU")" != "$(realpath_of "$LIVE_PRELOOP_DIRU")" ] || \
+    refuse "the Preloop install directory is the live one ($LIVE_PRELOOP_DIR)"
+  # a leftover directory from an earlier restore is ours to replace (it is named after this
+  # project and has no containers, both checked just above); the live one is never touched
 
-# The same credentials must not be used by two instances at once. Verifying an archive reads
-# nothing from the running instance, so that case is allowed.
-RUNNING="$(docker ps --format '{{.Names}}' | grep -E "^($LIVE_STACK-|preloop-oss-)" || true)"
-if [ -n "$RUNNING" ] && [ "$VERIFY_ONLY" = 0 ]; then
-  echo "The live instance is running. Stop it first, then run this again:" >&2
-  echo "  docker stop \$(docker ps --format '{{.Names}}' | grep -E '^($LIVE_STACK-|preloop-oss-)')" >&2
-  exit 3
+  # nothing of the live instance may be running: the two copies share credentials
+  RUNNING="$(docker ps --format '{{.Names}}' | grep -E "^($LIVE_STACK-|$LIVE_PRELOOP_PROJECT-)" || true)"
+  if [ -n "$RUNNING" ]; then
+    echo "The live instance is running. Stop it first, then run this again:" >&2
+    echo "  docker stop \$(docker ps --format '{{.Names}}' | grep -E '^($LIVE_STACK-|$LIVE_PRELOOP_PROJECT-)')" >&2
+    exit 3
+  fi
+  # the restored instance's own names must be free
+  for v in route-creds agent-home quota-home ws quota-obs; do
+    docker volume inspect "$STACK-$v" >/dev/null 2>&1 && \
+      refuse "volume $STACK-$v already exists (remove it or pick another --stack)"
+  done
+  EXISTING="$(docker ps -a --format '{{.Names}}' | grep -E "^$STACK-" || true)"
+  [ -z "$EXISTING" ] || refuse "containers of $STACK already exist: $(echo "$EXISTING" | tr '\n' ' ')"
+
+  # the workspace must not be one the live instance uses, and must not be overwritten by accident
+  LIVE_PATHS="$(docker inspect $(docker ps -aq --filter "name=$LIVE_STACK-") \
+      --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null | sort -u || true)"
+  if [ -n "$CLONE_FROM" ]; then
+    [ -e "$WORKSPACEU" ] && refuse "$WORKSPACE already exists (a clone needs a new directory)"
+  else
+    [ -d "$WORKSPACEU" ] || refuse "no such workspace: $WORKSPACE (use --clone-from to create one)"
+    if [ -e "$WORKSPACEU/config" ] || [ -e "$WORKSPACEU/evidence" ]; then
+      [ "$INTO_EXISTING" = 1 ] || \
+        refuse "$WORKSPACE already holds config/ or evidence/ — they would be replaced (pass --into-existing to accept)"
+    fi
+  fi
+  TARGET_REAL="$(realpath_of "$WORKSPACEU")"
+  for p in $LIVE_PATHS; do
+    pr="$(realpath_of "$(u "$p")")"
+    case "$TARGET_REAL/" in "$pr"/*) refuse "$WORKSPACE is inside a path the live instance mounts ($p)";; esac
+    case "$pr/" in "$TARGET_REAL"/*) refuse "$WORKSPACE contains a path the live instance mounts ($p)";; esac
+  done
+  say "target" "$STACK (workspace $WORKSPACE)"
+  say "preloop" "$PRELOOP_PROJECT in $PRELOOP_RESTORE_DIR"
+  say "live instance" "stopped; its volumes and paths untouched"
 fi
 
 STAGE="$(u "${TMPDIR:-/tmp}")/cadp-restore-$$"
 STAGEM="$(m "$STAGE")"
-mkdir -p "$STAGE"
+(umask 077; mkdir -p "$STAGE")
 cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
@@ -69,7 +122,7 @@ echo "== unpacking"
 docker run --rm -v "$(m "$(dirname "$ARCHIVEU")")":/in:ro -v "$STAGEM":/out -v "$(m "$KEYU")":/key:ro alpine sh -c "
   apk add --no-cache openssl >/dev/null 2>&1
   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass file:/key -in '/in/$(basename "$ARCHIVEU")' | tar xzf - -C /out"
-say "members" "$(find "$STAGE" -type f | wc -l)"
+say "members" "$(find "$STAGE" -type f | wc -l | tr -d ' ')"
 
 echo "== manifest"
 BAD="$(docker run --rm -v "$STAGEM":/w:ro alpine sh -c '
@@ -85,7 +138,6 @@ say "taken from" "$(grep -o '"workspace_revision": "[^"]*"' "$STAGE/release.json
 # ---------------------------------------------------------------- 2. workspace
 echo "== workspace"
 if [ -n "$CLONE_FROM" ]; then
-  [ -e "$WORKSPACEU" ] && { echo "refusing: $WORKSPACE already exists" >&2; exit 2; }
   # git here is a native Windows build: it takes native paths, not POSIX ones.
   git clone --quiet "$(m "$CLONE_FROM")" "$(m "$WORKSPACEU")"
   [ -n "$REV" ] && git -C "$(m "$WORKSPACEU")" checkout --quiet "$REV"
@@ -93,85 +145,123 @@ if [ -n "$CLONE_FROM" ]; then
   [ -d "$WORKSPACEU/poc/281-routing" ] && WORKSPACEU="$WORKSPACEU/poc/281-routing"
   say "cloned" "$(git -C "$(m "$WORKSPACEU")" rev-parse --short HEAD)"
 fi
-[ -d "$WORKSPACEU" ] || { echo "no such workspace: $WORKSPACE" >&2; exit 2; }
 WORKSPACE="$(m "$WORKSPACEU")"
-# The restored copy must be able to run under its own name. A revision from before the instance
-# name existed would silently start the live instance's containers against this workspace.
-grep -q 'STACK:-cadp278' "$WORKSPACEU/docker/compose.poc.yaml" && grep -q 'STACK=' "$WORKSPACEU/scripts/up.sh" || {
-  echo "refusing: $WORKSPACE has no instance-name support (STACK) — pick a revision that has it" >&2
-  exit 5
-}
+# The restored copy must be able to run under its own name, AND its scripts must read the
+# instance file this restore writes. A revision missing either one would start the live
+# instance's containers against this workspace instead — checked before anything is started.
+for need in \
+  "docker/compose.poc.yaml:STACK:-cadp278" \
+  "scripts/up.sh:config/instance.env" \
+  "scripts/down.sh:config/instance.env"
+do
+  f="${need%%:*}"; pat="${need#*:}"
+  [ -f "$WORKSPACEU/$f" ] && grep -q "$pat" "$WORKSPACEU/$f" || {
+    echo "refusing: $WORKSPACE/$f does not support running as a separate instance ($pat) —" >&2
+    echo "          pick a revision that does; nothing has been started" >&2
+    exit 5; }
+done
 
 untar_host() {  # member, destination parent
-  [ -f "$STAGE/host/$1.tar.gz" ] || { say "$1" "not in the backup"; return; }
+  [ -f "$STAGE/host/$1.tar.gz" ] || { say "$1" "not in the backup"; return 1; }
   mkdir -p "$2"
   tar xzf "$STAGE/host/$1.tar.gz" -C "$2"
-  say "$1" "-> ${2#$WORKSPACEU/}"
 }
-untar_host mlflow "$WORKSPACEU/evidence"
-untar_host evidence-p281 "$STAGE/tmp-p281" && [ -d "$STAGE/tmp-p281/p281" ] && \
-  { rm -rf "$WORKSPACEU/evidence/p281"; mv "$STAGE/tmp-p281/p281" "$WORKSPACEU/evidence/"; }
-untar_host evidence-ui-runs "$STAGE/tmp-ui" && [ -d "$STAGE/tmp-ui/ui-runs" ] && \
-  { rm -rf "$WORKSPACEU/evidence/ui-runs"; mv "$STAGE/tmp-ui/ui-runs" "$WORKSPACEU/evidence/"; }
-untar_host evidence-runs "$STAGE/tmp-runs" && [ -d "$STAGE/tmp-runs/runs" ] && \
-  { rm -rf "$WORKSPACEU/evidence/runs"; mv "$STAGE/tmp-runs/runs" "$WORKSPACEU/evidence/"; }
-untar_host evidence-conductor-events "$STAGE/tmp-ce" && [ -d "$STAGE/tmp-ce/conductor-events" ] && \
-  { rm -rf "$WORKSPACEU/evidence/conductor-events"; mv "$STAGE/tmp-ce/conductor-events" "$WORKSPACEU/evidence/"; }
-untar_host config "$STAGE/tmp-cfg" && { rm -rf "$WORKSPACEU/config"; mv "$STAGE/tmp-cfg/config" "$WORKSPACEU/"; }
-untar_host policy "$STAGE/tmp-pol" && { rm -rf "$WORKSPACEU/policy"; mv "$STAGE/tmp-pol/policy" "$WORKSPACEU/"; }
-RESEARCH_TARGET="$WORKSPACEU/evidence/research"
-untar_host research "$STAGE/tmp-res" && { rm -rf "$RESEARCH_TARGET"; mkdir -p "$(dirname "$RESEARCH_TARGET")"
-  mv "$STAGE/tmp-res/$(ls "$STAGE/tmp-res" | head -1)" "$RESEARCH_TARGET"; }
+replace_with() {  # member, directory name inside the tar, destination parent
+  untar_host "$1" "$STAGE/x-$1" || return 0
+  local src="$STAGE/x-$1/$2"
+  [ -d "$src" ] || { say "$1" "unexpected layout, skipped"; return 0; }
+  rm -rf "${3:?}/$2"; mkdir -p "$3"; mv "$src" "$3/"
+  say "$1" "-> ${3#$WORKSPACEU/}/$2"
+}
+replace_with mlflow mlflow "$WORKSPACEU/evidence"
+replace_with evidence-p281 p281 "$WORKSPACEU/evidence"
+replace_with evidence-ui-runs ui-runs "$WORKSPACEU/evidence"
+replace_with evidence-runs runs "$WORKSPACEU/evidence"
+replace_with evidence-conductor-events conductor-events "$WORKSPACEU/evidence"
+replace_with config config "$WORKSPACEU"
+replace_with policy policy "$WORKSPACEU"
+if untar_host research "$STAGE/x-research"; then
+  RES_SRC="$STAGE/x-research/$(ls "$STAGE/x-research" | head -1)"
+  rm -rf "$WORKSPACEU/evidence/research"; mkdir -p "$WORKSPACEU/evidence"
+  mv "$RES_SRC" "$WORKSPACEU/evidence/research"
+  say "research" "-> evidence/research"
+fi
 
 # ---------------------------------------------------------------- 3. volumes
 echo "== volumes"
 for v in route-creds agent-home quota-home; do
-  docker volume inspect "$STACK-$v" >/dev/null 2>&1 && \
-    { echo "refusing: volume $STACK-$v already exists (remove it or pick another --stack)" >&2; exit 2; }
   docker volume create "$STACK-$v" >/dev/null
-  docker run --rm -v "$STACK-$v:/v" -v "$STAGEM/volumes:/in:ro" alpine \
-    tar xzf "/in/$v.tar.gz" -C /v
+  docker run --rm -v "$STACK-$v:/v" -v "$STAGEM/volumes:/in:ro" alpine tar xzf "/in/$v.tar.gz" -C /v
   say "$v" "restored"
 done
 
 # ---------------------------------------------------------------- 4. Preloop
 echo "== Preloop"
-PRELOOP_RESTORE_DIR="$(u "$HOME")/.preloop-restore"
-rm -rf "$PRELOOP_RESTORE_DIR"; mkdir -p "$PRELOOP_RESTORE_DIR"
-mkdir -p "$STAGE/tmp-preloop"
-tar xzf "$STAGE/host/preloop-dir.tar.gz" -C "$STAGE/tmp-preloop"
-# the member is the Preloop install directory itself, whose name starts with a dot
-PRELOOP_SRC="$(dirname "$(find "$STAGE/tmp-preloop" -maxdepth 2 -name docker-compose.yaml | head -1)")"
-cp -a "$PRELOOP_SRC"/. "$PRELOOP_RESTORE_DIR"/
-PRELOOP_DIR_M="$(m "$PRELOOP_RESTORE_DIR")"
+rm -rf "$PRELOOP_RESTORE_DIRU"; mkdir -p "$PRELOOP_RESTORE_DIRU"
+mkdir -p "$STAGE/x-preloop"
+tar xzf "$STAGE/host/preloop-dir.tar.gz" -C "$STAGE/x-preloop"
+PRELOOP_SRC="$(dirname "$(find "$STAGE/x-preloop" -maxdepth 2 -name docker-compose.yaml | head -1)")"
+[ -d "$PRELOOP_SRC" ] || { echo "the backup has no Preloop install directory" >&2; exit 4; }
+cp -a "$PRELOOP_SRC"/. "$PRELOOP_RESTORE_DIRU"/
+PRELOOP_DIR_M="$(m "$PRELOOP_RESTORE_DIRU")"
 docker compose --project-directory "$PRELOOP_DIR_M" -p "$PRELOOP_PROJECT" \
   -f "$PRELOOP_DIR_M/docker-compose.yaml" -f "$PRELOOP_DIR_M/docker-compose.auth.yaml" \
   up -d postgres >/dev/null
-for i in $(seq 1 30); do
-  docker exec "$PRELOOP_PROJECT-postgres-1" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 2
-done
-docker exec "$PRELOOP_PROJECT-postgres-1" psql -U postgres -c "DROP DATABASE IF EXISTS preloop" >/dev/null
-docker exec "$PRELOOP_PROJECT-postgres-1" psql -U postgres -c "CREATE DATABASE preloop" >/dev/null
-docker exec -i "$PRELOOP_PROJECT-postgres-1" pg_restore -U postgres -d preloop --no-owner < "$STAGE/preloop.dump" >/dev/null 2>&1 || true
-TABLES="$(docker exec "$PRELOOP_PROJECT-postgres-1" psql -U postgres -d preloop -tAc \
-  "select count(*) from information_schema.tables where table_schema='public'")"
-say "database restored" "$TABLES tables"
+PGC="$PRELOOP_PROJECT-postgres-1"
+for i in $(seq 1 30); do docker exec "$PGC" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2; done
+docker exec "$PGC" pg_isready -U postgres >/dev/null 2>&1 || { echo "the restored database did not start" >&2; exit 4; }
+docker exec "$PGC" psql -U postgres -c "DROP DATABASE IF EXISTS preloop" >/dev/null
+docker exec "$PGC" psql -U postgres -c "CREATE DATABASE preloop" >/dev/null
+# A failed load must stop the restore here: a few tables existing proves nothing about the
+# account, its policies or its approval history.
+if ! docker exec -i "$PGC" pg_restore -U postgres -d preloop --no-owner --exit-on-error \
+      < "$STAGE/preloop.dump" > "$STAGE/pg_restore.log" 2>&1; then
+  echo "the database could not be restored:" >&2
+  tail -20 "$STAGE/pg_restore.log" >&2
+  echo "nothing was started; remove the volumes of $STACK and try again" >&2
+  exit 4
+fi
+# and what came back must match what was backed up
+MISMATCH="$(for t in account user api_key mcp_server approval_request; do
+  want="$(grep -o "\"$t\": [0-9]*" "$STAGE/release.json" | head -1 | awk '{print $2}')"
+  got="$(docker exec "$PGC" psql -U postgres -d preloop -tAc "select count(*) from \"$t\"" 2>/dev/null | tr -d '\r')"
+  [ -n "$want" ] || continue
+  [ "$want" = "$got" ] || echo "$t: backup $want, restored ${got:-none}"
+done)"
+[ -z "$MISMATCH" ] || { echo "the restored database does not match the backup:" >&2; echo "$MISMATCH" >&2; exit 4; }
+say "database restored" "$(docker exec "$PGC" psql -U postgres -d preloop -tAc \
+  "select count(*) from information_schema.tables where table_schema='public'" | tr -d '\r') tables, key counts match"
 
-# ---------------------------------------------------------------- 5. start
+# ---------------------------------------------------------------- 5. what this instance is
+cat > "$WORKSPACEU/config/instance.env" <<EOF
+# Written by scripts/restore.sh — read by scripts/up.sh and scripts/down.sh in THIS workspace,
+# so start, check and teardown act on this instance and never on the live one.
+STACK=$STACK
+PRELOOP_PROJECT=$PRELOOP_PROJECT
+PRELOOP_DIR=$PRELOOP_DIR_M
+POC_HOST_DIR=$WORKSPACE
+RESEARCH_HOST_DIR=$WORKSPACE/evidence/research
+HUB_PORT=$HUB_PORT
+OPS_PORT=$OPS_PORT
+MLFLOW_PORT=$MLFLOW_PORT
+PRELOOP_API_PORT=$PRELOOP_API_PORT
+PRELOOP_GATEWAY_PORT=$PRELOOP_GATEWAY_PORT
+PRELOOP_CONSOLE_PORT=$PRELOOP_CONSOLE_PORT
+RESTORED_FROM=$(basename "$ARCHIVEU")
+EOF
+# compose run by hand in that directory needs the same values
+sed 's/^#.*//' "$WORKSPACEU/config/instance.env" | grep -v '^$' > "$WORKSPACEU/docker/.env"
+say "instance.env" "config/instance.env, docker/.env"
+
+# ---------------------------------------------------------------- 6. start
 echo "== starting the restored instance"
-export STACK PRELOOP_PROJECT
-export PRELOOP_DIR="$PRELOOP_DIR_M"
-export POC_HOST_DIR="$WORKSPACE" RESEARCH_HOST_DIR="$WORKSPACE/evidence/research"
-(cd "$WORKSPACEU" && STACK="$STACK" PRELOOP_DIR="$PRELOOP_DIR_M" PRELOOP_PROJECT="$PRELOOP_PROJECT" \
-   bash scripts/up.sh)
-# what came up must be this instance, not the live one
+(cd "$WORKSPACEU" && bash scripts/up.sh)
 docker ps --format '{{.Names}}' | grep -q "^$STACK-agent$" || {
   echo "the restored instance did not start under its own name — check $WORKSPACE" >&2; exit 6; }
-docker ps --format '{{.Names}}' | grep -qE "^$LIVE_STACK-" && {
-  echo "WARNING: containers of the live instance ($LIVE_STACK) are running as well" >&2; }
+docker ps --format '{{.Names}}' | grep -qE "^$LIVE_STACK-" && \
+  echo "WARNING: containers of the live instance ($LIVE_STACK) are running as well" >&2
 echo
 echo "restored instance : $STACK   (hub http://127.0.0.1:$HUB_PORT, Preloop console http://127.0.0.1:$PRELOOP_CONSOLE_PORT)"
 echo "workspace         : $WORKSPACE"
-echo "to remove it      : docker compose -f $WORKSPACE/docker/compose.poc.yaml down && \\"
-echo "                    docker volume rm $STACK-route-creds $STACK-agent-home $STACK-quota-home $STACK-ws $STACK-quota-obs"
+echo "check it          : (cd $WORKSPACE && bash scripts/up.sh --check)"
+echo "remove it         : (cd $WORKSPACE && bash scripts/down.sh --volumes)"
