@@ -267,3 +267,17 @@ on that revision (detached); check out a branch again to continue development.
 Automatic rollback on a failed update is deliberately not included: the update prints the command
 and the operator decides. A database migration that changes Preloop's schema is not covered by
 image rollback either — that would need a restore from a backup taken before the update.
+
+### Review of the release path — five points closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the release carried `config/generated/state.json`, so a rollback claimed a policy the account did not have (A kept → B applied → back to A left the account on B, reported `applied`) | generated settings are not part of a release; after an update or a rollback the restored policy is **applied again** and the resulting state is printed | kept `polA` (policy `b-fsmcp`) → switched the profiles to a variant and applied it (account: variant) → rolled back: the account is on `b-fsmcp` again, `state: applied`, `active_on_account: policy/b-fsmcp.yaml` |
+| 2 | the rollback deleted `/home/agent/.local` and then unpacked; a damaged archive left the agent with no toolchain | images, both archives and the unpacked toolchain are verified **before** anything changes, and the running one is swapped only for a staged copy that looks usable | a truncated toolchain archive: "the release's archives do not verify — nothing was changed", and Claude and Conductor still ran |
+| 3 | the revision and configuration were read from wherever the script sat, the images from the running containers — they could describe different checkouts | every command first checks that this workspace is the one the agent mounts as `/work` (Docker's internal mount form normalised) | running `record` from the repository checkout: "this script is in … but cadp278-agent runs D:/Work/poc-278" |
+| 4 | an update rebuilt images but left the volume's toolchain in place, so a Dockerfile version bump changed nothing | the update compares the running tool versions with the new image's and **refuses** when they differ, unless `--replace-toolchain` is given, which stages the image's `/home/agent/.local` and swaps it in | with a deliberately different version in the volume the update refused and named the difference; with `--replace-toolchain` it replaced the toolchain and the intended version ran |
+| 5 | `record` accepted uncommitted changes to tracked files while keeping only the revision | `record` refuses them too (untracked run evidence is still fine) | refused with an edited tracked file |
+
+After these, a release is: revision + images + configuration **sources** + the toolchain, with the
+Preloop policy applied again on both paths. Data (logins, database, MLflow, run history) still
+belongs to `backup.sh`, not to a release.
