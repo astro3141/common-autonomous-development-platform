@@ -19,12 +19,13 @@ carries #278 material and local notes that were never mirrored. Two differences 
 
 | file | workspace (running) | repository |
 |---|---|---|
-| `docker/compose.poc.yaml` | bind sources default to `D:/Work/poc-278`, `/research` to `D:/Work/research-280` | relative (`..`, `../evidence/research`) — a fresh clone resolves inside `poc/281-routing/` |
+| `docker/compose.poc.yaml` | same defaults as the repository; this host's paths come from `docker/.env` (git-ignored: `POC_HOST_DIR=D:/Work/poc-278`, `RESEARCH_HOST_DIR=D:/Work/research-280`) | relative defaults (`..`, `../evidence/research`) — a fresh clone resolves inside `poc/281-routing/` |
 | `docker/agent.Dockerfile` | unpinned installs; copies one host CA file | Claude 2.1.278, Conductor `87f7788e`, Preloop CLI 0.15.0 pinned; `ca/` directory, certificates unversioned |
 
 So **the running agent image was built from the unpinned Dockerfile**, and the versions in it are
 whatever the installers returned on 2026-09-22 (§3). The pinned Dockerfile in the repository has
-never been built here.
+never been built here. The compose defaults are the repository's relative ones on both sides;
+what differs is this host's `docker/.env`, which is where a host's own paths belong.
 
 ## 2. Containers and images
 
@@ -185,3 +186,28 @@ how to stop it.
 **Not covered.** Expired or revoked credentials are not made to work again by a restore: what is
 restored is the state as it was. A restore proves the state comes back, not that a token is still
 valid.
+
+### Review of the first exercise — what was wrong, and what it does now (2026-09-23)
+
+A review of the scripts at `f295884` found six failure paths. All are fixed and each was exercised
+against the running stack.
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the teardown command printed after a restore carried no instance name, so in a new shell it resolved to the live project | the restore writes `config/instance.env` (instance name, Preloop project, paths, ports) and `docker/.env`; `up.sh` and the new `down.sh` in that workspace read it | in the restored workspace, `up.sh --check` used ports 8791/8790 and `down.sh --volumes` removed only `cadp278r-*` and `preloop-restore_*`; the six live volumes were untouched |
+| 2 | an existing workspace could be overwritten, and a stray `PRELOOP_PROJECT` could point the `DROP DATABASE` at the live database | every target — workspace, Preloop project and install directory, volumes, container names — is checked **before the first write**; the live instance's own mounts are compared against the target both ways | refused: the live workspace (with and without `--into-existing`), the live Preloop project, the live Preloop directory, the live stack name, an existing clone target, a missing workspace. Nothing was unpacked in any of them |
+| 3 | `pg_restore … \|\| true` discarded errors and the restore continued on a table count | `--exit-on-error`, the output kept, and the row counts of `account`, `user`, `api_key`, `mcp_server` and `approval_request` must match the numbers recorded in the backup | a truncated dump: `pg_restore: error: could not read from input file: end of file` → stopped, **no containers started**. A good archive: "80 tables, key counts match" |
+| 4 | the backup copied from wherever the script happened to live, and a missing source was just "skipped" | sources come from the running containers' mounts (`/work`, `/research`, `/mlflow`, normalised from Docker's internal form), and a missing **required** member fails the run (`--allow-missing` to override) | with `evidence/mlflow` moved aside: `backup failed: required members missing: mlflow`, and the staging directory removed |
+| 5 | a failure after the database dump left plaintext behind | staging is created `umask 077`/`chmod 700` and removed on every exit path, and the containers are started again from the same handler | after the induced failure: no staging directory left |
+| 6 | `release.json` was assembled by string concatenation and did not parse | it is written and re-read by a JSON library, and the release must be complete: tool versions and database counts are required members | parsed; `{"claude": "2.1.278 …", "codex": "codex-cli 0.155.1", …}` and `{"account": 1, "user": 1, "api_key": 6, "mcp_server": 2, "approval_request": 44}`. The tool versions are read from the container, which is started for the reading if it was stopped |
+
+**One more trap, found while re-testing.** A clone whose `up.sh` predates `instance.env` started the
+**live-named** containers against the restored workspace (it happened, and was reverted with no data
+loss: the live containers were recreated from the live workspace and all checks passed). The restore
+now refuses a revision whose `compose.poc.yaml`, `up.sh` or `down.sh` lacks instance support, before
+anything is started, and still verifies the names afterwards.
+
+**Second exercise, end to end** (archive `20260923-004642`): restored into a fresh clone →
+`cadp278r` on its own ports → 16/16 checks → Preloop counts match → run history and MLflow
+experiments present → `auto` workflow **PASS** → `down.sh --volumes` removed only the restored
+instance → the live instance came back with 16/16 checks.
