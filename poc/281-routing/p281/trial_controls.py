@@ -202,8 +202,129 @@ def controls_record_and_screen():
           bool(eval(cond, {"d": {"agent_name": "route"}, "str": str})), False)
 
 
+# ------------------------------------------------- the fan-out steps, with the real fanout module
+# Why this exists: the triage controls build `reviews_round.json` themselves, so they never call
+# the step that writes it. A review of the published tree found `novel_reviews.py` calling
+# `fanout.run_all(jobs, ledger=…)` against a `run_all(jobs)` — the step died with a TypeError
+# before a single reviewer started, and nothing here noticed. These controls run the real step
+# modules with the real `fanout`, replacing only the interpreter that would start a model call.
+STUB = '''#!/bin/sh
+# stands in for the step's interpreter: $1 is the script it would have run
+shift
+label=$3; expected=$5
+if [ "$label" = "$CTL_FAIL" ]; then echo '{"status":"FAILED","produced":false}'; exit 1; fi
+printf '%s' "$CTL_DOC" > "$CTL_WS/$expected"
+echo '{"status":"COMPLETED","produced":true,"run_id":"ctl"}'
+'''
+
+
+def run_step(path, name, argv, ws, doc, fail=""):
+    """Import and run a fan-out step with its workspace and its child interpreter faked."""
+    import contextlib, io, types
+    root = os.path.dirname(os.path.dirname(ws))
+    stub = os.path.join(root, "stub.sh")
+    with open(stub, "w", newline="\n") as f:
+        f.write(STUB)
+    os.chmod(stub, 0o755)
+
+    fake = types.ModuleType("settings")
+    fake.runtime = lambda: {"paths": {"workspace_root": os.path.dirname(ws),
+                                      "evidence_root": os.path.join(root, "evidence")}}
+    fake.profile = lambda n=None: {}
+    saved_settings, saved_argv = sys.modules.get("settings"), sys.argv
+    sys.modules["settings"] = fake
+    os.environ.update({"CONDUCTOR_SELF_RUN_ID": os.path.basename(ws), "POC_PY": stub,
+                       "CTL_WS": ws, "CTL_DOC": doc, "CTL_FAIL": fail})
+    sys.argv = [name, *argv]
+    buf = io.StringIO()
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[name] = m
+        with contextlib.redirect_stdout(buf):
+            spec.loader.exec_module(m)
+        return json.loads(buf.getvalue().strip().splitlines()[-1])
+    except Exception as e:                       # a broken step is the finding, not a crash here
+        return {"status": f"{type(e).__name__}: {e}"}
+    finally:
+        sys.argv = saved_argv
+        if saved_settings is not None:
+            sys.modules["settings"] = saved_settings
+        for k in ("POC_PY", "CTL_WS", "CTL_DOC", "CTL_FAIL"):
+            os.environ.pop(k, None)
+
+
+def controls_reviews_step():
+    print("reviews step — the real step, the real fanout, no model call")
+    ok = json.dumps({"reviewer": "x", "usable": True, "verdict": "PASS",
+                     "findings": [{"kind": "NONE", "severity": "MINOR", "what": "fine"}]})
+    specs = ["review-story:claude:claude:direct:/work/p281/prompts/novel-review-story.md:review_story.json:required",
+             "review-history:codex:codex:direct:/work/p281/prompts/novel-review-history.md:review_history.json:required",
+             "review-cold:grok:grok:direct:/work/p281/prompts/novel-cold.md:review_cold.json:advisory"]
+
+    for label, fail, want_triage in (("every reviewer produced", "", "PASS"),
+                                     ("a required reviewer failed", "review-history", "BLOCK")):
+        root = tempfile.mkdtemp(prefix="p281-step-")
+        ws = os.path.join(root, "ws", "ctlrun")
+        os.makedirs(ws)
+        ns = load("/work/p281/steps/novel_stage.py", f"ns_{fail or 'all'}", ws)
+        open(f"{ws}/draft.md", "w").write("a draft\n")
+        ns.cmd_freeze()
+        meta = json.load(open(f"{ws}/draft_meta.json"))
+
+        res = run_step("/work/p281/steps/novel_reviews.py", f"nr_{fail or 'all'}",
+                       ["research-default", *specs], ws, ok, fail)
+        check(f"{label}: the step ran", res.get("status"), "OK")
+        rec_path = f"{ws}/reviews_round.json"
+        check(f"{label}: a receipt was written", os.path.isfile(rec_path), True)
+        rec = json.load(open(rec_path)) if os.path.isfile(rec_path) else {}
+        check(f"{label}: the receipt names this draft", rec.get("draft_id"), meta["draft_id"])
+        if fail:
+            check(f"{label}: the failed reviewer is not counted",
+                  (rec.get("members", {}).get("history", {}).get("produced"),
+                   res.get("required_usable")), (False, 1))
+        else:
+            check(f"{label}: each member carries its file's sha256",
+                  rec.get("members", {}).get("story", {}).get("sha256"),
+                  ns.sha_file(f"{ws}/review_story.json"))
+            check(f"{label}: the reviewers overlapped", isinstance(res.get("overlap"), float), True)
+
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ns.cmd_triage("1")
+        check(f"{label}: triage then decides", json.loads(buf.getvalue().strip().splitlines()[-1])["decision"],
+              want_triage)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def controls_lanes_step():
+    print("lanes step — the real step, the real fanout, no model call")
+    root = tempfile.mkdtemp(prefix="p281-lanestep-")
+    ws = os.path.join(root, "ws", "ctlrun")
+    os.makedirs(ws)
+    ts = load("/work/p281/steps/trade_stage.py", "ts_step", ws)
+    _, packet, body, _ = ts.build_packet()
+    open(f"{ws}/packet.json", "w", encoding="utf-8").write(body)
+    syms = [s["symbol"] for s in packet["universe"]][:2]
+    doc = json.dumps({"lane": "ai", "model_calls": 1, "refs": [],
+                      "targets": [{"symbol": s, "weight": 0.2} for s in syms]})
+    specs = ["base:deterministic:none:none:none:none",
+             "ai:model:codex:codex:direct:/work/p281/prompts/trade-lane.md",
+             "ai2:model:claude:claude:direct:/work/p281/prompts/trade-lane2.md"]
+    res = run_step("/work/p281/steps/trade_lanes.py", "tl_step", ["research-default", *specs],
+                   ws, doc, fail="lane-ai2")
+    check("the step ran", res.get("status"), "OK")
+    check("three lanes, two of them produced", (res.get("lanes"), res.get("produced")), (3, 2))
+    check("the failed lane is named and alone", res.get("failed"), "ai2")
+    check("the deterministic lane needed no model", os.path.isfile(f"{ws}/lane_base.json"), True)
+    shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     controls_triage()
+    controls_reviews_step()
+    controls_lanes_step()
     controls_lanes()
     controls_roles()
     controls_record_and_screen()

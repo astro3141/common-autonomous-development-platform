@@ -22,6 +22,16 @@ carries #278 material and local notes that were never mirrored. Two differences 
 | `docker/compose.poc.yaml` | same defaults as the repository; this host's paths come from `docker/.env` (git-ignored: `POC_HOST_DIR=D:/Work/poc-278`, `RESEARCH_HOST_DIR=D:/Work/research-280`) | relative defaults (`..`, `../evidence/research`) — a fresh clone resolves inside `poc/281-routing/` |
 | `docker/agent.Dockerfile` | unpinned installs; copies one host CA file | Claude 2.1.278, Conductor `87f7788e`, Preloop CLI 0.15.0 pinned; `ca/` directory, certificates unversioned |
 
+**Everything else on both sides must be identical, and that is now checked.** A review of the
+published tree found `p281/steps/novel_reviews.py` calling `fanout.run_all(..., ledger=…)` against
+a `run_all(jobs)` that had been published without that parameter: the workspace ran (it still had
+the ledger version), the published pair stopped with a `TypeError` before a reviewer started, and
+the runs reported as "measured on the running stack" were of code no reader could execute. The
+per-member ledger was dropped from this scope on purpose, so the workspace was brought back to the
+published interface — and `scripts/mirror-check.sh` now compares every file that exists on both
+sides, with these two as its only documented exceptions. It is run before publishing, and a
+difference fails it.
+
 So **the running agent image was built from the unpinned Dockerfile**, and the versions in it are
 whatever the installers returned on 2026-09-22 (§3). The pinned Dockerfile in the repository has
 never been built here. The compose defaults are the repository's relative ones on both sides;

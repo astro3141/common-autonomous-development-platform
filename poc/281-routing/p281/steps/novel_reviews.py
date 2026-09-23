@@ -24,7 +24,6 @@ PY = os.environ.get("POC_PY", "/opt/venv/bin/python")
 prof = sys.argv[1]
 RUN = os.environ.get("CONDUCTOR_SELF_RUN_ID", "manual")
 WS = f"{settings.runtime()['paths']['workspace_root']}/{RUN}"
-LEDGER = f"{WS}/.fanout/reviews.json"     # per-member state, so a re-run resumes member by member
 
 jobs = []
 for spec in sys.argv[2:]:
@@ -36,7 +35,7 @@ for spec in sys.argv[2:]:
                  "argv": [PY, "/work/p281/steps/agent_task.py", provider, route, label,
                           prompt, expected, prof, login]})
 
-rows, wall = fanout.run_all(jobs, ledger=LEDGER)
+rows, wall = fanout.run_all(jobs)
 
 
 def sha_file(path):
@@ -66,8 +65,7 @@ for r in rows:
                      "status": res.get("status"), "produced": ok,
                      "started_at": r["started_at"], "ended_at": r["ended_at"],
                      "seconds": round(r["ended_at"] - r["started_at"], 2),
-                     "reused": bool(r.get("reused")),
-                     "attempts": res.get("attempts", r.get("attempts", 1)),
+                     "attempts": res.get("attempts", 1),
                      "run_id": res.get("run_id", "")})
 
 # The receipt triage reads: which reviewer produced what, for *this* draft. Without it a review
@@ -84,13 +82,12 @@ for r, o in zip(rows, out_rows):
     art = r.get("produces") or ""
     receipt["members"][key] = {"file": os.path.basename(art), "kind": r["kind"],
                                "status": o["status"], "produced": o["produced"],
-                               "reused": o["reused"], "sha256": sha_file(art) if o["produced"] else ""}
+                               "sha256": sha_file(art) if o["produced"] else ""}
 json.dump(receipt, open(f"{WS}/reviews_round.json", "w"), ensure_ascii=False, indent=1)
 
 print(json.dumps({
     "status": "OK",
     "reviewers": len(out_rows),
-    "reused": sum(1 for x in out_rows if x["reused"]),
     "required_usable": usable_required,
     "failed": ",".join(failed),
     "wall_s": wall,

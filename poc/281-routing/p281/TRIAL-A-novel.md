@@ -84,3 +84,11 @@ code. Each is fixed and pinned by `p281/trial_controls.py` (36/36, no model call
 | a blocked chapter was recorded as "the router started nothing" | `record_block` called the recorder without an execute record, so MLflow stored `status=HOLD`, `gate.decision=NOT_RUN` | `record_block` sends the same execute record the PASS path sends. Measured on a real blocked run: `status=COMPLETED`, `gate.decision=BLOCK`, the triage reason and the draft's sha256 |
 
 A fourth, in the run screen, is in trial B's record.
+
+A fifth was found in what had been **published** rather than in what ran: `novel_reviews.py` was
+mirrored calling `fanout.run_all(..., ledger=…)` while the published `fanout.py` takes
+`run_all(jobs)` — the reviewers never started there. Per-member resume is out of this scope, so the
+ledger was removed from the workspace too, and `p281/trial_controls.py` now runs the real reviews
+and lanes steps against the real `fanout` (a stub interpreter stands in for the model call), which
+reproduces that `TypeError` if the call is reverted. `scripts/mirror-check.sh` compares the two
+trees so a published file cannot again differ from the one that was measured.
