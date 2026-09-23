@@ -21,7 +21,21 @@ export MSYS_NO_PATHCONV=1
 u() { if command -v cygpath >/dev/null; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
 m() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="${RELEASE_SH_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+# An update or a rollback checks out another revision of this very workspace — including this
+# script. A shell reads a script as it goes, so replacing the file underneath a running one can
+# change behaviour halfway or break it outright. Run from a copy instead.
+if [ -z "${RELEASE_SH_PINNED:-}" ]; then
+  SELF_COPY="${TMPDIR:-/tmp}/cadp-release-$$.sh"
+  cp "$0" "$SELF_COPY"
+  RELEASE_SH_PINNED=1 RELEASE_SH_HOME="$HERE" RELEASE_SH_COPY="$SELF_COPY" \
+    exec bash "$SELF_COPY" "$@"
+fi
+cleanup_all() {
+  [ -n "${CAND_DIR:-}" ] && { git -C "$(m "$HERE")" worktree remove --force "$(m "$CAND_DIR")" >/dev/null 2>&1 || true; rm -rf "$CAND_DIR"; }
+  rm -f "${RELEASE_SH_COPY:-}"
+}
+trap cleanup_all EXIT
 [ -f "$HERE/config/instance.env" ] && . "$HERE/config/instance.env"
 STACK="${STACK:-cadp278}"
 AGENT="$STACK-agent"
@@ -121,6 +135,9 @@ swap_staged() {  # keeps .local.old until the new one has answered (see keep_or_
 }
 keep_or_restore_toolchain() {
   docker run --rm -v "$STACK-agent-home:/vol" alpine sh -c '[ -d /vol/.local.old ]' 2>/dev/null || return 0
+  # the tools are asked inside the container, so it has to be up even when the checks failed
+  docker start "$AGENT" >/dev/null 2>&1 || true
+  for i in $(seq 1 15); do docker exec "$AGENT" true >/dev/null 2>&1 && break; sleep 1; done
   bad=""
   for t in claude conductor preloop_cli; do
     [ -n "$(tool_running "$t")" ] || bad="$bad $t"
@@ -239,10 +256,14 @@ cmd_update() {
   echo "== candidate $TO"
   CAND_DIR="$(u "${TMPDIR:-/tmp}")/cadp-candidate-$$"
   CAND_IMAGE="cadp278/governed-runtime:cand-$(git_here rev-parse --short "$TO")"
-  cand_cleanup() { git_here worktree remove --force "$(m "$CAND_DIR")" >/dev/null 2>&1 || true; rm -rf "$CAND_DIR"; }
-  trap cand_cleanup EXIT
   git_here worktree add --quiet --detach "$(m "$CAND_DIR")" "$TO" || fail "could not prepare a candidate worktree"
-  docker build --quiet -t "$CAND_IMAGE" -f "$(m "$CAND_DIR")/docker/agent.Dockerfile" "$(m "$CAND_DIR")/docker" >/dev/null \
+  # A worktree is the whole repository, and this stack may sit below its root (it does in the
+  # repository layout, poc/281-routing/). The candidate's docker/ is therefore under the same
+  # prefix as this workspace has inside its own repository.
+  PREFIX="$(git_here rev-parse --show-prefix)"
+  CAND_DOCKER="$(m "$CAND_DIR")/${PREFIX}docker"
+  [ -f "$(u "$CAND_DOCKER")/agent.Dockerfile" ] || fail "the candidate has no ${PREFIX}docker/agent.Dockerfile"
+  docker build --quiet -t "$CAND_IMAGE" -f "$CAND_DOCKER/agent.Dockerfile" "$CAND_DOCKER" >/dev/null \
     || fail "the candidate build failed; nothing was changed"
   say "built" "$CAND_IMAGE"
   DIFFS=""
@@ -271,18 +292,26 @@ cmd_update() {
   echo "== toolchain"
   if [ -n "$DIFFS" ]; then
     say "replacing" "/home/agent/.local with the new image's toolchain"
-    docker stop "$AGENT" >/dev/null 2>&1 || true
+    # staging needs no downtime; only the swap does
     docker run --rm -v "$STACK-agent-home:/vol" --entrypoint sh "$CAND_IMAGE" -c \
       'rm -rf /vol/.local.new && cp -a /home/agent/.local /vol/.local.new' \
       || fail "could not stage the new toolchain; nothing was replaced"
     verify_staged || fail "the new toolchain did not verify; nothing was replaced"
+    docker stop "$AGENT" >/dev/null 2>&1 || true
     swap_staged || fail "could not swap in the new toolchain"
   else
     say "unchanged" "the new revision builds the same tool versions"
   fi
 
   echo "== starting and checking"
-  (cd "$HERE" && bash scripts/up.sh --recreate) || {
+  UP_RC=0
+  (cd "$HERE" && bash scripts/up.sh --recreate) || UP_RC=1
+  # Whatever happened, the swapped-in toolchain is judged now: a copy that does not answer is put
+  # back before anything else is decided, so no failure path can leave the instance without tools.
+  keep_or_restore_toolchain || {
+    echo; echo "the previous toolchain was put back; the update did not take effect." >&2
+    exit 1; }
+  [ "$UP_RC" = 0 ] || {
     echo; echo "the checks did not pass after the update. Go back with:" >&2
     echo "  scripts/release.sh rollback --to <tag>   (scripts/release.sh list)" >&2
     exit 1; }
@@ -292,7 +321,6 @@ cmd_update() {
     echo; echo "the update left the Preloop policy unapplied. Go back with:" >&2
     echo "  scripts/release.sh rollback --to <tag>   (scripts/release.sh list)" >&2
     exit 1; }
-  keep_or_restore_toolchain || exit 1
   for t in $TOOLS; do say "$t" "$(tool_running "$t")"; done
   echo
   echo "update done. If it misbehaves, go back with:"
@@ -318,14 +346,15 @@ cmd_rollback() {
   docker run --rm -v "$(m "$SRC"):/in:ro" alpine sh -c \
     'tar tzf /in/toolchain.tar.gz >/dev/null && tar tzf /in/config.tar.gz >/dev/null' \
     || fail "the release's archives do not verify — nothing was changed"
-  # unpack beside the running toolchain and only then swap: what runs is never deleted before a
-  # usable replacement exists
-  docker stop "$AGENT" >/dev/null 2>&1 || true
+  # Unpack beside the running toolchain and only then swap: what runs is never deleted before a
+  # usable replacement exists. Staging needs no downtime, so the agent keeps running until the
+  # staged copy has been verified — a refusal leaves the instance exactly as it was, still up.
   docker run --rm -v "$STACK-agent-home:/vol" -v "$(m "$SRC"):/in:ro" alpine sh -c \
     'rm -rf /vol/.local.new && mkdir -p /vol/.local.new && tar xzf /in/toolchain.tar.gz -C /vol/.local.new --strip-components=1' \
     || fail "the release's toolchain did not unpack — the running one is untouched"
   verify_staged || fail "the release's toolchain has no usable tools in it — the running one is untouched"
   say "verified" "images, archives, and the unpacked toolchain"
+  docker stop "$AGENT" >/dev/null 2>&1 || true
 
   git_here checkout --quiet "$REV" || fail "cannot check out $REV"
   say "workspace" "$(git_here rev-parse --short HEAD)"
@@ -343,10 +372,16 @@ cmd_rollback() {
   say "configuration" "config/ and policy/ sources only (generated settings are rebuilt)"
 
   echo "== starting and checking"
-  (cd "$HERE" && bash scripts/up.sh --recreate) || { echo "the checks did not pass after the rollback" >&2; exit 1; }
+  UP_RC=0
+  (cd "$HERE" && bash scripts/up.sh --recreate) || UP_RC=1
+  # judged before anything else, exactly as in an update: a toolchain that does not answer is put
+  # back, whatever the checks said
+  keep_or_restore_toolchain || {
+    echo; echo "the previous toolchain was put back; the rollback did not take effect." >&2
+    exit 1; }
+  [ "$UP_RC" = 0 ] || { echo "the checks did not pass after the rollback" >&2; exit 1; }
   # the account must enforce the policy that was just restored, not the one from before
   reapply_policy || exit 1
-  keep_or_restore_toolchain || exit 1
   for t in $TOOLS; do say "$t" "$(tool_running "$t")"; done
   echo
   echo "rolled back to $TO"

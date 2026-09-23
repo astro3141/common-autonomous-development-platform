@@ -298,3 +298,16 @@ the repository copy).
 
 Two smaller faults came out of the same run and are fixed: a tool that cannot answer no longer
 aborts the script, and the candidate build takes a native path for its context.
+
+### Third review of the release path — three boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the toolchain was judged only after the checks and the policy had passed, so a replacement that installed but could not run was left in place | the swapped-in toolchain is judged immediately after the stack comes back, whatever the checks said; a copy that does not answer is put back and the command fails | a release whose Claude was present and non-empty but not executable: "the new toolchain does not answer (claude) — putting the previous one back", exit 1, and the working tools answered again |
+| 2 | a refused toolchain left the agent stopped, because it was stopped before verification | staging and verification happen while the agent runs; only the swap stops it | the hollow-archive refusal now ends with the agent still `running` and Claude answering |
+| 3 | the candidate build looked for `docker/agent.Dockerfile` at the worktree root, which is wrong wherever this stack sits below the repository root (the restored copies from §7 do) | the candidate uses the same prefix this workspace has inside its own repository (`git rev-parse --show-prefix`) and says so if the file is not there | the prefix is empty in the PoC workspace and `poc/281-routing/` in a repository checkout; a worktree of this repository resolves `poc/281-routing/docker/agent.Dockerfile` |
+
+**One more, found while testing.** An update or a rollback checks out another revision of the very
+workspace this script lives in — including the script. A shell reads a script as it runs, so the
+file changed underneath it. `release.sh` now copies itself to a temporary file and re-executes that
+copy, so the running code cannot change halfway.
