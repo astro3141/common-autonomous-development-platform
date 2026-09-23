@@ -2,7 +2,8 @@
 //
 //   node run-agent.mjs <request.json>          prints one normalized result JSON on stdout
 //
-// request.json: { run_id, provider, model?, cwd, prompt, timeout_ms?, evidence_dir? }
+// request.json: { run_id, provider, model?, cwd, prompt, timeout_ms?, evidence_dir?,
+//                 mcp_principal? }   mcp_principal: present this role's Preloop credential
 //
 // Everything vendor-specific lives in PROVIDERS below. The caller (Conductor), Preloop and
 // MLflow see the same request and result shape whichever provider runs.
@@ -38,6 +39,24 @@ const LOGINS = RT.paths?.logins_root ?? "/route";
 let LOGIN = null;
 const loginDir = (provider) => `${LOGINS}/${LOGIN ?? provider}`;
 
+// ---- per-role Preloop principal (opt-in) ------------------------------------------------
+// A request may name a principal of its own (`mcp_principal`): the call then presents that
+// principal's Preloop credential to the MCP endpoint instead of the adapter's, so two roles on
+// the same provider can carry different tool rights (Preloop governs per subject — api_key_id,
+// then managed_agent_id). The token is never stored here and never written to the evidence: the
+// caller supplies it in PRELOOP_MCP_<NAME>. A named principal whose credential is missing is an
+// error, never a silent fall back to the adapter's wider rights.
+let PRINCIPAL = null;
+const principalEnv = (name) => `PRELOOP_MCP_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+function principalAuth(name) {
+  const v = process.env[principalEnv(name)];
+  if (!v) throw new Error(`mcp_principal "${name}": ${principalEnv(name)} is not set`);
+  return v.startsWith("Bearer ") ? v : `Bearer ${v}`;
+}
+// Every profile's mcpAuth() goes through this, so the override reaches both the server the
+// adapter attaches over ACP and the one it writes into a vendor config in memory.
+const withPrincipal = (own) => (PRINCIPAL ? principalAuth(PRINCIPAL) : own());
+
 // Option B egress: the routing layer's allowlist proxy. Preloop (tools, approvals), MLflow and
 // in-network names stay direct.
 const EGRESS = (() => {
@@ -69,7 +88,8 @@ const PROVIDERS = {
     directReplacesEnv: true,
     // This principal's Preloop MCP bearer (onboarding wrote it into ~/.claude.json).
     mcpAuth() {
-      return JSON.parse(readFileSync(join(homedir(), ".claude.json"), "utf8")).mcpServers.preloop.headers.Authorization;
+      return withPrincipal(() =>
+        JSON.parse(readFileSync(join(homedir(), ".claude.json"), "utf8")).mcpServers.preloop.headers.Authorization);
     },
     // Native write/shell removed through the workspace's project settings — acpx loads that
     // tier, and a deny rule cannot be lifted by another tier. The Preloop policy forbids MCP
@@ -113,10 +133,12 @@ const PROVIDERS = {
     },
     get sessionLedger() { return `${LOGINS}/codex-session-ledger.jsonl`; },
     mcpAuth() {
-      const t = readFileSync(join(homedir(), ".codex/config.toml"), "utf8");
-      const m = t.match(/\[mcp_servers\.preloop\.http_headers\][^[]*?Authorization\s*=\s*'([^']+)'/);
-      if (!m) throw new Error("no Preloop MCP bearer in ~/.codex/config.toml");
-      return m[1];
+      return withPrincipal(() => {
+        const t = readFileSync(join(homedir(), ".codex/config.toml"), "utf8");
+        const m = t.match(/\[mcp_servers\.preloop\.http_headers\][^[]*?Authorization\s*=\s*'([^']+)'/);
+        if (!m) throw new Error("no Preloop MCP bearer in ~/.codex/config.toml");
+        return m[1];
+      });
     },
     // Shell removed by feature flags. apply_patch has no off switch in this Codex; it stays
     // and, in read-only mode, every use escalates to Preloop approval.
@@ -156,10 +178,11 @@ const PROVIDERS = {
     // request labelled `claude_code`, and each stalled the run for the hook's 300 s timeout.
     directEnv() { return { GROK_HOME: loginDir("grok"), HOME: `${loginDir("grok")}/home`, ...EGRESS }; },
     directOnly: true,
-    // Grok is not onboarded to Preloop, so it has no principal of its own yet; see FINDINGS.
-    mcpAuth() {
-      return JSON.parse(readFileSync(join(homedir(), ".claude.json"), "utf8")).mcpServers.preloop.headers.Authorization;
-    },
+    // Grok has a Preloop principal of its own; its credential sits in the `preloop` MCP entry of
+    // /route/grok/config.toml (OPERATIONS.md), which is also why `mcp_principal` cannot apply
+    // here: Grok reads the credential from that file, not from what the adapter passes.
+    mcpAuthFromFile: true,
+    mcpAuth() { throw new Error("grok reads its Preloop credential from its own config file"); },
     disableNative() { return {}; },
     // Grok did not connect an MCP server handed over ACP (no connection attempt in its log;
     // its tool search waited ~5 min per call for a server "still connecting"). The same server
@@ -265,6 +288,15 @@ async function main() {
   // Preloop rules decide; the vendor's native write/shell tools are removed where the vendor
   // allows it, and whatever remains still escalates to Preloop approval.
   const mcpOnly = req.native_tools === false;
+  // A role may present a principal of its own. Refused where the vendor reads its credential
+  // from its own config file (Grok), because the adapter cannot substitute it for one call.
+  PRINCIPAL = req.mcp_principal || null;
+  if (PRINCIPAL && prof.mcpAuthFromFile) {
+    throw new Error(`mcp_principal is not supported for ${req.provider}: its Preloop credential comes from its own config file`);
+  }
+  if (PRINCIPAL && !mcpOnly) {
+    throw new Error("mcp_principal requires native_tools=false: without it the run does not go through the Preloop MCP server");
+  }
   const extraEnv = mcpOnly ? prof.disableNative(req.cwd) : {};
   // model_route: "direct" → the routing layer's own login + allowlist proxy; otherwise the
   // Preloop model gateway (the #278 path). Refused if the provider has no direct profile.
@@ -357,6 +389,7 @@ async function main() {
     status: norm,
     retryable_elsewhere: norm === "FAILED" && (result?.error?.retryable ?? false),
     provider: req.provider,
+    mcp_principal: PRINCIPAL ?? "",
     model: {
       requested: req.model ?? null,
       session_reported: status?.models?.currentModelId ?? status?.model ?? null,

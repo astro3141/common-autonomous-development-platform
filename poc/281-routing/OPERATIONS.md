@@ -511,3 +511,51 @@ two roles sharing one provider still share its rights.
 its configuration denies, and then gave up — "PROBE_BLOCKED: write and search_replace refused".
 Naming the MCP tool in the prompt (`preloop__write_file`) made it work. The credential was never
 the problem; tool choice was. A workflow that depends on Grok writing files should name the tool.
+
+### Per-role credentials: measured, and the adapter can now present one (2026-09-23)
+
+The limitation recorded above — *"this is per credential, and two roles sharing one provider still
+share its rights"* — was about this stack's wiring, not about Preloop. Both halves were measured.
+
+**Preloop side.** Two principals of the *same* vendor were created (`agent_kind: claude_code`,
+"Claude Code (role: author)" and "… (role: history)"), each with its own MCP credential, and
+`write_file` was disabled on the history principal alone. Governance is available per credential
+(`/api/v1/auth/api-keys/{key_id}/governance`) and per principal
+(`/api/v1/agents/{agent_id}/governance`); the principal level was used here, so the rule survives
+credential rotation.
+
+| credential presented to `/mcp/v1` | tools offered | `write_file` |
+|---|---|---|
+| role principal `author` | 19 | wrote the file |
+| role principal `history` (override `write_file:false`) | 18 — `write_file` is not in the list | "Access denied: Tool 'write_file' is not available" |
+| the adapter's own Claude credential, unchanged | 20 | wrote the file |
+
+**Adapter side.** A request may now name a principal: `mcp_principal: "<name>"` in `request.json`.
+The adapter then presents that principal's credential to the Preloop MCP endpoint instead of its
+own — for the server it attaches over ACP (Claude) and for the one it writes into a vendor config
+in memory (Codex). The token is never stored by the adapter and never written into the evidence:
+the caller supplies it in `PRELOOP_MCP_<NAME>`, and the result records only the principal's name.
+
+Measured through the routing layer, same provider, same login, same prompt, only the credential
+differing:
+
+| run | result |
+|---|---|
+| `mcp_principal: author` | `COMPLETED`, file written — the session called `mcp__preloop__write_file` |
+| `mcp_principal: history` | `COMPLETED`, no file — the session searched for the tool, did not find it in its list, and never called it |
+| `mcp_principal` named, `PRELOOP_MCP_<NAME>` not set | `FAILED` — fails closed, never falls back to the adapter's wider credential |
+| `mcp_principal` with `native_tools: true` | `FAILED` — the run would not go through the MCP server at all |
+| no `mcp_principal` (regression) | `COMPLETED`, file written with the adapter's own credential |
+| `mcp_principal` on Grok | `FAILED` — refused: Grok reads its credential from `/route/grok/config.toml`, so the adapter cannot substitute it for one call. Per-role for Grok would need a login directory (and config file) per role. |
+
+**What is still not built.** Nothing maps a workflow role to a principal: `steps/roles.py` binds a
+role to a vendor and a login, and no step passes `mcp_principal`, so no workflow uses this yet.
+Where the credentials come from is also left open on purpose — the adapter reads an environment
+variable, so an operator can inject them from wherever they are kept, and `cfg.py` would own the
+role → principal mapping the day a workflow needs it.
+
+**Two lifecycle facts worth keeping.** Deleting a managed agent (`DELETE /api/v1/agents/{id}`)
+revokes its credential immediately — the same token went from HTTP 200 to 401 — but the API key
+rows stay listed until deleted separately (`DELETE /api/v1/auth/api-keys/{key_id}`). The probe
+principals, their eight credentials and every probe file were removed after the measurement; the
+account is back to the four principals it had (Grok, Codex, two Claude).
