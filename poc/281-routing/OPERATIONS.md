@@ -397,3 +397,52 @@ never exercised on live data again.
 | `shutil.move` falls back to copy-then-delete, so a failure in the middle could leave the original partly gone while a copy sat in the holding place | the holding place is on the same mount by construction, so `os.rename` is used and nothing is copied; a rename that cannot be done is a failure to report | with a rename made to fail, every path of the run stayed where it was and the holding place was left empty |
 
 `p281/cleanup_controls.py` now covers 17 cases.
+
+## 10. Tool policy: what one Preloop account can and cannot separate (measured 2026-09-23)
+
+The question was whether different kinds of work — a novel workflow, a trading cycle, a development
+task — can be given different tool permissions on this stack. Read out of Preloop OSS 0.15.0's own
+code and API, not from its documentation:
+
+| fact | where it was read |
+|---|---|
+| A rule's condition sees **only the tool's arguments**. The evaluator is handed `{"args": tool_args}`; it also takes a `context` parameter and does not use it ("unused for argument evaluation") | `preloop/plugins/builtin/argument_evaluator.py`, `services/policy_evaluator.py` |
+| So **who is calling — agent, session, role, working directory — is not visible to a rule** | the same activation, on both the plain and the CEL path |
+| The MCP proxy is **one endpoint per account**: `/mcp/v1` answers, `/mcp/v1/<server>` is 404 | probed on the running console |
+| The policy schema binds tools to an **MCP server** (`source`), never to an agent or a key | `/api/v1/policies/schema` |
+| One policy is active per account | measured earlier (§7, `cfg.py`) |
+
+**Therefore a per-role permission — "the author may write here, the trading lane may not" — cannot
+be expressed in this version.** A rule written on paths or tool names applies to every role
+equally. Anything that carried the role in the arguments would be the model's own claim about
+itself, which is an audit trail, not a control.
+
+**What does separate work today**
+
+- The file server is the boundary that actually holds: `cadp278-fsmcp` serves `/ws` and nothing
+  else, so no tool call reaches the workspace, the evidence tree or the host.
+- Within that, rules by path and tool name are enforced for everyone alike (no writes into
+  `.claude`, none to the control file), and each run works in its own `/ws/<conductor run id>`.
+- `paths.workspace_root` may be `/ws` or any directory below it (§9), so a whole *instance* can be
+  pointed at a domain root.
+
+That is domain-shaped separation, not role-shaped, and this document does not call it more than
+that.
+
+**The opt-in design, if per-role policy is ever actually needed**
+
+One policy per account is the constraint, so the unit of policy has to become the account:
+
+1. A second Preloop project runs beside the first — the same thing `scripts/restore.sh` already
+   stands up (own compose project, own database, own ports), so it is proven to run here.
+2. Each domain gets its own account, its own agent enrolment and its own policy file.
+3. The routing layer picks the Preloop endpoint and token per role, the way it already picks a
+   provider login per role (`steps/roles.py`): a role names its policy domain, and the adapter
+   uses that domain's `PRELOOP_URL` / MCP token.
+4. `cfg.py` keeps one policy per domain and applies each to its own account; its "one policy for
+   all profiles" check becomes "one policy per domain".
+
+Cost, stated plainly: one more Preloop stack per domain (eight containers and a database), and an
+account bootstrap that only the operator can do — registration closes after the first user, and
+there is no user-creation API. It is not worth doing before two kinds of work genuinely need
+different tool rights; until then the file server's root and the path rules are the boundary.
