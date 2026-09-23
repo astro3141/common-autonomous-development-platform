@@ -122,17 +122,22 @@ def trash_for(path):
 
 
 def remove_group(paths):
-    """All or nothing: move every path aside first, put them back if one fails, delete only then."""
+    """All or nothing: move every path aside first, put them back if one fails, delete only then.
+
+    `os.rename`, never `shutil.move`: move falls back to copy-then-delete across mounts, and a
+    failure in the middle of that leaves half a directory behind with no way back. The holding
+    place is chosen on the same mount as the path (trash_for), so a rename is all that is needed —
+    and if it is not possible, that is a failure to report, not something to work around."""
     moved = []
     try:
         for p in paths:
             dest = trash_for(p) / f"{int(time.time())}-{os.getpid()}-{Path(p).name}"
-            shutil.move(p, dest)
+            os.rename(p, dest)
             moved.append((p, dest))
     except Exception as e:
         for original, dest in reversed(moved):
             try:
-                shutil.move(dest, original)
+                os.rename(dest, original)
             except Exception as back:
                 return False, f"{e}; and putting {dest} back failed: {back}"
         return False, str(e)
@@ -188,7 +193,10 @@ def main():
         removable.append({"ui_id": r["ui_id"], "conductor_run": r["conductor_run"],
                           "started_at": r["started_at"], "paths": [str(p) for p in paths if p.exists()]})
 
-    orphans, orphans_kept = [], []
+    # Orphans belong to runs too: /ws/<run>-execute and evidence/p281/<run>-execute-codex are one
+    # run's traces. Grouping them by the run id is what keeps a protected workspace from having
+    # its evidence deleted beside it.
+    groups = {}
     for base in (WS, EVID):
         if not base.is_dir():
             continue
@@ -198,30 +206,39 @@ def main():
             m = RUN_ID.match(p.name)
             if not m or m.group(0) in known:
                 continue
-            why = None
-            if unreadable:
-                why = f"{unreadable} run(s) on the screen could not be read — their traces cannot be told apart"
-            elif approval_under(str(p)):
-                why = "an approval is pending under it"
-            elif p.stat().st_mtime >= cutoff:
-                why = f"changed within {days} days"
-            (orphans_kept if why else orphans).append({"path": str(p), "why": why} if why else str(p))
+            groups.setdefault(m.group(0), []).append(p)
 
-    removed, failed = [], []
+    orphans, orphans_kept = [], []
+    for run_id, paths in sorted(groups.items()):
+        why = None
+        if unreadable:
+            why = f"{unreadable} run(s) on the screen could not be read — their traces cannot be told apart"
+        elif any(approval_under(str(p)) for p in paths):
+            why = "an approval is pending under it"
+        elif any(p.stat().st_mtime >= cutoff for p in paths):
+            why = f"changed within {days} days"
+        if why:
+            orphans_kept.append({"run": run_id, "paths": [str(p) for p in paths], "why": why})
+        else:
+            orphans.append({"run": run_id, "paths": [str(p) for p in paths]})
+
+    removed, failed, orphans_removed = [], [], []
     if apply:
         for r in removable:
             ok, err = remove_group(r["paths"])
             (removed if ok else failed).append({"ui_id": r["ui_id"], "error": err} if not ok else r["ui_id"])
         if orphans_too:
-            for p in orphans:
-                ok, err = remove_group([p])
+            for g in orphans:                      # a run's traces go together here as well
+                ok, err = remove_group(g["paths"])
                 if not ok:
-                    failed.append({"path": p, "error": err})
+                    failed.append({"path": f"orphan {g['run']}", "error": err})
+                else:
+                    orphans_removed.append(g["run"])
 
     result = {"apply": apply, "days": days, "keep": keep_n, "unreadable_runs": unreadable,
               "kept": kept, "removable": removable, "orphans": orphans, "orphans_kept": orphans_kept,
               "removed": removed, "failed": failed,
-              "orphans_removed": orphans if (apply and orphans_too and not failed) else []}
+              "orphans_removed": orphans_removed}
     if as_json:
         print(json.dumps(result, indent=1))
         return 1 if failed else 0
@@ -242,10 +259,10 @@ def main():
             print(f"      {p}")
     if orphans or orphans_kept:
         print(f"\n{len(orphans) + len(orphans_kept)} traces belong to no run on the screen:")
-        for p in orphans[:10]:
-            print(f"      {p}")
+        for g in orphans[:10]:
+            print(f"      run {g['run']}: " + ", ".join(g["paths"]))
         for k in orphans_kept[:10]:
-            print(f"      {k['path']}  (kept: {k['why']})")
+            print(f"      run {k['run']}: " + ", ".join(k["paths"]) + f"  (kept: {k['why']})")
         print("  they are removed only with --include-orphans"
               + (" — removed" if (apply and orphans_too and orphans) else ""))
     if failed:

@@ -36,6 +36,15 @@ class Sandbox:
                  "print(json.dumps({'complete': complete, 'items': items} if full else items))\n"))
         self.reader.write_text(body)
 
+    def set_pending(self, items):
+        """Point the stubbed reader at another list of pending requests."""
+        import json as _json
+        body = ("import json,sys\n"
+                "full='--all' in sys.argv[1:]\n"
+                f"items={_json.dumps(items)}\n"
+                "print(json.dumps({'complete': True, 'items': items} if full else items))\n")
+        self.reader.write_text(body)
+
     def load(self):
         import subprocess as real_subprocess
         cleanup = importlib.reload(importlib.import_module("cleanup"))
@@ -113,24 +122,24 @@ sb.drop()
 sb = Sandbox()
 d = sb.run("20260101-030303-cccccc", "33333333", "20260101")
 cleanup = sb.load()
-real_move = cleanup.shutil.move
+real_rename = cleanup.os.rename
 state = {"n": 0}
 
 
-def failing_move(src, dst):
+def failing_rename(src, dst):
     state["n"] += 1
     if state["n"] == 2:                      # the second path of the group cannot be moved
         raise PermissionError("permission denied (injected)")
-    return real_move(src, dst)
+    return real_rename(src, dst)
 
 
-cleanup.shutil.move = failing_move
+cleanup.os = type("O", (), {"rename": staticmethod(failing_rename), "getpid": os.getpid,
+                            "path": os.path, "utime": os.utime})
 sys.argv = ["cleanup.py", "--json", "--days", "0", "--keep", "0", "--apply"]
 buf = io.StringIO()
 with redirect_stdout(buf):
     rc = cleanup.main()
 res = json.loads(buf.getvalue())
-cleanup.shutil.move = real_move
 check("a group that cannot be removed in full is reported as failed, not removed",
       res["removed"] == [] and res["failed"] and rc == 1, res)
 check("… and every path of it is still there",
@@ -152,10 +161,7 @@ sb.drop()
 sb = Sandbox()
 p = sb.ws / "55555555-codex"; p.mkdir()
 os.utime(p, (old, old))
-sb2_pending = [{"cwd": str(p)}]
-sb.reader.write_text("import json,sys\nfull='--all' in sys.argv[1:]\n"
-                     f"items={json.dumps(sb2_pending)}\n"
-                     "print(json.dumps({'complete': True, 'items': items} if full else items))\n")
+sb.set_pending([{"cwd": str(p)}])
 out, err, rc = sb.call("--days", "0", "--keep", "0", "--apply", "--include-orphans")
 check("an orphan with a pending approval under it is kept",
       p.exists() and any("approval" in k["why"] for k in out["orphans_kept"]), out or err)
@@ -197,6 +203,59 @@ sb = Sandbox()
 d = sb.run("20260101-070707-aaaabb", "aaaaaaaa", "20260101")
 out, err, rc = sb.call("--days", "0", "--keep", "0")
 check("without --apply nothing is removed", d.exists() and out["removable"] and not out["removed"], out or err)
+sb.drop()
+
+# ------------------------------------------------------------------ orphans are grouped by run
+sb = Sandbox()
+ws_p = sb.ws / "abcdef01-execute"; ws_p.mkdir()
+ev_p = sb.evid / "abcdef01-execute-codex"; ev_p.mkdir()
+for q in (ws_p, ev_p):
+    os.utime(q, (old, old))
+sb.set_pending([{"cwd": str(ws_p)}])
+out, err, rc = sb.call("--days", "0", "--keep", "0", "--apply", "--include-orphans")
+check("an approval on one trace protects the whole run's orphan traces",
+      ws_p.exists() and ev_p.exists()
+      and any(k["run"] == "abcdef01" for k in out["orphans_kept"]), out or err)
+sb.drop()
+
+sb = Sandbox()
+ws_p = sb.ws / "abcdef02-execute"; ws_p.mkdir()
+ev_p = sb.evid / "abcdef02-execute-codex"; ev_p.mkdir()
+for q in (ws_p, ev_p):
+    os.utime(q, (old, old))
+out, err, rc = sb.call("--days", "0", "--keep", "0", "--apply", "--include-orphans")
+check("an unprotected orphan run goes with all of its traces",
+      not ws_p.exists() and not ev_p.exists() and out["orphans_removed"] == ["abcdef02"], out or err)
+sb.drop()
+
+# ------------------------------------------------------------------ no copy fallback on failure
+sb = Sandbox()
+d = sb.run("20260101-080808-bbbbcc", "bbbbbbbb", "20260101")
+cleanup = sb.load()
+real_rename = cleanup.os.rename
+calls = {"n": 0}
+
+
+def failing_rename(src, dst):
+    calls["n"] += 1
+    if calls["n"] == 2:
+        raise OSError(18, "Invalid cross-device link (injected)")
+    return real_rename(src, dst)
+
+
+cleanup.os = type("O", (), {"rename": staticmethod(failing_rename), "getpid": os.getpid,
+                            "path": os.path, "utime": os.utime})
+sys.argv = ["cleanup.py", "--json", "--days", "0", "--keep", "0", "--apply"]
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = cleanup.main()
+res = json.loads(buf.getvalue())
+check("a rename that fails leaves every path of the run where it was",
+      res["removed"] == [] and res["failed"] and rc == 1
+      and d.exists() and (sb.ws / "bbbbbbbb-codex").exists() and (sb.evid / "bbbbbbbb-propose-codex").exists(),
+      res)
+check("… and nothing of it is left in the holding place",
+      not any((sb.ws / ".cleanup-trash").glob("*")) and not any((sb.root / ".cleanup-trash").glob("*")))
 sb.drop()
 
 failed = [n for n, ok in results if not ok]

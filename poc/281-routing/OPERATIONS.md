@@ -374,9 +374,26 @@ used for its actual purpose here.
 These are covered by `p281/cleanup_controls.py` (13 checks), which runs against temporary
 directories with a stubbed approvals reader — no run of the instance is read or removed.
 
-**Cost of testing this badly.** Two of these cases were first exercised against the live
-workspace with `--apply`, which removed real run evidence. Everything tracked in git came back
-with `git checkout`, and 36 untracked evidence directories were restored from the backup, in two
-goes. The scratch workspaces under `/ws` for those runs are gone for good — they are classified
-as regenerate/discard in §4, which is the only reason this was recoverable at all. The controls
-exist so that these paths are never again exercised on live data.
+**Cost of testing this badly — what was and was not recovered.**
+
+Two of these cases were first exercised against the live workspace with `--apply`, which removed
+real run evidence. The recovery was **partial**:
+
+| trace | result |
+|---|---|
+| the screen's records (`evidence/ui-runs/`), tracked in git | fully recovered with `git checkout` |
+| adapter evidence (`evidence/p281/`), not tracked | 36 directories restored from the backup, in two goes. Four runs are still without it, because they ran after that backup was taken: `20260923-014530-00808d` (5775abd7), `20260923-014953-0b2b01` (405095d1), `20260923-022134-3ccc7a` (7933931d), `20260923-030330-8b15a3` (da721b3f) |
+| the scratch workspaces under `/ws` | **not recovered, for any of the twelve runs**: 7f7e0fa0, 552e1957, d9f651cc, c5ece803, e13fe17b, 7ed5fc4f, 189cd1a8, 38a59361, 5775abd7, 405095d1, 7933931d, da721b3f. They are classified regenerate/discard in §4 and are deliberately not in the backup |
+
+The 16/16 checks reported after the incident say the services are healthy. They are not evidence
+that past artifacts came back; the table above is. The controls exist so that these paths are
+never exercised on live data again.
+
+### Two more boundaries in the cleanup (2026-09-23)
+
+| was | is now | checked |
+|---|---|---|
+| an orphan was protected path by path, so a pending approval on `/ws/<run>-execute` still let `evidence/p281/<run>-execute-codex` be deleted | orphan traces are grouped by run id as well: protections and removal apply to the whole run | an approval on one trace keeps both; an unprotected orphan run goes with all of its traces |
+| `shutil.move` falls back to copy-then-delete, so a failure in the middle could leave the original partly gone while a copy sat in the holding place | the holding place is on the same mount by construction, so `os.rename` is used and nothing is copied; a rename that cannot be done is a failure to report | with a rename made to fail, every path of the run stayed where it was and the holding place was left empty |
+
+`p281/cleanup_controls.py` now covers 17 cases.
