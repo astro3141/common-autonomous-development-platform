@@ -398,51 +398,60 @@ never exercised on live data again.
 
 `p281/cleanup_controls.py` now covers 17 cases.
 
-## 10. Tool policy: what one Preloop account can and cannot separate (measured 2026-09-23)
+## 10. Tool policy per caller — corrected and measured (2026-09-23)
 
-The question was whether different kinds of work — a novel workflow, a trading cycle, a development
-task — can be given different tool permissions on this stack. Read out of Preloop OSS 0.15.0's own
-code and API, not from its documentation:
+An earlier version of this section concluded that a per-role permission "cannot be expressed in
+this version". **That was wrong**, and the review that caught it was right: the conclusion came
+from reading the condition evaluator alone and stopping there.
 
-| fact | where it was read |
+**What is true about conditions.** A rule's CEL expression is evaluated against `{"args": args}`
+only; the caller is not visible *inside the expression*.
+
+**What that misses.** Choosing *whose* rules apply happens before the expression is evaluated.
+Read in the running image (`ghcr.io/preloop/preloop:0.15.0`):
+
+| mechanism | where |
 |---|---|
-| A rule's condition sees **only the tool's arguments**. The evaluator is handed `{"args": tool_args}`; it also takes a `context` parameter and does not use it ("unused for argument evaluation") | `preloop/plugins/builtin/argument_evaluator.py`, `services/policy_evaluator.py` |
-| So **who is calling — agent, session, role, working directory — is not visible to a rule** | the same activation, on both the plain and the CEL path |
-| The MCP proxy is **one endpoint per account**: `/mcp/v1` answers, `/mcp/v1/<server>` is 404 | probed on the running console |
-| The policy schema binds tools to an **MCP server** (`source`), never to an agent or a key | `/api/v1/policies/schema` |
-| One policy is active per account | measured earlier (§7, `cfg.py`) |
+| `subject_scope_chain()` — the caller's `api_key_id`, then its `managed_agent_id` | `services/subject_governance.py` |
+| `get_scoped_tool_rules()` — the rules for that subject, most specific first | same |
+| `is_tool_enabled_for_subject()` — a per-subject on/off for a tool, checked **before** any rule | same |
+| both are called by the policy evaluator, which is handed `subject_context` | `services/policy_evaluator.py` |
+| the MCP proxy fills that context on every call and also filters the tool **list** per subject | `services/dynamic_fastmcp.py` |
+| per-key governance is readable and writable over the API | `GET/PUT /api/v1/auth/api-keys/{id}/governance` |
 
-**Therefore a per-role permission — "the author may write here, the trading lane may not" — cannot
-be expressed in this version.** A rule written on paths or tool names applies to every role
-equally. Anything that carried the role in the arguments would be the model's own claim about
-itself, which is an audit trail, not a control.
+**And each provider here already is a different subject.** Every CLI was enrolled as its own
+managed agent, so the account holds one credential per provider — Codex and Claude carry different
+`api_key_id` *and* different `managed_agent_id`.
 
-**What does separate work today**
+**Measured end to end on the live stack**, with one policy and one account:
 
-- The file server is the boundary that actually holds: `cadp278-fsmcp` serves `/ws` and nothing
-  else, so no tool call reaches the workspace, the evidence tree or the host.
-- Within that, rules by path and tool name are enforced for everyone alike (no writes into
-  `.claude`, none to the control file), and each run works in its own `/ws/<conductor run id>`.
-- `paths.workspace_root` may be `/ws` or any directory below it (§9), so a whole *instance* can be
-  pointed at a domain root.
+| step | result |
+|---|---|
+| `write_file` disabled on the Codex credential only (`tool_enabled_overrides`) | the governance API accepted it |
+| Codex asked to write a file | **DENIED**, no file written |
+| Claude asked to write the same file, unchanged | **COMPLETED**, file written |
+| the override cleared, Codex asked again | **COMPLETED**, file written |
 
-That is domain-shaped separation, not role-shaped, and this document does not call it more than
-that.
+So per-caller tool permission works today, at the granularity of a credential. Because the trials
+bind each role to a vendor, that is also per-role for those workflows. What is *not* built is the
+connection: nothing in this stack sets or tracks per-credential governance — `cfg.py` manages the
+account policy only, and a role's credential is chosen for its login, not for its permissions.
 
-**The opt-in design, if per-role policy is ever actually needed**
+**Correcting two more claims that were in this document**
 
-One policy per account is the constraint, so the unit of policy has to become the account:
+- "A second Preloop stack per domain is required" — not established. Different rules for different
+  callers do not need another account; they need per-credential governance, which is one API call.
+  A second stack is one option, not the only one.
+- "Registration closes after the first user" — that is a setting, not a law: `registration_enabled`
+  still decides once an instance has a user, and a bootstrap token path exists
+  (`api/auth/bootstrap.py`). The earlier wording stated a configuration as a property of the
+  product.
+- **Per-run directories are separation of storage, not of access.** The file server serves all of
+  `/ws`, and the account policy carries no per-run restriction, so nothing stops one run's agent
+  from reading or writing another run's directory. This document said "each run works in its own
+  directory", which is true and was easy to misread as isolation; it is not.
 
-1. A second Preloop project runs beside the first — the same thing `scripts/restore.sh` already
-   stands up (own compose project, own database, own ports), so it is proven to run here.
-2. Each domain gets its own account, its own agent enrolment and its own policy file.
-3. The routing layer picks the Preloop endpoint and token per role, the way it already picks a
-   provider login per role (`steps/roles.py`): a role names its policy domain, and the adapter
-   uses that domain's `PRELOOP_URL` / MCP token.
-4. `cfg.py` keeps one policy per domain and applies each to its own account; its "one policy for
-   all profiles" check becomes "one policy per domain".
-
-Cost, stated plainly: one more Preloop stack per domain (eight containers and a database), and an
-account bootstrap that only the operator can do — registration closes after the first user, and
-there is no user-creation API. It is not worth doing before two kinds of work genuinely need
-different tool rights; until then the file server's root and the path rules are the boundary.
+**What remains open**, stated as the review put it: per-role governance is **unimplemented here**,
+not impossible. The pieces measured above are the ones a design would use — a role names a
+credential, and that credential carries the tool rights — and `cfg.py` would have to own that
+mapping the way it owns the account policy today.
