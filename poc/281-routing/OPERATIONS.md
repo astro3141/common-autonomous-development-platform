@@ -311,3 +311,89 @@ aborts the script, and the candidate build takes a native path for its context.
 workspace this script lives in — including the script. A shell reads a script as it runs, so the
 file changed underneath it. `release.sh` now copies itself to a temporary file and re-executes that
 copy, so the running code cannot change halfway.
+
+## 9. Cleanup and check reporting (measured 2026-09-23)
+
+```bash
+scripts/cleanup.sh [--days N] [--keep N] [--apply] [--include-orphans] [--json]
+scripts/up.sh --check        # also writes evidence/checks/last.json
+```
+
+**Cleanup removes runs, not directories.** A run leaves three traces — the screen's record
+(`evidence/ui-runs/<id>/`, with Conductor's event log), the workspace it worked in
+(`<workspace_root>/<run>…`) and the adapter's evidence (`evidence/p281/<run>-…`). They are grouped
+by the Conductor run id and removed together or not at all, so the screen never lists a run whose
+artifacts are gone.
+
+**Preview is the default.** Nothing is deleted without `--apply`.
+
+**A run is kept, whatever its age, when** it is still running; Preloop has a pending approval under
+its workspace; the operator marked it (a `keep` file in its directory); or it is inside the
+retention window (`--days`, default 14) or among the newest (`--keep`, default 20). Traces that
+belong to no run on the screen are reported as orphans and are only removed with
+`--include-orphans`.
+
+Run times come from the run id, not from file timestamps — a restored or copied file carries the
+wrong date.
+
+**Checks now leave a record.** `scripts/up.sh --check` writes `evidence/checks/last.json` with the
+time, the instance, whether it passed and each failing check with what was expected and what was
+found. `ops` serves it at `/api/checks`, and the hub shows one line in the header:
+
+- `점검 통과 · 3분 전` — passed, and how long ago;
+- `점검 통과 · 2일 전 (오래됨)` — passed, but the last check is over a day old;
+- `점검 실패 · 3일 전 · grok /route login: yes 기대, no; MLflow: 200 기대, 000` — what failed.
+
+That is the only screen addition in this step.
+
+**What the exercise found**
+
+| case | result |
+|---|---|
+| preview by default | with no `--apply`, nothing was deleted and the grouped list was printed |
+| a run marked `keep` | kept under `--days 0 --keep 0` ("marked keep") |
+| a run still going | kept ("still running") |
+| a pending approval under a run's workspace | kept ("an approval is pending under its workspace") |
+| **the approvals reader failing** | **the first version deleted anyway** — the reader's non-zero exit produced an empty list. It now stops with "nothing was removed", for a failed reader and for unreadable output alike |
+| check reporting | passing, stale and failing states all shown on the screen, with the failing checks named |
+
+The bad case above was found by running it: 15 old runs were removed while the approvals reader was
+broken. Everything tracked in git came back with `git checkout`, and the 11 untracked evidence
+directories were restored from the backup taken earlier (§7) — which is the first time a backup was
+used for its actual purpose here.
+
+### Review of the cleanup — four boundaries closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the approvals reader asked for the first 50 requests of the whole history, so fifty decided ones hid a waiting one and its run was removed | it asks for `status=pending` and keeps asking until a page comes back short; `--all` reports whether the answer is **complete**, and the cleanup stops unless it is | a reader reporting `complete: false` stops the run with "nothing was removed"; a pending request that only a full scan reaches protects its run and its orphan traces |
+| 2 | orphans were collected separately and deleted straight away, with none of the protections | orphans are held to the same rules: a pending approval under them, a recent change, or **any** run whose state could not be read keeps them | each case exercised; an unreadable `meta.json` alone is enough to keep every orphan |
+| 3 | `ignore_errors=True` meant a group could half-disappear and still be reported as removed | every path of a group is moved aside first; if one move fails the others are put back and the run is reported as **failed**, not removed (exit code 1) | with a move made to fail, nothing of that run was gone and it was listed under "could NOT be removed" |
+| 4 | a run was judged by the state on the screen, so one whose launcher was still writing its final state could be removed | the launcher process is checked directly, whatever the log and the state say | a run with an end in its event log but a live launcher is kept ("its launcher is still alive") |
+
+These are covered by `p281/cleanup_controls.py` (13 checks), which runs against temporary
+directories with a stubbed approvals reader — no run of the instance is read or removed.
+
+**Cost of testing this badly — what was and was not recovered.**
+
+Two of these cases were first exercised against the live workspace with `--apply`, which removed
+real run evidence. The recovery was **partial**:
+
+| trace | result |
+|---|---|
+| the screen's records (`evidence/ui-runs/`), tracked in git | fully recovered with `git checkout` |
+| adapter evidence (`evidence/p281/`), not tracked | 36 directories restored from the backup, in two goes. Four runs are still without it, because they ran after that backup was taken: `20260923-014530-00808d` (5775abd7), `20260923-014953-0b2b01` (405095d1), `20260923-022134-3ccc7a` (7933931d), `20260923-030330-8b15a3` (da721b3f) |
+| the scratch workspaces under `/ws` | **not recovered, for any of the twelve runs**: 7f7e0fa0, 552e1957, d9f651cc, c5ece803, e13fe17b, 7ed5fc4f, 189cd1a8, 38a59361, 5775abd7, 405095d1, 7933931d, da721b3f. They are classified regenerate/discard in §4 and are deliberately not in the backup |
+
+The 16/16 checks reported after the incident say the services are healthy. They are not evidence
+that past artifacts came back; the table above is. The controls exist so that these paths are
+never exercised on live data again.
+
+### Two more boundaries in the cleanup (2026-09-23)
+
+| was | is now | checked |
+|---|---|---|
+| an orphan was protected path by path, so a pending approval on `/ws/<run>-execute` still let `evidence/p281/<run>-execute-codex` be deleted | orphan traces are grouped by run id as well: protections and removal apply to the whole run | an approval on one trace keeps both; an unprotected orphan run goes with all of its traces |
+| `shutil.move` falls back to copy-then-delete, so a failure in the middle could leave the original partly gone while a copy sat in the holding place | the holding place is on the same mount by construction, so `os.rename` is used and nothing is copied; a rename that cannot be done is a failure to report | with a rename made to fail, every path of the run stayed where it was and the holding place was left empty |
+
+`p281/cleanup_controls.py` now covers 17 cases.

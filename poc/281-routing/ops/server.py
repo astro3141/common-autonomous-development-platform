@@ -127,6 +127,15 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, jexec([PY, "/work/p281/run_workflow.py", "list"]))
         if p == "/api/approvals":          # read-only; approving stays in Preloop's console
             return self._send(200, jexec([PY, "/work/p281/approvals.py"]))
+        if p == "/api/checks":             # what scripts/up.sh --check last found, and when
+            rc, out, _ = dexec(["cat", "/work/evidence/checks/last.json"])
+            if rc != 0:
+                return self._send(200, {"at": None, "ok": None,
+                                        "error": "the checks have not been run since this was added"})
+            try:
+                return self._send(200, json.loads(out))
+            except ValueError:
+                return self._send(200, {"at": None, "ok": None, "error": "unreadable check result"})
         m = re.fullmatch(r"/api/runs/([a-z0-9-]{6,40})", p)
         if m:
             return self._send(200, jexec([PY, "/work/p281/run_workflow.py", "show", m.group(1)]))
