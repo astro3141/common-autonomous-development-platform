@@ -224,10 +224,12 @@ agents:
     description: Record the run (never fails the workflow)
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/record.py"]
-    stdin: "{{ {'execute': author.output, 'check': {'decision': triage.output.decision, 'reason': triage.output.reason, 'file_sha256': triage.output.draft_sha256}, 'route': route.output} | tojson }}"
+    stdin: "{{ {'execute': author.output, 'executions': [architect.output], 'receipts': [reviews.output.receipt], 'measurements': {'repairs': triage.output.repairs_done, 'chars': triage.output.chars, 'review_overlap': reviews.output.overlap}, 'check': {'decision': triage.output.decision, 'reason': triage.output.reason, 'file_sha256': triage.output.draft_sha256}, 'route': route.output} | tojson }}"
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
+      executions: {type: number}
+      children: {type: number}
       record_error: {type: string}
     routes:
       - to: done_pass
@@ -241,10 +243,12 @@ agents:
     description: Record a blocked run
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/record.py"]
-    stdin: "{{ {'execute': (author.output if author is defined else architect.output), 'check': {'decision': 'BLOCK', 'reason': (triage.output.reason if triage is defined else ('author produced no draft' if author is defined else 'architect produced no contract')), 'file_sha256': (triage.output.draft_sha256 if triage is defined else '')}, 'route': route.output} | tojson }}"
+    stdin: "{{ {'execute': (author.output if author is defined else architect.output), 'executions': ([architect.output] if author is defined else []), 'receipts': ([reviews.output.receipt] if reviews is defined else []), 'check': {'decision': 'BLOCK', 'reason': (triage.output.reason if triage is defined else ('author produced no draft' if author is defined else 'architect produced no contract')), 'file_sha256': (triage.output.draft_sha256 if triage is defined else '')}, 'route': route.output} | tojson }}"
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
+      executions: {type: number}
+      children: {type: number}
       record_error: {type: string}
     routes:
       - to: done_block
@@ -258,6 +262,8 @@ agents:
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
+      executions: {type: number}
+      children: {type: number}
       record_error: {type: string}
     routes:
       - to: done_hold

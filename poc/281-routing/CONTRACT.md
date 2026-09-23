@@ -47,9 +47,10 @@ not drawn while they were being written. Audited against the rule above:
 | `steps/novel_reviews.py` | it knew "required" and "advisory" and counted usable required reviews — a judgement about the work | **separated**: the receipt states what each member produced; `novel_stage.py triage` is told which labels are required |
 | `steps/trade_lanes.py` | it computed the deterministic baseline — a trading decision — inside the fan-out | **separated**: `trade_stage.py baseline` is a step of the trading workflow |
 | `steps/agent_task.py` | one retry after 20 s when the provider calls a failure a login refresh | **kept, narrowed**: this is recovery from an infrastructure fault the caller cannot see, so it is the capability's; it is bounded, reported as `attempts`, and never retries a failure the model produced |
-| `steps/record.py` | one execute record per run, so a multi-lane cycle had to flatten itself and a blocked run had to hand-build a record | **open**: recording several executions under one run is a missing capability, not a workflow problem. Listed, not built |
+| `steps/record.py` | one execute record per run, so a multi-lane cycle had to flatten itself into it: the lanes' own tokens, durations and providers existed in the evidence directory but could not be compared in MLflow, which is the point of running lanes | **separated**: the recorder takes the executions a run actually made — from the workflow and from any fan-out receipt — and writes a parent run carrying the judgement with a child run per execution. What counts as a measurement is still the workflow's |
 | `router.py` | "the first eligible candidate wins" | **kept**: the order is the profile's, so the policy is the caller's; the platform only walks it |
 
-The one still open is named where it belongs: `record.py` should accept the executions a run
-actually made. Until it does, the workflows work around it, and that is a platform debt, not a
-workflow feature.
+Nothing on that list is open now. The receipt is where the two sides meet without leaking into
+each other: the platform writes what each member produced and with which hash, and carries the
+caller's `context` string back unchanged; the workflow decides what that context has to be, which
+members matter, and what a missing one means.

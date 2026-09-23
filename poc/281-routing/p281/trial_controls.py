@@ -15,6 +15,7 @@ fails if the fix is reverted. What each group pins:
   screen    every recording step's MLflow result reaches the run screen
   boundary  the platform's fan-out capability carries no domain rule, and the workflow's steps
             carry the judgements (CONTRACT.md)
+  recorder  a run with several executions is recorded as several runs, one per execution
 """
 import importlib.util, json, os, re, shutil, sys, tempfile
 
@@ -331,6 +332,108 @@ def controls_lanes_step():
     shutil.rmtree(root, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- the recorder
+def controls_recorder():
+    """Drive the real recorder with its network calls captured, so nothing is written anywhere."""
+    print("recorder — one MLflow run per execution, under the run's own")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("record_ctl", "/work/p281/steps/record.py")
+    rec = importlib.util.module_from_spec(spec)
+    sys.modules["record_ctl"] = rec
+    spec.loader.exec_module(rec)
+
+    sent = []
+    ids = iter(f"rid{n}" for n in range(1, 99))
+
+    def fake_call(path, body=None, method="POST"):
+        sent.append((path, body))
+        if "get-by-name" in path:
+            return {"experiment": {"experiment_id": "7"}}
+        if path.endswith("runs/create"):
+            return {"run": {"info": {"run_id": next(ids)}}}
+        return {}
+    rec.call = fake_call
+    rec.put_artifact = lambda *a: None
+
+    def ex(run_id, provider, status="COMPLETED", tokens=None):
+        return {"run_id": run_id, "provider": provider, "status": status, "model_route": "direct",
+                "model_session_reported": "default", "model_adapter_reported": "",
+                "model_served": "unknown", "evidence_dir": "/nowhere", "profile": "research-default",
+                "approvals_requested": 0, "mcp_rule_denials": 0,
+                "measurements": {"total_tokens": tokens} if tokens else {}}
+
+    root = tempfile.mkdtemp(prefix="p281-rec-")
+    receipt = os.path.join(root, "lanes_round.json")
+    json.dump({"context": "packet-sha", "members": {
+        "ai": {"provider": "codex", "produced": True, "result": ex("run-ai", "codex", tokens=11)},
+        "ai2": {"provider": "claude", "produced": False,
+                "result": ex("run-ai2", "claude", status="FAILED")}}},
+        open(receipt, "w"))
+    check_ = {"decision": "CYCLE", "reason": "best ai", "file_sha256": "abc"}
+    route = {"decision": "ROUTE", "reason": "codex: within limits", "profile": "research-default"}
+
+    def runs_of():
+        return [b for p, b in sent if p.endswith("runs/create")]
+
+    def tags_of(rid):
+        for p, b in sent:
+            if p.endswith("log-batch") and b.get("run_id") == rid:
+                return {t["key"]: t["value"] for t in b.get("tags", [])}
+        return {}
+
+    def metrics_of(rid):
+        for p, b in sent:
+            if p.endswith("log-batch") and b.get("run_id") == rid:
+                return {m["key"]: m["value"] for m in b.get("metrics", [])}
+        return {}
+
+    # one execution: unchanged — a single run named after it
+    sent.clear()
+    out = rec.record({"execute": ex("solo", "claude"), "check": check_, "route": route})
+    check("one execution is still one run", (out["executions"], out["children"]), (1, 0))
+    check("the run is named after the execution",
+          [r["run_name"] for r in runs_of()], ["solo"])
+    check("it carries the gate decision", tags_of(out["mlflow_run_id"]).get("gate.decision"), "CYCLE")
+
+    # several: a parent and a child per execution
+    sent.clear()
+    out = rec.record({"receipts": [receipt], "check": check_, "route": route,
+                      "measurements": {"valid_lanes": 3}})
+    check("both lanes are recorded", (out["executions"], out["children"]), (2, 2))
+    parent = out["mlflow_run_id"]
+    kids = [r["run_id"] for p, r in sent if p.endswith("log-batch")
+            and r["run_id"] != parent]
+    check("each child points at the parent",
+          sorted({tags_of(k).get("mlflow.parentRunId") for k in kids}), [parent])
+    check("each child keeps its own provider",
+          sorted(tags_of(k).get("provider") for k in kids), ["claude", "codex"])
+    check("each child keeps its member name",
+          sorted(tags_of(k).get("member") for k in kids), ["ai", "ai2"])
+    check("a lane's own numbers stay with the lane",
+          [metrics_of(k).get("total_tokens") for k in kids if tags_of(k).get("member") == "ai"], [11.0])
+    check("the parent carries the run's numbers", metrics_of(parent).get("valid_lanes"), 3.0)
+    check("the parent says how many executions there were",
+          (metrics_of(parent).get("executions"), metrics_of(parent).get("executions_completed")),
+          (2.0, 1.0))
+    check("one failed lane makes the run partial", tags_of(parent).get("status"), "PARTIAL")
+    check("no execution is counted twice",
+          rec.record({"execute": ex("run-ai", "codex"), "receipts": [receipt],
+                      "check": check_, "route": route})["executions"], 2)
+
+    # nothing ran at all
+    sent.clear()
+    out = rec.record({"check": check_, "route": route})
+    check("a run the router held is still recorded",
+          (out["executions"], tags_of(out["mlflow_run_id"]).get("status")), (0, "HOLD"))
+
+    # a receipt that cannot be read is reported, not guessed at
+    out = rec.record({"execute": ex("solo", "claude"), "receipts": ["/nowhere/x.json"],
+                      "check": check_, "route": route})
+    check("an unreadable receipt is named in the error",
+          ("x.json" in out["record_error"], out["executions"]), (True, 1))
+    shutil.rmtree(root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- the boundary itself
 DOMAIN_WORDS = ("review", "reviewer", "lane", "draft", "packet", "chapter", "trading", "novel",
                 "required", "advisory", "blocking", "verdict")
@@ -359,6 +462,7 @@ def controls_boundary():
 
 if __name__ == "__main__":
     controls_boundary()
+    controls_recorder()
     controls_triage()
     controls_reviews_step()
     controls_lanes_step()

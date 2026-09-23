@@ -8,9 +8,11 @@ What this guarantees, and nothing more:
   * the tasks are started together and each is timed on its own (steps/fanout.py);
   * one task's failure does not touch another — every member is reported, none aborts the step;
   * a **receipt** is written before this step reports: for each member, what it was, whether the
-    artifact it was asked for exists, that artifact's sha256, and how long it took. The receipt
-    carries the caller's `context` string unchanged — the platform never interprets it, and a
-    caller that wants its results bound to something (a frozen draft, a packet hash) passes that.
+    artifact it was asked for exists, that artifact's sha256, how long it took, and the member's
+    own execution record as the routed call returned it — which is what lets the recorder give
+    every member an MLflow run of its own. The receipt carries the caller's `context` string
+    unchanged — the platform never interprets it, and a caller that wants its results bound to
+    something (a frozen draft, a packet hash) passes that.
 
 What this deliberately does not know: which members matter, what a missing one means, or whether
 the result is any good. Those are the workflow's, and it decides them from the receipt.
@@ -74,7 +76,9 @@ for r in rows:
         "started_at": r["started_at"], "ended_at": r["ended_at"],
         "seconds": round(r["ended_at"] - r["started_at"], 2),
         "attempts": res.get("attempts", 1), "run_id": res.get("run_id", ""),
-        "error": res.get("error", "")[:200] if not produced else ""}
+        "error": res.get("error", "")[:200] if not produced else "",
+        # the routed call's own record, kept whole: the recorder reads it, this step does not
+        "result": res}
 
 os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
 json.dump({"context": context, "wall_s": wall, "members": members},
