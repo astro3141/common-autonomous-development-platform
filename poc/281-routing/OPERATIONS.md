@@ -44,6 +44,15 @@ whatever the installers returned on 2026-09-22 (§3). The pinned Dockerfile in t
 never been built here. The compose defaults are the repository's relative ones on both sides;
 what differs is this host's `docker/.env`, which is where a host's own paths belong.
 
+### What the platform provides, and what a workflow decides
+
+`CONTRACT.md` draws that line: the platform provides capabilities with guarantees, the workflow
+decides behaviour. It carries the audit of where this PoC had crossed it — the fan-out each
+workflow had re-implemented (now `p281/steps/tasks.py`), the "required review" judgement that sat
+inside it, the trading baseline computed in a platform step, and `record.py` accepting only one
+execution per run (now a parent run with a child run per execution, so a lane's own tokens and
+duration can be compared).
+
 ## 2. Containers and images
 
 | container | image | image id | restart |

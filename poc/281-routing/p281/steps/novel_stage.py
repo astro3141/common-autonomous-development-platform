@@ -3,7 +3,7 @@
 usage:
   novel_stage.py stage                 copy the fixture entry state into the run's workspace
   novel_stage.py freeze                fix the draft: id + sha256, so reviewers judge one artifact
-  novel_stage.py triage <max_repairs>  read the reviews, decide PASS or a bounded repair
+  novel_stage.py triage <max_repairs> <required-labels>   decide PASS or a bounded repair
 
 Nothing here calls a model. The workflow's routing decisions are made by this script from files on
 disk, which is the point of the trial: the models produce semantics, the graph edge is chosen
@@ -128,7 +128,12 @@ def read_review(name, round_member=None, required=False):
 
 
 def read_round(meta):
-    """This round's reviews-step receipt, or None when it does not belong to this draft."""
+    """This round's receipt from the reviews step, or None when it is not about this draft.
+
+    The receipt is the platform's (steps/tasks.py): it says what each member produced and with
+    which sha256, and carries back the `context` string this workflow gave it. What that context
+    has to be — the frozen draft's sha256 — is this workflow's rule, checked here.
+    """
     p = f"{WS}/reviews_round.json"
     if not os.path.isfile(p):
         return None
@@ -138,21 +143,24 @@ def read_round(meta):
         return None
     if not isinstance(r, dict) or not isinstance(r.get("members"), dict):
         return None
-    if r.get("draft_id") != meta.get("draft_id") or r.get("draft_sha256") != meta.get("draft_sha256"):
+    if not meta.get("draft_sha256") or r.get("context") != meta["draft_sha256"]:
         return None                      # a receipt for another draft is not this round's
     return r
 
 
-def cmd_triage(max_repairs):
+def cmd_triage(max_repairs, required="story,history"):
+    """Which reviews are required is this workflow's judgement, so it is an argument, not a rule
+    buried in the step that ran them."""
+    need = [x for x in required.split(",") if x]
     meta = json.load(open(f"{WS}/draft_meta.json", encoding="utf-8")) if os.path.isfile(f"{WS}/draft_meta.json") else {}
     rnd = read_round(meta)
     members = (rnd or {}).get("members") or {}
-    story, history, cold = (read_review(f"review_{k}.json", members.get(k), required=k != "cold")
-                            for k in ("story", "history", "cold"))
+    reviews = {k: read_review(f"review_{k}.json", members.get(k), required=k in need)
+               for k in ("story", "history", "cold")}
+    story, history, cold = reviews["story"], reviews["history"], reviews["cold"]
     done = len(glob.glob(f"{WS}/findings-*.json"))          # repairs already asked for
     # Required reviews must be usable; the Cold Reader is advisory and may be missing entirely.
-    missing = [f"{n} ({r.get('why')})" for n, r in (("story", story), ("history", history))
-               if not r.get("usable")]
+    missing = [f"{n} ({reviews[n].get('why')})" for n in need if not reviews[n].get("usable")]
     if rnd is None:
         missing = missing or ["no reviews receipt for this draft"]
     blocking = [f for r in (story, history)
@@ -180,4 +188,5 @@ def cmd_triage(max_repairs):
 if __name__ == "__main__":
     a = sys.argv[1]
     {"stage": cmd_stage, "freeze": cmd_freeze,
-     "triage": lambda: cmd_triage(sys.argv[2] if len(sys.argv) > 2 else 2)}[a]()
+     "triage": lambda: cmd_triage(sys.argv[2] if len(sys.argv) > 2 else 2,
+                                  sys.argv[3] if len(sys.argv) > 3 else "story,history")}[a]()

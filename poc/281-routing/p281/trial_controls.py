@@ -1,4 +1,4 @@
-"""Controls for the five defects found in the capability-trial steps — each one reproduced first.
+"""Controls for the trial steps: the defects review found, and the platform/workflow boundary.
 
 usage: trial_controls.py            (no model call, no network; fake inputs only)
 
@@ -13,6 +13,9 @@ fails if the fix is reverted. What each group pins:
   roles     a role is bound only to a provider the router found eligible in this run
   record    a blocked run is recorded as a blocked execution, not as "the router started nothing"
   screen    every recording step's MLflow result reaches the run screen
+  boundary  the platform's fan-out capability carries no domain rule, and the workflow's steps
+            carry the judgements (CONTRACT.md)
+  recorder  a run with several executions is recorded as several runs, one per execution
 """
 import importlib.util, json, os, re, shutil, sys, tempfile
 
@@ -63,13 +66,14 @@ def triage_case(label, *, receipt_draft="d02", produced=True, story=None, histor
         if doc is not None:
             json.dump(doc, open(f"{ws}/review_{n}.json", "w"))
         exists = os.path.isfile(f"{ws}/review_{n}.json")
-        members[n] = {"file": f"review_{n}.json", "kind": "required",
+        members[n] = {"artifact": f"review_{n}.json",
                       "status": "COMPLETED" if produced else "FAILED",
                       "produced": produced and exists,
                       "sha256": ns.sha_file(f"{ws}/review_{n}.json") if exists else ""}
     if not no_receipt:
-        json.dump({"draft_id": receipt_draft, "draft_sha256": meta["draft_sha256"],
-                   "members": members}, open(f"{ws}/reviews_round.json", "w"))
+        ctx = meta["draft_sha256"] if receipt_draft == "d02" else "an earlier draft's sha256"
+        json.dump({"context": ctx, "members": members},
+                  open(f"{ws}/reviews_round.json", "w"))
     if tamper:
         json.dump({**good, "verdict": "PASS", "findings": [{"kind": "NONE", "severity": "MINOR"}]},
                   open(f"{ws}/review_story.json", "w"))
@@ -258,12 +262,12 @@ def controls_reviews_step():
     print("reviews step — the real step, the real fanout, no model call")
     ok = json.dumps({"reviewer": "x", "usable": True, "verdict": "PASS",
                      "findings": [{"kind": "NONE", "severity": "MINOR", "what": "fine"}]})
-    specs = ["review-story:claude:claude:direct:/work/p281/prompts/novel-review-story.md:review_story.json:required",
-             "review-history:codex:codex:direct:/work/p281/prompts/novel-review-history.md:review_history.json:required",
-             "review-cold:grok:grok:direct:/work/p281/prompts/novel-cold.md:review_cold.json:advisory"]
+    specs = ["story:claude:claude:direct:/work/p281/prompts/novel-review-story.md:review_story.json",
+             "history:codex:codex:direct:/work/p281/prompts/novel-review-history.md:review_history.json",
+             "cold:grok:grok:direct:/work/p281/prompts/novel-cold.md:review_cold.json"]
 
     for label, fail, want_triage in (("every reviewer produced", "", "PASS"),
-                                     ("a required reviewer failed", "review-history", "BLOCK")):
+                                     ("a required reviewer failed", "history", "BLOCK")):
         root = tempfile.mkdtemp(prefix="p281-step-")
         ws = os.path.join(root, "ws", "ctlrun")
         os.makedirs(ws)
@@ -272,22 +276,26 @@ def controls_reviews_step():
         ns.cmd_freeze()
         meta = json.load(open(f"{ws}/draft_meta.json"))
 
-        res = run_step("/work/p281/steps/novel_reviews.py", f"nr_{fail or 'all'}",
-                       ["research-default", *specs], ws, ok, fail)
+        res = run_step("/work/p281/steps/tasks.py", f"nr_{fail or 'all'}",
+                       ["reviews_round.json", meta["draft_sha256"], "research-default", *specs],
+                       ws, ok, fail)
         check(f"{label}: the step ran", res.get("status"), "OK")
         rec_path = f"{ws}/reviews_round.json"
         check(f"{label}: a receipt was written", os.path.isfile(rec_path), True)
         rec = json.load(open(rec_path)) if os.path.isfile(rec_path) else {}
-        check(f"{label}: the receipt names this draft", rec.get("draft_id"), meta["draft_id"])
+        check(f"{label}: the receipt carries this draft's context", rec.get("context"),
+              meta["draft_sha256"])
         if fail:
-            check(f"{label}: the failed reviewer is not counted",
+            check(f"{label}: the failed member is reported, the others produced",
                   (rec.get("members", {}).get("history", {}).get("produced"),
-                   res.get("required_usable")), (False, 1))
+                   res.get("produced"), res.get("failed")), (False, 2, "history"))
         else:
             check(f"{label}: each member carries its file's sha256",
                   rec.get("members", {}).get("story", {}).get("sha256"),
                   ns.sha_file(f"{ws}/review_story.json"))
-            check(f"{label}: the reviewers overlapped", isinstance(res.get("overlap"), float), True)
+            check(f"{label}: the capability reports an overlap", isinstance(res.get("overlap"), float), True)
+            check(f"{label}: the capability names no domain rule",
+                  ("required" in json.dumps(res)) or ("advisory" in json.dumps(res)), False)
 
         import contextlib, io
         buf = io.StringIO()
@@ -309,19 +317,152 @@ def controls_lanes_step():
     syms = [s["symbol"] for s in packet["universe"]][:2]
     doc = json.dumps({"lane": "ai", "model_calls": 1, "refs": [],
                       "targets": [{"symbol": s, "weight": 0.2} for s in syms]})
-    specs = ["base:deterministic:none:none:none:none",
-             "ai:model:codex:codex:direct:/work/p281/prompts/trade-lane.md",
-             "ai2:model:claude:claude:direct:/work/p281/prompts/trade-lane2.md"]
-    res = run_step("/work/p281/steps/trade_lanes.py", "tl_step", ["research-default", *specs],
-                   ws, doc, fail="lane-ai2")
+    ts.cmd_baseline("base")                      # the workflow's own step, no model call
+    specs = ["ai:codex:codex:direct:/work/p281/prompts/trade-lane.md:lane_ai.json",
+             "ai2:claude:claude:direct:/work/p281/prompts/trade-lane2.md:lane_ai2.json"]
+    res = run_step("/work/p281/steps/tasks.py", "tl_step",
+                   ["lanes_round.json", "packet-sha", "research-default", *specs],
+                   ws, doc, fail="ai2")
     check("the step ran", res.get("status"), "OK")
-    check("three lanes, two of them produced", (res.get("lanes"), res.get("produced")), (3, 2))
+    check("two model lanes, one produced", (res.get("tasks"), res.get("produced")), (2, 1))
     check("the failed lane is named and alone", res.get("failed"), "ai2")
     check("the deterministic lane needed no model", os.path.isfile(f"{ws}/lane_base.json"), True)
+    check("the receipt carries the cycle's packet",
+          json.load(open(f"{ws}/lanes_round.json")).get("context"), "packet-sha")
     shutil.rmtree(root, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- the recorder
+def controls_recorder():
+    """Drive the real recorder with its network calls captured, so nothing is written anywhere."""
+    print("recorder — one MLflow run per execution, under the run's own")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("record_ctl", "/work/p281/steps/record.py")
+    rec = importlib.util.module_from_spec(spec)
+    sys.modules["record_ctl"] = rec
+    spec.loader.exec_module(rec)
+
+    sent = []
+    ids = iter(f"rid{n}" for n in range(1, 99))
+
+    def fake_call(path, body=None, method="POST"):
+        sent.append((path, body))
+        if "get-by-name" in path:
+            return {"experiment": {"experiment_id": "7"}}
+        if path.endswith("runs/create"):
+            return {"run": {"info": {"run_id": next(ids)}}}
+        return {}
+    rec.call = fake_call
+    rec.put_artifact = lambda *a: None
+
+    def ex(run_id, provider, status="COMPLETED", tokens=None):
+        return {"run_id": run_id, "provider": provider, "status": status, "model_route": "direct",
+                "model_session_reported": "default", "model_adapter_reported": "",
+                "model_served": "unknown", "evidence_dir": "/nowhere", "profile": "research-default",
+                "approvals_requested": 0, "mcp_rule_denials": 0,
+                "measurements": {"total_tokens": tokens} if tokens else {}}
+
+    root = tempfile.mkdtemp(prefix="p281-rec-")
+    receipt = os.path.join(root, "lanes_round.json")
+    json.dump({"context": "packet-sha", "members": {
+        "ai": {"provider": "codex", "produced": True, "result": ex("run-ai", "codex", tokens=11)},
+        "ai2": {"provider": "claude", "produced": False,
+                "result": ex("run-ai2", "claude", status="FAILED")}}},
+        open(receipt, "w"))
+    check_ = {"decision": "CYCLE", "reason": "best ai", "file_sha256": "abc"}
+    route = {"decision": "ROUTE", "reason": "codex: within limits", "profile": "research-default"}
+
+    def runs_of():
+        return [b for p, b in sent if p.endswith("runs/create")]
+
+    def tags_of(rid):
+        for p, b in sent:
+            if p.endswith("log-batch") and b.get("run_id") == rid:
+                return {t["key"]: t["value"] for t in b.get("tags", [])}
+        return {}
+
+    def metrics_of(rid):
+        for p, b in sent:
+            if p.endswith("log-batch") and b.get("run_id") == rid:
+                return {m["key"]: m["value"] for m in b.get("metrics", [])}
+        return {}
+
+    # one execution: unchanged — a single run named after it
+    sent.clear()
+    out = rec.record({"execute": ex("solo", "claude"), "check": check_, "route": route})
+    check("one execution is still one run", (out["executions"], out["children"]), (1, 0))
+    check("the run is named after the execution",
+          [r["run_name"] for r in runs_of()], ["solo"])
+    check("it carries the gate decision", tags_of(out["mlflow_run_id"]).get("gate.decision"), "CYCLE")
+
+    # several: a parent and a child per execution
+    sent.clear()
+    out = rec.record({"receipts": [receipt], "check": check_, "route": route,
+                      "measurements": {"valid_lanes": 3}})
+    check("both lanes are recorded", (out["executions"], out["children"]), (2, 2))
+    parent = out["mlflow_run_id"]
+    kids = [r["run_id"] for p, r in sent if p.endswith("log-batch")
+            and r["run_id"] != parent]
+    check("each child points at the parent",
+          sorted({tags_of(k).get("mlflow.parentRunId") for k in kids}), [parent])
+    check("each child keeps its own provider",
+          sorted(tags_of(k).get("provider") for k in kids), ["claude", "codex"])
+    check("each child keeps its member name",
+          sorted(tags_of(k).get("member") for k in kids), ["ai", "ai2"])
+    check("a lane's own numbers stay with the lane",
+          [metrics_of(k).get("total_tokens") for k in kids if tags_of(k).get("member") == "ai"], [11.0])
+    check("the parent carries the run's numbers", metrics_of(parent).get("valid_lanes"), 3.0)
+    check("the parent says how many executions there were",
+          (metrics_of(parent).get("executions"), metrics_of(parent).get("executions_completed")),
+          (2.0, 1.0))
+    check("one failed lane makes the run partial", tags_of(parent).get("status"), "PARTIAL")
+    check("no execution is counted twice",
+          rec.record({"execute": ex("run-ai", "codex"), "receipts": [receipt],
+                      "check": check_, "route": route})["executions"], 2)
+
+    # nothing ran at all
+    sent.clear()
+    out = rec.record({"check": check_, "route": route})
+    check("a run the router held is still recorded",
+          (out["executions"], tags_of(out["mlflow_run_id"]).get("status")), (0, "HOLD"))
+
+    # a receipt that cannot be read is reported, not guessed at
+    out = rec.record({"execute": ex("solo", "claude"), "receipts": ["/nowhere/x.json"],
+                      "check": check_, "route": route})
+    check("an unreadable receipt is named in the error",
+          ("x.json" in out["record_error"], out["executions"]), (True, 1))
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- the boundary itself
+DOMAIN_WORDS = ("review", "reviewer", "lane", "draft", "packet", "chapter", "trading", "novel",
+                "required", "advisory", "blocking", "verdict")
+
+
+def controls_boundary():
+    print("boundary — the capability knows no domain, the workflow keeps the judgement")
+    cap = open("/work/p281/steps/tasks.py", encoding="utf-8").read()
+    body = "\n".join(l for l in cap.splitlines()
+                     if not l.lstrip().startswith("#") and "Conductor" not in l)
+    body = body.split('"""', 2)[-1].lower()          # code only, not the module's explanation
+    found = sorted({w for w in DOMAIN_WORDS if w in body})
+    check("no domain vocabulary in the capability's code", found, [])
+    for name, path, want in (
+            ("what is required", "/work/p281/steps/novel_stage.py", "required"),
+            ("what a valid proposal is", "/work/p281/steps/trade_stage.py", "INVALID"),
+            ("the deterministic baseline", "/work/p281/steps/trade_stage.py", "momentum20")):
+        check(f"the workflow still owns: {name}", want in open(path, encoding="utf-8").read(), True)
+    check("nothing imports the removed fan-out wrappers",
+          any(os.path.exists(p) for p in ("/work/p281/steps/novel_reviews.py",
+                                          "/work/p281/steps/trade_lanes.py")), False)
+    y = open("/work/p281/workflows/novel-a.yaml", encoding="utf-8").read()
+    check("the reviews step names the capability", "steps/tasks.py" in y, True)
+    check("the triage step is told what is required", '"story,history"' in y, True)
+
+
 if __name__ == "__main__":
+    controls_boundary()
+    controls_recorder()
     controls_triage()
     controls_reviews_step()
     controls_lanes_step()

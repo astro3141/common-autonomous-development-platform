@@ -77,23 +77,41 @@ agents:
       deterministic: {type: string}
       symbols: {type: number}
     routes:
+      - to: baseline
+
+  # The deterministic lane is a trading decision, so it is this workflow's own step and runs
+  # before the model lanes: a cycle then has a baseline even if every model lane fails.
+  - name: baseline
+    type: script
+    description: Deterministic lane from the same frozen packet (no model call)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/trade_stage.py", "baseline", "base"]
+    output:
+      status: {type: string}
+      lane: {type: string}
+      positions: {type: number}
+      model_calls: {type: number}
+    routes:
       - to: lanes
 
+  # The model lanes run through the platform's fan-out (steps/tasks.py): started together, timed
+  # individually, isolated from each other, with a receipt bound to this cycle's packet hash. It
+  # knows nothing about lanes — validation and comparison are the evaluate step below.
   - name: lanes
     type: script
-    description: One deterministic lane and two model lanes, decided at the same time
+    description: The model lanes, decided at the same time from the frozen packet
     command: "${POC_PY:-/opt/venv/bin/python}"
-    args: ["/work/p281/steps/trade_lanes.py", "{{ route.output.profile }}",
-           "base:deterministic:none:none:none:none",
-           "ai:model:{{ roles.output.ai_provider }}:{{ roles.output.ai_login }}:{{ roles.output.ai_route }}:/work/p281/prompts/trade-lane.md",
-           "ai2:model:{{ roles.output.ai2_provider }}:{{ workflow.input.lane2_login or roles.output.ai2_login }}:{{ roles.output.ai2_route }}:/work/p281/prompts/trade-lane2.md"]
+    args: ["/work/p281/steps/tasks.py", "lanes_round.json", "{{ packet.output.packet_sha256 }}",
+           "{{ route.output.profile }}",
+           "ai:{{ roles.output.ai_provider }}:{{ roles.output.ai_login }}:{{ roles.output.ai_route }}:/work/p281/prompts/trade-lane.md:lane_ai.json",
+           "ai2:{{ roles.output.ai2_provider }}:{{ workflow.input.lane2_login or roles.output.ai2_login }}:{{ roles.output.ai2_route }}:/work/p281/prompts/trade-lane2.md:lane_ai2.json"]
     timeout: 900
     output:
       status: {type: string}
-      lanes: {type: number}
+      receipt: {type: string}
+      tasks: {type: number}
       produced: {type: number}
       failed: {type: string}
-      model_calls: {type: number}
       wall_s: {type: number}
       busy_s: {type: number}
       overlap: {type: number}
@@ -118,15 +136,20 @@ agents:
     routes:
       - to: record_cycle
 
+  # Every lane is an execution of this cycle, so every lane gets its own MLflow run under the
+  # cycle's: the recorder reads them from the fan-out receipt. The cycle's own numbers — how many
+  # lanes were valid, how long the lanes took — belong to the parent.
   - name: record_cycle
     type: script
-    description: Record the cycle (never fails the workflow)
+    description: Record the cycle and each lane (never fails the workflow)
     command: "${POC_PY:-/opt/venv/bin/python}"
     args: ["/work/p281/steps/record.py"]
-    stdin: "{{ {'execute': {'provider': roles.output.ai_provider, 'model_route': roles.output.ai_route, 'run_id': packet.output.packet_sha256[:12], 'status': 'COMPLETED', 'model_session_reported': '', 'model_adapter_reported': '', 'model_served': 'unknown', 'evidence_dir': route.output.evidence_dir, 'measurements': {'valid_lanes': evaluate.output.valid, 'model_calls': lanes.output.model_calls, 'lane_wall_s': lanes.output.wall_s}}, 'check': {'decision': 'CYCLE', 'reason': 'best ' + evaluate.output.best_lane + ' ret ' + evaluate.output.best_ret, 'file_sha256': evaluate.output.packet_sha256}, 'route': route.output} | tojson }}"
+    stdin: "{{ {'receipts': [lanes.output.receipt], 'measurements': {'valid_lanes': evaluate.output.valid, 'lane_wall_s': lanes.output.wall_s, 'lane_overlap': lanes.output.overlap}, 'check': {'decision': 'CYCLE', 'reason': 'best ' + evaluate.output.best_lane + ' ret ' + evaluate.output.best_ret, 'file_sha256': evaluate.output.packet_sha256}, 'route': route.output} | tojson }}"
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
+      executions: {type: number}
+      children: {type: number}
       record_error: {type: string}
     routes:
       - to: done_cycle
@@ -142,6 +165,8 @@ agents:
     output:
       mlflow_run_id: {type: string}
       experiment_id: {type: string}
+      executions: {type: number}
+      children: {type: number}
       record_error: {type: string}
     routes:
       - to: done_hold
@@ -172,7 +197,8 @@ output:
   best_ret: "{% if evaluate is defined %}{{ evaluate.output.best_ret }}{% endif %}"
   packet_sha256: "{% if packet is defined %}{{ packet.output.packet_sha256 }}{% endif %}"
   packet_deterministic: "{% if packet is defined %}{{ packet.output.deterministic }}{% endif %}"
-  model_calls: "{% if lanes is defined %}{{ lanes.output.model_calls }}{% endif %}"
+  model_calls: "{% if lanes is defined %}{{ lanes.output.produced }}{% endif %}"
+  recorded_lanes: "{% if record_cycle is defined %}{{ record_cycle.output.children }}{% endif %}"
   lane_overlap: "{% if lanes is defined %}{{ lanes.output.overlap }}{% endif %}"
   report: "{% if evaluate is defined %}{{ evaluate.output.report }}{% endif %}"
   mlflow_run_id: "{% if record_cycle is defined %}{{ record_cycle.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"

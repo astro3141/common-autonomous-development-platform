@@ -2,6 +2,7 @@
 
 usage:
   trade_stage.py packet            build the lanes' input packet, twice, and compare the hashes
+  trade_stage.py baseline <lane>   compute the deterministic lane from the same packet
   trade_stage.py evaluate          validate every lane, score them, write the comparison report
 
 The packet the lanes see never contains `next_session`: the scoring returns are held back, exactly
@@ -44,6 +45,24 @@ def cmd_packet():
     out(status="OK", workspace=WS, packet_sha256=sha1,
         deterministic="yes" if sha1 == sha2 else "no",
         symbols=len(json.loads(body)["universe"]))
+
+
+def cmd_baseline(lane_id):
+    """Momentum baseline: the three best 20-day returns, equal weight, nothing else.
+
+    A trading decision, so it is a step of this workflow — it used to be computed inside the
+    fan-out that ran the model lanes, which made the platform's concurrency step carry one
+    domain's policy. It makes no model call, so a cycle always has a baseline even when every
+    model lane fails.
+    """
+    packet = json.load(open(f"{WS}/packet.json", encoding="utf-8"))
+    top = sorted(packet["universe"], key=lambda s: s["ret_20d"], reverse=True)[:3]
+    w = round(min(packet["constraints"]["max_weight_per_symbol"], 0.75 / len(top)), 4)
+    doc = {"lane": lane_id, "policy": "momentum20-top3-equal-weight", "model_calls": 0,
+           "targets": [{"symbol": s["symbol"], "weight": w} for s in top],
+           "rationale": "결정론 기준선: 20일 수익률 상위 3종목 동일 비중", "refs": []}
+    json.dump(doc, open(f"{WS}/lane_{lane_id}.json", "w"), ensure_ascii=False, indent=1)
+    out(status="OK", lane=lane_id, positions=len(top), weight=w, model_calls=0)
 
 
 def validate(lane_id, doc, packet):
@@ -151,4 +170,5 @@ def cmd_evaluate():
 
 
 if __name__ == "__main__":
-    {"packet": cmd_packet, "evaluate": cmd_evaluate}[sys.argv[1]]()
+    {"packet": cmd_packet, "evaluate": cmd_evaluate,
+     "baseline": lambda: cmd_baseline(sys.argv[2] if len(sys.argv) > 2 else "base")}[sys.argv[1]]()
