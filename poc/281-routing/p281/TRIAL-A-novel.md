@@ -35,22 +35,30 @@ Claude, cold reader = Grok** — three vendors inside one run, each on its own l
 - **Bounded repair.** `max_repairs` is enforced by the triage, not by a model's judgement.
 - **Advisory failure is isolated.** A dead Cold Reader neither blocked the chapter nor failed the
   run; a required reviewer failing would have blocked it (`required review unusable`).
-- **Concurrency.** The three reviewers overlap: measured `concurrency` (sum of step times ÷ wall
-  time) 1.99–2.90, wall 30–69 s.
+- **Concurrency.** The three reviewers do overlap. **The first numbers reported here (1.99–2.90)
+  were wrong** and have been withdrawn: the step collected its children with a sequential loop and
+  stamped each child's end time when the loop reached it, so a slow child stretched the others.
+  Corrected measurement (`steps/fanout.py`, one thread per child, each stamping its own end):
+  **overlap 1.91 over a 65 s wall** for the three reviewers, re-run `20260923-080609-01bad2`.
+  `p281/fanout_controls.py` holds the check that the number means what it says — a 6 s + 0.4 s +
+  0.4 s fan-out must report ~1.0, three equal children ~3.0 (8/8).
 
 ## What it exposed — the limits worth knowing
 
-1. **Conductor's own parallelism cannot be used here.** Both `parallel` groups and dynamic
-   `for_each` groups **reject script steps** (validator, v0.1.37), and every routed model call in
-   this stack *is* a script step, because the model runs through the routing/execution layer rather
-   than Conductor's provider clients. Concurrency therefore lives inside a step
-   (`steps/novel_reviews.py` starts one subprocess per reviewer). The trade is real: Conductor sees
-   one step, so its own checkpoint/resume granularity is the group, not the member.
-2. **Two processes on one provider login collide.** The first attempt failed with Claude's own
-   message — *"another Claude Code process is refreshing it"* — when the quota observer read usage
-   while the author was starting. A single retry after 20 s clears it, and the step now reports
-   `attempts` so it is never hidden. A design that runs two Claude roles at once on the same login
-   would hit this repeatedly.
+1. **Concurrency works; Conductor's management of it does not apply.** Both `parallel` groups and
+   dynamic `for_each` groups **reject script steps** (validator, v0.1.37), and every routed model
+   call in this stack *is* a script step, because the model runs through the routing/execution
+   layer rather than Conductor's provider clients. Running things at the same time is therefore
+   fine — it happens inside a step (`steps/novel_reviews.py`). What is missing is per-member
+   management: Conductor sees one step, so **a single reviewer or lane cannot be resumed on its
+   own**, and its checkpoints are the group's. That responsibility now sits in this stack's own
+   code, and it is not implemented.
+2. **One observed collision on a shared login directory.** The first attempt failed with Claude's
+   own message — *"another Claude Code process is refreshing it"* — when the quota observer read
+   usage from `/route/claude` while the author was starting on the same directory. One retry after
+   20 s cleared it and `attempts` is now reported. What this does **not** establish: that two roles
+   of the same vendor cannot run at once in general, or that one retry makes concurrent use of one
+   login dependable. Both would need their own measurement; neither was done.
 3. **Run inputs cannot carry paths.** The workflow input validator allows `[A-Za-z0-9._- ]`, so a
    prompt had to be chosen by name (`review_mode`), not by path. That is the input contract working
    as intended, but it shapes how a workflow is parameterised.

@@ -3,18 +3,21 @@
 usage: trade_lanes.py <profile> <spec> [<spec> ...]
        spec = lane:kind:provider:login:route:prompt-file   kind = model | deterministic
 
-One subprocess per lane, started together. A lane that fails is recorded as failed and the others
-are untouched — the isolation a multi-lane experiment depends on. The deterministic lane makes no
-model call at all: it is computed here, from the same packet, so a cycle always has a baseline
-even when every model lane fails.
+One subprocess per model lane, started together (steps/fanout.py, which times each child on its
+own). A lane that fails is recorded as failed and the others are untouched — the isolation a
+multi-lane experiment depends on. The deterministic lane makes no model call at all: it is
+computed here, from the same packet, so a cycle always has a baseline even when every model lane
+fails.
 
 Conductor's own `parallel` / `for_each` groups cannot be used: they refuse script steps (v0.1.37),
 and a routed model call is a script step. Trial A recorded the same finding.
 """
-import json, os, subprocess, sys, time
+import json, os, sys, time
 
 sys.path.insert(0, "/work/p281")
+sys.path.insert(0, "/work/p281/steps")
 import settings
+import fanout
 
 PY = os.environ.get("POC_PY", "/opt/venv/bin/python")
 RT = settings.runtime()
@@ -34,49 +37,49 @@ def deterministic_lane(lane_id):
            "targets": [{"symbol": s["symbol"], "weight": w} for s in top],
            "rationale": "결정론 기준선: 20일 수익률 상위 3종목 동일 비중", "refs": []}
     json.dump(doc, open(f"{WS}/lane_{lane_id}.json", "w"), ensure_ascii=False, indent=1)
-    return {"status": "COMPLETED", "produced": True, "run_id": f"{RUN}-{lane_id}-deterministic"}
 
 
 t0 = time.time()
-running, results = [], []
+results, jobs = [], []
 for lane, kind, provider, login, route, prompt in specs:
-    started = round(time.time() - t0, 2)
     if kind == "deterministic":
-        r = deterministic_lane(lane)
-        results.append({"lane": lane, "kind": kind, "provider": "none", "status": r["status"],
+        started = round(time.time() - t0, 2)
+        deterministic_lane(lane)
+        results.append({"lane": lane, "kind": kind, "provider": "none", "status": "COMPLETED",
                         "produced": True, "started_at": started,
                         "ended_at": round(time.time() - t0, 2), "model_calls": 0})
         continue
-    argv = [PY, "/work/p281/steps/agent_task.py", provider, route, f"lane-{lane}",
-            prompt, f"lane_{lane}.json", prof, login]
-    running.append({"lane": lane, "kind": kind, "provider": provider, "started_at": started,
-                    "p": subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)})
+    jobs.append({"key": lane, "lane": lane, "kind": kind, "provider": provider,
+                 "argv": [PY, "/work/p281/steps/agent_task.py", provider, route, f"lane-{lane}",
+                          prompt, f"lane_{lane}.json", prof, login]})
 
+rows, wall = fanout.run_all(jobs)
 failed = []
-for r in running:
-    out_s, err_s = r["p"].communicate()
+for r in rows:
     try:
-        res = json.loads(out_s.strip().splitlines()[-1])
+        res = json.loads(r["stdout"].strip().splitlines()[-1])
     except Exception:
-        res = {"status": "FAILED", "produced": False, "error": (err_s or out_s)[-200:]}
+        res = {"status": "FAILED", "produced": False, "error": (r["stderr"] or r["stdout"])[-200:]}
     ok = bool(res.get("produced"))
     if not ok:
         failed.append(r["lane"])
     results.append({"lane": r["lane"], "kind": r["kind"], "provider": r["provider"],
                     "status": res.get("status"), "produced": ok, "started_at": r["started_at"],
-                    "ended_at": round(time.time() - t0, 2), "model_calls": 1,
+                    "ended_at": r["ended_at"], "model_calls": 1,
                     "attempts": res.get("attempts", 1), "run_id": res.get("run_id", "")})
 
-wall = round(time.time() - t0, 2)
-serial = sum(x["ended_at"] - x["started_at"] for x in results)
+for x in results:
+    x["seconds"] = round(x["ended_at"] - x["started_at"], 2)
+total_wall = round(time.time() - t0, 2)
 print(json.dumps({
     "status": "OK",
     "lanes": len(results),
     "produced": sum(1 for x in results if x["produced"]),
     "failed": ",".join(failed),
     "model_calls": sum(x["model_calls"] for x in results),
-    "wall_s": wall,
-    "sum_of_steps_s": round(serial, 2),
-    "concurrency": round(serial / wall, 2) if wall else 0,
+    "wall_s": total_wall,
+    "busy_s": round(sum(x["seconds"] for x in results), 2),
+    # only the model lanes are started together; the deterministic one is computed in-line
+    "overlap": fanout.overlap(rows, wall) if rows else 0.0,
     "detail": json.dumps(results, ensure_ascii=False),
 }))

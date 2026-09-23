@@ -93,8 +93,8 @@ agents:
       failed: {type: string}
       model_calls: {type: number}
       wall_s: {type: number}
-      sum_of_steps_s: {type: number}
-      concurrency: {type: number}
+      busy_s: {type: number}
+      overlap: {type: number}
       detail: {type: string}
     routes:
       - to: evaluate
@@ -171,7 +171,7 @@ output:
   packet_sha256: "{% if packet is defined %}{{ packet.output.packet_sha256 }}{% endif %}"
   packet_deterministic: "{% if packet is defined %}{{ packet.output.deterministic }}{% endif %}"
   model_calls: "{% if lanes is defined %}{{ lanes.output.model_calls }}{% endif %}"
-  lane_concurrency: "{% if lanes is defined %}{{ lanes.output.concurrency }}{% endif %}"
+  lane_overlap: "{% if lanes is defined %}{{ lanes.output.overlap }}{% endif %}"
   report: "{% if evaluate is defined %}{{ evaluate.output.report }}{% endif %}"
   mlflow_run_id: "{% if record_cycle is defined %}{{ record_cycle.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
   record_error: "{% if record_cycle is defined %}{{ record_cycle.output.record_error }}{% elif record_hold is defined %}{{ record_hold.output.record_error }}{% endif %}"

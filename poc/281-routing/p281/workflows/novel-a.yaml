@@ -168,9 +168,9 @@ agents:
       required_usable: {type: number}
       failed: {type: string}
       wall_s: {type: number}
-      sum_of_steps_s: {type: number}
+      busy_s: {type: number}
       longest_step_s: {type: number}
-      concurrency: {type: number}
+      overlap: {type: number}
       detail: {type: string}
     routes:
       - to: triage
@@ -279,7 +279,7 @@ output:
   repairs: "{% if triage is defined %}{{ triage.output.repairs_done }}{% endif %}"
   cold_available: "{% if triage is defined %}{{ triage.output.cold_available }}{% endif %}"
   cold_continue_reading: "{% if triage is defined %}{{ triage.output.cold_continue_reading }}{% endif %}"
-  review_concurrency: "{% if reviews is defined %}{{ reviews.output.concurrency }}{% endif %}"
+  review_overlap: "{% if reviews is defined %}{{ reviews.output.overlap }}{% endif %}"
   review_wall_s: "{% if reviews is defined %}{{ reviews.output.wall_s }}{% endif %}"
   reviews_failed: "{% if reviews is defined %}{{ reviews.output.failed }}{% endif %}"
   mlflow_run_id: "{% if record_pass is defined %}{{ record_pass.output.mlflow_run_id }}{% elif record_block is defined %}{{ record_block.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
