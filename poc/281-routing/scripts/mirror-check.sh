@@ -36,7 +36,12 @@ sub="poc/281-routing"
 # are written for #281 and its readers, this workspace's RUNBOOK.md is the #278 stack's own and
 # predates them. Checked, not assumed — the first version of this script never looked at the root
 # documents, which is how they were noticed.
-known_different="docker/compose.poc.yaml docker/agent.Dockerfile docker/ca/README.md README.md RUNBOOK.md"
+#
+# docker/compose.poc.yaml was on this list and is not any more: the two copies were identical (the
+# defaults are the repository's relative ones on both sides — what differs per host is docker/.env,
+# which is not published). Leaving it excused would have let a change to the services themselves,
+# like the profiles a composition selects, stay unpublished.
+known_different="docker/agent.Dockerfile docker/ca/README.md README.md RUNBOOK.md"
 
 [ -d "$repo/$sub" ] || { echo "no $sub in $repo"; exit 2; }
 

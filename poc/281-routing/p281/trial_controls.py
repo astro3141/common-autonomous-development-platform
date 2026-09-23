@@ -16,6 +16,8 @@ fails if the fix is reverted. What each group pins:
   boundary  the platform's fan-out capability carries no domain rule, and the workflow's steps
             carry the judgements (CONTRACT.md)
   recorder  a run with several executions is recorded as several runs, one per execution
+  reduced   a smaller composition may drop recording and the screen — never what the stack's
+            guarantees rest on — and a run that loses a capability is refused, not silently run
 """
 import importlib.util, json, os, re, shutil, sys, tempfile
 
@@ -460,8 +462,52 @@ def controls_boundary():
     check("the triage step is told what is required", '"story,history"' in y, True)
 
 
+# ---------------------------------------------------------------- a reduced composition
+def controls_composition():
+    print("reduced — what a composition may drop, and what a run is refused for")
+    sys.path.insert(0, "/work/p281")
+    import capabilities
+
+    def caps(**avail):
+        base = {"tool_rights": True, "approvals": True, "egress": True, "record": True,
+                "admission": True}
+        base.update(avail)
+        return {k: {"available": v, "required": k in ("tool_rights", "approvals", "egress"),
+                    "without_it": "", "detail": ""} for k, v in base.items()}
+
+    check("everything there → nothing missing",
+          capabilities.missing(caps()), [])
+    check("no recording, and no one said so → refused",
+          capabilities.missing(caps(record=False)), ["record"])
+    check("no recording, said so → allowed",
+          capabilities.missing(caps(record=False), need_record=False), [])
+    check("no tool rights → refused even with the opt-in",
+          capabilities.missing(caps(tool_rights=False), need_record=False), ["tool_rights"])
+    check("no egress → refused even with the opt-in",
+          capabilities.missing(caps(egress=False), need_record=False), ["egress"])
+    check("stale quota is reported, not a refusal (the router holds the run itself)",
+          capabilities.missing(caps(admission=False), need_record=False), [])
+
+    import yaml                                   # the compose file itself, not a guess at it
+    svcs = (yaml.safe_load(open("/work/docker/compose.poc.yaml", encoding="utf-8"))
+            or {}).get("services") or {}
+    optional = sorted(n for n, v in svcs.items() if (v or {}).get("profiles"))
+    check("only these services are optional", optional, ["hub", "mlflow", "ops"])
+    for must in ("egress", "toolsvc", "fsmcp", "quota", "agent"):
+        check(f"{must} can never be dropped", must in optional, False)
+
+    up = open("/work/scripts/up.sh", encoding="utf-8").read()
+    for name in ("full", "no-record", "runtime"):
+        check(f"up.sh knows the {name} composition", f"  {name})" in up or f"  {name})" in up, True)
+    check("an unknown composition is refused", "unknown composition:" in up, True)
+    check("a composition that drops a service also stops it", "rm -sf $drop" in up, True)
+    down = open("/work/scripts/down.sh", encoding="utf-8").read()
+    check("down takes everything, whatever was up", 'COMPOSE_PROFILES="record,ui"' in down, True)
+
+
 if __name__ == "__main__":
     controls_boundary()
+    controls_composition()
     controls_recorder()
     controls_triage()
     controls_reviews_step()

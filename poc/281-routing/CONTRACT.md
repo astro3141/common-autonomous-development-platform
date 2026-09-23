@@ -28,6 +28,7 @@ the capability, not decisions about the work, and they stay in the platform.
 | **Concurrency** (`steps/fanout.py`, `steps/tasks.py`) | the members run at the same time, each timed on its own; one member's failure does not touch another; a receipt records what each produced, with hashes | which tasks, which of them matter, and what a missing one means |
 | **Recording** (`steps/record.py`) | the run's facts reach MLflow, and a recording failure never changes the run's outcome | what counts as a measurement in this domain, and what the run's decision was |
 | **Operation** (`scripts/*.sh`, `p281/cleanup.py`) | backup, restore, update, rollback and cleanup of the stack itself, preview before destruction, pending approvals protected | when to run them, and what to keep |
+| **Composition** (`scripts/up.sh --composition`, `p281/capabilities.py`) | the stack starts with a named set of services, says which capabilities it therefore has — probed, not declared — and refuses a run that needs one it does not have | which composition to run, and whether an unrecorded run is acceptable (`--allow-unrecorded`) |
 
 ## What a workflow owns
 

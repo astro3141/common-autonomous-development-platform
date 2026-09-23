@@ -163,9 +163,18 @@ class H(BaseHTTPRequestHandler):
             wf, prof, inputs = b.get("workflow"), b.get("profile") or "research-default", b.get("inputs") or {}
             if wf not in ("auto", "research-r", "novel-a", "trading-b") or not NAME.fullmatch(prof) or not isinstance(inputs, dict):
                 return self._send(400, {"error": "invalid workflow, profile or inputs"})
+            # The run is started detached, so what the stack cannot do has to be found out before
+            # that: a refusal after detaching would look like a run that never reported anything.
+            unrecorded = b.get("allow_unrecorded") is True
+            gate = jexec([PY, "/work/p281/capabilities.py", "--missing"]
+                         + (["--allow-unrecorded"] if unrecorded else []))
+            if gate.get("missing"):
+                return self._send(409, {"error": "the stack cannot run this now: "
+                                                 + ", ".join(gate["missing"]), **gate})
             ui = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
             pairs = [f"{k}={v}" for k, v in inputs.items() if isinstance(v, (str, int))]
-            rc, out, err = dexec([PY, "/work/p281/run_workflow.py", "start", ui, wf, prof] + pairs, detach=True)
+            rc, out, err = dexec([PY, "/work/p281/run_workflow.py", "start", ui, wf, prof] + pairs
+                                 + (["--allow-unrecorded"] if unrecorded else []), detach=True)
             return self._send(202 if rc == 0 else 500, {"ui_id": ui} if rc == 0 else {"error": err[-300:]})
         return self._send(404, {"error": "no such route"})
 
