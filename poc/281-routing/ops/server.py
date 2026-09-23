@@ -161,7 +161,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, jexec([PY, "/work/p281/login_helper.py", "code", prov, login], stdin=code))
         if p == "/api/runs":
             wf, prof, inputs = b.get("workflow"), b.get("profile") or "research-default", b.get("inputs") or {}
-            if wf not in ("auto", "research-r", "novel-a", "trading-b") or not NAME.fullmatch(prof) or not isinstance(inputs, dict):
+            if wf not in ("auto", "research-r", "novel-a", "trading-b", "trading-shapes") or not NAME.fullmatch(prof) or not isinstance(inputs, dict):
                 return self._send(400, {"error": "invalid workflow, profile or inputs"})
             # The run is started detached, so what the stack cannot do has to be found out before
             # that: a refusal after detaching would look like a run that never reported anything.

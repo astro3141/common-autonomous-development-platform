@@ -1,7 +1,11 @@
 """Platform capability: run several routed model tasks at the same time, and say what each produced.
 
 usage: tasks.py <receipt-path> <context> <profile> <spec> [<spec> ...]
-       spec = label:provider:login:route:prompt-file:expected-file
+       tasks.py <receipt-path> <context> <profile> --plan <plan.json>
+
+       spec = label:provider:login:route:prompt-file:expected-file   (one call per member)
+       plan = {"members": [{"label", "steps": [...]}, ...]}          (a member may be a sequence,
+              run in order by steps/task_chain.py; members still run at the same time)
 
 What this guarantees, and nothing more:
 
@@ -50,12 +54,30 @@ if not os.path.isabs(receipt_path):
     receipt_path = f"{WS}/{receipt_path}"
 
 jobs = []
-for spec in sys.argv[4:]:
-    label, provider, login, route, prompt, expected = spec.split(":")
-    jobs.append({"key": label, "label": label, "provider": provider, "expected": expected,
-                 "produces": f"{WS}/{expected}",
-                 "argv": [PY, "/work/p281/steps/agent_task.py", provider, route, label,
-                          prompt, expected, prof, login]})
+if sys.argv[4:5] == ["--plan"]:
+    # A member may be a chain of steps. The plan is written by the workflow, which is the only
+    # place that knows what a lane of its experiment is made of; this step only runs it.
+    plan = json.load(open(sys.argv[5], encoding="utf-8"))
+    mdir = f"{WS}/.members"
+    os.makedirs(mdir, exist_ok=True)
+    for m in plan["members"]:
+        m.setdefault("profile", prof)
+        mp = f"{mdir}/{m['label']}.json"
+        json.dump(m, open(mp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        expected = (m["steps"][-1].get("expected") or "")
+        jobs.append({"key": m["label"], "label": m["label"],
+                     "provider": ",".join(sorted({st.get("provider", "none")
+                                                  for st in m["steps"] if st["kind"] == "model"})) or "none",
+                     "expected": expected, "produces": f"{WS}/{expected}" if expected else "",
+                     "steps_planned": len(m["steps"]),
+                     "argv": [PY, "/work/p281/steps/task_chain.py", mp]})
+else:
+    for spec in sys.argv[4:]:
+        label, provider, login, route, prompt, expected = spec.split(":")
+        jobs.append({"key": label, "label": label, "provider": provider, "expected": expected,
+                     "produces": f"{WS}/{expected}",
+                     "argv": [PY, "/work/p281/steps/agent_task.py", provider, route, label,
+                              prompt, expected, prof, login]})
 
 rows, wall = fanout.run_all(jobs)
 
@@ -76,6 +98,8 @@ for r in rows:
         "started_at": r["started_at"], "ended_at": r["ended_at"],
         "seconds": round(r["ended_at"] - r["started_at"], 2),
         "attempts": res.get("attempts", 1), "run_id": res.get("run_id", ""),
+        "steps_run": res.get("steps_run", 1), "steps_planned": r.get("steps_planned", 1),
+        "failed_step": res.get("failed_step", ""),
         "error": res.get("error", "")[:200] if not produced else "",
         # the routed call's own record, kept whole: the recorder reads it, this step does not
         "result": res}
@@ -90,6 +114,7 @@ print(json.dumps({
     "receipt": receipt_path,
     "tasks": len(members),
     "produced": sum(1 for m in members.values() if m["produced"]),
+    "model_calls": sum((m["result"] or {}).get("model_calls", 1) for m in members.values()),
     "failed": ",".join(failed),
     "wall_s": wall,
     "busy_s": busy,
