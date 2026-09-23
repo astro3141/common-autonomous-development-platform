@@ -83,7 +83,15 @@ def executions_of(payload):
             continue
         for label, m in sorted((rec.get("members") or {}).items()):
             r = (m or {}).get("result")
-            if isinstance(r, dict) and r.get("run_id"):
+            if not isinstance(r, dict):
+                errors.append(f"receipt member {label}: no execution record")
+                continue
+            steps = [st for st in (r.get("steps") or [])
+                     if isinstance(st, dict) and st.get("run_id") and st.get("kind") == "model"]
+            if steps:
+                # a member that is a chain is several executions, and each gets its own run
+                found.extend({**st, "member": f"{label}:{st.get('step', '')}"} for st in steps)
+            elif r.get("run_id") and r.get("provider"):
                 found.append({**r, "member": label})
             else:
                 errors.append(f"receipt member {label}: no execution record")

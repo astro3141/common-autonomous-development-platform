@@ -34,7 +34,8 @@ import capabilities
 
 WORKFLOWS = {"auto": "p281/workflows/auto.yaml", "research-r": "p281/workflows/research-r.yaml",
              "novel-a": "p281/workflows/novel-a.yaml",
-             "trading-b": "p281/workflows/trading-b.yaml"}
+             "trading-b": "p281/workflows/trading-b.yaml",
+             "trading-shapes": "p281/workflows/trading-shapes.yaml"}
 RUNS = Path("/work/evidence/ui-runs")
 SAFE = re.compile(r"[A-Za-z0-9._\- ]{0,200}")
 

@@ -16,6 +16,8 @@ fails if the fix is reverted. What each group pins:
   boundary  the platform's fan-out capability carries no domain rule, and the workflow's steps
             carry the judgements (CONTRACT.md)
   recorder  a run with several executions is recorded as several runs, one per execution
+  chains    a member may be a sequence: its steps run in order, a failed step stops that member
+            only, and every step is one execution in the record
   reduced   a smaller composition may drop recording and the screen — never what the stack's
             guarantees rest on — and a run that loses a capability is refused, not silently run
 """
@@ -23,6 +25,7 @@ import importlib.util, json, os, re, shutil, sys, tempfile
 
 sys.path.insert(0, "/work/p281")
 sys.path.insert(0, "/work/p281/steps")
+import settings as settings_real
 
 PASS, FAIL = [], []
 
@@ -31,6 +34,15 @@ def check(name, got, want):
     (PASS if got == want else FAIL).append((name, got, want))
     print(f"  {'ok  ' if got == want else 'FAIL'}  {name:<58} {got!r}" +
           ("" if got == want else f"  (expected {want!r})"))
+
+
+def real_ws():
+    """A throwaway run directory under the real workspace root, removed by the caller."""
+    import secrets
+    root = settings_real.runtime()["paths"]["workspace_root"]
+    ws = os.path.join(root, "ctl-" + secrets.token_hex(4))
+    os.makedirs(ws, exist_ok=True)
+    return ws
 
 
 def load(path, name, ws):
@@ -215,7 +227,11 @@ def controls_record_and_screen():
 # before a single reviewer started, and nothing here noticed. These controls run the real step
 # modules with the real `fanout`, replacing only the interpreter that would start a model call.
 STUB = '''#!/bin/sh
-# stands in for the step's interpreter: $1 is the script it would have run
+# Stands in for the step's interpreter: $1 is the script it would have run. Only the routed call
+# is faked — a chain runner is a step of the platform under test, so it runs for real.
+case "$1" in
+  */task_chain.py) exec /opt/venv/bin/python "$@";;
+esac
 shift
 label=$3; expected=$5
 if [ "$label" = "$CTL_FAIL" ]; then echo '{"status":"FAILED","produced":false}'; exit 1; fi
@@ -224,10 +240,15 @@ echo '{"status":"COMPLETED","produced":true,"run_id":"ctl"}'
 '''
 
 
-def run_step(path, name, argv, ws, doc, fail=""):
-    """Import and run a fan-out step with its workspace and its child interpreter faked."""
+def run_step(path, name, argv, ws, doc, fail="", scratch=None):
+    """Import and run a fan-out step with its workspace and its child interpreter faked.
+
+    The workspace lives under the real workspace root, because a chained member runs in its own
+    process: that process reads the stack's own settings, and a temporary directory invented here
+    would not be the one it looks in.
+    """
     import contextlib, io, types
-    root = os.path.dirname(os.path.dirname(ws))
+    root = scratch or tempfile.mkdtemp(prefix="p281-scratch-")
     stub = os.path.join(root, "stub.sh")
     with open(stub, "w", newline="\n") as f:
         f.write(STUB)
@@ -271,8 +292,7 @@ def controls_reviews_step():
     for label, fail, want_triage in (("every reviewer produced", "", "PASS"),
                                      ("a required reviewer failed", "history", "BLOCK")):
         root = tempfile.mkdtemp(prefix="p281-step-")
-        ws = os.path.join(root, "ws", "ctlrun")
-        os.makedirs(ws)
+        ws = real_ws()
         ns = load("/work/p281/steps/novel_stage.py", f"ns_{fail or 'all'}", ws)
         open(f"{ws}/draft.md", "w").write("a draft\n")
         ns.cmd_freeze()
@@ -306,13 +326,13 @@ def controls_reviews_step():
         check(f"{label}: triage then decides", json.loads(buf.getvalue().strip().splitlines()[-1])["decision"],
               want_triage)
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(ws, ignore_errors=True)
 
 
 def controls_lanes_step():
     print("lanes step — the real step, the real fanout, no model call")
     root = tempfile.mkdtemp(prefix="p281-lanestep-")
-    ws = os.path.join(root, "ws", "ctlrun")
-    os.makedirs(ws)
+    ws = real_ws()
     ts = load("/work/p281/steps/trade_stage.py", "ts_step", ws)
     _, packet, body, _ = ts.build_packet()
     open(f"{ws}/packet.json", "w", encoding="utf-8").write(body)
@@ -332,6 +352,7 @@ def controls_lanes_step():
     check("the receipt carries the cycle's packet",
           json.load(open(f"{ws}/lanes_round.json")).get("context"), "packet-sha")
     shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(ws, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- the recorder
@@ -462,6 +483,98 @@ def controls_boundary():
     check("the triage step is told what is required", '"story,history"' in y, True)
 
 
+# ---------------------------------------------------------------- members that are chains
+def controls_chains():
+    print("chains — a lane may be a sequence of steps, and stays one lane's business")
+    root = tempfile.mkdtemp(prefix="p281-chain-")
+    ws = real_ws()
+    ts = load("/work/p281/steps/trade_stage.py", "ts_chain", ws)
+    _, packet, body, _ = ts.build_packet()
+    open(f"{ws}/packet.json", "w", encoding="utf-8").write(body)
+    syms = [x["symbol"] for x in packet["universe"]][:2]
+    doc = json.dumps({"model_calls": 1, "refs": [],
+                      "targets": [{"symbol": s, "weight": 0.2} for s in syms]})
+
+    plan = {"members": [
+        {"label": "chain", "steps": [
+            {"kind": "model", "name": "s1", "provider": "codex", "login": "codex",
+             "route": "direct", "prompt": "/p1.md", "expected": "lane_chain.json"},
+            {"kind": "script", "name": "s2", "expected": "",
+             "argv": ["/bin/sh", "-c", "echo '{\"status\":\"OK\"}'"]},
+            {"kind": "model", "name": "s3", "provider": "claude", "login": "claude",
+             "route": "direct", "prompt": "/p2.md", "expected": "lane_chain.json"}]},
+        {"label": "solo", "steps": [
+            {"kind": "model", "name": "t1", "provider": "grok", "login": "grok",
+             "route": "direct", "prompt": "/p3.md", "expected": "lane_solo.json"}]}]}
+    pp = os.path.join(root, "plan.json")
+    json.dump(plan, open(pp, "w"), ensure_ascii=False)
+
+    res = run_step("/work/p281/steps/tasks.py", "tasks_chain",
+                   ["lanes_round.json", "packet-sha", "research-default", "--plan", pp],
+                   ws, doc)
+    check("the plan ran", res.get("status"), "OK")
+    check("two members, both produced", (res.get("tasks"), res.get("produced")), (2, 2))
+    check("the calls are counted, not the members", res.get("model_calls"), 3)
+    rec = json.load(open(f"{ws}/lanes_round.json"))
+    chain = rec["members"]["chain"]["result"]
+    check("the chain ran its steps in order",
+          [st["step"] for st in chain["steps"]], ["s1", "s2", "s3"])
+    check("a script step inside a lane is not a model call", chain["model_calls"], 2)
+
+    # a step that produces nothing stops its own member and no other
+    res = run_step("/work/p281/steps/tasks.py", "tasks_chain_fail",
+                   ["lanes_round.json", "packet-sha", "research-default", "--plan", pp],
+                   ws, doc, fail="s1")
+    check("a failed step stops its member", res.get("failed"), "chain")
+    check("the other member is untouched", res.get("produced"), 1)
+    rec = json.load(open(f"{ws}/lanes_round.json"))
+    check("the failed step is named",
+          rec["members"]["chain"]["result"]["failed_step"], "s1")
+    check("the rest of the chain did not run",
+          rec["members"]["chain"]["result"]["steps_run"], 1)
+
+    # the recorder turns a chain into one execution per call
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("record_chain", "/work/p281/steps/record.py")
+    rec_mod = importlib.util.module_from_spec(spec)
+    sys.modules["record_chain"] = rec_mod
+    spec.loader.exec_module(rec_mod)
+    receipt = os.path.join(root, "receipt.json")
+    ex = lambda rid, prov: {"run_id": rid, "provider": prov, "status": "COMPLETED",
+                            "model_session_reported": "", "model_adapter_reported": "",
+                            "model_served": "", "evidence_dir": "", "kind": "model"}
+    json.dump({"context": "c", "members": {"chain": {"produced": True, "result": {
+        "run_id": "m", "steps": [{**ex("a", "codex"), "step": "s1"},
+                                 {"run_id": "", "kind": "script", "step": "s2"},
+                                 {**ex("b", "claude"), "step": "s3"}]}}}},
+        open(receipt, "w"))
+    found, errs = rec_mod.executions_of({"receipts": [receipt]})
+    check("a chain is recorded call by call",
+          [e["member"] for e in found], ["chain:s1", "chain:s3"])
+    check("its script step is not an execution", len(found), 2)
+
+    # a lane that produced nothing is still in the comparison (its own workspace: the chain above
+    # left its artifact behind, and this asks what the comparison does with a lane that is absent)
+    shutil.rmtree(ws, ignore_errors=True)
+    ws = real_ws()
+    open(f"{ws}/packet.json", "w", encoding="utf-8").write(body)
+    ts2 = load("/work/p281/steps/trade_stage.py", "ts_missing", ws)
+    json.dump({"members": [{"label": "GONE", "steps": []}, {"label": "solo", "steps": []}]},
+              open(f"{ws}/lanes_plan.json", "w"))
+    json.dump({"lane": "solo", "model_calls": 1, "refs": [],
+               "targets": [{"symbol": syms[0], "weight": 0.2}]}, open(f"{ws}/lane_solo.json", "w"))
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ts2.cmd_evaluate()
+    out = json.loads(buf.getvalue().strip().splitlines()[-1])
+    check("a planned lane that produced nothing is MISSING, not absent",
+          (out.get("missing"), out["lanes"]), ("GONE", 2))
+    check("and it is not counted as valid", out["valid"], 1)
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(ws, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- a reduced composition
 def controls_composition():
     print("reduced — what a composition may drop, and what a run is refused for")
@@ -507,6 +620,7 @@ def controls_composition():
 
 if __name__ == "__main__":
     controls_boundary()
+    controls_chains()
     controls_composition()
     controls_recorder()
     controls_triage()

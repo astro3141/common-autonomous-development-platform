@@ -70,3 +70,51 @@ Per-lane results of the first run (scored against returns the lanes never saw):
 
 Both are pinned by `p281/trial_controls.py` (36/36), which drives the real functions with fake
 inputs and needs no model call.
+
+
+## Trial B2 — one lane per decision shape (2026-09-24)
+
+The harness runs lanes A–I. Several are the same shape as far as an execution layer is concerned,
+so this cycle ran **one lane per distinct shape** rather than nine lanes:
+
+| shape | lane | covers | steps |
+|---|---|---|---|
+| deterministic rules, no model call | B | A | 1 script |
+| deterministic base + overlay + critic | D | C | 2 calls, chained |
+| one call decides | E | G (same shape, different input) | 1 call |
+| a desk of roles | F | — | 3 calls, chained |
+| forecast → deterministic grade → decision | H | — | 2 calls with a script between them |
+| screen → thesis → review | I | — | 3 calls, chained |
+
+Four of the six needed something this stack could not do: **a member of a fan-out that is itself a
+sequence.** `steps/task_chain.py` is that capability — steps in order, a failed step stopping that
+member and no other, every step kept as its own record — and `steps/tasks.py --plan` takes a plan
+the workflow writes. What each lane is made of stays in `trade_stage.py shapes-plan`, which is the
+trading workflow's own step (CONTRACT.md).
+
+**Measured** (`p281/workflows/trading-shapes.yaml`, one frozen packet, fixture data):
+
+| lane | provider | steps | seconds | gross | next-session return | vs benchmark |
+|---|---|---|---|---|---|---|
+| B | — (0 calls) | 1 script | — | 0.750 | +0.250% | +0.025% |
+| D | codex | model, model | 50.8 | 0.562 | +0.224% | **+0.055%** |
+| E | grok | model | 35.0 | 0.700 | +0.230% | +0.020% |
+| F | codex | model ×3 | 70.3 | 0.406 | +0.087% | −0.035% |
+| H | claude | model, **script**, model | 52.5 | 0.850 | +0.251% | −0.004% |
+| I | claude | model ×3 | 82.3 | 0.500 | +0.150% | 0.000% |
+
+11 model calls in one cycle, **overlap 3.54 over an 82 s wall** — on average three and a half
+children busy throughout — and all six lanes validated by the same deterministic checks. The
+recorder wrote **11 child runs under one parent**, each with its own provider, tokens and duration
+(claude 74–97k tokens per call, codex ~17k, grok reports none).
+
+**Two things the trial found.**
+
+1. *A lane that produced nothing disappeared from the comparison.* The first cycle lost lane D at
+   its first step (a prompt of this trial's own named the wrong file) and the cycle still reported
+   "5/5 lanes valid" — `evaluate` counted the files it could see, not the lanes the run set out to
+   decide. It now reads the plan and reports an absent lane as `MISSING`, which is not valid.
+2. *Repairing one lane did not need the cycle re-run.* With the prompt fixed, lane D alone was
+   re-run against the **same frozen packet** (`task_chain.py` on that member's plan) and the
+   comparison recomputed — 6/6 valid. That is the manual half of what per-lane recovery would
+   automate, and it works today without any of it.
