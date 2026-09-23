@@ -18,6 +18,8 @@ fails if the fix is reverted. What each group pins:
   recorder  a run with several executions is recorded as several runs, one per execution
   chains    a member may be a sequence: its steps run in order, a failed step stops that member
             only, and every step is one execution in the record
+  running   unattended operation: one cycle at a time, a skip and a refusal both recorded, and
+            the health report counting what actually happened
   reduced   a smaller composition may drop recording and the screen — never what the stack's
             guarantees rest on — and a run that loses a capability is refused, not silently run
 """
@@ -575,6 +577,58 @@ def controls_chains():
     shutil.rmtree(ws, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- unattended operation
+def controls_running():
+    print("running — what a week of unattended cycles leaves behind, and what it says")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ops_health_ctl", "/work/p281/ops_health.py")
+    oh = importlib.util.module_from_spec(spec)
+    sys.modules["ops_health_ctl"] = oh
+    spec.loader.exec_module(oh)
+
+    rows = [
+        {"at": "t1", "ui": "a", "seconds": 40, "outcome": {"ended_at": "done_cycle", "mlflow": True}},
+        {"at": "t2", "skipped": "busy"},
+        {"at": "t3", "ui": "b", "seconds": 80, "outcome": {"ended_at": "done_hold", "mlflow": True}},
+        {"at": "t4", "refused": {"missing": ["record"], "why": {"record": "nothing recorded"}}},
+        {"at": "t5", "ui": "c", "seconds": 60,
+         "outcome": {"ended_at": "done_cycle", "mlflow": False, "record_error": "URLError"}},
+    ]
+    r = oh.summarise(rows)
+    check("a skipped cycle is not counted as a cycle", r["cycles_recorded"], 3)
+    check("a skip is counted as a skip", r["skipped_busy"], 1)
+    check("a refusal is counted, with its reason", (r["refused"], r["refused_why"]),
+          (1, [["record"]]))
+    check("how cycles ended is counted", r["ended"], {"done_cycle": 2, "done_hold": 1})
+    check("durations are reported as a spread",
+          (r["seconds"]["min"], r["seconds"]["median"], r["seconds"]["max"]), (40, 60, 80))
+    check("a cycle that never reached MLflow is visible", r["not_in_mlflow"], 1)
+    check("and its error is carried", r["record_errors"][-1][1], "URLError")
+    check("nothing at all is not an error", oh.summarise([])["cycles_recorded"], 0)
+
+    # a lock nobody released: visible, and never cleared by the thing that would be blocked by it
+    d = tempfile.mkdtemp(prefix="p281-lock-")
+    check("no lock is not a problem", oh.stuck_lock(os.path.join(d, "none")), None)
+    open(os.path.join(d, "started"), "w").write("2026-09-23T04:00:00Z")
+    open(os.path.join(d, "started_epoch"), "w").write(str(int(__import__("time").time()) - 3600))
+    held = oh.stuck_lock(d)
+    check("a held lock is reported with its age", (held["since"], held["age_s"] >= 3600),
+          ("2026-09-23T04:00:00Z", True))
+    shutil.rmtree(d, ignore_errors=True)
+
+    cyc = open("/work/scripts/cycle.sh", encoding="utf-8").read()
+    check("a cycle takes a lock before starting anything", 'mkdir "$LOCKDIR"' in cyc, True)
+    check("a busy scheduler tick is skipped, not queued", '"skipped":"busy"' in cyc, True)
+    check("a stale lock is reported, never removed by this script",
+          'rm -rf "$LOCKDIR"' in cyc, False)
+    check("a skip says how long the lock has been held", "lock_age_s" in cyc, True)
+    check("a stack that cannot run it exits 3", "exit 3" in cyc, True)
+    check("nothing is deleted unless retention is asked for",
+          'if [ -n "$RETAIN_DAYS$RETAIN_KEEP" ]' in cyc, True)
+    soak = open("/work/scripts/soak.sh", encoding="utf-8").read()
+    check("the soak measures without cleaning up", "cleanup" not in soak.split("#!")[1].split("set -u")[1], True)
+
+
 # ---------------------------------------------------------------- a reduced composition
 def controls_composition():
     print("reduced — what a composition may drop, and what a run is refused for")
@@ -621,6 +675,7 @@ def controls_composition():
 if __name__ == "__main__":
     controls_boundary()
     controls_chains()
+    controls_running()
     controls_composition()
     controls_recorder()
     controls_triage()

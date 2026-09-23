@@ -132,8 +132,10 @@ echo
 # Leave the result where the screen can read it: when the checks last ran and what failed.
 # A check that has not run for a long time is itself worth seeing.
 mkdir -p "$HERE/evidence/checks"
-printf '{"at":"%s","stack":"%s","ok":%s,"failed":[%s]}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$STACK" "$([ $fail = 0 ] && echo true || echo false)" \
-  "${FAILED%,}" > "$HERE/evidence/checks/last.json"
+printf '{"at":"%s","stack":"%s","composition":"%s","ok":%s,"failed":[%s],"capabilities":%s}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$STACK" "$COMPOSITION" \
+  "$([ $fail = 0 ] && echo true || echo false)" "${FAILED%,}" \
+  "$(in_agent 'python3 /work/p281/capabilities.py --json' || echo '{}')" \
+  > "$HERE/evidence/checks/last.json"
 
 [ $fail = 0 ] && echo "ALL CHECKS PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }
