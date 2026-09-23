@@ -6,7 +6,7 @@ every model step of the run shares, so a later step can read what an earlier one
 Writes are only possible through the Preloop MCP server (native write/shell are removed);
 Preloop's rules decide them. Emits the normalized result flat for Conductor.
 """
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 sys.path.insert(0, "/work/p281")
 import settings
 
@@ -27,12 +27,26 @@ req = {"run_id": run_id, "provider": provider, "model_route": model_route or "pr
        "prompt": open(prompt_file, encoding="utf-8").read().replace("{WS}", ws)}
 rp = os.path.join(evid, "request.json")
 json.dump(req, open(rp, "w"), indent=1)
-p = subprocess.run(["node", "/work/p281/run-agent.mjs", rp], capture_output=True, text=True,
-                   env={**os.environ, "NODE_NO_WARNINGS": "1"})
-try:
-    r = json.loads(p.stdout.strip().splitlines()[-1])
-except Exception:
-    r = {"status": "FAILED", "failure": {"message": (p.stderr or p.stdout)[-400:]}}
+def run_once():
+    p = subprocess.run(["node", "/work/p281/run-agent.mjs", rp], capture_output=True, text=True,
+                       env={**os.environ, "NODE_NO_WARNINGS": "1"})
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"status": "FAILED", "failure": {"message": (p.stderr or p.stdout)[-400:]}}
+
+
+r = run_once()
+# One retry for a login the provider itself calls transient. Measured: two processes touching the
+# same Claude login directory (the quota observer reading usage, and this step) collide on an
+# OAuth refresh — "another Claude Code process is refreshing it". Retrying once is enough; it is
+# counted here so a run never hides it.
+attempts = 1
+msg = json.dumps(r.get("turn", {}).get("error", {}) or r.get("failure", {}))
+if r.get("status") != "COMPLETED" and "refresh" in msg.lower():
+    time.sleep(20)
+    r = run_once()
+    attempts = 2
 q = ((r.get("turn") or {}).get("_meta") or {}).get("quota") or {}
 meas = {"total_tokens": (q.get("token_count") or {}).get("totalTokens"), "wall_ms": r.get("wall_ms")}
 exp_path = os.path.join(ws, expected)
@@ -52,6 +66,7 @@ print(json.dumps({
     "retryable_elsewhere": bool(r.get("retryable_elsewhere")),
     "evidence_dir": evid,
     "profile": prof_name,
+    "attempts": attempts,
     "ledger_error": r.get("ledger_error") or "",
     # missing measurements are omitted, never 0
     "measurements": {k: v for k, v in meas.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},

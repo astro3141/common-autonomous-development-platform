@@ -1,0 +1,291 @@
+# Capability trial A — can this stack run a novel-shaped workflow?
+#
+# Shape taken from the France Novel design (Notion): roles split across vendors, an immutable
+# draft that every reviewer judges, required reviews plus an advisory Cold Reader, a deterministic
+# triage that owns the graph edge, and a bounded repair loop. Nothing of that project is imported:
+# the entry state is a fixture written for this trial.
+#
+# What is being tried out here, and has never run in this stack before:
+#   * a real Conductor `parallel` group (three reviewers at once, continue_on_error)
+#   * three different vendors inside one run, each on its own login
+#   * a deterministic step choosing PASS / REPAIR from files the models wrote
+#
+#   conductor run p281/workflows/novel-a.yaml -i profile=research-default
+workflow:
+  name: p281-novel-a
+  description: Role-split chapter with parallel reviews and bounded repair (capability trial)
+  entry_point: route
+  input:
+    profile:
+      type: string
+      required: false
+      default: research-default
+      description: execution profile (config/profiles/<name>.yaml)
+    max_repairs:
+      type: string
+      required: false
+      default: "1"
+      description: how many repair rounds are allowed before the chapter is blocked
+    review_mode:
+      type: string
+      required: false
+      default: "default"
+      description: "default | strict — the strict story reviewer exercises the repair loop (run inputs may not contain paths)"
+    cold_login:
+      type: string
+      required: false
+      default: ""
+      description: override the Cold Reader's login (a missing one exercises advisory failure)
+  limits:
+    max_iterations: 30
+    timeout_seconds: 3000
+
+agents:
+  # Quota still decides whether anything may run at all.
+  - name: route
+    type: script
+    description: Quota admission (the roles below are bound by design, not by the router)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/route.py", "{{ workflow.input.profile }}"]
+    output:
+      decision: {type: string}
+      provider: {type: string}
+      reason: {type: string}
+      profile: {type: string}
+      evidence_dir: {type: string}
+    routes:
+      - to: roles
+        when: "{{ route.output.decision == 'ROUTE' }}"
+      - to: record_hold
+
+  - name: roles
+    type: script
+    description: Bind each role to its vendor, with that vendor's login and route
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/roles.py", "{{ route.output.profile }}", "{{ route.output.evidence_dir }}",
+           "architect=codex", "author=claude", "story=codex", "history=claude", "cold=grok"]
+    output:
+      ok: {type: string}
+      missing: {type: string}
+      ineligible: {type: string}
+      architect_provider: {type: string}
+      architect_login: {type: string}
+      architect_route: {type: string}
+      author_provider: {type: string}
+      author_login: {type: string}
+      author_route: {type: string}
+      story_provider: {type: string}
+      story_login: {type: string}
+      story_route: {type: string}
+      history_provider: {type: string}
+      history_login: {type: string}
+      history_route: {type: string}
+      cold_provider: {type: string}
+      cold_login: {type: string}
+      cold_route: {type: string}
+    routes:
+      - to: stage
+        when: "{{ roles.output.ok == 'yes' }}"
+      - to: record_hold
+
+  - name: stage
+    type: script
+    description: Put the fixture entry state in the run's workspace
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/novel_stage.py", "stage"]
+    output:
+      status: {type: string}
+      workspace: {type: string}
+      staged: {type: string}
+    routes:
+      - to: architect
+
+  - name: architect
+    type: script
+    description: Chapter contract (no prose)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/agent_task.py", "{{ roles.output.architect_provider }}",
+           "{{ roles.output.architect_route }}", "architect",
+           "/work/p281/prompts/novel-architect.md", "contract.json",
+           "{{ route.output.profile }}", "{{ roles.output.architect_login }}"]
+    timeout: 600
+    output:
+      status: {type: string}
+      produced: {type: boolean}
+      provider: {type: string}
+      run_id: {type: string}
+    routes:
+      - to: author
+        when: "{{ architect.output.produced == true }}"
+      - to: record_block
+
+  - name: author
+    type: script
+    description: Prose — only this role writes prose
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/agent_task.py", "{{ roles.output.author_provider }}",
+           "{{ roles.output.author_route }}", "author",
+           "/work/p281/prompts/novel-author.md", "draft.md",
+           "{{ route.output.profile }}", "{{ roles.output.author_login }}"]
+    timeout: 900
+    output:
+      status: {type: string}
+      produced: {type: boolean}
+      provider: {type: string}
+      run_id: {type: string}
+    routes:
+      - to: freeze
+        when: "{{ author.output.produced == true }}"
+      - to: record_block
+
+  - name: freeze
+    type: script
+    description: Fix the draft (id + sha256) so every reviewer judges the same artifact
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/novel_stage.py", "freeze"]
+    output:
+      status: {type: string}
+      draft_id: {type: string}
+      draft_sha256: {type: string}
+      chars: {type: number}
+    routes:
+      - to: reviews
+
+  # ---- the reviewers run at the same time, inside one step ----
+  # Conductor's own `parallel` / `for_each` groups refuse script steps (v0.1.37), and every routed
+  # model call here is a script step. So the fan-out lives in the step: see steps/novel_reviews.py.
+  - name: reviews
+    type: script
+    description: Story + history (required) and Cold Reader (advisory), started together
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/novel_reviews.py", "{{ route.output.profile }}",
+           "review-story:{{ roles.output.story_provider }}:{{ roles.output.story_login }}:{{ roles.output.story_route }}:{% if workflow.input.review_mode == 'strict' %}/work/p281/prompts/novel-review-story-strict.md{% elif workflow.input.review_mode == 'marker' %}/work/p281/prompts/novel-review-story-marker.md{% else %}/work/p281/prompts/novel-review-story.md{% endif %}:review_story.json:required",
+           "review-history:{{ roles.output.history_provider }}:{{ roles.output.history_login }}:{{ roles.output.history_route }}:/work/p281/prompts/novel-review-history.md:review_history.json:required",
+           "review-cold:{{ roles.output.cold_provider }}:{{ workflow.input.cold_login or roles.output.cold_login }}:{{ roles.output.cold_route }}:/work/p281/prompts/novel-cold.md:review_cold.json:advisory"]
+    timeout: 900
+    output:
+      status: {type: string}
+      reviewers: {type: number}
+      required_usable: {type: number}
+      failed: {type: string}
+      wall_s: {type: number}
+      busy_s: {type: number}
+      longest_step_s: {type: number}
+      overlap: {type: number}
+      detail: {type: string}
+    routes:
+      - to: triage
+
+  - name: triage
+    type: script
+    description: Deterministic routing decision from what the reviewers wrote
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/novel_stage.py", "triage", "{{ workflow.input.max_repairs }}"]
+    output:
+      decision: {type: string}
+      reason: {type: string}
+      repairs_done: {type: number}
+      blocking_count: {type: number}
+      cold_available: {type: string}
+      cold_continue_reading: {type: string}
+      draft_id: {type: string}
+      draft_sha256: {type: string}
+      chars: {type: number}
+    routes:
+      - to: repair
+        when: "{{ triage.output.decision == 'REPAIR' }}"
+      - to: record_pass
+        when: "{{ triage.output.decision == 'PASS' }}"
+      - to: record_block
+
+  - name: repair
+    type: script
+    description: Repair — the same Author, fixing exactly the findings
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/agent_task.py", "{{ roles.output.author_provider }}",
+           "{{ roles.output.author_route }}", "repair",
+           "/work/p281/prompts/novel-author.md", "draft.md",
+           "{{ route.output.profile }}", "{{ roles.output.author_login }}"]
+    timeout: 900
+    output:
+      status: {type: string}
+      produced: {type: boolean}
+    routes:
+      - to: freeze
+
+  - name: record_pass
+    type: script
+    description: Record the run (never fails the workflow)
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'execute': author.output, 'check': {'decision': triage.output.decision, 'reason': triage.output.reason, 'file_sha256': triage.output.draft_sha256}, 'route': route.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: done_pass
+
+  # A BLOCK is a judgement about an execution that happened, so it is recorded as one: the same
+  # execute record the PASS path uses, with the real decision and reason. Called without it, the
+  # recorder takes its "the router started nothing" path and a reviewed-then-blocked chapter was
+  # stored as status=HOLD, gate.decision=NOT_RUN (measured).
+  - name: record_block
+    type: script
+    description: Record a blocked run
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'execute': (author.output if author is defined else architect.output), 'check': {'decision': 'BLOCK', 'reason': (triage.output.reason if triage is defined else ('author produced no draft' if author is defined else 'architect produced no contract')), 'file_sha256': (triage.output.draft_sha256 if triage is defined else '')}, 'route': route.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: done_block
+
+  - name: record_hold
+    type: script
+    description: Record a run the router held
+    command: "${POC_PY:-/opt/venv/bin/python}"
+    args: ["/work/p281/steps/record.py"]
+    stdin: "{{ {'route': route.output} | tojson }}"
+    output:
+      mlflow_run_id: {type: string}
+      experiment_id: {type: string}
+      record_error: {type: string}
+    routes:
+      - to: done_hold
+
+  - name: done_pass
+    type: terminate
+    status: success
+    reason: "PASS: {{ triage.output.reason }} (draft {{ triage.output.draft_id }}, repairs {{ triage.output.repairs_done }})"
+
+  - name: done_block
+    type: terminate
+    status: failed
+    reason: "BLOCK: {{ triage.output.reason }}"
+
+  - name: done_hold
+    type: terminate
+    status: failed
+    reason: "HOLD: {{ route.output.reason }} {{ roles.output.missing }} {{ roles.output.ineligible }}"
+
+
+output:
+  profile: "{{ route.output.profile }}"
+  route: "{{ route.output.decision }}: {{ route.output.reason }}"
+  roles: "{% if roles is defined %}architect={{ roles.output.architect_provider }} author={{ roles.output.author_provider }} story={{ roles.output.story_provider }} history={{ roles.output.history_provider }} cold={{ roles.output.cold_provider }}{% endif %}"
+  decision: "{% if triage is defined %}{{ triage.output.decision }}{% endif %}"
+  reason: "{% if triage is defined %}{{ triage.output.reason }}{% endif %}"
+  draft_id: "{% if triage is defined %}{{ triage.output.draft_id }}{% endif %}"
+  draft_sha256: "{% if triage is defined %}{{ triage.output.draft_sha256 }}{% endif %}"
+  chars: "{% if triage is defined %}{{ triage.output.chars }}{% endif %}"
+  repairs: "{% if triage is defined %}{{ triage.output.repairs_done }}{% endif %}"
+  cold_available: "{% if triage is defined %}{{ triage.output.cold_available }}{% endif %}"
+  cold_continue_reading: "{% if triage is defined %}{{ triage.output.cold_continue_reading }}{% endif %}"
+  review_overlap: "{% if reviews is defined %}{{ reviews.output.overlap }}{% endif %}"
+  review_wall_s: "{% if reviews is defined %}{{ reviews.output.wall_s }}{% endif %}"
+  reviews_failed: "{% if reviews is defined %}{{ reviews.output.failed }}{% endif %}"
+  mlflow_run_id: "{% if record_pass is defined %}{{ record_pass.output.mlflow_run_id }}{% elif record_block is defined %}{{ record_block.output.mlflow_run_id }}{% elif record_hold is defined %}{{ record_hold.output.mlflow_run_id }}{% endif %}"
+  record_error: "{% if record_pass is defined %}{{ record_pass.output.record_error }}{% elif record_block is defined %}{{ record_block.output.record_error }}{% elif record_hold is defined %}{{ record_hold.output.record_error }}{% endif %}"

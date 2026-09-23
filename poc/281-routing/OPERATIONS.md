@@ -22,6 +22,23 @@ carries #278 material and local notes that were never mirrored. Two differences 
 | `docker/compose.poc.yaml` | same defaults as the repository; this host's paths come from `docker/.env` (git-ignored: `POC_HOST_DIR=D:/Work/poc-278`, `RESEARCH_HOST_DIR=D:/Work/research-280`) | relative defaults (`..`, `../evidence/research`) — a fresh clone resolves inside `poc/281-routing/` |
 | `docker/agent.Dockerfile` | unpinned installs; copies one host CA file | Claude 2.1.278, Conductor `87f7788e`, Preloop CLI 0.15.0 pinned; `ca/` directory, certificates unversioned |
 
+**Everything else on both sides must be identical, and that is now checked.** A review of the
+published tree found `p281/steps/novel_reviews.py` calling `fanout.run_all(..., ledger=…)` against
+a `run_all(jobs)` that had been published without that parameter: the workspace ran (it still had
+the ledger version), the published pair stopped with a `TypeError` before a reviewer started, and
+the runs reported as "measured on the running stack" were of code no reader could execute. The
+per-member ledger was dropped from this scope on purpose, so the workspace was brought back to the
+published interface — and `scripts/mirror-check.sh` now compares every file that exists on both
+sides, with these two as its only documented exceptions. It is run before publishing, and a
+difference fails it.
+
+Its first version compared code and documents only: a changed `p281/fixtures/trading/packet.json`
+(what every lane decides from) and a changed `policy/b-fsmcp.yaml` (what the tools may do) both
+passed as `MIRROR OK`, which review demonstrated on two temporary trees. Inputs and policy decide
+what a run produces, so both are compared now (83 files); each of those two cases fails the check.
+Generated configuration (`config/generated/`, written by `cfg.py` per host) and anything holding
+credentials stay out of it — they are not published and are per-host by design.
+
 So **the running agent image was built from the unpinned Dockerfile**, and the versions in it are
 whatever the installers returned on 2026-09-22 (§3). The pinned Dockerfile in the repository has
 never been built here. The compose defaults are the repository's relative ones on both sides;
@@ -397,3 +414,165 @@ never exercised on live data again.
 | `shutil.move` falls back to copy-then-delete, so a failure in the middle could leave the original partly gone while a copy sat in the holding place | the holding place is on the same mount by construction, so `os.rename` is used and nothing is copied; a rename that cannot be done is a failure to report | with a rename made to fail, every path of the run stayed where it was and the holding place was left empty |
 
 `p281/cleanup_controls.py` now covers 17 cases.
+
+## 10. Tool policy per caller — corrected and measured (2026-09-23)
+
+An earlier version of this section concluded that a per-role permission "cannot be expressed in
+this version". **That was wrong**, and the review that caught it was right: the conclusion came
+from reading the condition evaluator alone and stopping there.
+
+**What is true about conditions.** A rule's CEL expression is evaluated against `{"args": args}`
+only; the caller is not visible *inside the expression*.
+
+**What that misses.** Choosing *whose* rules apply happens before the expression is evaluated.
+Read in the running image (`ghcr.io/preloop/preloop:0.15.0`):
+
+| mechanism | where |
+|---|---|
+| `subject_scope_chain()` — the caller's `api_key_id`, then its `managed_agent_id` | `services/subject_governance.py` |
+| `get_scoped_tool_rules()` — the rules for that subject, most specific first | same |
+| `is_tool_enabled_for_subject()` — a per-subject on/off for a tool, checked **before** any rule | same |
+| both are called by the policy evaluator, which is handed `subject_context` | `services/policy_evaluator.py` |
+| the MCP proxy fills that context on every call and also filters the tool **list** per subject | `services/dynamic_fastmcp.py` |
+| per-key governance is readable and writable over the API | `GET/PUT /api/v1/auth/api-keys/{id}/governance` |
+
+**Two of the three providers are different subjects; the third is not.** Codex and Claude were each
+enrolled as their own managed agent, and the account holds a credential for each, with different
+`api_key_id` *and* `managed_agent_id` (read from the API). **Grok presents Claude's credential**:
+comparing the bearer token each provider sends to the Preloop MCP endpoint (hashes only, never the
+values) gives
+
+| provider | MCP credential |
+|---|---|
+| Claude | `57dfc1f6…` — the same token the adapter uses for permission checks |
+| Grok | `57dfc1f6…` — **the same one** |
+| Codex | `5f90701f…` — its own |
+
+So a per-credential rule aimed at Claude would hit Grok as well. That is a fact about this
+installation, not about Preloop: Grok's Preloop registration was never separate here (see
+`run-agent.mjs`, the Grok profile — it has no Preloop principal of its own, a known open item of
+#281), and nothing has given it one.
+
+**Measured end to end on the live stack**, with one policy and one account:
+
+| step | result |
+|---|---|
+| `write_file` disabled on the Codex credential only (`tool_enabled_overrides`) | the governance API accepted it |
+| Codex asked to write a file | **DENIED**, no file written |
+| Claude asked to write the same file, unchanged | **COMPLETED**, file written |
+| the override cleared, Codex asked again | **COMPLETED**, file written |
+
+So per-caller tool permission works today, **at the granularity of a credential** — which is what
+was measured, and no further. It is not per role: in the novel trial one credential carries two
+roles on each side (Codex is architect *and* story reviewer, Claude is author *and* history
+reviewer), so "the author may write, the history reviewer may not" was **not** shown and does not
+follow from this test. Telling two roles of the same vendor apart would need a credential per
+role. What is *not* built is the
+connection: nothing in this stack sets or tracks per-credential governance — `cfg.py` manages the
+account policy only, and a role's credential is chosen for its login, not for its permissions.
+
+**Correcting two more claims that were in this document**
+
+- "A second Preloop stack per domain is required" — not established. Different rules for different
+  callers do not need another account; they need per-credential governance, which is one API call.
+  A second stack is one option, not the only one.
+- "Registration closes after the first user" — that is a setting, not a law: `registration_enabled`
+  still decides once an instance has a user, and a bootstrap token path exists
+  (`api/auth/bootstrap.py`). The earlier wording stated a configuration as a property of the
+  product.
+- **Per-run directories are separation of storage, not of access.** The file server serves all of
+  `/ws`, and the account policy carries no per-run restriction, so nothing stops one run's agent
+  from reading or writing another run's directory. This document said "each run works in its own
+  directory", which is true and was easy to misread as isolation; it is not.
+
+**Where this leaves it**, in the reviewer's words: *differentiated rights per credential inside one
+account are reported working; choosing a Preloop credential per role, and managing those settings,
+is unimplemented.* The pieces measured above are the ones a design would use — a role names a
+credential, and that credential carries the tool rights, which for two roles of the same vendor
+means a credential per role — and `cfg.py` would have to own that mapping the way it owns the
+account policy today. Per-lane recovery (§ trial records) and this mapping both stay on the same
+footing: built when something actually needs them.
+
+### Grok now has a Preloop principal of its own (2026-09-23)
+
+The open item was real: Grok presented **Claude's** credential to the Preloop MCP endpoint, so any
+per-credential rule aimed at one hit the other. It is closed, and the closing needed no new
+Preloop feature.
+
+**How.** `preloop agents discover` does not know Grok, but the API does not depend on discovery:
+
+```
+POST /api/v1/agents                      {"display_name": "...", "agent_kind": "grok"}
+POST /api/v1/agents/{id}/credentials     {"name": "...", "scopes": ["mcp:read","mcp:write"]}
+```
+
+The credential is returned once; it went into the `Authorization` header of the `preloop` MCP
+server entry in `/route/grok/config.toml` (the previous file is kept as `config.toml.bak`).
+Nothing else changed — a masked diff of the two files differs only in the token.
+
+**Measured after the change**
+
+| check | result |
+|---|---|
+| credential Grok presents | `00794a90…`, no longer Claude's `57dfc1f6…` |
+| MCP authentication with it | HTTP 200, and `tools/list` offers 19 tools (the adapter's credential is offered 20) |
+| a task through the routing layer | file written through `preloop__write_file` |
+| `write_file` disabled **on the Grok credential only** | Grok: no file. Claude at the same moment: file written |
+| override cleared | Grok writes again |
+
+So the three providers are now three subjects, and a tool right can be given or withheld per
+provider. The earlier limitation stands where it was narrowed to: this is **per credential**, and
+two roles sharing one provider still share its rights.
+
+**One behaviour worth recording.** Grok reached for its own `write`/`search_replace` first, which
+its configuration denies, and then gave up — "PROBE_BLOCKED: write and search_replace refused".
+Naming the MCP tool in the prompt (`preloop__write_file`) made it work. The credential was never
+the problem; tool choice was. A workflow that depends on Grok writing files should name the tool.
+
+### Per-role credentials: measured, and the adapter can now present one (2026-09-23)
+
+The limitation recorded above — *"this is per credential, and two roles sharing one provider still
+share its rights"* — was about this stack's wiring, not about Preloop. Both halves were measured.
+
+**Preloop side.** Two principals of the *same* vendor were created (`agent_kind: claude_code`,
+"Claude Code (role: author)" and "… (role: history)"), each with its own MCP credential, and
+`write_file` was disabled on the history principal alone. Governance is available per credential
+(`/api/v1/auth/api-keys/{key_id}/governance`) and per principal
+(`/api/v1/agents/{agent_id}/governance`); the principal level was used here, so the rule survives
+credential rotation.
+
+| credential presented to `/mcp/v1` | tools offered | `write_file` |
+|---|---|---|
+| role principal `author` | 19 | wrote the file |
+| role principal `history` (override `write_file:false`) | 18 — `write_file` is not in the list | "Access denied: Tool 'write_file' is not available" |
+| the adapter's own Claude credential, unchanged | 20 | wrote the file |
+
+**Adapter side.** A request may now name a principal: `mcp_principal: "<name>"` in `request.json`.
+The adapter then presents that principal's credential to the Preloop MCP endpoint instead of its
+own — for the server it attaches over ACP (Claude) and for the one it writes into a vendor config
+in memory (Codex). The token is never stored by the adapter and never written into the evidence:
+the caller supplies it in `PRELOOP_MCP_<NAME>`, and the result records only the principal's name.
+
+Measured through the routing layer, same provider, same login, same prompt, only the credential
+differing:
+
+| run | result |
+|---|---|
+| `mcp_principal: author` | `COMPLETED`, file written — the session called `mcp__preloop__write_file` |
+| `mcp_principal: history` | `COMPLETED`, no file — the session searched for the tool, did not find it in its list, and never called it |
+| `mcp_principal` named, `PRELOOP_MCP_<NAME>` not set | `FAILED` — fails closed, never falls back to the adapter's wider credential |
+| `mcp_principal` with `native_tools: true` | `FAILED` — the run would not go through the MCP server at all |
+| no `mcp_principal` (regression) | `COMPLETED`, file written with the adapter's own credential |
+| `mcp_principal` on Grok | `FAILED` — refused: Grok reads its credential from `/route/grok/config.toml`, so the adapter cannot substitute it for one call. Per-role for Grok would need a login directory (and config file) per role. |
+
+**What is still not built.** Nothing maps a workflow role to a principal: `steps/roles.py` binds a
+role to a vendor and a login, and no step passes `mcp_principal`, so no workflow uses this yet.
+Where the credentials come from is also left open on purpose — the adapter reads an environment
+variable, so an operator can inject them from wherever they are kept, and `cfg.py` would own the
+role → principal mapping the day a workflow needs it.
+
+**Two lifecycle facts worth keeping.** Deleting a managed agent (`DELETE /api/v1/agents/{id}`)
+revokes its credential immediately — the same token went from HTTP 200 to 401 — but the API key
+rows stay listed until deleted separately (`DELETE /api/v1/auth/api-keys/{key_id}`). The probe
+principals, their eight credentials and every probe file were removed after the measurement; the
+account is back to the four principals it had (Grok, Codex, two Claude).
