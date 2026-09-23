@@ -475,3 +475,39 @@ credential, and that credential carries the tool rights, which for two roles of 
 means a credential per role — and `cfg.py` would have to own that mapping the way it owns the
 account policy today. Per-lane recovery (§ trial records) and this mapping both stay on the same
 footing: built when something actually needs them.
+
+### Grok now has a Preloop principal of its own (2026-09-23)
+
+The open item was real: Grok presented **Claude's** credential to the Preloop MCP endpoint, so any
+per-credential rule aimed at one hit the other. It is closed, and the closing needed no new
+Preloop feature.
+
+**How.** `preloop agents discover` does not know Grok, but the API does not depend on discovery:
+
+```
+POST /api/v1/agents                      {"display_name": "...", "agent_kind": "grok"}
+POST /api/v1/agents/{id}/credentials     {"name": "...", "scopes": ["mcp:read","mcp:write"]}
+```
+
+The credential is returned once; it went into the `Authorization` header of the `preloop` MCP
+server entry in `/route/grok/config.toml` (the previous file is kept as `config.toml.bak`).
+Nothing else changed — a masked diff of the two files differs only in the token.
+
+**Measured after the change**
+
+| check | result |
+|---|---|
+| credential Grok presents | `00794a90…`, no longer Claude's `57dfc1f6…` |
+| MCP authentication with it | HTTP 200, and `tools/list` offers 19 tools (the adapter's credential is offered 20) |
+| a task through the routing layer | file written through `preloop__write_file` |
+| `write_file` disabled **on the Grok credential only** | Grok: no file. Claude at the same moment: file written |
+| override cleared | Grok writes again |
+
+So the three providers are now three subjects, and a tool right can be given or withheld per
+provider. The earlier limitation stands where it was narrowed to: this is **per credential**, and
+two roles sharing one provider still share its rights.
+
+**One behaviour worth recording.** Grok reached for its own `write`/`search_replace` first, which
+its configuration denies, and then gave up — "PROBE_BLOCKED: write and search_replace refused".
+Naming the MCP tool in the prompt (`preloop__write_file`) made it work. The credential was never
+the problem; tool choice was. A workflow that depends on Grok writing files should name the tool.
