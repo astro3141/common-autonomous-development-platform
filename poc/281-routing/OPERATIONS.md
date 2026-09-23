@@ -211,3 +211,17 @@ anything is started, and still verifies the names afterwards.
 `cadp278r` on its own ports → 16/16 checks → Preloop counts match → run history and MLflow
 experiments present → `auto` workflow **PASS** → `down.sh --volumes` removed only the restored
 instance → the live instance came back with 16/16 checks.
+
+### Second review — four failure paths closed (2026-09-23)
+
+| # | was | is now | checked |
+|---|---|---|---|
+| 1 | the restore compared its Preloop directory with the live one for equality only, and split the live mount list on spaces, so a parent directory of the live install (later `rm -rf`'d) and a path with spaces slipped through | every directory the restore writes to or deletes — its workspace and its Preloop install — is compared **both ways** against every directory the live instance uses, on normalised paths, read line by line. Docker's internal mount form (`/run/desktop/mnt/host/d/…`) is normalised first; unnormalised it matched nothing and the check passed silently | refused: workspace equal to, inside, or containing the live workspace; workspace equal to the live research directory; Preloop directory equal to, above, or inside a live directory; the restore's own two directories overlapping each other; and the same with spaces in the path. A separate target still passes |
+| 2 | `down.sh --volumes` selected by name prefix, so with `STACK=cadp278r` a volume named `cadp278r-second-…` was selected too | the five volumes of the instance and its Preloop data volume are named exactly | with `cadp278r-second-route-creds` and `cadp278r-second-agent-home` present, only `cadp278r-route-creds` was removed; the lookalikes survived |
+| 3 | `up.sh` defaulted `POC_HOST_DIR`/`RESEARCH_HOST_DIR` to its own directory and exported them, and a shell variable wins over `docker/.env` — so the live agent had ended up mounting the wrong research directory | no path is defaulted in `up.sh`/`down.sh`; one is exported only when the environment or a restored workspace's `instance.env` set it. Compose then reads `docker/.env`, and falls back to the relative defaults | after the fix the live agent mounts `D:/Work/research-280` again (it had been mounting `…/poc-278/evidence/research`), and the restored copy mounts its own |
+| 4 | the row counts were read before the writers were stopped and the dump taken after, so an approval arriving in between made a good dump look wrong | the counts are read after the stop and immediately before `pg_dump`, from the same quiesced state | a fresh backup and restore: "80 tables, key counts match" |
+
+Third exercise, end to end (archive `20260923-011845`): fresh clone → `cadp278r` on its own ports →
+16/16 checks → counts match → `auto` workflow **PASS** → the research data restored (48 MB of the
+49 MB directory, the difference being files the backup excludes) → `down.sh --volumes` removed only
+this instance's six volumes → the live instance came back with 16/16 checks and its correct mounts.
