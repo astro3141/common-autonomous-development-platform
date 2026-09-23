@@ -114,7 +114,7 @@ services:
       # (DNS-rebinding protection). In-network clients address it as `mlflow:5000`,
       # so that name has to be allowed explicitly. Measured: without this, OTLP
       # ingest answers 403 "Invalid Host header".
-      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000"
+      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow,mlflow:5000,localhost,localhost:${MLFLOW_PORT:-5000},127.0.0.1,127.0.0.1:${MLFLOW_PORT:-5000}"
     ports:
       # Inbound only. Publishing a port does not give any container egress,
       # so this does not weaken the N7 claim.
@@ -132,7 +132,9 @@ services:
     container_name: ${STACK:-cadp278}-toolsvc
     restart: unless-stopped
     networks:
-      - toolnet
+      toolnet:
+        # instance-independent name: the Preloop policy addresses the tool servers by it
+        aliases: [toolsvc]
     volumes:
       - type: bind
         source: ${POC_HOST_DIR:-D:/Work/poc-278}/evidence/n1-markers
@@ -148,7 +150,9 @@ services:
     container_name: ${STACK:-cadp278}-fsmcp
     restart: unless-stopped
     networks:
-      - toolnet
+      toolnet:
+        # instance-independent name: the Preloop policy addresses the tool servers by it
+        aliases: [fsmcp]
     volumes:
       - ws:/ws
 

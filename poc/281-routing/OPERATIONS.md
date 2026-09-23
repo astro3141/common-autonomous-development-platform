@@ -123,3 +123,65 @@ taken on 2026-09-23 sits in `D:\docker-vhdx-backup-20260923`.
    checks that show when they last ran and why they failed.
 4. **Full fresh installation** — deferred. What is manual today stays written down instead
    (`RUNBOOK.md`, #278 §2.1–2.6 plus the #281 bring-up and the operator logins).
+
+## 7. Backup and restore (measured 2026-09-23)
+
+```bash
+scripts/backup.sh [--out DIR] [--key FILE]     # stops the writers, copies, encrypts
+scripts/restore.sh --archive FILE --workspace DIR --clone-from REPO --rev REV --stack NAME
+scripts/restore.sh --archive FILE --workspace X --verify-only    # decrypt + manifest only
+```
+
+**What a backup holds** — everything marked *restore required* in §4: the three volumes
+(`route-creds`, `agent-home`, `quota-home`), a transactional dump of Preloop's database, and the
+host paths `evidence/mlflow`, `evidence/p281`, `evidence/ui-runs`, `evidence/runs`,
+`evidence/conductor-events`, `config/` (including `generated/state.json`, taken with the database
+so the two agree), `policy/`, the research data and the Preloop install directory with its `.env`.
+`quota-obs` and `ws` are left out: they are regenerated. A `release.json` records the revision,
+image ids and the tool versions read from the running containers (§3).
+
+**Consistency.** Every writer is stopped for the copy (15 containers, ~2 minutes); Postgres stays
+up for its dump alone. `--no-stop` exists for a dry run and is crash-consistent only.
+
+**Encryption.** The archive holds provider logins, the Preloop enrolment token and Preloop's key
+file, so it is always AES-256 encrypted with a key file kept outside the archive
+(`~/.cadp-backup.key`, created on first use). **Lose the key and the backup is unreadable — keep a
+copy of the key, and of the archive, on separate media.** Nothing is written inside the workspace
+or the repository.
+
+**Restoring never touches the instance in use.** The restored copy gets its own instance name
+(`STACK`, default `cadp278r`), its own volumes, its own Preloop project and its own ports (hub
+8790, ops 8791, MLflow 5010, Preloop 8010/8011/3010). Both copies hold the *same* credentials, so
+they must not run at once: the script refuses to start while the live instance is up, and prints
+how to stop it.
+
+**Result of the first real exercise** (backup `20260922-234312`, 1.1 GB, 14 members):
+
+| criterion | result |
+|---|---|
+| archive readable and unchanged | 14/14 members match their SHA-256 |
+| restored into a fresh clone (`poc/281-ops`), new volumes, new ports | instance `cadp278r` came up; live volumes and workspace untouched |
+| authentication | all three provider logins usable without logging in again; observer login too |
+| policy | `cfg.py status` → `applied`; Preloop MCP still requires authentication; fsmcp tools exposed |
+| records | the run history and the MLflow experiments from the backup were there |
+| a small task | `auto` workflow → **PASS** (`file present with expected content`) |
+| all checks | 16/16 |
+
+**Three faults the exercise found — all fixed:**
+
+1. **A Windows clone broke the observer.** Git checked the shell scripts out with CRLF; `/bin/sh`
+   inside the container then failed (`Syntax error: end of file unexpected`). Fixed by
+   `.gitattributes` (`* text=auto eol=lf`).
+2. **A clone without instance names silently started the live instance** against the restored
+   workspace. The restore script now refuses a revision that has no `STACK` support, and checks
+   after start-up that the containers carry its own name.
+3. **The Preloop policy addressed the tool servers by instance-specific host names**
+   (`cadp278-toolsvc`, `cadp278-fsmcp`), so in the restored copy the model could not reach them and
+   the task ended `BLOCK`. The services now carry the instance-independent aliases `toolsvc` and
+   `fsmcp`, and every policy file uses those. Re-applied and verified on both instances (live task:
+   PASS).
+   MLflow's allowed-host list also had the port fixed at 5000; it now follows the instance's port.
+
+**Not covered.** Expired or revoked credentials are not made to work again by a restore: what is
+restored is the state as it was. A restore proves the state comes back, not that a token is still
+valid.
