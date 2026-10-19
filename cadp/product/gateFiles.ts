@@ -24,6 +24,7 @@ export const GATE_PATH_RULES: readonly string[] = [
   "cadp/product/workerProviders.ts", // which worker models are selectable
   "cadp/product/reviewProviders.ts", // which reviewer models are selectable
   "cadp/product/planProviders.ts", // which planner models are selectable
+  "cadp/product/executionContract.ts", // what the broker digests and what it refuses to execute
   "cadp/product/brokerTransport.ts", // the activity-host -> broker transport bounds
   "cadp/product/timeouts.ts", // the declared timeout hierarchy
   "cadp/product/mcp.ts", // the tool surface a supervising session drives
